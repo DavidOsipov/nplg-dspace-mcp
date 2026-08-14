@@ -1,0 +1,171 @@
+name: Restore verified Python source
+
+on:
+  push:
+    branches:
+      - restore-python-source-20260814
+    paths:
+      - .source-transfer/READY
+
+permissions:
+  contents: write
+
+concurrency:
+  group: restore-nplg-python-source
+  cancel-in-progress: false
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      EXPECTED_MAIN_SHA: a3fae1cb0e0af2c7a18a3ac6784343bba06c839f
+      EXPECTED_SOURCE_COMMIT: d0629703f85c903ae687cf178ca49527022db8f4
+    steps:
+      - name: Check out transfer branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Python 3.14
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          version: "latest-known"
+          enable-cache: false
+
+      - name: Reconstruct and authenticate source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse origin/main)" = "$EXPECTED_MAIN_SHA"
+          test "$(cat .source-transfer/SOURCE_COMMIT)" = "$EXPECTED_SOURCE_COMMIT"
+          mkdir -p /tmp/nplg-source
+          cat .source-transfer/part-*.b64 | base64 --decode > /tmp/nplg-source.tar.xz
+          expected_archive_sha="$(cat .source-transfer/archive.sha256)"
+          actual_archive_sha="$(sha256sum /tmp/nplg-source.tar.xz | awk '{print $1}')"
+          test "$actual_archive_sha" = "$expected_archive_sha"
+
+          python - <<'PY'
+          import subprocess
+          from pathlib import PurePosixPath
+
+          entries = subprocess.check_output(
+              ["tar", "-tJf", "/tmp/nplg-source.tar.xz"],
+              text=True,
+          ).splitlines()
+          if not entries:
+              raise SystemExit("source archive is empty")
+          for raw in entries:
+              path = PurePosixPath(raw)
+              if path.is_absolute() or ".." in path.parts or ".git" in path.parts:
+                  raise SystemExit(f"unsafe archive entry: {raw}")
+          PY
+
+          tar -xJf /tmp/nplg-source.tar.xz -C /tmp/nplg-source
+          (cd /tmp/nplg-source && sha256sum -c "$GITHUB_WORKSPACE/.source-transfer/MANIFEST.sha256")
+          test -f /tmp/nplg-source/pyproject.toml
+          test -f /tmp/nplg-source/alpic.json
+          test -f /tmp/nplg-source/src/nplg_mcp/__main__.py
+          test "$(cat /tmp/nplg-source/.python-version)" = "3.14"
+          test ! -e /tmp/nplg-source/.source-transfer
+          test ! -e /tmp/nplg-source/.bootstrap
+
+      - name: Reproduce the exact Alpic install on Python 3.14
+        working-directory: /tmp/nplg-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv venv --python python3 .venv-alpic
+          uv pip install --python .venv-alpic/bin/python --no-deps --only-binary=:all: -r requirements.lock
+          .venv-alpic/bin/python - <<'PY'
+          import fastapi
+          import httpx
+          import lxml
+          import PIL
+          import pydantic
+          import pypdfium2
+          import uvicorn
+          print("Alpic runtime imports succeeded")
+          PY
+          NODE_ENV=production \
+          ALPIC_HOST=restore-check.alpic.live \
+          ASSET_SIGNING_SECRET=ssssssssssssssssssssssssssssssss \
+          ALLOW_ANONYMOUS=true \
+          PYTHONPATH=src \
+          .venv-alpic/bin/python - <<'PY'
+          from nplg_mcp.config import load_config
+          import os
+
+          config = load_config(os.environ)
+          assert config.public_base_url == "https://restore-check.alpic.live"
+          assert str(config.cache_dir) == "/tmp/nplg-dspace-mcp-cache"
+          print("Alpic environment derivation succeeded")
+          PY
+
+      - name: Run tests and local Streamable HTTP smoke test
+        working-directory: /tmp/nplg-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv venv --python python3 .venv-test
+          uv pip install --python .venv-test/bin/python -e '.[test]'
+          .venv-test/bin/python -m pytest -q
+          .venv-test/bin/python -m compileall -q src scripts
+
+          NODE_ENV=test \
+          PUBLIC_BASE_URL=http://127.0.0.1:8765 \
+          ASSET_SIGNING_SECRET=ssssssssssssssssssssssssssssssss \
+          ALLOW_ANONYMOUS=true \
+          CACHE_DIR=/tmp/nplg-ci-cache \
+          HOST=127.0.0.1 \
+          PORT=8765 \
+          PYTHONPATH=src \
+          .venv-alpic/bin/python -m nplg_mcp > /tmp/nplg-server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+
+          for attempt in $(seq 1 40); do
+            if .venv-alpic/bin/python - <<'PY'
+          import json
+          import urllib.request
+
+          with urllib.request.urlopen("http://127.0.0.1:8765/healthz", timeout=1) as response:
+              assert json.load(response) == {"status": "ok"}
+          PY
+            then
+              break
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              cat /tmp/nplg-server.log
+              exit 1
+            fi
+            sleep 0.25
+          done
+          .venv-alpic/bin/python scripts/verify_deploy.py --base-url http://127.0.0.1:8765
+
+      - name: Publish one clean source commit to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse origin/main)" = "$EXPECTED_MAIN_SHA"
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a /tmp/nplg-source/. .
+          rm -rf .venv-alpic .venv-test
+          test -f pyproject.toml
+          test -f alpic.json
+          test ! -e .source-transfer
+          test ! -e .bootstrap
+          git add -A
+          git diff --cached --check
+          tree_sha="$(git write-tree)"
+          export GIT_AUTHOR_NAME="github-actions[bot]"
+          export GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          commit_sha="$(printf '%s\n' 'fix: publish complete Python source for Alpic' | git commit-tree "$tree_sha" -p "$EXPECTED_MAIN_SHA")"
+          git push origin "$commit_sha:refs/heads/main" --force-with-lease="refs/heads/main:$EXPECTED_MAIN_SHA"
