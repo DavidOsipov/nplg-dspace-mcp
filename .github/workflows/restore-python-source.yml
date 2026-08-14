@@ -21,6 +21,7 @@ jobs:
     env:
       EXPECTED_MAIN_SHA: a3fae1cb0e0af2c7a18a3ac6784343bba06c839f
       EXPECTED_SOURCE_COMMIT: d0629703f85c903ae687cf178ca49527022db8f4
+      EXPECTED_FINAL_TREE: 2adaf45a31f2bff33bd0990464eba37f841a0929
     steps:
       - name: Check out transfer branch
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -68,6 +69,8 @@ jobs:
 
           tar -xJf /tmp/nplg-source.tar.xz -C /tmp/nplg-source
           (cd /tmp/nplg-source && sha256sum -c "$GITHUB_WORKSPACE/.source-transfer/MANIFEST.sha256")
+          python "$GITHUB_WORKSPACE/.source-transfer/apply-test-hotfix.py"
+          (cd /tmp/nplg-source && sha256sum -c "$GITHUB_WORKSPACE/.source-transfer/FINAL_MANIFEST.sha256")
           test -f /tmp/nplg-source/pyproject.toml
           test -f /tmp/nplg-source/alpic.json
           test -f /tmp/nplg-source/src/nplg_mcp/__main__.py
@@ -163,6 +166,7 @@ jobs:
           git add -A
           git diff --cached --check
           tree_sha="$(git write-tree)"
+          test "$tree_sha" = "$EXPECTED_FINAL_TREE"
           export GIT_AUTHOR_NAME="github-actions[bot]"
           export GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
           export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
