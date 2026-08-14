@@ -1,0 +1,26 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+.data/
+.cache/
+*.log
+.DS_Store
+
+.worktrees/
+.tmp/
+.serena/
+lancedb/
+.venv/
+backups/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+*.egg-info/

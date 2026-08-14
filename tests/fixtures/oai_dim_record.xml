@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/" xmlns:dim="http://www.dspace.org/xmlns/dspace/dim">
+  <responseDate>2026-08-14T18:00:00Z</responseDate>
+  <GetRecord><record><header><identifier>oai:dspace.nplg.gov.ge:1234/560975</identifier><datestamp>2025-08-27</datestamp></header>
+  <metadata><dim:dim dspaceType="ITEM">
+    <dim:field mdschema="dc" element="contributor" qualifier="editor">გაგუა, მალხაზ</dim:field>
+    <dim:field mdschema="dc" element="date" qualifier="issued">2025-08-27</dim:field>
+    <dim:field mdschema="dc" element="identifier" qualifier="issn">2244-5374</dim:field>
+    <dim:field mdschema="dc" element="identifier" qualifier="uri">https://dspace.nplg.gov.ge/handle/1234/560975</dim:field>
+    <dim:field mdschema="dc" element="description" lang="en_US">საზოგადოებრივ-პოლიტიკური გაზეთი</dim:field>
+    <dim:field mdschema="dc" element="language" qualifier="iso" lang="en_US">ka</dim:field>
+    <dim:field mdschema="dc" element="publisher" lang="en_US">თბილისი</dim:field>
+    <dim:field mdschema="dc" element="subject" lang="en_US">პოლიტიკა</dim:field>
+    <dim:field mdschema="dc" element="title" lang="en_US">რეზონანსი N164</dim:field>
+    <dim:field mdschema="dc" element="type" lang="en_US">Newspaper</dim:field>
+    <dim:field mdschema="dc" element="rights" qualifier="holder" lang="en_US">საქართველოს ეროვნული ბიბლიოთეკა</dim:field>
+  </dim:dim></metadata></record></GetRecord>
+</OAI-PMH>

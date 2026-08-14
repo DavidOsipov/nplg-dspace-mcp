@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">
+  <responseDate>2026-08-14T18:00:00Z</responseDate>
+  <request verb="ListMetadataFormats">https://dspace.nplg.gov.ge/oai/request</request>
+  <ListMetadataFormats>
+    <metadataFormat><metadataPrefix>oai_dc</metadataPrefix><schema>http://www.openarchives.org/OAI/2.0/oai_dc.xsd</schema><metadataNamespace>http://www.openarchives.org/OAI/2.0/oai_dc/</metadataNamespace></metadataFormat>
+    <metadataFormat><metadataPrefix>dim</metadataPrefix><schema>https://dspace.nplg.gov.ge/oai/dim.xsd</schema><metadataNamespace>http://www.dspace.org/xmlns/dspace/dim</metadataNamespace></metadataFormat>
+  </ListMetadataFormats>
+</OAI-PMH>
