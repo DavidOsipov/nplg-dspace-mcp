@@ -1,0 +1,90 @@
+name: Restore and verify source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.source-transfer/READY'
+
+permissions:
+  contents: write
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v8
+        with:
+          version: "0.11.16"
+          enable-cache: true
+      - name: Reconstruct and authenticate source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/nplg-source /tmp/nplg-test
+          cat .source-transfer/part-*.b64 | base64 --decode > /tmp/nplg-source.tar.xz
+          expected_archive_sha="$(cat .source-transfer/archive.sha256)"
+          actual_archive_sha="$(sha256sum /tmp/nplg-source.tar.xz | awk '{print $1}')"
+          test "$actual_archive_sha" = "$expected_archive_sha"
+
+          python - <<'PY'
+          import subprocess
+          from pathlib import PurePosixPath
+
+          entries = subprocess.check_output(
+              ["tar", "-tJf", "/tmp/nplg-source.tar.xz"],
+              text=True,
+          ).splitlines()
+          if not entries:
+              raise SystemExit("source archive is empty")
+          for raw in entries:
+              path = PurePosixPath(raw)
+              if path.is_absolute() or ".." in path.parts or ".git" in path.parts:
+                  raise SystemExit(f"unsafe archive entry: {raw}")
+          PY
+
+          tar -xJf /tmp/nplg-source.tar.xz -C /tmp/nplg-source
+          (cd /tmp/nplg-source && sha256sum -c "$GITHUB_WORKSPACE/.source-transfer/MANIFEST.sha256")
+          test "$(cat .source-transfer/SOURCE_COMMIT)" = "ceb5e5a3bd82de7e3dbaaafe54f4629c1ef4c1d3"
+          cp -a /tmp/nplg-source/. /tmp/nplg-test/
+      - name: Install official MCP SDK and test dependencies
+        working-directory: /tmp/nplg-test
+        run: uv sync --extra alpic --extra test --no-dev
+      - name: Run deterministic tests and compile sources
+        working-directory: /tmp/nplg-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run python -m pytest -q
+          uv run python -m compileall -q src scripts main.py
+      - name: Exercise official SDK over Streamable HTTP
+        working-directory: /tmp/nplg-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT=8765 uv run python main.py > /tmp/nplg-mcp.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          uv run python scripts/verify_official_sdk.py --url http://127.0.0.1:8765/mcp
+      - name: Replace incomplete repository tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a /tmp/nplg-source/. .
+          test ! -e .source-transfer
+          test ! -e .bootstrap
+          test "$(git ls-files --others --exclude-standard | wc -l)" -ge 1
+          git add -A
+          git diff --cached --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "fix: restore Python source and add Alpic deployment"
+          git push origin HEAD:main
