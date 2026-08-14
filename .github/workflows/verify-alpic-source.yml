@@ -1,0 +1,78 @@
+name: Verify Alpic source tree
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-alpic-source.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: verify-alpic-source
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify complete root tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f pyproject.toml
+          test -f alpic.json
+          test -f requirements.lock
+          test -f src/nplg_mcp/app.py
+          test -f scripts/verify_deploy.py
+          test ! -e .bootstrap
+          test ! -e .upload
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install, test, and compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test]'
+          python -m pytest -q
+          python -m compileall -q src scripts
+
+      - name: Publish verified-source marker
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          Path('.alpic-source-ready.json').write_text(
+              json.dumps(
+                  {
+                      'verified_source_commit': os.environ['GITHUB_SHA'],
+                      'python': '3.13',
+                      'checks': ['root-tree', 'install', 'pytest', 'compileall'],
+                  },
+                  indent=2,
+                  sort_keys=True,
+              ) + '\n',
+              encoding='utf-8',
+          )
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .alpic-source-ready.json
+          git commit -m 'ci: verify Alpic source tree'
+          git push origin HEAD:main
