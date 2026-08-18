@@ -1,3 +1,6 @@
+# Copyright (c) 2026 David Osipov
+"""PDF inspection, rendering, and tile extraction primitives."""
+
 from __future__ import annotations
 
 import hashlib
@@ -5,35 +8,56 @@ import io
 import json
 import math
 import re
-from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import TYPE_CHECKING, cast
 
 import pypdfium2 as pdfium
 from PIL import Image, ImageChops, ImageStat, UnidentifiedImageError
-from PIL import __version__ as PILLOW_VERSION
+from PIL import __version__ as pillow_version
 from pypdfium2 import raw as pdfium_c
 
 from .config import HARD_MAX_TILE_DIMENSION, HARD_MAX_TILE_OVERLAP
 from .errors import AppError, ErrorCode
-from .storage import ContentAddressedStore
+from .json_types import (
+    JsonObject,
+    JsonValue,
+    dataclass_to_json,
+    load_json_value,
+    require_json_object,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
+
+    from .storage import ContentAddressedStore
 
 _RENDER_ID_RE = re.compile(r"^rnd_[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _RENDERER_VERSION = (
     f"pdfium-{pdfium.PDFIUM_INFO}_"
     f"pypdfium2-{pdfium.PYPDFIUM_INFO}_"
-    f"pillow-{PILLOW_VERSION}"
+    f"pillow-{pillow_version}"
 )
 _DOMINANT_COVERAGE = 0.98
 _MIN_EFFECTIVE_DPI = 50.0
 _MAX_EFFECTIVE_DPI = 2400.0
+_RECT_COORDINATE_COUNT = 4
+_MAX_VISUAL_CHANNEL_DELTA = 8
+_MIN_IMAGE_COVERAGE = 0.05
+_MAX_PAGES_PER_RENDER_LIMIT = 64
+_MIN_FALLBACK_DPI = 72
+_MAX_FALLBACK_DPI = 1200
+_EXACT_PIXEL_GRID = "the requested exact pixel grid without resizing."
+
+Rect = tuple[float, float, float, float]
 
 
 @dataclass(frozen=True, slots=True)
 class TileBox:
+    """Describe one exact crop rectangle in pixel coordinates."""
+
     x: int
     y: int
     width: int
@@ -42,6 +66,8 @@ class TileBox:
 
 @dataclass(frozen=True, slots=True)
 class PageInspection:
+    """Describe the classified geometry and raster content of one PDF page."""
+
     page_number: int
     width_points: float
     height_points: float
@@ -64,6 +90,8 @@ class PageInspection:
 
 @dataclass(frozen=True, slots=True)
 class PdfInspection:
+    """Describe deterministic inspection results for a complete PDF."""
+
     source_sha256: str
     page_count: int
     renderer_version: str
@@ -72,6 +100,8 @@ class PdfInspection:
 
 @dataclass(frozen=True, slots=True)
 class RenderedPage:
+    """Describe one persisted full-page render."""
+
     page_number: int
     width: int
     height: int
@@ -93,6 +123,8 @@ class RenderedPage:
 
 @dataclass(frozen=True, slots=True)
 class RenderManifest:
+    """Bind persisted page renders to their source and renderer identity."""
+
     render_id: str
     source_sha256: str
     renderer_version: str
@@ -103,6 +135,8 @@ class RenderManifest:
 
 @dataclass(frozen=True, slots=True)
 class RenderedTile:
+    """Describe one persisted crop-only page tile."""
+
     tile_id: str
     page_number: int
     x: int
@@ -124,6 +158,8 @@ class RenderedTile:
 
 @dataclass(frozen=True, slots=True)
 class TileManifest:
+    """Bind a deterministic tile set to its source page and geometry."""
+
     render_id: str
     page_number: int
     page_sha256: str
@@ -144,6 +180,223 @@ class _ImageCandidate:
     coverage: float
 
 
+@dataclass(frozen=True, slots=True)
+class _TileManifestRequest:
+    relative_path: str
+    render_id: str
+    page_number: int
+    tile_width: int
+    tile_height: int
+    overlap: int
+    page: RenderedPage
+    boxes: tuple[TileBox, ...]
+    tile_root: str
+
+
+type _RenderGrid = tuple[int, int, float, float, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _EncodedPage:
+    data: bytes
+    conversion_path: str
+    renderer_resampling: str
+    reencoded: bool
+    lossy: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PageRenderRequest:
+    render_id: str
+    page_number: int
+    inspection: PageInspection
+    grid: _RenderGrid
+
+
+@dataclass(frozen=True, slots=True)
+class _RenderRequest:
+    source_sha256: str
+    selected_pages: tuple[int, ...]
+    mode: str
+    render_id: str
+
+
+def _rect(values: Iterable[float]) -> Rect:
+    """Return exactly four finite rectangle coordinates."""
+    coordinates = tuple(float(value) for value in values)
+    if len(coordinates) != _RECT_COORDINATE_COUNT or not all(
+        math.isfinite(value) for value in coordinates
+    ):
+        message = "PDF rectangle must contain four finite coordinates"
+        raise ValueError(message)
+    return (
+        coordinates[0],
+        coordinates[1],
+        coordinates[2],
+        coordinates[3],
+    )
+
+
+def _field(payload: JsonObject, name: str) -> JsonValue:
+    """Read a required serialized manifest field."""
+    if name not in payload:
+        raise KeyError(name)
+    return payload[name]
+
+
+def _string_field(payload: JsonObject, name: str) -> str:
+    value = _field(payload, name)
+    if not isinstance(value, str):
+        message = f"manifest field {name} must be a string"
+        raise TypeError(message)
+    return value
+
+
+def _integer_field(payload: JsonObject, name: str) -> int:
+    value = _field(payload, name)
+    if type(value) is not int:
+        message = f"manifest field {name} must be an integer"
+        raise TypeError(message)
+    return value
+
+
+def _boolean_field(payload: JsonObject, name: str) -> bool:
+    value = _field(payload, name)
+    if type(value) is not bool:
+        message = f"manifest field {name} must be a boolean"
+        raise TypeError(message)
+    return value
+
+
+def _float_field(payload: JsonObject, name: str) -> float:
+    value = _field(payload, name)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        message = f"manifest field {name} must be numeric"
+        raise TypeError(message)
+    return float(value)
+
+
+def _list_field(payload: JsonObject, name: str) -> list[JsonValue]:
+    value = _field(payload, name)
+    if not isinstance(value, list):
+        message = f"manifest field {name} must be an array"
+        raise TypeError(message)
+    return value
+
+
+def _closed_object(
+    value: object, *, context: str, fields: frozenset[str]
+) -> JsonObject:
+    payload = require_json_object(value, context=context)
+    if frozenset(payload) != fields:
+        message = f"{context} has unknown or missing fields"
+        raise TypeError(message)
+    return payload
+
+
+def _rendered_page_from_json(value: object) -> RenderedPage:
+    payload = _closed_object(
+        value,
+        context="rendered page",
+        fields=frozenset(
+            {
+                "page_number",
+                "width",
+                "height",
+                "rotation",
+                "classification",
+                "effective_dpi_x",
+                "effective_dpi_y",
+                "resolution_source",
+                "conversion_path",
+                "relative_path",
+                "sha256",
+                "media_type",
+                "resize_applied",
+                "pixel_dimensions_preserved",
+                "renderer_resampling",
+                "reencoded",
+                "lossy_conversion",
+            }
+        ),
+    )
+    return RenderedPage(
+        page_number=_integer_field(payload, "page_number"),
+        width=_integer_field(payload, "width"),
+        height=_integer_field(payload, "height"),
+        rotation=_integer_field(payload, "rotation"),
+        classification=_string_field(payload, "classification"),
+        effective_dpi_x=_float_field(payload, "effective_dpi_x"),
+        effective_dpi_y=_float_field(payload, "effective_dpi_y"),
+        resolution_source=_string_field(payload, "resolution_source"),
+        conversion_path=_string_field(payload, "conversion_path"),
+        relative_path=_string_field(payload, "relative_path"),
+        sha256=_string_field(payload, "sha256"),
+        media_type=_string_field(payload, "media_type"),
+        resize_applied=_boolean_field(payload, "resize_applied"),
+        pixel_dimensions_preserved=_boolean_field(
+            payload, "pixel_dimensions_preserved"
+        ),
+        renderer_resampling=_string_field(payload, "renderer_resampling"),
+        reencoded=_boolean_field(payload, "reencoded"),
+        lossy_conversion=_boolean_field(payload, "lossy_conversion"),
+    )
+
+
+def _rendered_tile_from_json(value: object) -> RenderedTile:
+    payload = _closed_object(
+        value,
+        context="rendered tile",
+        fields=frozenset(
+            {
+                "tile_id",
+                "page_number",
+                "x",
+                "y",
+                "width",
+                "height",
+                "full_page_width",
+                "full_page_height",
+                "overlap",
+                "relative_path",
+                "sha256",
+                "media_type",
+                "resize_applied",
+                "pixel_dimensions_preserved",
+                "renderer_resampling",
+                "reencoded",
+                "lossy_conversion",
+            }
+        ),
+    )
+
+    return RenderedTile(
+        tile_id=_string_field(payload, "tile_id"),
+        page_number=_integer_field(payload, "page_number"),
+        x=_integer_field(payload, "x"),
+        y=_integer_field(payload, "y"),
+        width=_integer_field(payload, "width"),
+        height=_integer_field(payload, "height"),
+        full_page_width=_integer_field(payload, "full_page_width"),
+        full_page_height=_integer_field(payload, "full_page_height"),
+        overlap=_integer_field(payload, "overlap"),
+        relative_path=_string_field(payload, "relative_path"),
+        sha256=_string_field(payload, "sha256"),
+        media_type=_string_field(payload, "media_type"),
+        resize_applied=_boolean_field(payload, "resize_applied"),
+        pixel_dimensions_preserved=_boolean_field(
+            payload, "pixel_dimensions_preserved"
+        ),
+        renderer_resampling=_string_field(payload, "renderer_resampling"),
+        reencoded=_boolean_field(payload, "reencoded"),
+        lossy_conversion=_boolean_field(payload, "lossy_conversion"),
+    )
+
+
+def _candidate_sort_key(item: _ImageCandidate) -> tuple[float, int]:
+    return -item.coverage, item.image_index
+
+
 def _tile_layout(
     width: int,
     height: int,
@@ -153,16 +406,29 @@ def _tile_layout(
     overlap: int,
 ) -> tuple[int, int, int]:
     values = (width, height, tile_width, tile_height, overlap)
-    if any(not isinstance(value, int) or isinstance(value, bool) for value in values):
-        raise AppError(ErrorCode.INVALID_INPUT, "Tile geometry must use integer pixel values.")
+    if any(type(value) is not int for value in values):
+        raise AppError(
+            ErrorCode.INVALID_INPUT, "Tile geometry must use integer pixel values."
+        )
     if width <= 0 or height <= 0 or tile_width <= 0 or tile_height <= 0 or overlap < 0:
-        raise AppError(ErrorCode.INVALID_INPUT, "Tile geometry must be positive and overlap must be non-negative.")
+        raise AppError(
+            ErrorCode.INVALID_INPUT,
+            "Tile geometry must be positive and overlap must be non-negative.",
+        )
     if tile_width > HARD_MAX_TILE_DIMENSION or tile_height > HARD_MAX_TILE_DIMENSION:
-        raise AppError(ErrorCode.INVALID_INPUT, "Tile dimensions exceed the compiled safety ceiling.")
+        raise AppError(
+            ErrorCode.INVALID_INPUT,
+            "Tile dimensions exceed the compiled safety ceiling.",
+        )
     if overlap > HARD_MAX_TILE_OVERLAP:
-        raise AppError(ErrorCode.INVALID_INPUT, "Tile overlap exceeds the compiled safety ceiling.")
+        raise AppError(
+            ErrorCode.INVALID_INPUT, "Tile overlap exceeds the compiled safety ceiling."
+        )
     if overlap >= tile_width or overlap >= tile_height:
-        raise AppError(ErrorCode.INVALID_INPUT, "Tile overlap must be smaller than both tile dimensions.")
+        raise AppError(
+            ErrorCode.INVALID_INPUT,
+            "Tile overlap must be smaller than both tile dimensions.",
+        )
     stride_x = tile_width - overlap
     stride_y = tile_height - overlap
     columns = ((width - 1) // stride_x) + 1
@@ -178,6 +444,7 @@ def tile_boxes(
     tile_height: int,
     overlap: int,
 ) -> tuple[TileBox, ...]:
+    """Return deterministic row-major crop boxes for a page pixel grid."""
     stride_x, stride_y, _ = _tile_layout(
         width,
         height,
@@ -205,28 +472,30 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-@lru_cache(maxsize=4096)
-def _sha256_for_fingerprint(
-    path_value: str,
-    device: int,
-    inode: int,
-    size: int,
-    mtime_ns: int,
-    ctime_ns: int,
-) -> str:
-    del device, inode, size, mtime_ns, ctime_ns
-    return _sha256_file(Path(path_value))
+type _FileFingerprint = tuple[str, int, int, int, int, int]
+
+
+def _uncached_sha256_for_fingerprint(fingerprint: _FileFingerprint) -> str:
+    return _sha256_file(Path(fingerprint[0]))
+
+
+_sha256_for_fingerprint = cast(
+    "Callable[[_FileFingerprint], str]",
+    lru_cache(maxsize=4096)(_uncached_sha256_for_fingerprint),
+)
 
 
 def _verified_sha256(path: Path) -> str:
     metadata = path.stat()
     return _sha256_for_fingerprint(
-        str(path),
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_size,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
+        (
+            str(path),
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
     )
 
 
@@ -260,44 +529,63 @@ def _intersection_area(
     return float((right - left) * (top - bottom))
 
 
-def _jpeg_bytes(image: Image.Image, *, dpi_x: float | None = None, dpi_y: float | None = None) -> bytes:
+def _jpeg_bytes(
+    image: Image.Image, *, dpi_x: float | None = None, dpi_y: float | None = None
+) -> bytes:
     output = io.BytesIO()
     converted = image if image.mode == "RGB" else image.convert("RGB")
-    kwargs: dict[str, Any] = {
-        "format": "JPEG",
-        "quality": 100,
-        "subsampling": 0,
-        "progressive": False,
-        "optimize": False,
-    }
     if dpi_x and dpi_y:
-        kwargs["dpi"] = (round(dpi_x), round(dpi_y))
-    converted.save(output, **kwargs)
+        converted.save(
+            output,
+            format="JPEG",
+            quality=100,
+            subsampling=0,
+            progressive=False,
+            optimize=False,
+            dpi=(round(dpi_x), round(dpi_y)),
+        )
+    else:
+        converted.save(
+            output,
+            format="JPEG",
+            quality=100,
+            subsampling=0,
+            progressive=False,
+            optimize=False,
+        )
     return output.getvalue()
 
 
 def _decode_image(data: bytes) -> Image.Image:
     try:
         with Image.open(io.BytesIO(data)) as opened:
-            opened.load()
+            _ = opened.load()
             return opened.convert("RGB")
     except (UnidentifiedImageError, OSError, ValueError) as exc:
-        raise AppError(ErrorCode.PDF_PROCESSING_FAILED, "An embedded page image could not be decoded.", http_status=422) from exc
+        raise AppError(
+            ErrorCode.PDF_PROCESSING_FAILED,
+            "An embedded page image could not be decoded.",
+            http_status=422,
+        ) from exc
 
 
-def _bitmap_image(bitmap: Any) -> Image.Image:
+def _bitmap_image(bitmap: pdfium.PdfBitmap) -> Image.Image:
     try:
         # pypdfium2's PIL adapter may expose the native bitmap buffer directly.
         # Copy before closing the PDFium bitmap so the returned image owns bytes.
         return bitmap.to_pil().convert("RGB").copy()
     finally:
-        bitmap.close()
+        _ = bitmap.close()
 
 
-def _render_scale(page: Any, width: int, height: int) -> float:
+def _render_scale(page: pdfium.PdfPage, width: int, height: int) -> float:
     page_width, page_height = (float(value) for value in page.get_size())
     if page_width <= 0 or page_height <= 0:
-        raise AppError(ErrorCode.INVALID_DOCUMENT, "The PDF page has invalid dimensions.", http_status=422)
+        raise AppError(
+            ErrorCode.INVALID_DOCUMENT,
+            "The PDF page has invalid dimensions.",
+            http_status=422,
+        )
 
     # PdfPage.render() uses ceil(page_dimension * scale). Find a single scale
     # lying in both exact-output intervals. This avoids any post-render resize.
@@ -307,14 +595,14 @@ def _render_scale(page: Any, width: int, height: int) -> float:
     if not math.isfinite(scale) or scale <= 0 or scale <= lower:
         raise AppError(
             ErrorCode.PDF_PROCESSING_FAILED,
-            "The PDF renderer could not map the page onto the requested exact pixel grid without resizing.",
+            f"The PDF renderer could not map the page onto {_EXACT_PIXEL_GRID}",
             http_status=422,
             safe_details={"requested": [width, height]},
         )
     return scale
 
 
-def _page_image(page: Any, width: int, height: int) -> Image.Image:
+def _page_image(page: pdfium.PdfPage, width: int, height: int) -> Image.Image:
     try:
         bitmap = page.render(
             scale=_render_scale(page, width, height),
@@ -323,13 +611,17 @@ def _page_image(page: Any, width: int, height: int) -> Image.Image:
             draw_annots=True,
         )
     except (pdfium.PdfiumError, RuntimeError, ValueError, OSError) as exc:
-        raise AppError(ErrorCode.PDF_PROCESSING_FAILED, "The PDF page could not be rendered.", http_status=422) from exc
-    if bitmap.width != width or bitmap.height != height:
-        actual = [int(bitmap.width), int(bitmap.height)]
-        bitmap.close()
         raise AppError(
             ErrorCode.PDF_PROCESSING_FAILED,
-            "The PDF renderer could not produce the requested exact pixel grid without resizing.",
+            "The PDF page could not be rendered.",
+            http_status=422,
+        ) from exc
+    if bitmap.width != width or bitmap.height != height:
+        actual = [int(bitmap.width), int(bitmap.height)]
+        _ = bitmap.close()
+        raise AppError(
+            ErrorCode.PDF_PROCESSING_FAILED,
+            f"The PDF renderer could not produce {_EXACT_PIXEL_GRID}",
             http_status=422,
             safe_details={"requested": [width, height], "actual": actual},
         )
@@ -343,15 +635,20 @@ def _images_visually_equivalent(source: Image.Image, rendered: Image.Image) -> b
     if difference.getbbox() is None:
         return True
     extrema = difference.getextrema()
-    maximum = max(channel[1] for channel in extrema)
+    if not isinstance(extrema[0], tuple):
+        return False
+    channels = cast("tuple[tuple[int | float, int | float], ...]", extrema)
+    maximum = max(channel[1] for channel in channels)
     mean = max(ImageStat.Stat(difference).mean)
     # PDFium and Pillow can differ by a few decoder/color-rounding levels for
     # the same DCT stream. Geometry is independently constrained before this
     # check, so this tolerance is only a conservative equivalence guard.
-    return maximum <= 8 and mean <= 1.0
+    return maximum <= _MAX_VISUAL_CHANNEL_DELTA and mean <= 1.0
 
 
-def _visually_equivalent(extracted: bytes, page: Any, width: int, height: int) -> bool:
+def _visually_equivalent(
+    extracted: bytes, page: pdfium.PdfPage, width: int, height: int
+) -> bool:
     try:
         source = _decode_image(extracted)
         return _images_visually_equivalent(source, _page_image(page, width, height))
@@ -359,19 +656,29 @@ def _visually_equivalent(extracted: bytes, page: Any, width: int, height: int) -
         return False
 
 
-def _open_document(path: Path) -> Any:
+def _open_document(path: Path) -> pdfium.PdfDocument:
     if not path.is_file() or path.is_symlink():
-        raise AppError(ErrorCode.INVALID_DOCUMENT, "The cached PDF does not identify a regular file.", http_status=422)
+        raise AppError(
+            ErrorCode.INVALID_DOCUMENT,
+            "The cached PDF does not identify a regular file.",
+            http_status=422,
+        )
     try:
         document = pdfium.PdfDocument(path)
     except (pdfium.PdfiumError, RuntimeError, TypeError, ValueError, OSError) as exc:
         # PDFium intentionally does not expose a stable, portable distinction
         # between malformed and password-protected load failures here. Both
         # are rejected without attempting passwords or recovery.
-        raise AppError(ErrorCode.INVALID_DOCUMENT, "The PDF is malformed, encrypted, or unsupported.", http_status=422) from exc
+        raise AppError(
+            ErrorCode.INVALID_DOCUMENT,
+            "The PDF is malformed, encrypted, or unsupported.",
+            http_status=422,
+        ) from exc
     if len(document) <= 0:
-        document.close()
-        raise AppError(ErrorCode.INVALID_DOCUMENT, "The PDF contains no pages.", http_status=422)
+        _ = document.close()
+        raise AppError(
+            ErrorCode.INVALID_DOCUMENT, "The PDF contains no pages.", http_status=422
+        )
     return document
 
 
@@ -383,8 +690,8 @@ def _image_extension(filters: tuple[str, ...]) -> str:
     return "raster"
 
 
-def _page_objects(page: Any) -> tuple[tuple[_ImageCandidate, ...], bool]:
-    cropbox = tuple(float(value) for value in page.get_cropbox())
+def _page_objects(page: pdfium.PdfPage) -> tuple[tuple[_ImageCandidate, ...], bool]:
+    cropbox = _rect(page.get_cropbox())
     page_area = _rect_width(cropbox) * _rect_height(cropbox)
     if page_area <= 0:
         return (), True
@@ -396,8 +703,10 @@ def _page_objects(page: Any) -> tuple[tuple[_ImageCandidate, ...], bool]:
         for obj in page.get_objects():
             object_type = int(obj.type)
             if object_type == pdfium_c.FPDF_PAGEOBJ_IMAGE:
+                if not isinstance(obj, pdfium.PdfImage):
+                    return (), True
                 width, height = (int(value) for value in obj.get_px_size())
-                bounds = tuple(float(value) for value in obj.get_bounds())
+                bounds = _rect(obj.get_bounds())
                 filters = tuple(str(value) for value in obj.get_filters())
                 if width > 0 and height > 0:
                     coverage = min(1.0, _intersection_area(bounds, cropbox) / page_area)
@@ -418,10 +727,10 @@ def _page_objects(page: Any) -> tuple[tuple[_ImageCandidate, ...], bool]:
                 has_drawings = True
     except (pdfium.PdfiumError, RuntimeError, TypeError, ValueError):
         return (), True
-    return tuple(sorted(candidates, key=lambda item: (-item.coverage, item.image_index))), has_drawings
+    return tuple(sorted(candidates, key=_candidate_sort_key)), has_drawings
 
 
-def _page_has_text(page: Any) -> bool:
+def _page_has_text(page: pdfium.PdfPage) -> bool:
     textpage = None
     try:
         textpage = page.get_textpage()
@@ -431,16 +740,24 @@ def _page_has_text(page: Any) -> bool:
         return True
     finally:
         if textpage is not None:
-            textpage.close()
+            _ = textpage.close()
 
 
-def _inspect_page(page: Any, page_number: int) -> PageInspection:
+def _inspect_page(page: pdfium.PdfPage, page_number: int) -> PageInspection:
     candidates, has_drawings = _page_objects(page)
-    meaningful = tuple(candidate for candidate in candidates if candidate.coverage >= 0.05)
-    dominant = candidates[0] if candidates and candidates[0].coverage >= _DOMINANT_COVERAGE else None
+    meaningful = tuple(
+        candidate
+        for candidate in candidates
+        if candidate.coverage >= _MIN_IMAGE_COVERAGE
+    )
+    dominant = (
+        candidates[0]
+        if candidates and candidates[0].coverage >= _DOMINANT_COVERAGE
+        else None
+    )
     has_text = _page_has_text(page)
-    cropbox = tuple(float(value) for value in page.get_cropbox())
-    mediabox = tuple(float(value) for value in page.get_mediabox())
+    cropbox = _rect(page.get_cropbox())
+    mediabox = _rect(page.get_mediabox())
     crop_applied = not _rect_equal(cropbox, mediabox)
     rotation = int(page.get_rotation())
     width_points, height_points = (float(value) for value in page.get_size())
@@ -465,8 +782,12 @@ def _inspect_page(page: Any, page_number: int) -> PageInspection:
             and _MIN_EFFECTIVE_DPI <= dpi_x <= _MAX_EFFECTIVE_DPI
             and _MIN_EFFECTIVE_DPI <= dpi_y <= _MAX_EFFECTIVE_DPI
         )
-        unrotated_width = max(1, round(_rect_width(cropbox) * dominant.width / bounds_width))
-        unrotated_height = max(1, round(_rect_height(cropbox) * dominant.height / bounds_height))
+        unrotated_width = max(
+            1, round(_rect_width(cropbox) * dominant.width / bounds_width)
+        )
+        unrotated_height = max(
+            1, round(_rect_height(cropbox) * dominant.height / bounds_height)
+        )
         if rotation in {90, 270}:
             native_width, native_height = unrotated_height, unrotated_width
             dpi_x, dpi_y = dpi_y, dpi_x
@@ -489,8 +810,12 @@ def _inspect_page(page: Any, page_number: int) -> PageInspection:
             and native_width == dominant.width
             and native_height == dominant.height
         )
-        direct_eligible = bool(classification == "single_raster_jpeg" and exact_geometry)
-        raster_extract_eligible = bool(classification == "single_raster_other" and exact_geometry)
+        direct_eligible = bool(
+            classification == "single_raster_jpeg" and exact_geometry
+        )
+        raster_extract_eligible = bool(
+            classification == "single_raster_other" and exact_geometry
+        )
 
     return PageInspection(
         page_number=page_number,
@@ -514,34 +839,197 @@ def _inspect_page(page: Any, page_number: int) -> PageInspection:
     )
 
 
-def _page_image_object(page: Any, image_index: int) -> Any:
+def _page_image_object(page: pdfium.PdfPage, image_index: int) -> pdfium.PdfImage:
     images = tuple(page.get_objects(filter=[pdfium_c.FPDF_PAGEOBJ_IMAGE]))
     if image_index < 0 or image_index >= len(images):
-        raise AppError(ErrorCode.PDF_PROCESSING_FAILED, "The dominant embedded image could not be reopened.", http_status=422)
-    return images[image_index]
+        raise AppError(
+            ErrorCode.PDF_PROCESSING_FAILED,
+            "The dominant embedded image could not be reopened.",
+            http_status=422,
+        )
+    image = images[image_index]
+    if not isinstance(image, pdfium.PdfImage):
+        raise AppError(
+            ErrorCode.PDF_PROCESSING_FAILED,
+            "The dominant embedded image has an invalid PDF object type.",
+            http_status=422,
+        )
+    return image
 
 
-def _raw_jpeg_bytes(page: Any, image_index: int) -> bytes:
+def _raw_jpeg_bytes(page: pdfium.PdfPage, image_index: int) -> bytes:
     image = _page_image_object(page, image_index)
     filters = tuple(str(value) for value in image.get_filters())
     # Decode transport/simple filters (for example ASCII85) while preserving
     # the terminal DCT stream byte-for-byte.
     data = bytes(image.get_data(decode_simple=True))
-    if not filters or filters[-1] != "DCTDecode" or not data.startswith(b"\xff\xd8") or not data.endswith(b"\xff\xd9"):
-        raise AppError(ErrorCode.PDF_PROCESSING_FAILED, "The embedded JPEG stream could not be extracted losslessly.", http_status=422)
+    if (
+        not filters
+        or filters[-1] != "DCTDecode"
+        or not data.startswith(b"\xff\xd8")
+        or not data.endswith(b"\xff\xd9")
+    ):
+        raise AppError(
+            ErrorCode.PDF_PROCESSING_FAILED,
+            "The embedded JPEG stream could not be extracted losslessly.",
+            http_status=422,
+        )
     return data
 
 
-def _native_image(page: Any, image_index: int) -> Image.Image:
+def _native_image(page: pdfium.PdfPage, image_index: int) -> Image.Image:
     image = _page_image_object(page, image_index)
     try:
         return _bitmap_image(image.get_bitmap(render=False))
     except (pdfium.PdfiumError, RuntimeError, TypeError, ValueError, OSError) as exc:
-        raise AppError(ErrorCode.PDF_PROCESSING_FAILED, "The embedded page image could not be decoded.", http_status=422) from exc
+        raise AppError(
+            ErrorCode.PDF_PROCESSING_FAILED,
+            "The embedded page image could not be decoded.",
+            http_status=422,
+        ) from exc
+
+
+def _validated_page_count(document: pdfium.PdfDocument, maximum: int) -> int:
+    page_count = len(document)
+    if page_count > maximum:
+        raise AppError(
+            ErrorCode.PDF_PROCESSING_FAILED,
+            "The PDF exceeds the maximum supported page count.",
+            http_status=422,
+            safe_details={"page_count": page_count, "maximum": maximum},
+        )
+    return page_count
+
+
+def _inspect_selected_pages(
+    document: pdfium.PdfDocument, selected: tuple[int, ...]
+) -> dict[int, PageInspection]:
+    inspections: dict[int, PageInspection] = {}
+    for page_number in selected:
+        page = document[page_number - 1]
+        try:
+            inspections[page_number] = _inspect_page(page, page_number)
+        finally:
+            _ = page.close()
+    return inspections
+
+
+def _encoded_grid_render(
+    page: pdfium.PdfPage,
+    grid: _RenderGrid,
+    *,
+    conversion_path: str,
+) -> _EncodedPage:
+    width, height, dpi_x, dpi_y, _resolution_source = grid
+    return _EncodedPage(
+        data=_jpeg_bytes(
+            _page_image(page, width, height),
+            dpi_x=dpi_x,
+            dpi_y=dpi_y,
+        ),
+        conversion_path=conversion_path,
+        renderer_resampling="possible",
+        reencoded=True,
+        lossy=True,
+    )
+
+
+def _encode_page(
+    page: pdfium.PdfPage,
+    inspection: PageInspection,
+    grid: _RenderGrid,
+) -> _EncodedPage:
+    width, height, dpi_x, dpi_y, resolution_source = grid
+    image_index = inspection.dominant_image_index
+    if inspection.direct_jpeg_eligible and image_index is not None:
+        try:
+            extracted = _raw_jpeg_bytes(page, image_index)
+        except AppError:
+            extracted = b""
+        if extracted and _visually_equivalent(extracted, page, width, height):
+            return _EncodedPage(
+                data=extracted,
+                conversion_path="direct_extract",
+                renderer_resampling="none",
+                reencoded=False,
+                lossy=False,
+            )
+        return _encoded_grid_render(
+            page,
+            grid,
+            conversion_path="native_grid_render",
+        )
+    if inspection.native_raster_extract_eligible and image_index is not None:
+        rendered = _page_image(page, width, height)
+        try:
+            decoded = _native_image(page, image_index)
+        except AppError:
+            decoded = None
+        if (
+            decoded is not None
+            and decoded.size == (width, height)
+            and _images_visually_equivalent(decoded, rendered)
+        ):
+            return _EncodedPage(
+                data=_jpeg_bytes(decoded, dpi_x=dpi_x, dpi_y=dpi_y),
+                conversion_path="native_raster_reencode",
+                renderer_resampling="none",
+                reencoded=True,
+                lossy=True,
+            )
+        return _EncodedPage(
+            data=_jpeg_bytes(rendered, dpi_x=dpi_x, dpi_y=dpi_y),
+            conversion_path="native_grid_render",
+            renderer_resampling="possible",
+            reencoded=True,
+            lossy=True,
+        )
+    conversion_path = (
+        "fallback_400dpi"
+        if resolution_source == "fallback_400_dpi"
+        else "native_grid_render"
+    )
+    return _encoded_grid_render(page, grid, conversion_path=conversion_path)
+
+
+def _cached_render_matches(manifest: RenderManifest, request: _RenderRequest) -> bool:
+    return (
+        manifest.source_sha256 == request.source_sha256
+        and manifest.mode == request.mode
+        and tuple(page.page_number for page in manifest.pages) == request.selected_pages
+    )
+
+
+def _validated_tile_source(
+    source: Image.Image,
+    page: RenderedPage,
+) -> None:
+    if source.size != (page.width, page.height):
+        raise AppError(
+            ErrorCode.INTERNAL_ERROR,
+            "The cached page dimensions do not match its manifest.",
+            http_status=500,
+        )
+
+
+def _validated_tile_crop(source: Image.Image, box: TileBox) -> Image.Image:
+    cropped = source.crop((box.x, box.y, box.x + box.width, box.y + box.height))
+    if cropped.size != (box.width, box.height):
+        cropped.close()
+        raise AppError(
+            ErrorCode.INTERNAL_ERROR,
+            "A tile crop did not preserve the requested pixel rectangle.",
+            http_status=500,
+        )
+    return cropped
 
 
 class PdfProcessor:
-    def __init__(
+    """Inspect PDFs and persist deterministic page and tile render artifacts."""
+
+    # app.py, app_factory.py, test_pdf.py, and delete_render.py depend on this
+    # explicit keyword contract; a limits bundle crosses Task 6A/6C boundaries.
+    def __init__(  # noqa: PLR0913
         self,
         *,
         store: ContentAddressedStore,
@@ -555,6 +1043,8 @@ class PdfProcessor:
         max_tiles_per_page: int = 100,
         max_document_pages: int = 2000,
     ) -> None:
+        """Initialize bounded render, cache, and tiling limits."""
+        super().__init__()
         self.store = store
         self.max_pages_per_render = max_pages_per_render
         self.max_page_pixels = max_page_pixels
@@ -565,17 +1055,24 @@ class PdfProcessor:
         self.tile_overlap = tile_overlap
         self.max_tiles_per_page = max_tiles_per_page
         self.max_document_pages = max_document_pages
-        if not 1 <= max_pages_per_render <= 64:
-            raise ValueError("max_pages_per_render must be between 1 and 64")
+        if not 1 <= max_pages_per_render <= _MAX_PAGES_PER_RENDER_LIMIT:
+            msg = "max_pages_per_render must be between 1 and 64"
+            raise ValueError(msg)
         if max_page_pixels <= 0 or max_render_pixels <= 0:
-            raise ValueError("pixel limits must be positive")
-        if not 72 <= fallback_dpi <= 1200:
-            raise ValueError("fallback_dpi must be between 72 and 1200")
+            msg = "pixel limits must be positive"
+            raise ValueError(msg)
+        if not _MIN_FALLBACK_DPI <= fallback_dpi <= _MAX_FALLBACK_DPI:
+            msg = "fallback_dpi must be between 72 and 1200"
+            raise ValueError(msg)
         if max_tiles_per_page <= 0:
-            raise ValueError("max_tiles_per_page must be positive")
-        tile_boxes(1, 1, tile_width=tile_width, tile_height=tile_height, overlap=tile_overlap)
+            msg = "max_tiles_per_page must be positive"
+            raise ValueError(msg)
+        _ = tile_boxes(
+            1, 1, tile_width=tile_width, tile_height=tile_height, overlap=tile_overlap
+        )
 
     def inspect(self, pdf_path: Path | str) -> PdfInspection:
+        """Inspect every page without persisting render artifacts."""
         path = Path(pdf_path).resolve()
         source_sha256 = _verified_sha256(path) if path.is_file() else ""
         document = _open_document(path)
@@ -586,7 +1083,10 @@ class PdfProcessor:
                     ErrorCode.PDF_PROCESSING_FAILED,
                     "The PDF exceeds the maximum supported page count.",
                     http_status=422,
-                    safe_details={"page_count": page_count, "maximum": self.max_document_pages},
+                    safe_details={
+                        "page_count": page_count,
+                        "maximum": self.max_document_pages,
+                    },
                 )
             inspected: list[PageInspection] = []
             for index in range(page_count):
@@ -594,7 +1094,7 @@ class PdfProcessor:
                 try:
                     inspected.append(_inspect_page(page, index + 1))
                 finally:
-                    page.close()
+                    _ = page.close()
             return PdfInspection(
                 source_sha256=source_sha256,
                 page_count=page_count,
@@ -602,7 +1102,7 @@ class PdfProcessor:
                 pages=tuple(inspected),
             )
         finally:
-            document.close()
+            _ = document.close()
 
     def _render_id(self, source_sha256: str, pages: tuple[int, ...], mode: str) -> str:
         key = {
@@ -612,7 +1112,9 @@ class PdfProcessor:
             "renderer_version": _RENDERER_VERSION,
             "source_sha256": source_sha256,
         }
-        digest = hashlib.sha256(json.dumps(key, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(
+            json.dumps(key, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         return f"rnd_{digest[:32]}"
 
     @staticmethod
@@ -621,33 +1123,47 @@ class PdfProcessor:
             raise AppError(ErrorCode.INVALID_INPUT, "Render identifier is invalid.")
         return render_id
 
-    def _write_render_asset(self, render_id: str, relative_name: str, data: bytes) -> tuple[str, str]:
-        self._validate_render_id(render_id)
+    def _write_render_asset(
+        self, render_id: str, relative_name: str, data: bytes
+    ) -> tuple[str, str]:
+        _ = self._validate_render_id(render_id)
         pure = PurePosixPath(relative_name)
-        if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts) or "\\" in relative_name:
+        if (
+            pure.is_absolute()
+            or any(part in {"", ".", ".."} for part in pure.parts)
+            or "\\" in relative_name
+        ):
             raise AppError(ErrorCode.INVALID_INPUT, "Render asset name is invalid.")
         render_root = (self.store.root / "renders" / render_id).resolve()
         destination = (render_root / Path(*pure.parts)).resolve()
         try:
-            destination.relative_to(render_root)
+            _ = destination.relative_to(render_root)
         except ValueError as exc:
-            raise AppError(ErrorCode.INVALID_INPUT, "Render asset path escapes its render directory.") from exc
+            raise AppError(
+                ErrorCode.INVALID_INPUT,
+                "Render asset path escapes its render directory.",
+            ) from exc
         relative_path = destination.relative_to(self.store.root).as_posix()
         return self.store.put_render_bytes(relative_path, data)
 
-    def _manifest_from_dict(self, payload: dict[str, Any]) -> RenderManifest:
+    def _manifest_from_dict(self, payload: JsonObject) -> RenderManifest:
         try:
-            pages = tuple(RenderedPage(**item) for item in payload["pages"])
+            page_values = _list_field(payload, "pages")
+            pages = tuple(_rendered_page_from_json(item) for item in page_values)
             return RenderManifest(
-                render_id=str(payload["render_id"]),
-                source_sha256=str(payload["source_sha256"]),
-                renderer_version=str(payload["renderer_version"]),
-                mode=str(payload["mode"]),
+                render_id=_string_field(payload, "render_id"),
+                source_sha256=_string_field(payload, "source_sha256"),
+                renderer_version=_string_field(payload, "renderer_version"),
+                mode=_string_field(payload, "mode"),
                 pages=pages,
-                manifest_relative_path=str(payload["manifest_relative_path"]),
+                manifest_relative_path=_string_field(payload, "manifest_relative_path"),
             )
         except (KeyError, TypeError, ValueError) as exc:
-            raise AppError(ErrorCode.INTERNAL_ERROR, "The cached render manifest is invalid.", http_status=500) from exc
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "The cached render manifest is invalid.",
+                http_status=500,
+            ) from exc
 
     def _validate_manifest_assets(self, manifest: RenderManifest) -> None:
         if (
@@ -656,11 +1172,17 @@ class PdfProcessor:
             or manifest.mode != "native"
             or not manifest.pages
         ):
-            raise AppError(ErrorCode.INTERNAL_ERROR, "The cached render manifest is invalid.", http_status=500)
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "The cached render manifest is invalid.",
+                http_status=500,
+            )
         seen_pages: set[int] = set()
         try:
             for page in manifest.pages:
-                expected_path = f"renders/{manifest.render_id}/page-{page.page_number:04d}.jpg"
+                expected_path = (
+                    f"renders/{manifest.render_id}/page-{page.page_number:04d}.jpg"
+                )
                 if (
                     isinstance(page.page_number, bool)
                     or page.page_number < 1
@@ -671,44 +1193,69 @@ class PdfProcessor:
                     or page.media_type != "image/jpeg"
                     or not _SHA256_RE.fullmatch(page.sha256)
                 ):
-                    raise AppError(ErrorCode.INTERNAL_ERROR, "The cached render manifest is invalid.", http_status=500)
+                    raise AppError(
+                        ErrorCode.INTERNAL_ERROR,
+                        "The cached render manifest is invalid.",
+                        http_status=500,
+                    )
                 path = self.store.resolve_asset(page.relative_path)
                 if _verified_sha256(path) != page.sha256:
-                    raise AppError(ErrorCode.INTERNAL_ERROR, "A cached render asset failed integrity validation.", http_status=500)
+                    raise AppError(
+                        ErrorCode.INTERNAL_ERROR,
+                        "A cached render asset failed integrity validation.",
+                        http_status=500,
+                    )
                 seen_pages.add(page.page_number)
         except (OSError, TypeError, ValueError) as exc:
-            raise AppError(ErrorCode.INTERNAL_ERROR, "The cached render manifest is invalid.", http_status=500) from exc
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "The cached render manifest is invalid.",
+                http_status=500,
+            ) from exc
 
     def _read_tile_manifest(
         self,
-        relative_path: str,
-        *,
-        render_id: str,
-        page_number: int,
-        tile_width: int,
-        tile_height: int,
-        overlap: int,
-        page: RenderedPage,
-        boxes: tuple[TileBox, ...],
-        tile_root: str,
+        request: _TileManifestRequest,
     ) -> TileManifest:
+        relative_path = request.relative_path
+        render_id = request.render_id
+        page_number = request.page_number
+        tile_width = request.tile_width
+        tile_height = request.tile_height
+        overlap = request.overlap
+        page = request.page
+        boxes = request.boxes
+        tile_root = request.tile_root
         path = self.store.resolve_asset(relative_path)
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
-                raise TypeError("tile manifest root must be an object")
-            manifest = TileManifest(
-                render_id=str(payload["render_id"]),
-                page_number=int(payload["page_number"]),
-                page_sha256=str(payload["page_sha256"]),
-                tile_width=int(payload["tile_width"]),
-                tile_height=int(payload["tile_height"]),
-                overlap=int(payload["overlap"]),
-                tiles=tuple(RenderedTile(**item) for item in payload["tiles"]),
-                manifest_relative_path=str(payload["manifest_relative_path"]),
+            payload = require_json_object(
+                load_json_value(path.read_text(encoding="utf-8")),
+                context="tile manifest root",
             )
-        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            raise AppError(ErrorCode.INTERNAL_ERROR, "The cached tile manifest is invalid.", http_status=500) from exc
+            tile_values = _list_field(payload, "tiles")
+            manifest = TileManifest(
+                render_id=_string_field(payload, "render_id"),
+                page_number=_integer_field(payload, "page_number"),
+                page_sha256=_string_field(payload, "page_sha256"),
+                tile_width=_integer_field(payload, "tile_width"),
+                tile_height=_integer_field(payload, "tile_height"),
+                overlap=_integer_field(payload, "overlap"),
+                tiles=tuple(_rendered_tile_from_json(item) for item in tile_values),
+                manifest_relative_path=_string_field(payload, "manifest_relative_path"),
+            )
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "The cached tile manifest is invalid.",
+                http_status=500,
+            ) from exc
         if (
             manifest.render_id != render_id
             or manifest.page_number != page_number
@@ -719,82 +1266,338 @@ class PdfProcessor:
             or manifest.page_sha256 != page.sha256
             or len(manifest.tiles) != len(boxes)
         ):
-            raise AppError(ErrorCode.INTERNAL_ERROR, "The cached tile manifest is not bound to its request.", http_status=500)
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "The cached tile manifest is not bound to its request.",
+                http_status=500,
+            )
         try:
-            for index, (tile, box) in enumerate(zip(manifest.tiles, boxes, strict=True), start=1):
-                expected_id = f"p{page_number:04d}_w{tile_width:04d}-h{tile_height:04d}-o{overlap:03d}_x{box.x:06d}_y{box.y:06d}"
+            for _index, (tile, box) in enumerate(
+                zip(manifest.tiles, boxes, strict=True), start=1
+            ):
+                expected_id = (
+                    f"p{page_number:04d}_w{tile_width:04d}-h{tile_height:04d}"
+                    f"-o{overlap:03d}_x{box.x:06d}_y{box.y:06d}"
+                )
                 expected_path = f"renders/{render_id}/{tile_root}/{expected_id}.jpg"
                 if (
                     tile.tile_id != expected_id
                     or tile.page_number != page_number
-                    or (tile.x, tile.y, tile.width, tile.height) != (box.x, box.y, box.width, box.height)
-                    or (tile.full_page_width, tile.full_page_height) != (page.width, page.height)
+                    or (tile.x, tile.y, tile.width, tile.height)
+                    != (box.x, box.y, box.width, box.height)
+                    or (tile.full_page_width, tile.full_page_height)
+                    != (page.width, page.height)
                     or tile.overlap != overlap
                     or tile.relative_path != expected_path
                     or tile.media_type != "image/jpeg"
                     or not _SHA256_RE.fullmatch(tile.sha256)
                 ):
-                    raise AppError(ErrorCode.INTERNAL_ERROR, "The cached tile manifest is invalid.", http_status=500)
+                    raise AppError(
+                        ErrorCode.INTERNAL_ERROR,
+                        "The cached tile manifest is invalid.",
+                        http_status=500,
+                    )
                 path = self.store.resolve_asset(tile.relative_path)
                 if _verified_sha256(path) != tile.sha256:
-                    raise AppError(ErrorCode.INTERNAL_ERROR, "A cached tile failed integrity validation.", http_status=500)
+                    raise AppError(
+                        ErrorCode.INTERNAL_ERROR,
+                        "A cached tile failed integrity validation.",
+                        http_status=500,
+                    )
         except (OSError, TypeError, ValueError) as exc:
-            raise AppError(ErrorCode.INTERNAL_ERROR, "The cached tile manifest is invalid.", http_status=500) from exc
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "The cached tile manifest is invalid.",
+                http_status=500,
+            ) from exc
         return manifest
 
     def get_manifest(self, render_id: str) -> RenderManifest:
+        """Load and integrity-check a persisted page-render manifest."""
         render_id = self._validate_render_id(render_id)
         relative_path = f"renders/{render_id}/manifest.json"
         path = self.store.resolve_asset(relative_path)
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = require_json_object(
+                load_json_value(path.read_text(encoding="utf-8")),
+                context="render manifest root",
+            )
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise AppError(ErrorCode.INTERNAL_ERROR, "The cached render manifest could not be read.", http_status=500) from exc
-        if not isinstance(payload, dict):
-            raise AppError(ErrorCode.INTERNAL_ERROR, "The cached render manifest is invalid.", http_status=500)
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "The cached render manifest could not be read.",
+                http_status=500,
+            ) from exc
         manifest = self._manifest_from_dict(payload)
-        if manifest.render_id != render_id or manifest.manifest_relative_path != relative_path:
-            raise AppError(ErrorCode.INTERNAL_ERROR, "The cached render manifest is not bound to its render identifier.", http_status=500)
+        if (
+            manifest.render_id != render_id
+            or manifest.manifest_relative_path != relative_path
+        ):
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "The cached render manifest is not bound to its render identifier.",
+                http_status=500,
+            )
         self._validate_manifest_assets(manifest)
         return manifest
 
-    def _validate_page_selection(self, pages: Iterable[int], page_count: int) -> tuple[int, ...]:
+    def _validate_page_selection(
+        self, pages: Iterable[int], page_count: int
+    ) -> tuple[int, ...]:
         selected = tuple(pages)
         if not selected or len(selected) > self.max_pages_per_render:
             raise AppError(
                 ErrorCode.INVALID_INPUT,
-                f"Select between 1 and {self.max_pages_per_render} pages per render request.",
+                " ".join(
+                    (
+                        f"Select between 1 and {self.max_pages_per_render} pages per",
+                        "render request.",
+                    )
+                ),
             )
         if len(set(selected)) != len(selected):
-            raise AppError(ErrorCode.INVALID_INPUT, "Page selection must not contain duplicates.")
-        if any(not isinstance(page, int) or isinstance(page, bool) or page < 1 or page > page_count for page in selected):
-            raise AppError(ErrorCode.INVALID_INPUT, "Page numbers are one-based and must exist in the PDF.")
+            raise AppError(
+                ErrorCode.INVALID_INPUT, "Page selection must not contain duplicates."
+            )
+        if any(
+            type(page) is not int or page < 1 or page > page_count for page in selected
+        ):
+            raise AppError(
+                ErrorCode.INVALID_INPUT,
+                "Page numbers are one-based and must exist in the PDF.",
+            )
         return selected
 
-    def _target_grid(self, inspection: PageInspection) -> tuple[int, int, float, float, str]:
-        if inspection.classification in {"single_raster_jpeg", "single_raster_other", "raster_with_overlay"} and inspection.native_width and inspection.native_height:
+    def _target_grid(self, inspection: PageInspection) -> _RenderGrid:
+        if (
+            inspection.classification
+            in {"single_raster_jpeg", "single_raster_other", "raster_with_overlay"}
+            and inspection.native_width
+            and inspection.native_height
+        ):
             width = inspection.native_width
             height = inspection.native_height
             dpi_x = inspection.effective_dpi_x or width * 72.0 / inspection.width_points
-            dpi_y = inspection.effective_dpi_y or height * 72.0 / inspection.height_points
+            dpi_y = (
+                inspection.effective_dpi_y or height * 72.0 / inspection.height_points
+            )
             return width, height, dpi_x, dpi_y, "embedded_scan"
         width = max(1, round(inspection.width_points * self.fallback_dpi / 72.0))
         height = max(1, round(inspection.height_points * self.fallback_dpi / 72.0))
-        return width, height, float(self.fallback_dpi), float(self.fallback_dpi), "fallback_400_dpi"
+        return (
+            width,
+            height,
+            float(self.fallback_dpi),
+            float(self.fallback_dpi),
+            "fallback_400_dpi",
+        )
 
-    def render_pages(self, pdf_path: Path | str, *, pages: Iterable[int], mode: str = "native") -> RenderManifest:
+    def _render_grids(
+        self, inspections: dict[int, PageInspection]
+    ) -> dict[int, _RenderGrid]:
+        grids: dict[int, _RenderGrid] = {}
+        total_pixels = 0
+        for page_number, inspection in inspections.items():
+            grid = self._target_grid(inspection)
+            pixels = grid[0] * grid[1]
+            if pixels > self.max_page_pixels:
+                raise AppError(
+                    ErrorCode.PDF_PROCESSING_FAILED,
+                    "A rendered page would exceed the configured pixel limit.",
+                    http_status=422,
+                    safe_details={
+                        "page": page_number,
+                        "pixels": pixels,
+                        "maximum": self.max_page_pixels,
+                    },
+                )
+            total_pixels += pixels
+            grids[page_number] = grid
+        if total_pixels > self.max_render_pixels:
+            raise AppError(
+                ErrorCode.PDF_PROCESSING_FAILED,
+                "The render request would exceed the configured total pixel limit.",
+                http_status=422,
+                safe_details={
+                    "pixels": total_pixels,
+                    "maximum": self.max_render_pixels,
+                },
+            )
+        return grids
+
+    def _render_page(
+        self,
+        document: pdfium.PdfDocument,
+        request: _PageRenderRequest,
+    ) -> RenderedPage:
+        page = document[request.page_number - 1]
+        try:
+            encoded = _encode_page(page, request.inspection, request.grid)
+        finally:
+            _ = page.close()
+        width, height, dpi_x, dpi_y, resolution_source = request.grid
+        relative_path, output_sha = self._write_render_asset(
+            request.render_id,
+            f"page-{request.page_number:04d}.jpg",
+            encoded.data,
+        )
+        return RenderedPage(
+            page_number=request.page_number,
+            width=width,
+            height=height,
+            rotation=request.inspection.rotation,
+            classification=request.inspection.classification,
+            effective_dpi_x=round(dpi_x, 6),
+            effective_dpi_y=round(dpi_y, 6),
+            resolution_source=resolution_source,
+            conversion_path=encoded.conversion_path,
+            relative_path=relative_path,
+            sha256=output_sha,
+            media_type="image/jpeg",
+            resize_applied=False,
+            pixel_dimensions_preserved=resolution_source == "embedded_scan",
+            renderer_resampling=encoded.renderer_resampling,
+            reencoded=encoded.reencoded,
+            lossy_conversion=encoded.lossy,
+        )
+
+    def _write_render_manifest(
+        self,
+        request: _RenderRequest,
+        pages: tuple[RenderedPage, ...],
+    ) -> RenderManifest:
+        manifest_relative_path = f"renders/{request.render_id}/manifest.json"
+        manifest = RenderManifest(
+            render_id=request.render_id,
+            source_sha256=request.source_sha256,
+            renderer_version=_RENDERER_VERSION,
+            mode=request.mode,
+            pages=pages,
+            manifest_relative_path=manifest_relative_path,
+        )
+        payload = json.dumps(
+            dataclass_to_json(manifest, context="render manifest"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        written_path, _ = self._write_render_asset(
+            request.render_id, "manifest.json", payload
+        )
+        if written_path != manifest_relative_path:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Render manifest path mismatch.",
+                http_status=500,
+            )
+        return manifest
+
+    def _render_tile(
+        self,
+        request: _TileManifestRequest,
+        source: Image.Image,
+        box: TileBox,
+    ) -> RenderedTile:
+        geometry_key = (
+            f"w{request.tile_width:04d}-h{request.tile_height:04d}"
+            f"-o{request.overlap:03d}"
+        )
+        tile_id = f"p{request.page_number:04d}_{geometry_key}_x{box.x:06d}_y{box.y:06d}"
+        with _validated_tile_crop(source, box) as cropped:
+            data = _jpeg_bytes(
+                cropped,
+                dpi_x=request.page.effective_dpi_x,
+                dpi_y=request.page.effective_dpi_y,
+            )
+        relative_path, sha256 = self._write_render_asset(
+            request.render_id,
+            f"{request.tile_root}/{tile_id}.jpg",
+            data,
+        )
+        return RenderedTile(
+            tile_id=tile_id,
+            page_number=request.page_number,
+            x=box.x,
+            y=box.y,
+            width=box.width,
+            height=box.height,
+            full_page_width=request.page.width,
+            full_page_height=request.page.height,
+            overlap=request.overlap,
+            relative_path=relative_path,
+            sha256=sha256,
+            media_type="image/jpeg",
+        )
+
+    def _crop_tiles(
+        self,
+        request: _TileManifestRequest,
+    ) -> tuple[RenderedTile, ...]:
+        source_path = self.store.resolve_asset(request.page.relative_path)
+        with Image.open(source_path) as source:
+            _ = source.load()
+            _validated_tile_source(source, request.page)
+            return tuple(
+                self._render_tile(request, source, box) for box in request.boxes
+            )
+
+    def _write_tile_manifest(
+        self,
+        request: _TileManifestRequest,
+        tiles: tuple[RenderedTile, ...],
+    ) -> TileManifest:
+        result = TileManifest(
+            render_id=request.render_id,
+            page_number=request.page_number,
+            page_sha256=request.page.sha256,
+            tile_width=request.tile_width,
+            tile_height=request.tile_height,
+            overlap=request.overlap,
+            tiles=tiles,
+            manifest_relative_path=request.relative_path,
+        )
+        payload = json.dumps(
+            dataclass_to_json(result, context="tile manifest"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        written_path, _ = self._write_render_asset(
+            request.render_id,
+            f"{request.tile_root}/manifest.json",
+            payload,
+        )
+        if written_path != request.relative_path:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Tile manifest path mismatch.",
+                http_status=500,
+            )
+        return result
+
+    def render_pages(
+        self, pdf_path: Path | str, *, pages: Iterable[int], mode: str = "native"
+    ) -> RenderManifest:
+        """Render selected pages onto deterministic native pixel grids."""
         if mode != "native":
-            raise AppError(ErrorCode.INVALID_INPUT, "Only native rendering mode is supported in the MVP.")
+            raise AppError(
+                ErrorCode.INVALID_INPUT,
+                "Only native rendering mode is supported in the MVP.",
+            )
         path = Path(pdf_path).resolve()
         source_sha256 = _verified_sha256(path) if path.is_file() else ""
         document = _open_document(path)
         transaction = None
         try:
-            page_count = len(document)
-            if page_count > self.max_document_pages:
-                raise AppError(ErrorCode.PDF_PROCESSING_FAILED, "The PDF exceeds the maximum supported page count.", http_status=422)
+            page_count = _validated_page_count(document, self.max_document_pages)
             selected = self._validate_page_selection(pages, page_count)
             render_id = self._render_id(source_sha256, selected, mode)
+            request = _RenderRequest(
+                source_sha256=source_sha256,
+                selected_pages=selected,
+                mode=mode,
+                render_id=render_id,
+            )
             transaction = self.store.begin_render_transaction(
                 f"renders/{render_id}",
                 completion_file="manifest.json",
@@ -802,151 +1605,52 @@ class PdfProcessor:
             if transaction.complete:
                 try:
                     cached = self.get_manifest(render_id)
-                    if (
-                        cached.source_sha256 != source_sha256
-                        or cached.mode != mode
-                        or tuple(page.page_number for page in cached.pages) != selected
-                    ):
-                        raise AppError(ErrorCode.INTERNAL_ERROR, "The cached render is not bound to its request.", http_status=500)
                 except AppError:
                     transaction.reset()
                 else:
-                    transaction.commit()
-                    return cached
+                    if _cached_render_matches(cached, request):
+                        transaction.commit()
+                        return cached
+                    transaction.reset()
 
-            inspections: dict[int, PageInspection] = {}
-            for page_number in selected:
-                page = document[page_number - 1]
-                try:
-                    inspections[page_number] = _inspect_page(page, page_number)
-                finally:
-                    page.close()
+            inspections = _inspect_selected_pages(document, selected)
+            grids = self._render_grids(inspections)
 
-            grids: dict[int, tuple[int, int, float, float, str]] = {}
-            total_pixels = 0
-            for page_number, inspection in inspections.items():
-                grid = self._target_grid(inspection)
-                pixels = grid[0] * grid[1]
-                if pixels > self.max_page_pixels:
-                    raise AppError(
-                        ErrorCode.PDF_PROCESSING_FAILED,
-                        "A rendered page would exceed the configured pixel limit.",
-                        http_status=422,
-                        safe_details={"page": page_number, "pixels": pixels, "maximum": self.max_page_pixels},
-                    )
-                total_pixels += pixels
-                grids[page_number] = grid
-            if total_pixels > self.max_render_pixels:
-                raise AppError(
-                    ErrorCode.PDF_PROCESSING_FAILED,
-                    "The render request would exceed the configured total pixel limit.",
-                    http_status=422,
-                    safe_details={"pixels": total_pixels, "maximum": self.max_render_pixels},
-                )
-
-            rendered_pages: list[RenderedPage] = []
-            for page_number in selected:
-                page = document[page_number - 1]
-                try:
-                    inspection = inspections[page_number]
-                    width, height, dpi_x, dpi_y, resolution_source = grids[page_number]
-                    image_bytes: bytes
-                    conversion_path: str
-                    resampling: str
-                    reencoded: bool
-                    lossy: bool
-
-                    if inspection.direct_jpeg_eligible and inspection.dominant_image_index is not None:
-                        try:
-                            extracted = _raw_jpeg_bytes(page, inspection.dominant_image_index)
-                        except AppError:
-                            extracted = b""
-                        if extracted and _visually_equivalent(extracted, page, width, height):
-                            image_bytes = extracted
-                            conversion_path = "direct_extract"
-                            resampling = "none"
-                            reencoded = False
-                            lossy = False
-                        else:
-                            image_bytes = _jpeg_bytes(_page_image(page, width, height), dpi_x=dpi_x, dpi_y=dpi_y)
-                            conversion_path = "native_grid_render"
-                            resampling = "possible"
-                            reencoded = True
-                            lossy = True
-                    elif inspection.native_raster_extract_eligible and inspection.dominant_image_index is not None:
-                        rendered = _page_image(page, width, height)
-                        try:
-                            decoded = _native_image(page, inspection.dominant_image_index)
-                        except AppError:
-                            decoded = None
-                        if decoded is not None and decoded.size == (width, height) and _images_visually_equivalent(decoded, rendered):
-                            image_bytes = _jpeg_bytes(decoded, dpi_x=dpi_x, dpi_y=dpi_y)
-                            conversion_path = "native_raster_reencode"
-                            resampling = "none"
-                        else:
-                            image_bytes = _jpeg_bytes(rendered, dpi_x=dpi_x, dpi_y=dpi_y)
-                            conversion_path = "native_grid_render"
-                            resampling = "possible"
-                        reencoded = True
-                        lossy = True
-                    else:
-                        image_bytes = _jpeg_bytes(_page_image(page, width, height), dpi_x=dpi_x, dpi_y=dpi_y)
-                        if resolution_source == "fallback_400_dpi":
-                            conversion_path = "fallback_400dpi"
-                        else:
-                            conversion_path = "native_grid_render"
-                        resampling = "possible"
-                        reencoded = True
-                        lossy = True
-                finally:
-                    page.close()
-
-                relative_path, output_sha = self._write_render_asset(render_id, f"page-{page_number:04d}.jpg", image_bytes)
-                rendered_pages.append(
-                    RenderedPage(
+            rendered_pages = tuple(
+                self._render_page(
+                    document,
+                    _PageRenderRequest(
+                        render_id=render_id,
                         page_number=page_number,
-                        width=width,
-                        height=height,
-                        rotation=inspection.rotation,
-                        classification=inspection.classification,
-                        effective_dpi_x=round(dpi_x, 6),
-                        effective_dpi_y=round(dpi_y, 6),
-                        resolution_source=resolution_source,
-                        conversion_path=conversion_path,
-                        relative_path=relative_path,
-                        sha256=output_sha,
-                        media_type="image/jpeg",
-                        resize_applied=False,
-                        pixel_dimensions_preserved=resolution_source == "embedded_scan",
-                        renderer_resampling=resampling,
-                        reencoded=reencoded,
-                        lossy_conversion=lossy,
-                    )
+                        inspection=inspections[page_number],
+                        grid=grids[page_number],
+                    ),
                 )
-
-            manifest_relative_path = f"renders/{render_id}/manifest.json"
-            manifest = RenderManifest(
-                render_id=render_id,
-                source_sha256=source_sha256,
-                renderer_version=_RENDERER_VERSION,
-                mode=mode,
-                pages=tuple(rendered_pages),
-                manifest_relative_path=manifest_relative_path,
+                for page_number in selected
             )
-            payload = json.dumps(asdict(manifest), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            written_path, _ = self._write_render_asset(render_id, "manifest.json", payload)
-            if written_path != manifest_relative_path:
-                raise AppError(ErrorCode.INTERNAL_ERROR, "Render manifest path mismatch.", http_status=500)
+
+            manifest = self._write_render_manifest(request, rendered_pages)
             transaction.commit()
-            return manifest
         except AppError:
             raise
-        except (pdfium.PdfiumError, RuntimeError, TypeError, ValueError, OSError) as exc:
-            raise AppError(ErrorCode.PDF_PROCESSING_FAILED, "The PDF renderer failed safely.", http_status=422) from exc
+        except (
+            pdfium.PdfiumError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            OSError,
+        ) as exc:
+            raise AppError(
+                ErrorCode.PDF_PROCESSING_FAILED,
+                "The PDF renderer failed safely.",
+                http_status=422,
+            ) from exc
+        else:
+            return manifest
         finally:
             if transaction is not None:
                 transaction.rollback()
-            document.close()
+            _ = document.close()
 
     def render_tiles(
         self,
@@ -957,10 +1661,16 @@ class PdfProcessor:
         tile_height: int | None = None,
         overlap: int | None = None,
     ) -> TileManifest:
+        """Crop a rendered page into deterministic row-major JPEG tiles."""
         manifest = self.get_manifest(render_id)
-        page = next((item for item in manifest.pages if item.page_number == page_number), None)
+        page = next(
+            (item for item in manifest.pages if item.page_number == page_number), None
+        )
         if page is None:
-            raise AppError(ErrorCode.INVALID_INPUT, "The selected page is not present in this render.")
+            raise AppError(
+                ErrorCode.INVALID_INPUT,
+                "The selected page is not present in this render.",
+            )
         width = self.tile_width if tile_width is None else tile_width
         height = self.tile_height if tile_height is None else tile_height
         applied_overlap = self.tile_overlap if overlap is None else overlap
@@ -978,97 +1688,55 @@ class PdfProcessor:
                 http_status=422,
                 safe_details={"tiles": tile_count, "maximum": self.max_tiles_per_page},
             )
-        boxes = tile_boxes(page.width, page.height, tile_width=width, tile_height=height, overlap=applied_overlap)
+        boxes = tile_boxes(
+            page.width,
+            page.height,
+            tile_width=width,
+            tile_height=height,
+            overlap=applied_overlap,
+        )
         geometry_key = f"w{width:04d}-h{height:04d}-o{applied_overlap:03d}"
         tile_root = f"tiles/page-{page_number:04d}/{geometry_key}"
-        source_path = self.store.resolve_asset(page.relative_path)
         tile_manifest_path = f"renders/{render_id}/{tile_root}/manifest.json"
+        request = _TileManifestRequest(
+            relative_path=tile_manifest_path,
+            render_id=render_id,
+            page_number=page_number,
+            tile_width=width,
+            tile_height=height,
+            overlap=applied_overlap,
+            page=page,
+            boxes=boxes,
+            tile_root=tile_root,
+        )
         transaction = self.store.begin_render_transaction(
             f"renders/{render_id}/{tile_root}",
             completion_file="manifest.json",
         )
-        if transaction.complete:
+        try:
+            if transaction.complete:
+                try:
+                    cached = self._read_tile_manifest(request)
+                except AppError:
+                    transaction.reset()
+                else:
+                    transaction.commit()
+                    return cached
             try:
-                cached = self._read_tile_manifest(
-                    tile_manifest_path,
-                    render_id=render_id,
-                    page_number=page_number,
-                    tile_width=width,
-                    tile_height=height,
-                    overlap=applied_overlap,
-                    page=page,
-                    boxes=boxes,
-                    tile_root=tile_root,
-                )
-                transaction.commit()
-                return cached
-            except AppError:
-                transaction.reset()
-            except BaseException:
-                transaction.rollback()
-                raise
-        try:
-            with Image.open(source_path) as source:
-                source.load()
-                if source.size != (page.width, page.height):
-                    raise AppError(ErrorCode.INTERNAL_ERROR, "The cached page dimensions do not match its manifest.", http_status=500)
-                tiles: list[RenderedTile] = []
-                for index, box in enumerate(boxes, start=1):
-                    tile_id = f"p{page_number:04d}_{geometry_key}_x{box.x:06d}_y{box.y:06d}"
-                    cropped = source.crop((box.x, box.y, box.x + box.width, box.y + box.height))
-                    if cropped.size != (box.width, box.height):
-                        raise AppError(ErrorCode.INTERNAL_ERROR, "A tile crop did not preserve the requested pixel rectangle.", http_status=500)
-                    data = _jpeg_bytes(cropped, dpi_x=page.effective_dpi_x, dpi_y=page.effective_dpi_y)
-                    relative_path, sha256 = self._write_render_asset(
-                        render_id,
-                        f"{tile_root}/{tile_id}.jpg",
-                        data,
-                    )
-                    tiles.append(
-                        RenderedTile(
-                            tile_id=tile_id,
-                            page_number=page_number,
-                            x=box.x,
-                            y=box.y,
-                            width=box.width,
-                            height=box.height,
-                            full_page_width=page.width,
-                            full_page_height=page.height,
-                            overlap=applied_overlap,
-                            relative_path=relative_path,
-                            sha256=sha256,
-                            media_type="image/jpeg",
-                        )
-                    )
-        except AppError:
-            transaction.rollback()
-            raise
-        except (UnidentifiedImageError, OSError, ValueError) as exc:
-            transaction.rollback()
-            raise AppError(ErrorCode.PDF_PROCESSING_FAILED, "The rendered page could not be tiled.", http_status=422) from exc
-        except BaseException:
-            transaction.rollback()
-            raise
-
-        try:
-            result = TileManifest(
-                render_id=render_id,
-                page_number=page_number,
-                page_sha256=page.sha256,
-                tile_width=width,
-                tile_height=height,
-                overlap=applied_overlap,
-                tiles=tuple(tiles),
-                manifest_relative_path=tile_manifest_path,
-            )
-            payload = json.dumps(asdict(result), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            self._write_render_asset(render_id, f"{tile_root}/manifest.json", payload)
+                tiles = self._crop_tiles(request)
+            except (UnidentifiedImageError, OSError, ValueError) as exc:
+                raise AppError(
+                    ErrorCode.PDF_PROCESSING_FAILED,
+                    "The rendered page could not be tiled.",
+                    http_status=422,
+                ) from exc
+            result = self._write_tile_manifest(request, tiles)
             transaction.commit()
             return result
-        except BaseException:
+        finally:
             transaction.rollback()
-            raise
 
     def delete_render(self, render_id: str) -> bool:
+        """Delete one validated render subtree and release its cache bytes."""
         render_id = self._validate_render_id(render_id)
         return self.store.delete_render_subtree(f"renders/{render_id}")

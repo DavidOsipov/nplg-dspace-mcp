@@ -14,12 +14,14 @@ coverage/
 .serena/
 lancedb/
 .venv/
+.tools/
 backups/
 
 # Python
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.hypothesis/
 .coverage
 htmlcov/
 build/

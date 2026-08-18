@@ -1,16 +1,86 @@
+# Copyright (c) 2026 David Osipov
+"""Static deployment-policy tests."""
+
 from __future__ import annotations
 
 import ast
+import tomllib
 from pathlib import Path
+from stat import S_IMODE
+from typing import TYPE_CHECKING, cast
 
+import pytest
 import yaml
 
+from nplg_mcp.json_types import (
+    JsonObject,
+    JsonValue,
+    load_json_value,
+    require_json_object,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 ROOT = Path(__file__).parents[2]
+OPERATOR_SCRIPT_MODE = 0o755
+MAX_CONTAINER_PIDS = 256
+DEPENDABOT_POLICY_VERSION = 2
+EXPECTED_DOCKER_BASE = (
+    "FROM python:3.13.14-slim-trixie@sha256:"
+    "6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91"
+)
+EXPECTED_CADDY_IMAGE = (
+    "caddy:2.11.4-alpine@sha256:"
+    "5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
+)
+EXPECTED_ALPIC_INSTALL_COMMAND = (
+    "uv venv --python python3 .venv && uv pip install --python .venv/bin/python "
+    "--require-hashes --no-deps --only-binary=:all: -r requirements.lock"
+)
+
+load_yaml_object = cast("Callable[[str], object]", yaml.safe_load)
+load_toml_object = cast("Callable[[str], object]", tomllib.loads)
+
+
+def _read_json_object(path: Path) -> JsonObject:
+    return require_json_object(
+        load_json_value(path.read_text(encoding="utf-8")),
+        context=str(path.relative_to(ROOT)),
+    )
+
+
+def _read_toml_object(path: Path) -> JsonObject:
+    return require_json_object(
+        load_toml_object(path.read_text(encoding="utf-8")),
+        context=str(path.relative_to(ROOT)),
+    )
+
+
+def _read_yaml_object(path: Path) -> JsonObject:
+    return require_json_object(
+        load_yaml_object(path.read_text(encoding="utf-8")),
+        context=str(path.relative_to(ROOT)),
+    )
+
+
+def _object_field(parent: JsonObject, key: str, *, context: str) -> JsonObject:
+    return require_json_object(parent[key], context=f"{context}.{key}")
+
+
+def _string_array(value: JsonValue, *, context: str) -> list[str]:
+    if not isinstance(value, list):
+        message = f"{context} must be an array"
+        raise TypeError(message)
+    items = cast("list[object]", value)
+    if not all(type(item) is str for item in items):
+        message = f"{context} must contain only strings"
+        raise TypeError(message)
+    return cast("list[str]", items)
 
 
 def test_obsolete_typescript_scaffold_is_removed() -> None:
     for relative in (
-        "package.json",
         "tsconfig.json",
         "src/app/config.ts",
         "src/domain/errors.ts",
@@ -18,6 +88,18 @@ def test_obsolete_typescript_scaffold_is_removed() -> None:
         "test/unit/config.test.ts",
     ):
         assert not (ROOT / relative).exists(), relative
+    package = _read_json_object(ROOT / "package.json")
+    assert package["private"] is True
+    assert package["packageManager"] == "npm@11.18.0"
+    assert package["devDependencies"] == {
+        "@eslint/js": "10.0.1",
+        "@types/node": "24.13.3",
+        "eslint": "10.8.1",
+        "pyright": "1.1.413",
+        "typescript": "6.0.3",
+        "typescript-eslint": "8.67.0",
+        "zod": "4.4.3",
+    }
 
 
 def test_environment_example_matches_strict_runtime_configuration() -> None:
@@ -31,6 +113,8 @@ def test_environment_example_matches_strict_runtime_configuration() -> None:
         "UPSTREAM_RATE_PER_SECOND=1.0",
         "MAX_REQUEST_BODY_BYTES=1048576",
         "REQUEST_BODY_TIMEOUT_SECONDS=10",
+        "PDF_EXECUTOR=serialized",
+        "MAX_CONCURRENT_PDF_JOBS=1",
         "MAX_CONCURRENT_MCP_REQUESTS=16",
         "MAX_CONCURRENT_ASSET_STREAMS=8",
         "MAX_CONCURRENT_HTTP_REQUESTS=128",
@@ -46,7 +130,7 @@ def test_environment_example_matches_strict_runtime_configuration() -> None:
 
 def test_dockerfile_is_pinned_non_root_and_health_checked() -> None:
     text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    assert text.startswith("FROM python:3.13.14-slim-trixie@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91")
+    assert text.startswith(EXPECTED_DOCKER_BASE)
     assert "requirements.lock" in text
     assert "--no-deps" in text
     assert "--require-hashes" in text
@@ -57,7 +141,6 @@ def test_dockerfile_is_pinned_non_root_and_health_checked() -> None:
     assert "chmod -R a=rX /app/src /app/scripts" in text
     assert "ASSET_SIGNING_SECRET=" not in text
     assert "API_BEARER_TOKEN=" not in text
-
 
 
 def test_runtime_lock_is_complete_and_exactly_pinned() -> None:
@@ -80,7 +163,7 @@ def test_runtime_lock_is_complete_and_exactly_pinned() -> None:
         "h11==0.16.0",
         "httpcore==1.0.9",
         "httpx==0.28.1",
-        "idna==3.17",
+        "idna==3.18",
         "lxml==6.1.1",
         "pillow==12.3.0",
         "prometheus-client==0.25.0",
@@ -101,31 +184,53 @@ def test_runtime_lock_is_complete_and_exactly_pinned() -> None:
     assert input_lines == expected
     assert lines == expected
     blocks = lock_text.splitlines()
-    requirement_indexes = [index for index, line in enumerate(blocks) if line and not line[0].isspace() and "==" in line]
+    requirement_indexes = [
+        index
+        for index, line in enumerate(blocks)
+        if line and not line[0].isspace() and "==" in line
+    ]
     for position, start in enumerate(requirement_indexes):
-        end = requirement_indexes[position + 1] if position + 1 < len(requirement_indexes) else len(blocks)
+        end = (
+            requirement_indexes[position + 1]
+            if position + 1 < len(requirement_indexes)
+            else len(blocks)
+        )
         assert any("--hash=sha256:" in line for line in blocks[start:end])
 
+
 def test_compose_has_reverse_proxy_persistent_cache_and_container_hardening() -> None:
-    data = yaml.safe_load((ROOT / "compose.yaml").read_text(encoding="utf-8"))
-    app = data["services"]["app"]
-    caddy = data["services"]["caddy"]
+    data = _read_yaml_object(ROOT / "compose.yaml")
+    services = _object_field(data, "services", context="compose")
+    app = _object_field(services, "app", context="compose.services")
+    caddy = _object_field(services, "caddy", context="compose.services")
     assert "ports" not in app
     assert app["expose"] == ["8000"]
     assert app["read_only"] is True
     assert app["cap_drop"] == ["ALL"]
-    assert "no-new-privileges:true" in app["security_opt"]
-    assert app["pids_limit"] <= 256
+    security_options = _string_array(
+        app["security_opt"], context="compose.services.app.security_opt"
+    )
+    assert "no-new-privileges:true" in security_options
+    pids_limit = app["pids_limit"]
+    assert type(pids_limit) is int
+    assert pids_limit <= MAX_CONTAINER_PIDS
     assert app["restart"] == "unless-stopped"
-    assert any("nplg_cache:/data/cache" in volume for volume in app["volumes"])
+    app_volumes = _string_array(app["volumes"], context="compose.services.app.volumes")
+    assert any("nplg_cache:/data/cache" in volume for volume in app_volumes)
     assert "healthcheck" in app
-    assert caddy["image"] == "caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
-    assert caddy["depends_on"]["app"]["condition"] == "service_healthy"
-    assert set(caddy["ports"]) == {"80:80", "443:443"}
-    assert set(data["volumes"]) >= {"nplg_cache", "caddy_data", "caddy_config"}
+    assert caddy["image"] == EXPECTED_CADDY_IMAGE
+    depends_on = _object_field(caddy, "depends_on", context="compose.services.caddy")
+    app_dependency = _object_field(
+        depends_on, "app", context="compose.services.caddy.depends_on"
+    )
+    assert app_dependency["condition"] == "service_healthy"
+    caddy_ports = _string_array(caddy["ports"], context="compose.services.caddy.ports")
+    assert set(caddy_ports) == {"80:80", "443:443"}
+    volumes = _object_field(data, "volumes", context="compose")
+    assert set(volumes) >= {"nplg_cache", "caddy_data", "caddy_config"}
 
 
-def test_caddy_and_operator_guide_cover_tls_limits_smoke_backup_and_residual_egress_risk() -> None:
+def test_caddy_and_guide_cover_operations_and_residual_egress_risk() -> None:
     caddy = (ROOT / "deploy" / "Caddyfile").read_text(encoding="utf-8").lower()
     guide = (ROOT / "deploy" / "README.md").read_text(encoding="utf-8").lower()
     assert "reverse_proxy app:8000" in caddy
@@ -158,8 +263,24 @@ def test_caddy_and_operator_guide_cover_tls_limits_smoke_backup_and_residual_egr
 
 
 def test_operator_scripts_parse_as_python() -> None:
-    for relative in ("scripts/verify_deploy.py", "scripts/smoke_live.py", "scripts/delete_render.py"):
-        ast.parse((ROOT / relative).read_text(encoding="utf-8"), filename=relative)
+    for relative in (
+        "scripts/verify_deploy.py",
+        "scripts/smoke_live.py",
+        "scripts/delete_render.py",
+    ):
+        _ = ast.parse((ROOT / relative).read_text(encoding="utf-8"), filename=relative)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "scripts/verify_deploy.py",
+        "scripts/smoke_live.py",
+        "scripts/delete_render.py",
+    ],
+)
+def test_operator_scripts_are_executable(relative: str) -> None:
+    assert S_IMODE((ROOT / relative).stat().st_mode) == OPERATOR_SCRIPT_MODE
 
 
 def test_operator_render_cleanup_script_is_available_inside_the_app_image() -> None:
@@ -170,7 +291,9 @@ def test_operator_render_cleanup_script_is_available_inside_the_app_image() -> N
 def test_operator_render_cleanup_requires_the_app_to_be_stopped() -> None:
     guide = (ROOT / "deploy" / "README.md").read_text(encoding="utf-8")
     assert "docker compose exec -T app python scripts/delete_render.py" not in guide
-    assert "docker compose run --rm --no-deps app python scripts/delete_render.py" in guide
+    assert (
+        "docker compose run --rm --no-deps app python scripts/delete_render.py" in guide
+    )
 
 
 def test_public_tool_verifier_expects_a_read_only_catalog() -> None:
@@ -224,20 +347,31 @@ def test_local_recovery_and_agent_state_are_excluded_from_git_and_images() -> No
 
 
 def test_pdf_runtime_and_test_fixtures_use_only_permissive_dependencies() -> None:
-    import tomllib
-
-    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    runtime = set(pyproject["project"]["dependencies"])
-    test_dependencies = set(pyproject["project"]["optional-dependencies"]["test"])
+    pyproject = _read_toml_object(ROOT / "pyproject.toml")
+    project = _object_field(pyproject, "project", context="pyproject")
+    optional_dependencies = _object_field(
+        project, "optional-dependencies", context="pyproject.project"
+    )
+    runtime = set(
+        _string_array(project["dependencies"], context="project.dependencies")
+    )
+    test_dependencies = set(
+        _string_array(
+            optional_dependencies["test"],
+            context="project.optional-dependencies.test",
+        )
+    )
     lock = (ROOT / "requirements.lock").read_text(encoding="utf-8")
     source = (ROOT / "src" / "nplg_mcp" / "pdf.py").read_text(encoding="utf-8")
-    fixtures = (ROOT / "tests" / "helpers" / "pdf_factory.py").read_text(encoding="utf-8")
+    fixtures = (ROOT / "tests" / "helpers" / "pdf_factory.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "pypdfium2==5.8.0" in runtime
     assert "PyMuPDF==1.26.7" not in runtime
     assert "PyMuPDF==1.26.7" not in test_dependencies
     assert "reportlab==4.4.9" in test_dependencies
-    assert "pypdf==5.9.0" in test_dependencies
+    assert "pypdf==6.16.1" in test_dependencies
     assert "pypdfium2==5.8.0" in lock
     assert "PyMuPDF==1.26.7" not in lock
     assert "import pypdfium2" in source
@@ -247,44 +381,132 @@ def test_pdf_runtime_and_test_fixtures_use_only_permissive_dependencies() -> Non
 
 def test_distribution_includes_pdfium_notices_and_connected_image_scan_gate() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    notice = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8") if (ROOT / "THIRD_PARTY_NOTICES.md").exists() else ""
+    notice = (
+        (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+        if (ROOT / "THIRD_PARTY_NOTICES.md").exists()
+        else ""
+    )
     guide = (ROOT / "deploy" / "README.md").read_text(encoding="utf-8").lower()
 
-    assert "COPY pyproject.toml README.md LICENSE THIRD_PARTY_NOTICES.md ./" in dockerfile
+    assert (
+        "COPY pyproject.toml README.md LICENSE THIRD_PARTY_NOTICES.md ./" in dockerfile
+    )
     assert "pypdfium2" in notice
     assert "apache-2.0" in notice.lower()
     assert "bsd-3-clause" in notice.lower()
     assert "pymupdf/mupdf is not" in notice.lower()
-    assert "reportlab" in notice.lower() and "pypdf" in notice.lower()
+    assert "reportlab" in notice.lower()
+    assert "pypdf" in notice.lower()
     assert "trivy image" in guide
     assert "high,critical" in guide
     assert "unfixed" in guide
     assert "cve triage" in guide
 
 
-def test_distribution_uses_non_deprecated_spdx_license_metadata() -> None:
-    import tomllib
+def test_dependabot_covers_each_reviewed_dependency_ecosystem_weekly() -> None:
+    path = ROOT / ".github" / "dependabot.yml"
+    assert path.is_file(), "Dependabot policy is absent"
+    policy = _read_yaml_object(path)
+    assert policy["version"] == DEPENDABOT_POLICY_VERSION
+    raw_updates = policy["updates"]
+    assert isinstance(raw_updates, list)
+    updates = tuple(
+        require_json_object(update, context="dependabot update")
+        for update in cast("list[object]", raw_updates)
+    )
+    ecosystems: set[str] = set()
+    for update in updates:
+        ecosystem = update["package-ecosystem"]
+        assert type(ecosystem) is str
+        ecosystems.add(ecosystem)
+    assert ecosystems == {
+        "pip",
+        "npm",
+        "github-actions",
+    }
+    for update in updates:
+        assert update["directory"] == "/"
+        schedule = require_json_object(update["schedule"], context="schedule")
+        assert schedule["interval"] == "weekly"
 
-    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert pyproject["build-system"]["requires"][0] == "setuptools>=77"
-    assert pyproject["project"]["license"] == "MIT"
+
+def test_security_policy_has_private_reporting_and_closed_response_windows() -> None:
+    path = ROOT / "SECURITY.md"
+    assert path.is_file(), "SECURITY.md is absent"
+    policy = path.read_text(encoding="utf-8").lower()
+    for phrase in (
+        "supported versions",
+        "security/advisories/new",
+        "do not open a public issue",
+        "known exploited",
+        "critical",
+        "24 hours",
+        "7 days",
+        "high",
+        "3 days",
+        "30 days",
+        "medium",
+        "14 days",
+        "90 days",
+        "low",
+        "180 days",
+        "unknown severity",
+        "release blocker",
+        "dependabot",
+        "discovery",
+        "not evidence",
+    ):
+        assert phrase in policy
+
+
+def test_operator_guide_requires_offline_digest_scans_and_external_receipts() -> None:
+    guide = (ROOT / "deploy" / "README.md").read_text(encoding="utf-8").lower()
+    for phrase in (
+        "immutable image digest",
+        "offline scan",
+        "externally acquired",
+        "independently signed receipt",
+        "24 hours",
+        "do_not_release",
+        "--skip-db-update",
+        "--offline-scan",
+    ):
+        assert phrase in guide
+    for forbidden in (
+        "## connected image scan",
+        "--ignore-unfixed",
+        'app_image="$(docker compose images -q app)"',
+        'caddy_image="$(docker compose images -q caddy)"',
+    ):
+        assert forbidden not in guide
+
+
+def test_distribution_uses_non_deprecated_spdx_license_metadata() -> None:
+    pyproject = _read_toml_object(ROOT / "pyproject.toml")
+    build_system = _object_field(pyproject, "build-system", context="pyproject")
+    project = _object_field(pyproject, "project", context="pyproject")
+    assert build_system["requires"] == [
+        "setuptools==84.0.0",
+        "wheel==0.48.0",
+    ]
+    assert project["license"] == "MIT"
 
 
 def test_wheel_metadata_includes_third_party_notices() -> None:
-    import tomllib
-
-    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert pyproject["project"]["license-files"] == ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+    pyproject = _read_toml_object(ROOT / "pyproject.toml")
+    project = _object_field(pyproject, "project", context="pyproject")
+    assert project["license-files"] == [
+        "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
+    ]
 
 
 def test_alpic_declares_python_runtime_and_explicit_uv_commands() -> None:
-    import json
-
     assert (ROOT / ".python-version").read_text(encoding="utf-8").strip() == "3.13"
-    data = json.loads((ROOT / "alpic.json").read_text(encoding="utf-8"))
+    data = _read_json_object(ROOT / "alpic.json")
     assert data == {
         "$schema": "https://assets.alpic.ai/alpic.json",
-        "installCommand": "uv venv --python python3 .venv && uv pip install --python .venv/bin/python --require-hashes --no-deps --only-binary=:all: -r requirements.lock",
+        "installCommand": EXPECTED_ALPIC_INSTALL_COMMAND,
         "buildCommand": ".venv/bin/python -m compileall -q src scripts",
         "startCommand": "HOST=0.0.0.0 PYTHONPATH=src .venv/bin/python -m nplg_mcp",
     }

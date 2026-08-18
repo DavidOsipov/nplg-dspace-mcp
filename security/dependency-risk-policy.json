@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "owner": "NPLG release security owner",
+  "review_cadence_days": 30,
+  "advisory_sources": [
+    {
+      "source_id": "osv",
+      "kind": "https_snapshot",
+      "locator": "https://api.osv.dev/v1/querybatch",
+      "max_age_hours": 24,
+      "require_digest": true,
+      "require_signature": false
+    },
+    {
+      "source_id": "npm-advisories",
+      "kind": "https_snapshot",
+      "locator": "https://registry.npmjs.org/-/npm/v1/security/advisories/bulk",
+      "max_age_hours": 24,
+      "require_digest": true,
+      "require_signature": false
+    },
+    {
+      "source_id": "trivy-db",
+      "kind": "oci_artifact",
+      "locator": "ghcr.io/aquasecurity/trivy-db",
+      "max_age_hours": 24,
+      "require_digest": true,
+      "require_signature": true
+    }
+  ],
+  "known_exploited": {
+    "triage_hours": 24,
+    "remediation_days": 7
+  },
+  "critical": {
+    "triage_hours": 24,
+    "remediation_days": 7
+  },
+  "high": {
+    "triage_hours": 72,
+    "remediation_days": 30
+  },
+  "medium": {
+    "triage_hours": 336,
+    "remediation_days": 90
+  },
+  "low": {
+    "triage_hours": 720,
+    "remediation_days": 180
+  },
+  "unknown_severity_action": "block_release",
+  "stale_or_unavailable_source_action": "block_release",
+  "missing_package_provenance_action": "block_release",
+  "breached_window_action": "block_release",
+  "exception_policy": {
+    "require_revision_and_subject": true,
+    "require_reachability_analysis": true,
+    "require_owner": true,
+    "require_compensating_controls": true,
+    "expiry_within_underlying_window": true,
+    "require_separate_verified_risk_acceptance": true,
+    "allowed_scope": "named_non_public_staging_or_private",
+    "terminal_recommendation": "do_not_release",
+    "permits_public_eligibility": false,
+    "permits_asvs_conformance": false
+  }
+}

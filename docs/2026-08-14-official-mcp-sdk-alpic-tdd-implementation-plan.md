@@ -1,5 +1,45 @@
 # NPLG DSpace MCP Official Python SDK and Alpic Audit-ready Staging/Release-decision Implementation Plan
 
+> **Implementation audit note (2026-08-15):** The requested single
+> development lock cannot contain both `mcp==2.0.0` and `semgrep==1.173.0`:
+> Semgrep declares a hard dependency on `mcp==1.29.0`. This implementation
+> keeps the official SDK in `requirements-dev.lock` and isolates Semgrep in
+> `requirements-security.lock`; merging them would be unsatisfiable. The
+> configured uv index also does not provide CPython `3.13.15`, so local
+> verification uses `3.13.13` without claiming the exact patch. These are
+> release blockers, not silently substituted pins.
+
+> **Phase 0-1 execution reconciliation (2026-08-16):** Work advanced beyond
+> the requested audit boundary before the user stopped execution. The review
+> below retains only changes with independently reproduced security,
+> behavioral, provenance, or strict-static value; it does not authorize Phase
+> 2 or later implementation. “Locally complete” means the named local task
+> gates and independent review passed. It does not mean committed, pushed,
+> protected-branch verified, deployed, ASVS-conformant, or release-eligible.
+>
+> | Task | Reconciled local status | Binding limitation / next action |
+> | --- | --- | --- |
+> | 0 | Locally complete; retain | Bootstrap and locks are reproducible, but remote registry/CI/release proof remains external. |
+> | 1 | Locally complete; retain | Frozen behavior/provenance is local dirty-candidate evidence, not publication proof. |
+> | 1A | Locally complete; retain | PDFium access is serialized, not process-isolated. |
+> | 1B | Locally complete; retain | Exact touched legacy slice is clean; this only partially discharges Task 6B. |
+> | 2 | Locally complete; retain | All 759 rows remain `Not assessed`, evidence manifest/authorities are empty, and the decision is `do_not_release`. |
+> | 3 | Locally complete; retain temporarily | The ratchet prevents regression while inherited diagnostics exist and must be deleted at Task 6C zero. |
+> | 4 | Locally complete; retain | The PDFium stub edit is provisional and earns no Task 6A runtime-contract credit. |
+> | 5 | Locally complete; retain | DNS-answer-to-TCP binding remains Task 17 work. |
+> | 6 | Locally complete; retain | Full regression, provenance refresh, and independent review are recorded locally; publication evidence remains external. |
+> | 6A | Locally complete; retain | The exact pinned-wheel reflection contract is implemented and verified locally. |
+> | 6B | Locally complete; retain | The literal source, unit, integration, security, and conformance scope is strict-gate clean. |
+> | 6C | Locally complete; retain | All operational CLIs are complete and the temporary ratchet/baseline is removed. |
+> | 7 | Locally complete; retain | The authoritative branch/diff and mutation gates meet their reviewed local floors. |
+> | 8 | Locally complete; external authority required | Local CI/security policy and release-controller interfaces fail closed; protected CI, custody, scanning, signing, publication, and deployment evidence remain external. |
+>
+> The Phase 1 aggregate status is therefore **LOCALLY COMPLETE / not release-ready**.
+> Existing unchecked task boxes remain unchecked because checkpoint commits,
+> remote controls, and later external gates were not performed. Durable task
+> reports hold volatile hashes, counts, temporary paths, and review-round
+> evidence; those values must not be copied into this normative plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILLS: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` task-by-task, use `superpowers:test-driven-development` for every behavioral/security change, and use `superpowers:verification-before-completion` at every phase gate. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Migrate the existing NPLG DSpace server to the official MCP Python SDK, make every public boundary strictly typed and independently contract-tested, isolate untrusted PDF processing, and produce an evidence-backed Alpic metadata staging candidate plus a falsifiable release decision aligned with OWASP ASVS 5.0.0 Level 2. A public release is conditional on the separately governed issuer, provider, protected release-controller, and operational evidence named below; this plan may correctly end with `do not release` and must not relabel a staging result as production eligibility.
@@ -21,7 +61,7 @@
 - Follow red–green–refactor TDD for every behavioral or security change: focused failing test, observed relevant failure, minimal repair, focused green test, broader regression suite.
 - For lint/type-only cleanup, the checker diagnostic is the RED gate and existing behavioral tests must be green before and after. If a cleanup needs any runtime behavior change, stop that cleanup and start a separate focused behavioral RED test first.
 - Every security fix includes negative and adversarial cases. Parsing, URL, cursor, schema, IPC, and state-machine boundaries also receive property tests.
-- End-state gates are zero Ruff diagnostics under `select = ["ALL"]` with only documented incompatibility/test exceptions, zero Pyright strict errors, zero mypy strict errors, at least 95% branch-enabled project coverage, 100% changed-line coverage, and 100% changed branch-arc coverage.
+- End-state gates are zero Ruff diagnostics under `select = ["ALL"]` with only documented incompatibility/test exceptions, zero Pyright strict errors, zero mypy strict errors, at least 95% branch-enabled project coverage, at least 95% changed-line coverage, and at least 95% changed branch-arc coverage.
 - Strict gates cover `src`, `tests`, `scripts`, and project-owned `typings/**/*.pyi`; test and stub code is not exempt from type checking, package-boundary checks, formatting, notice checks, or linting except for the exact documented `S101`, `D102`, and `D103` allowances under `tests/**/*.py`.
 - Every Python or Python-stub file created by this plan starts with the exact reviewed notice `# Copyright (c) 2026 David Osipov` (second line only when an executable shebang must remain first), followed in Ruff-compatible order by its module docstring/imports, and is Ruff/Pyright/mypy-clean at creation. This applies immediately to Task 0's `tests/conftest.py`, `tests/helpers/app_factory.py`, and `tests/unit/test_test_factories.py`, Task 1's `tests/contracts/test_frozen_baseline.py`, and Task 2's `scripts/build_asvs_matrix.py` and `tests/static/test_asvs_evidence.py`; later create-lists inherit the same rule. Task 3 statically verifies those pre-tooling files and its package markers, and Task 6C verifies the complete tracked `src`/`tests`/`scripts` Python plus `typings/**/*.pyi` inventory. A task may not defer a new file's `CPY001`, docstring, annotation, or formatting diagnostics to the legacy ratchet.
 - A coverage percentage, scanner result, passing test suite, or Alpic audit is evidence, not by itself proof of ASVS L2 conformance.
@@ -35,6 +75,11 @@
 - Public multi-user publication requires identity-aware authentication, scopes, per-principal limits, and attributable audit events. Neither selected MCP profile permits shared/static API-key authentication; an Alpic provider-admin key exists only inside the isolated protected staging helper and is never an application/client credential.
 - Deployment, DNS, registry publication, branch protection changes, commits, pushes, and secret configuration require explicit user authorization at execution time.
 - Preserve unrelated work. At this audit, `docs/nplg-dspace-mcp-architecture-handoff-2026-08-14.md` is user-owned staged state; never clean, reset, restage, or absorb it into a task commit. Treat any user-owned untracked path discovered at execution the same way rather than encoding an ephemeral scratch-path prerequisite.
+- The 2026-08-16 user-authorized transfer into the primary checkout supersedes
+  the earlier prohibition on writing there only for the already named Phase
+  0-1 files. The primary checkout remains a dirty development candidate: do
+  not stage, commit, push, deploy, change refs, or describe it as clean/release
+  evidence without fresh explicit authorization.
 - Before Task 0 executes, require the recorded commit/tree identity or explicitly revise and re-review this plan; do not silently generate a baseline from a different source revision.
 - Commit commands below are execution checkpoints, not authorization to commit. Stage only the paths named by the current task.
 - No Rust rewrite is in scope. Re-evaluate Rust only after the Python production profile has measured evidence that Python is the limiting factor.
@@ -47,15 +92,31 @@ The plan is grounded in repository identity:
 
 - Commit: `2ba5dc18385747aa5d12a3b560eaab2ab97b7a40`
 - Tree: `b17c840ddd3c0dc0ec98fb150e18c22cf6c3b9e8`
+- Reviewed docs-only execution candidate commit:
+  `da5cc20e4f8bf3e1cacf74c49d5391487cb11cb0`.
+- Reviewed docs-only execution candidate tree:
+  `2464df5aa1880e99168ce07c23d891ab66ed3959`. These candidate values are
+  recorded as execution provenance; they do not relabel the original audit
+  commit/tree.
+- The Task 0 preflight admits only the exact audit commit/tree above with an
+  empty audit-to-HEAD changed-path set, or the exact reviewed candidate
+  commit/tree above with exactly the implementation plan and architecture
+  handoff as its audit-to-HEAD changed-path set. The audit commit must be an
+  ancestor and `HEAD:src` must be exactly
+  `fcd9debdb533498486a2bbeaf909ea5bfb95b52c` in both cases.
 - Recorded Python 3.13.13 baseline at the frozen commit: 254 tests passed.
 - Recorded branch-enabled coverage baseline: 82%, with the existing floor at 80%.
 - Historical discovery used Pyright 1.1.412 and recorded 539 strict errors across 40 files. The reviewed pin is now 1.1.413; Task 3 must recapture diagnostic identities from scratch and must not reuse the 1.1.412 count as a ratchet baseline.
 - Reproduced Ruff 0.16.3 `select ALL` discovery baseline: 2,377 diagnostics across 67 rules; this includes mutually incompatible docstring rules and test-only `assert` findings, so the final configuration must use narrow, explained exceptions rather than blindly accepting noise.
-- Audit caveat: the checkout has no `.venv`; therefore the recorded pytest, coverage, and Pyright baselines are evidence to revalidate, not current-turn executions. Task 0 must reproduce or explicitly disposition every delta before Task 1.
+- Historical pre-execution caveat: the audited checkout initially had no
+  `.venv`; the baseline numbers in this subsection describe discovery, not the
+  current working tree. Task reports contain the later locked-tool executions.
 - Current MCP entry point: `src/nplg_mcp/app.py:create_app` instantiates `src/nplg_mcp/protocol.py:McpProtocol`.
 - Current tool input base: `src/nplg_mcp/tools.py:StrictInput` already uses strict Pydantic validation.
 - Current tool handlers return `dict[str, Any]` and publish no declared output schemas.
-- Current PDF execution: `src/nplg_mcp/tools.py:ToolService._run_pdf_job` uses `asyncio.to_thread()` and permits two jobs by default.
+- Historical pre-Task-1A PDF execution used `asyncio.to_thread()` with two
+  jobs by default. Task 1A now serializes the compatibility backend; it does
+  not provide the process isolation required by Tasks 15-16A.
 
 This plan supersedes the runtime direction in `docs/superpowers/specs/2026-08-14-nplg-dspace-mcp-design.md` and the completed historical plan in `docs/superpowers/plans/2026-08-14-nplg-dspace-mcp-implementation.md` wherever they prescribe a hand-written MCP transport or a TypeScript runtime. Their NPLG, provenance, PDF, and read-only behavioral invariants remain inputs to the frozen contract.
 
@@ -67,22 +128,27 @@ This plan supersedes the runtime direction in `docs/superpowers/specs/2026-08-14
 | `private-full` | Existing capability, hardened before release | Current full catalog | Persistent local volume | Isolated PDF worker |
 | `distributed-full` | Conditional | Full catalog or approved job tools | Durable object and job stores | External isolated worker |
 
-The metadata-first choice is this plan's conservative default (~90% confidence) because the prior release-scope question was not explicitly answered. Confirm it at Task 1 review before the ADR is accepted or production code beyond Task 1A begins. If the first Alpic release must include PDF download/render/tile processing, stop this plan and write the separate provider/job/object-storage design required by Phase 7. Full-fidelity Alpic remains blocked until the platform and official SDK expose a version-matched supported mechanism for durable long-running work, or the architecture uses an external service without presenting it as MCP Tasks.
+The metadata-first choice is confirmed by Task 1 and its accepted ADR:
+`alpic-metadata` is the only first-release Alpic profile. If that scope changes
+to include PDF download/render/tile processing, stop this plan and write the
+separate provider/job/object-storage design required by Phase 7.
+Full-fidelity Alpic remains blocked until the platform and official SDK expose
+a version-matched supported mechanism for durable long-running work, or the
+architecture uses an external service without presenting it as MCP Tasks.
 
 ## 2. Phase Dependency Graph
 
 ```text
 Task 0: reproducible development bootstrap and baseline revalidation
   └── Task 1: frozen contract
-        ├── Task 1A: immediate serialized PDF safety repair
-        └── Task 2: ASVS/threat-model evidence inventory
-
-Task 0 + Task 1A + Task 2
-  └── Phase 1: bootstrap CI, strict quality cleanup, final CI
-        └── Phase 2: strict Pydantic outputs and Zod oracle
-              ├── Phase 3: official MCP SDK adapter and wire cutover
-              ├── Phase 4 Tasks 15–16A: PDF process isolation/scanning
-              └── Phase 5: upstream SSRF/parser/cursor hardening
+        └── Task 1A: immediate serialized PDF safety repair
+              └── Task 1B: touched legacy static closure
+                    └── Task 2: ASVS/threat-model evidence inventory
+                          └── Tasks 3 → 4 → 5 → 6 → 6A → residual 6B → 6C → 7 → 8
+                                └── Phase 2: strict Pydantic outputs and Zod oracle
+                                      ├── Phase 3: official MCP SDK adapter and wire cutover
+                                      ├── Phase 4 Tasks 15–16A: PDF process isolation/scanning
+                                      └── Phase 5: upstream SSRF/parser/cursor hardening
 
 Phase 1 + Phase 3 + Phase 5
   └── Phase 6 Tasks 19–20: profile isolation and identity/audit controls
@@ -241,7 +307,20 @@ For every task:
 8. Inspect `git diff --check` and the scoped diff.
 9. Request review; commit only after user authorization.
 
-Execute implementation in a dedicated worktree whose index starts empty. If the primary checkout contains any user-owned staged, unstaged, or untracked path, preserve it byte-for-byte: never stash, reset, stage, commit, clean, or run plan builds in that checkout. Before every task staging step, require `git diff --cached --quiet`; after staging, compare the NUL-delimited cached path set with that task's exact declared allowlist and abort on any missing/extra path before `git commit`. A commit checkpoint never authorizes creating the commit, using the shared primary index, or including an earlier staged path; each still requires explicit user authorization.
+Ordinarily execute implementation in a dedicated worktree whose index starts
+empty. The sole current exception is the user-authorized 2026-08-16 Phase 0-1
+transfer/reconciliation described above and in Task 0's historical recovery
+note. In that dirty primary checkout, preserve every pre-existing logical
+staged entry and unrelated path byte-for-byte; never stash, reset, stage,
+commit, clean, push, deploy, or run work outside the exact reviewed Phase 0-1
+scopes. This exception ends with the reconciliation and is not precedent for
+Phase 2 or later work. Outside that exception, never run plan builds in a dirty
+primary checkout. Before every authorized task staging step, require
+`git diff --cached --quiet`; after staging, compare the NUL-delimited cached
+path set with that task's exact declared allowlist and abort on any
+missing/extra path before `git commit`. A commit checkpoint never authorizes
+creating the commit, using the shared primary index, or including an earlier
+staged path; each still requires explicit user authorization.
 
 Every later “Stage … then commit” sentence is declarative shorthand for this mandatory protocol, never a bare `git add`/`git commit`. Before staging, expand that task's `Files` section into a literal Bash `task_paths=(...)` array: one repository-relative element per exact Create/Modify/Delete path, no directory, glob, category, substitution, or omitted test. Use a validated external mode-`0700` `CHECKPOINT_TMP_PARENT`, then run the following only after the task's explicit commit authorization; preserve the resulting comparison files as checkpoint evidence:
 
@@ -283,11 +362,18 @@ Security test naming must identify the prohibited behavior, for example `test_sd
 
 #### Files
 
+- Modify: `.gitignore`, `requirements.in`, `requirements.lock`
 - Create: `requirements-dev.in`, `requirements-dev.lock`
+- Create: `requirements-security.in`, `requirements-security.lock`
 - Create: `package.json`, `package-lock.json`
 - Create: `security/bootstrap-toolchain-lock.json`, `scripts/bootstrap_toolchain.py`, `tests/unit/test_bootstrap_toolchain.py`
 - Create: `tests/conftest.py`, `tests/helpers/app_factory.py`, `tests/unit/test_test_factories.py`, `tests/contracts/test_sdk_auth_feasibility.py`, `tests/contracts/test_alpic_oauth_discovery.py`, `tests/contracts/test_oauth_provider_capability.py`, `contracts/sdk-authorization-capability.json`, `contracts/alpic-oauth-discovery-capability.json`, `contracts/oauth-provider-capability.json`
 - Modify: `pyproject.toml`, `README.md`
+
+`requirements*.lock` and `package-lock.json` are the authoritative dependency
+locks. A second generated `uv.lock` is deliberately out of scope and must
+remain absent unless a future task first replaces, rather than duplicates, an
+existing lock authority.
 
 #### Interfaces
 
@@ -301,17 +387,87 @@ Security test naming must identify the prohibited behavior, for example `test_sd
 
 - [ ] **Step 1: Create the lock inputs before invoking `.venv`**
 
-Before creating or regenerating any file, installing anything, or invoking npm/uv resolution, enter a dedicated clean Git worktree for the implementation and run this fail-stop preflight. The plan may be read from the primary checkout, but Task 0 never writes there:
+Before creating or regenerating any file, installing anything, or invoking
+npm/uv resolution, enter a dedicated clean Git worktree for the implementation
+and run this fail-stop preflight. HEAD must be exactly either the original
+audit commit/tree or the specifically reviewed docs-only candidate commit/tree;
+no later descendant is admitted. The plan may be read from the primary
+checkout, but Task 0 never writes there:
 
 ```bash
 set -euo pipefail
-test "$(git rev-parse HEAD)" = "2ba5dc18385747aa5d12a3b560eaab2ab97b7a40"
-test "$(git rev-parse HEAD^{tree})" = "b17c840ddd3c0dc0ec98fb150e18c22cf6c3b9e8"
-test "$(git rev-parse HEAD:src)" = "fcd9debdb533498486a2bbeaf909ea5bfb95b52c"
+audit_commit=2ba5dc18385747aa5d12a3b560eaab2ab97b7a40
+audit_tree=b17c840ddd3c0dc0ec98fb150e18c22cf6c3b9e8
+audit_src_tree=fcd9debdb533498486a2bbeaf909ea5bfb95b52c
+reviewed_candidate_commit=da5cc20e4f8bf3e1cacf74c49d5391487cb11cb0
+reviewed_candidate_tree=2464df5aa1880e99168ce07c23d891ab66ed3959
+candidate_commit=$(git rev-parse HEAD)
+candidate_tree=$(git rev-parse 'HEAD^{tree}')
+git merge-base --is-ancestor "$audit_commit" "$candidate_commit"
+test "$(git rev-parse HEAD:src)" = "$audit_src_tree"
+
+require_empty_changed_paths() {
+  local changed_path
+  if IFS= read -r -d '' changed_path; then
+    printf 'unexpected changed path for audit identity: %s\n' "$changed_path" >&2
+    return 1
+  fi
+}
+
+require_reviewed_changed_paths() {
+  local changed_path
+  IFS= read -r -d '' changed_path || return 1
+  test "$changed_path" = \
+    docs/2026-08-14-official-mcp-sdk-alpic-tdd-implementation-plan.md
+  IFS= read -r -d '' changed_path || return 1
+  test "$changed_path" = \
+    docs/nplg-dspace-mcp-architecture-handoff-2026-08-14.md
+  if IFS= read -r -d '' changed_path; then
+    printf 'unexpected additional reviewed-candidate path: %s\n' \
+      "$changed_path" >&2
+    return 1
+  fi
+}
+
+if test "$candidate_commit" = "$audit_commit" &&
+   test "$candidate_tree" = "$audit_tree"; then
+  git diff --name-only -z "$audit_commit..$candidate_commit" \
+    | LC_ALL=C sort -z | require_empty_changed_paths
+elif test "$candidate_commit" = "$reviewed_candidate_commit" &&
+     test "$candidate_tree" = "$reviewed_candidate_tree"; then
+  git diff --name-only -z "$audit_commit..$candidate_commit" \
+    | LC_ALL=C sort -z | require_reviewed_changed_paths
+else
+  printf 'unreviewed Task 0 identity: commit=%s tree=%s\n' \
+    "$candidate_commit" "$candidate_tree" >&2
+  exit 1
+fi
 test -z "$(git status --porcelain=v1 --untracked-files=all --ignored=matching)"
+printf 'candidate_commit=%s\ncandidate_tree=%s\naudit_src_tree=%s\n' \
+  "$candidate_commit" "$candidate_tree" "$audit_src_tree"
 ```
 
-If any identity or cleanliness assertion fails, stop before side effects and explicitly revise/re-review the baseline; never point Task 0 at the dirty primary checkout or silently recapture another revision.
+Record the actual `candidate_commit` and `candidate_tree` in execution evidence;
+never substitute them for or relabel the original audit commit/tree. If the
+exact approved commit/tree identity, ancestor, exact `HEAD:src`,
+identity-specific changed-path set, or cleanliness assertion fails, stop before
+side effects and explicitly revise/re-review the baseline. Never point Task 0
+at the dirty primary checkout or silently recapture another revision.
+
+#### Historical staged-recovery exception
+
+Phase 0-1 began in an explicitly authorized isolated worktree whose imported
+index and empty working tree were recorded before implementation. That
+one-time evidence is preserved in the Task 0 report; its temporary path and
+shell transcript are intentionally not normative plan requirements. It is not
+a reusable recovery mode and does not establish current cleanliness.
+
+On 2026-08-16 the user explicitly authorized transferring and continuing the
+named Phase 0-1 work in the primary checkout. That later direction supersedes
+the historical primary-write prohibition only for the reviewed file scopes.
+The protected imported staged entries remain user state: compare their logical
+entry digest, never rewrite them, and do not stage, commit, reset, push,
+deploy, or claim a clean release candidate without new authorization.
 
 Before any network access or managed tool exists, create `scripts/bootstrap_toolchain.py` as a behavior-free typed scaffold and `tests/unit/test_bootstrap_toolchain.py` as a standard-library-only `unittest` module using injected local fake archives, lock records, downloader, signature verifier, and filesystem. Verify the documented system prerequisite with `python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 12))'`, run `python3 -m unittest tests.unit.test_bootstrap_toolchain`, and require the intended RED to reach `NotImplementedError`. Implement only digest/signature verification, traversal-safe extraction, exact embedded-version checking, and atomic installation; rerun the same command to GREEN, record the no-refactor/refactor decision, and run deliberate wrong-digest, symlink-entry, current/chosen-drift, and partial-publication faults before allowing the real bootstrap. Missing `unittest`, a Python below the documented prerequisite, or any network-dependent test is a bootstrap failure, not RED.
 
@@ -379,8 +535,54 @@ Expected: PASS against the current implementation, proving that later RED tests 
 
 ```bash
 set -euo pipefail
-test "$(git rev-parse HEAD)" = "2ba5dc18385747aa5d12a3b560eaab2ab97b7a40"
-test "$(git rev-parse HEAD^{tree})" = "b17c840ddd3c0dc0ec98fb150e18c22cf6c3b9e8"
+audit_commit=2ba5dc18385747aa5d12a3b560eaab2ab97b7a40
+audit_tree=b17c840ddd3c0dc0ec98fb150e18c22cf6c3b9e8
+audit_src_tree=fcd9debdb533498486a2bbeaf909ea5bfb95b52c
+reviewed_candidate_commit=da5cc20e4f8bf3e1cacf74c49d5391487cb11cb0
+reviewed_candidate_tree=2464df5aa1880e99168ce07c23d891ab66ed3959
+candidate_commit=$(git rev-parse HEAD)
+candidate_tree=$(git rev-parse 'HEAD^{tree}')
+git merge-base --is-ancestor "$audit_commit" "$candidate_commit"
+test "$(git rev-parse HEAD:src)" = "$audit_src_tree"
+
+require_empty_changed_paths() {
+  local changed_path
+  if IFS= read -r -d '' changed_path; then
+    printf 'unexpected changed path for audit identity: %s\n' "$changed_path" >&2
+    return 1
+  fi
+}
+
+require_reviewed_changed_paths() {
+  local changed_path
+  IFS= read -r -d '' changed_path || return 1
+  test "$changed_path" = \
+    docs/2026-08-14-official-mcp-sdk-alpic-tdd-implementation-plan.md
+  IFS= read -r -d '' changed_path || return 1
+  test "$changed_path" = \
+    docs/nplg-dspace-mcp-architecture-handoff-2026-08-14.md
+  if IFS= read -r -d '' changed_path; then
+    printf 'unexpected additional reviewed-candidate path: %s\n' \
+      "$changed_path" >&2
+    return 1
+  fi
+}
+
+if test "$candidate_commit" = "$audit_commit" &&
+   test "$candidate_tree" = "$audit_tree"; then
+  git diff --name-only -z "$audit_commit..$candidate_commit" \
+    | LC_ALL=C sort -z | require_empty_changed_paths
+elif test "$candidate_commit" = "$reviewed_candidate_commit" &&
+     test "$candidate_tree" = "$reviewed_candidate_tree"; then
+  git diff --name-only -z "$audit_commit..$candidate_commit" \
+    | LC_ALL=C sort -z | require_reviewed_changed_paths
+else
+  printf 'unreviewed Task 0 identity: commit=%s tree=%s\n' \
+    "$candidate_commit" "$candidate_tree" >&2
+  exit 1
+fi
+printf 'candidate_commit=%s\ncandidate_tree=%s\n' \
+  "$candidate_commit" "$candidate_tree"
 .venv/bin/python -m pytest -q
 .venv/bin/python -m pytest --cov=nplg_mcp --cov-branch \
   --cov-report=term-missing --cov-fail-under=80 -q
@@ -406,14 +608,121 @@ After explicit authorization, stage only `pyproject.toml`, the named locks, shar
 - Create: `contracts/baseline/result-cases.json`
 - Create: `contracts/baseline/error-cases.json`
 - Create: `contracts/baseline/manifest.json`
+- Create: `contracts/zod/capability-contracts.mjs`
+- Create: `contracts/zod/baseline-contracts.mjs`
+- Create: `scripts/capture_baseline.py`
+- Create: `scripts/baseline_capture_io.py`
+- Create: `scripts/baseline_replay.py`
 - Create: `tests/contracts/test_frozen_baseline.py`
+- Create: `tests/contracts/zod_contracts.test.mjs`
+- Create: `tests/contracts/zod_baseline_contracts.test.mjs`
+- Create: `eslint.config.mjs`
+- Create: `tsconfig.contracts.json`
+- Modify: `tests/helpers/app_factory.py`
+- Modify: `tests/helpers/pdf_factory.py` for strict typed deterministic PDF
+  fixture construction without semantic byte drift
+- Modify: `package.json`, `package-lock.json` only for the exact Task-1-owned
+  baseline Zod lint/typecheck commands and exact reviewed development pins
+- Modify: `tests/static/test_quality_policy.py` only when executable static
+  policy assertions are required for the Task-1-owned Python/JavaScript scope
+- Modify: `tests/static/test_deployment.py` only to keep its exact Node
+  development-dependency inventory synchronized with the Task-1-owned pinned
+  TypeScript and ESLint toolchain
+- Modify: `src/nplg_mcp/tools.py` only for an injected, timezone-aware UTC clock seam used by deterministic signed-asset fixture replay
+- Modify: `src/nplg_mcp/protocol.py` only for RED-proven closed JSON-RPC envelope and method-parameter validation; the frozen oracle must not preserve permissive unknown-field acceptance
+- Modify: `docs/2026-08-14-official-mcp-sdk-alpic-tdd-implementation-plan.md`
 - Modify: `docs/superpowers/specs/2026-08-14-nplg-dspace-mcp-design.md`
 - Modify: `docs/superpowers/plans/2026-08-14-nplg-dspace-mcp-implementation.md`
 
 #### Interfaces
 
 - Consumes: `ToolService.list_tools()`, `ToolService.call(name, arguments)`, `McpProtocol.handle(payload, headers)`.
-- Produces: immutable JSON fixtures keyed by tool name and case ID; ADR decision `ADR-001` declaring Python SDK migration and `alpic-metadata` first release.
+- Produces: immutable JSON fixtures keyed by tool name and case ID; strict frozen
+  Pydantic replay/setup/request/expected models; an independent pinned-Zod
+  baseline schema/oracle; and ADR decision `ADR-001` declaring Python SDK
+  migration and `alpic-metadata` first release. Request JSON bytes and headers
+  remain exact and are never normalized. Response comparison alone uses the
+  versioned semantic-number rule: preserve booleans, map finite mathematically
+  integral floats within the JavaScript safe-integer range to integers (including
+  negative zero to zero), and reject fractional, non-finite, or out-of-range
+  values.
+
+Task 1 also owns strict static closure for
+`scripts/capture_baseline.py`, `scripts/baseline_capture_io.py`,
+`scripts/baseline_replay.py`, `tests/contracts/test_frozen_baseline.py`, and
+`tests/helpers/pdf_factory.py`, plus type-aware ESLint/checkJs closure for the
+two baseline Zod `.mjs` files. The Python split preserves all frozen behavior,
+provenance, no-follow/bounds/race/process-group guarantees, and exposes only
+typed public test seams. New local modules/configuration are admitted to the
+synthetic index only through the exact reviewed `included_untracked_paths`
+tuple; broad untracked discovery remains forbidden. Strict configuration and
+source-wide ignores are forbidden. A narrowly reviewed local suppression is
+permitted only where the secure implementation inherently triggers a tool rule,
+such as the one audited no-shell absolute-executable subprocess boundary or the
+last-resort sanitizer wrapper; each suppression must name one exact rule at the
+smallest statement and remain mutation-tested. Blanket ignores, per-file
+ignores, `type: ignore`/`Any`, disable directives, and syntactic evasions are not
+acceptable static closure.
+
+The Task-1-owned Python suppression inventory tokenizes comment-oriented
+controls and separately applies Coverage.py's pinned raw-source expressions;
+it uses closed source-derived grammars rather than substring guesses. After
+Task 6C, its closed accepted output is exactly nine reviewed statement-local
+records: five `S603`, one `S310`, one `PLR0913`, one `BLE001`, and one `TRY400`;
+no other suppression is accepted. Against the pinned analyzers it must detect file-level and inline
+Pyright modes, ignores, severity toggles over the exact pinned diagnostic-rule
+tuple, and the exact accepted boolean-rule tuple; mypy controls only at the
+literal, case-sensitive, column-zero `# mypy: ` prefix; Ruff/Flake8 lint,
+file-ignore, block disable/enable, file-noqa, and formatter controls;
+import-sorter, security-scanner, Coverage.py exclusion/partial-branch, and coded
+or blanket type-ignore forms.
+
+A count is not proof of the Pyright rule boundary: an independent literal
+81-entry oracle extracted from pinned 1.1.413 must be duplicate-free and exactly
+set-equal to the classifier tuple. Dedicated ignore and severity mutations for
+every review-discovered missing name fail independently before that tuple may be
+called complete.
+
+The grammar mirrors pinned quirks that are security relevant. Pyright retries a
+later candidate after a malformed `pyright:` marker, treats trailing prose
+after a blanket ignore and arbitrary suffix text after a closed rule bracket as
+active, drops empty/unknown comma-list companions while retaining an effective
+known rule, and stops after a syntactically valid but ineffective first bracket.
+Its configuration parser accepts only the exact pinned modes, boolean rules,
+diagnostic names, cases, and values. Mypy removes double quotes and concatenates
+quoted/unquoted fragments while splitting only commas outside quotes; preserves
+leading/interior empty items; drops a final item only when its final buffer is
+empty; retains already parsed items after an unmatched quote; converts hyphens
+to underscores; and case-folds option names through `RawConfigParser`. A valid
+control remains inventoried when an empty, malformed, or prose companion emits
+a configuration diagnostic, because an effective `ignore_errors` can suppress
+that diagnostic. A malformed item with no applied configuration remains a
+benign negative control.
+
+Ruff finds later `# noqa`, `# ruff: noqa`, `# ruff: ignore[...]`,
+`# ruff: file-ignore[...]`, block `# ruff: disable[...]`/`enable[...]`, later-hash
+`# fmt: skip`, and context-valid import-sorter controls. Bandit treats the
+`nosec` prefix as blanket suppression. Coverage.py applies its documented
+all-lowercase or all-uppercase `pragma`/`no`/`cover|branch` expressions over raw
+source rather than Python COMMENT tokens, so matching text inside a literal is
+inventoried and `coverage`/`branching` suffixes remain active. Literal strings
+for token-based tools, ordinary prose, invalid placements, ineffective unknown
+rules, malformed values, and case/spacing variants the pinned analyzers do not
+consume remain absent. Persistent source-derived differential tables exercise
+every forbidden family and benign near-match so a missing branch, failed retry,
+or conservative false positive fails independently.
+
+For the two baseline JavaScript files, the resolved ESLint configuration is
+strictly parsed and binds `linterOptions.noInlineConfig === true` plus
+`reportUnusedDisableDirectives === "error"` (resolved severity `2`). Real
+`ESLint.lintText` calls use
+both configured file paths and prove an inline `eslint-disable` attack cannot
+silence the forbidden JSDoc-any rule; a deliberately weakened in-memory config
+with `noInlineConfig=false` must demonstrate that the same attack would
+otherwise become message-free. The package policy freezes the exact
+`contracts:baseline-static` command including `--max-warnings 0`, preserves the
+capability and dedicated baseline Zod scripts, and binds the aggregate script
+to both suites.
 
 - [ ] **Step 1: Write the failing completeness test**
 
@@ -456,21 +765,101 @@ class BaselineEntry(BaselineModel):
     sha256: HexDigest
 
 
+class GitSourceIdentity(BaselineModel):
+    commit: GitObjectId
+    tree: GitObjectId
+    src_tree: GitObjectId
+
+
+class RecoveryIdentity(BaselineModel):
+    base_commit: GitObjectId
+    base_tree: GitObjectId
+    imported_index_tree: GitObjectId
+
+
+class IndexTransitionIdentity(BaselineModel):
+    transition_id: Literal["phase-1-reviewed-index-transition-v1"]
+    imported_index_tree: Literal[
+        "6cb461d986c21e4cb2852a07b06f75812ec27bbb"
+    ]
+    imported_staged_entries_sha256: Literal[
+        "fcfe06d851c83040d860f9f887efe18bde9dbe46c4eeb1aaa3f68b3af8f3ccaf"
+    ]
+    candidate_index_tree: Literal[
+        "55691718dade75b44a8ed025fcf48dabf87a7969"
+    ]
+    candidate_staged_entries_sha256: Literal[
+        "9426ba909728d29d2009607264a9ffb1c028c4c645bbacd72f98867132e24f68"
+    ]
+
+
+class CaptureInputIdentity(BaselineModel):
+    tree_before: GitObjectId
+    tree_after: GitObjectId
+    src_tree: GitObjectId
+    git_object_format: Literal["sha1"]
+    excluded_output_paths: Annotated[
+        tuple[
+            Literal[
+                "contracts/baseline/tool-catalog.json",
+                "contracts/baseline/resources.json",
+                "contracts/baseline/result-cases.json",
+                "contracts/baseline/error-cases.json",
+                "contracts/baseline/manifest.json",
+            ],
+            ...,
+        ],
+        Field(min_length=5, max_length=5),
+    ]
+    included_untracked_paths: tuple[
+        Literal["contracts/zod/asvs-evidence-contracts.mjs"],
+        Literal["contracts/zod/baseline-contracts.mjs"],
+        Literal["docs/security/threat-model.json"],
+        Literal["eslint.config.mjs"],
+        Literal["scripts/baseline_capture_io.py"],
+        Literal["scripts/baseline_replay.py"],
+        Literal["tests/contracts/zod_asvs_evidence_contracts.test.mjs"],
+        Literal["tests/contracts/zod_baseline_contracts.test.mjs"],
+        Literal["tests/property/test_asvs_evidence.py"],
+        Literal["tests/unit/test_build_asvs_matrix.py"],
+        Literal["tsconfig.contracts.json"],
+    ]
+
+
+class GeneratorIdentity(BaselineModel):
+    path: Literal["scripts/capture_baseline.py"]
+    version: Literal["3"]
+    blob: GitObjectId
+    sha256: HexDigest
+
+
 class BaselineManifest(BaselineModel):
-    schema_version: Literal[1]
-    audit_source_commit: GitObjectId
-    audit_source_tree: GitObjectId
-    audit_src_tree: GitObjectId
-    capture_commit: GitObjectId
-    capture_tree: GitObjectId
-    capture_src_tree: GitObjectId
+    schema_version: Literal[3]
+    capture_mode: Literal["synthetic-index-staged-recovery"]
+    audit: GitSourceIdentity
+    recovery: RecoveryIdentity
+    index_transition: IndexTransitionIdentity
+    input: CaptureInputIdentity
+    generator: GeneratorIdentity
+    canonicalization: Literal["nplg-json-sort-utf8-lf-v1"]
+    response_canonicalization: Literal[
+        "nplg-response-semantic-numbers-v1"
+    ]
     entries: Annotated[
         tuple[BaselineEntry, ...],
         Field(min_length=4, max_length=4),
     ]
+    required_tool_names: Annotated[
+        tuple[CaseId, ...],
+        Field(min_length=8, max_length=8),
+    ]
     required_case_ids: Annotated[
         tuple[CaseId, ...],
         Field(min_length=1, max_length=512),
+    ]
+    release_eligible: Literal[False]
+    release_blockers: tuple[
+        Literal["BASELINE_CAPTURE_NOT_COMMIT_REACHABLE"]
     ]
 
 
@@ -522,12 +911,42 @@ def test_frozen_baseline_is_complete_and_digest_bound(
         Path("contracts/baseline/manifest.json").read_text(encoding="utf-8"),
         strict=True,
     )
-    assert manifest.audit_source_commit == "2ba5dc18385747aa5d12a3b560eaab2ab97b7a40"
-    assert manifest.audit_source_tree == "b17c840ddd3c0dc0ec98fb150e18c22cf6c3b9e8"
-    assert manifest.audit_src_tree == "fcd9debdb533498486a2bbeaf909ea5bfb95b52c"
-    assert manifest.capture_tree == git_rev_parse(f"{manifest.capture_commit}^{{tree}}")
-    assert manifest.capture_src_tree == git_rev_parse(f"{manifest.capture_commit}:src")
-    assert manifest.capture_src_tree == manifest.audit_src_tree
+    assert manifest.audit.commit == "2ba5dc18385747aa5d12a3b560eaab2ab97b7a40"
+    assert manifest.audit.tree == "b17c840ddd3c0dc0ec98fb150e18c22cf6c3b9e8"
+    assert manifest.audit.src_tree == "fcd9debdb533498486a2bbeaf909ea5bfb95b52c"
+    assert manifest.recovery.base_commit == (
+        "da5cc20e4f8bf3e1cacf74c49d5391487cb11cb0"
+    )
+    assert manifest.recovery.base_tree == (
+        "2464df5aa1880e99168ce07c23d891ab66ed3959"
+    )
+    assert manifest.recovery.imported_index_tree == (
+        "6cb461d986c21e4cb2852a07b06f75812ec27bbb"
+    )
+    assert manifest.index_transition.imported_index_tree == (
+        manifest.recovery.imported_index_tree
+    )
+    assert manifest.index_transition.candidate_index_tree == (
+        "55691718dade75b44a8ed025fcf48dabf87a7969"
+    )
+    assert manifest.index_transition.imported_staged_entries_sha256 == (
+        "fcfe06d851c83040d860f9f887efe18bde9dbe46c4eeb1aaa3f68b3af8f3ccaf"
+    )
+    assert manifest.index_transition.candidate_staged_entries_sha256 == (
+        "9426ba909728d29d2009607264a9ffb1c028c4c645bbacd72f98867132e24f68"
+    )
+    assert manifest.input.tree_before == manifest.input.tree_after
+    assert manifest.input.git_object_format == "sha1"
+    assert manifest.input.excluded_output_paths == (
+        "contracts/baseline/tool-catalog.json",
+        "contracts/baseline/resources.json",
+        "contracts/baseline/result-cases.json",
+        "contracts/baseline/error-cases.json",
+        "contracts/baseline/manifest.json",
+    )
+    assert manifest.input.src_tree == git_rev_parse(
+        f"{manifest.input.tree_before}:src"
+    )
     assert {entry.path for entry in manifest.entries} == {
         "tool-catalog.json",
         "resources.json",
@@ -535,6 +954,7 @@ def test_frozen_baseline_is_complete_and_digest_bound(
         "error-cases.json",
     }
     assert len({entry.path for entry in manifest.entries}) == len(manifest.entries)
+    assert set(manifest.required_tool_names) == frozen_tool_names()
     assert len(set(manifest.required_case_ids)) == len(manifest.required_case_ids)
     assert all(
         entry.sha256 == sha256_file(BASELINE_DIR / entry.path)
@@ -555,7 +975,89 @@ Expected: collection/imports PASS; the test FAILS on the intentional absence of 
 
 - [ ] **Step 3: Capture deterministic fixtures and the ADR**
 
-Store sorted JSON with no timestamps. Create a strict manifest listing exactly all four fixture files, their SHA-256 digests, required case categories/IDs, the original audited commit/tree/`src` tree above, and the actual clean Task 0 checkpoint capture commit/tree/`src` tree derived with `git rev-parse HEAD`, `HEAD^{tree}`, and `HEAD:src` immediately before fixture generation. Require the capture commit to exist and its `src` tree to equal the audited `fcd9debdb533498486a2bbeaf909ea5bfb95b52c`; any Task 0 production-source delta stops capture and requires a new reviewed baseline rather than relabelling it. The whole capture tree is expected to differ because Task 0 adds locks/test factories and is never misreported as the original tree. Include all eight current tools, modern and legacy success/error envelopes, resource listings/reads, strict input rejection, sanitized public errors, and representative PDF manifests generated by existing deterministic factories. Freeze intended domain semantics, not vulnerabilities: if the current server leaks a canary, coerces a forbidden value, accepts unsafe framing, or violates another new security invariant, record that input as a negative regression and mark the current result as a defect rather than an accepted oracle value. The root `SPEC.md` is the normative product/scope ledger, links the approved design and ADR, and records the user-confirmed value, core actions, data boundaries, and one machine-readable closed `first_release_profile` field plus the digest of that profile decision. Stop after the draft if that product/profile decision is not explicitly approved. The ADR records:
+Store canonical sorted UTF-8 JSON with no timestamps, floats, duplicate keys,
+BOM, alternate whitespace, or missing final LF. For this one authorized recovery,
+derive a fresh capture input from an absolute temporary index seeded with exact
+tree `6cb461d986c21e4cb2852a07b06f75812ec27bbb`: run only
+`git add -u -- .`, remove the literal four fixture paths plus `manifest.json`,
+then, inside the same closed private Git boundary, add only the exact reviewed,
+sorted untracked tuple using the literal argv
+`git add -- contracts/zod/asvs-evidence-contracts.mjs contracts/zod/baseline-contracts.mjs docs/security/threat-model.json eslint.config.mjs scripts/baseline_capture_io.py scripts/baseline_replay.py tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/property/test_asvs_evidence.py tests/unit/test_build_asvs_matrix.py tsconfig.contracts.json`
+before writing the synthetic input tree. Never use `git add -A`, a bare
+`git add`, a wildcard, or any other untracked-path discovery. Before and after
+that exact add, bounded no-follow reads must prove all eleven declared paths are
+single-link mode-`0644` regular files with unchanged identity, size, bytes, and
+independently computed blob IDs; missing, symlink, special, hard-linked,
+oversized, or raced declared inputs fail closed. The written tree must contain
+all eleven exact declared entries and blobs, while unrelated untracked and ignored
+paths remain absent. Validate the exact audit commit/tree/`src`,
+reviewed base commit/tree, real imported-index tree, object types, and ancestry
+before capture. Reject symlink/special tree entries, materialize that exact tree
+into a private mode-`0700` root, and run its generator in a fresh `python -P`
+child whose `PYTHONPATH` names only the materialized `src` and root. Repeat the
+synthetic-index derivation after collection and reject any tree, `src`, generator
+blob, or generator-digest drift before outputs are touched.
+
+Manifest schema v3 records the closed audit and recovery identities, the exact
+reviewed historical-import-to-candidate transition and both canonical staged-entry
+digests, identical
+`input.tree_before`/`tree_after`, derived input `src` tree, generator path/version/
+blob/SHA-256, exact four fixture digests, exact eight tool names, sorted unique
+case IDs, canonicalization ID, `release_eligible=false`, and sole blocker
+`BASELINE_CAPTURE_NOT_COMMIT_REACHABLE`. `--check` uses a temporary object
+database populated by a bounded no-follow private object byte copy; it rejects `info/alternates` and `info/http-alternates`, and
+`GIT_ALTERNATE_OBJECT_DIRECTORIES` is absent. It computes every output in
+memory, compares exact bytes, and leaves the real index and the complete real
+object inventory unchanged, including names, bytes, modes, link counts, sizes,
+mtimes, ctimes, and inodes. `--write` uses an append-only real object destination:
+it may add immutable objects and Git may refresh metadata for pre-existing
+objects, but it must preserve their bytes, modes, sizes, and object identities as
+well as refs and real-index bytes. It stages and fsyncs all five outputs on the
+same filesystem, validates them, publishes the four fixtures first and manifest
+last, and rolls back caught write/rename faults. This is fail-closed manifest-last
+publication, not cross-file crash atomicity.
+
+All capture Git operations run with an absolute system Git executable against a
+fresh private `GIT_DIR`, copied temporary index, empty hooks/info directories,
+and a closed prompt/credential/config environment. Check mode uses only the
+verified private object copy; write mode uses the explicit append-only real
+object destination. Repository-local filters, hooks, config, and
+`info/attributes` are therefore outside the execution boundary. Every Git child
+has a fixed deadline, bounded stdout/stderr, whole-process-group termination,
+exact status/UTF-8/record parsing, and no shell. The manifest binds literal
+`git_object_format="sha1"`
+and both the ordered five-path exclusion tuple and exact sorted eleven-path `included_untracked_paths` tuple (`contracts/zod/asvs-evidence-contracts.mjs`, `contracts/zod/baseline-contracts.mjs`, `docs/security/threat-model.json`, `eslint.config.mjs`, `scripts/baseline_capture_io.py`, `scripts/baseline_replay.py`, `tests/contracts/zod_asvs_evidence_contracts.test.mjs`, `tests/contracts/zod_baseline_contracts.test.mjs`, `tests/property/test_asvs_evidence.py`, `tests/unit/test_build_asvs_matrix.py`, `tsconfig.contracts.json`). Before and after the capture child,
+validate the complete materialized relative-path inventory, regular-file modes,
+single-link/inode state, sizes, and independently computed Git blob IDs against
+the synthetic tree; reject links, special files, extra paths, content changes,
+and identical-byte replacements. Case IDs must be unique across all three case
+fixture files, not merely unique within each file or after set union.
+
+Every Task 1 temporary-repository Git setup/probe uses an equally closed
+test-only command seam: absolute system Git and exact literal argv, disabled
+system/global configuration, private mode-`0700` `HOME`/`XDG_CONFIG_HOME`,
+fixed locale/path/timezone and author/committer identity/date, disabled prompts,
+askpass, editors, pagers, SSH, credentials, and optional locks, plus explicit
+`commit.gpgSign=false` and `tag.gpgSign=false` command configuration. Each child
+runs without a shell through the bounded process-group runner with a five-second
+deadline, 1-MiB stdout and 64-KiB stderr ceilings, strict UTF-8/status handling,
+and closed failure mapping. Tests inject ambient global signing configuration
+and a helper canary without changing real global configuration; the helper must
+never execute. Exact environment, argv, deadline, ceilings, timeout/output-limit
+mapping, and use by every temporary Git setup call are executable assertions.
+
+Include all eight current tools, modern and legacy success/error envelopes,
+resource listings/reads, strict input rejection, sanitized public errors, and
+representative PDF manifests generated by existing deterministic factories.
+Freeze intended domain semantics, not vulnerabilities: if the current server
+leaks a canary, coerces a forbidden value, accepts unsafe framing, or violates
+another new security invariant, record that input as a negative regression and
+mark the current result as a defect rather than an accepted oracle value. The
+root `SPEC.md` is the normative product/scope ledger, links the approved design
+and ADR, and records the user-confirmed value, core actions, data boundaries,
+and one machine-readable closed `first_release_profile` field plus the digest of
+that profile decision. Stop after the draft if that product/profile decision is
+not explicitly approved. The ADR records:
 
 The machine-readable record is the sole line between literal markers `<!-- nplg-release-profile:v1` and `-->`, contains the canonical RFC 8785-compatible UTF-8 JSON object `{"decision_sha256":"b064e1d16fca1c4f86f9d8c2a5f1053cd25d50f88c169505eb79464d49c259cb","first_release_profile":"alpic-metadata","schema_version":1}`, and has no duplicate/unknown keys or alternate record. `decision_sha256` is SHA-256 over the exact UTF-8 preimage `{"profile":"alpic-metadata","schema_version":1}\n`; it is not a digest of its own enclosing object. The schema permits only the closed profile enum `alpic-metadata | private-full | distributed-full`, but this approved record fixes `alpic-metadata`. Static tests parse marker bytes, canonicalize/recompute the preimage, and reject missing/duplicate/malformed/stale/extra fields, alternate Unicode/newline serialization, or disagreement with the ADR and baseline manifest. Task 22 derives the selected profile from this verified record; an ambient requested profile can only be compared with it, never override it.
 
@@ -805,28 +1307,183 @@ Expected: both the focused group and complete pre-Task-7 baseline PASS after the
 
 Stage named files, then: `git commit -m "fix: serialize compatibility PDF execution"`.
 
+### Task 1B: Close the touched legacy service/static surface before ratchet capture
+
+This audit-remediation task executes before Task 2 and supersedes the later
+Task 6B file ordering only for the exact paths named here. It does not widen
+the official-SDK cutover, change a public wire result, or authorize a commit.
+
+#### Files
+
+- Modify: `src/nplg_mcp/protocol.py`, `src/nplg_mcp/tools.py`,
+  `src/nplg_mcp/app.py`
+- Create: `src/nplg_mcp/json_types.py` as the closed typed JSON boundary
+  shared by this cleanup and later named tasks
+- Modify: `tests/helpers/app_factory.py`, `tests/unit/test_tools.py`
+- Modify: `tests/contracts/test_frozen_baseline.py` only for the closed
+  suppression inventory and provenance assertions
+- Modify: `contracts/baseline/manifest.json` only for a tested provenance
+  refresh; `tool-catalog.json`, `resources.json`, `result-cases.json`, and
+  `error-cases.json` must remain byte-identical
+- Modify: `quality-baseline.json` only through the reviewed version-2 capture
+  command when exact diagnostic identities change
+- Modify: this implementation plan
+- Create (ignored evidence):
+  `.superpowers/sdd/2026-08-14-official-mcp-sdk-alpic-tdd-implementation-plan/task-1-legacy-static-report.md`
+
+No other source, test, quality-policy, baseline-payload, lock, package, CI, or
+deployment path is authorized by Task 1B. If a direct caller outside this list
+requires a change, stop and amend/re-review this file list first.
+
+#### Interfaces and invariants
+
+- Produce a frozen, slotted `ToolServiceDependencies` dataclass containing the
+  repository, downloader, PDF, and store collaborators. `ToolService` consumes
+  that bundle plus `AppConfig` and the optional typed UTC clock. The bundle is
+  an internal object graph, not an untrusted serialization boundary, so it must
+  not weaken Pydantic with `arbitrary_types_allowed=True`.
+- Preserve the existing keyword-only construction semantics at every direct
+  caller, the exact eight-tool catalog, all 66 replay outcomes, JSON-RPC status
+  and error envelopes, resource-link order/deduplication, and the serialized
+  PDF concurrency/cancellation behavior.
+- Ruff-required Pydantic model docstrings must not add class-derived top-level
+  `description` or `title` members to exported `inputSchema`. Remove only those
+  two top-level presentation keys after `model_json_schema()` and prove the
+  frozen catalog bytes remain unchanged; retain all field descriptions,
+  constraints, and `additionalProperties: false` semantics.
+- Rename the internal exception class to `ProtocolError` for `N818`, while
+  retaining `ProtocolFailure = ProtocolError` as a compatibility alias until
+  Task 14 deletes the custom protocol.
+- The final JSON-RPC sanitizer deliberately catches `Exception` and deliberately
+  uses `logger.error`, not `logger.exception`. Exactly two inline suppressions
+  are permitted there: `BLE001` for the final fail-closed boundary and `TRY400`
+  because exception messages/tracebacks can contain untrusted archival or
+  application data. Each directive requires a three-line adjacent rationale,
+  checker code, official Ruff rule URL, and exact closed-inventory entry.
+  Moving, adding, removing, or changing either directive fails the inventory.
+- Every touched Python file must finish with zero direct Ruff `ALL`
+  diagnostics, Ruff-format clean, zero mypy strict diagnostics, and zero
+  Pyright strict diagnostics. Do not hide inherited caller diagnostics by
+  checking only the three leaf files, changing thresholds, adding another
+  suppression, routing parameters through untyped `**kwargs`, or relying on a
+  generated constructor solely to evade `PLR0913`.
+
+- [ ] **Step 1: Record independent static and behavior RED evidence**
+
+Run direct Ruff JSON, Ruff format, mypy, and Pyright commands over the exact
+five-file source/test scope before editing production code. Record per-file and
+per-rule counts and exact tool versions. Then run:
+
+```bash
+.venv/bin/python -m pytest -p no:cacheprovider \
+  tests/unit/test_tools.py \
+  tests/conformance/test_mcp_http.py \
+  tests/unit/test_test_factories.py -q
+```
+
+The static commands must be RED for the recorded legacy diagnostics while the
+behavior group is green. A parser/tool/environment failure is not an accepted
+RED.
+
+- [ ] **Step 2: Apply behavior-neutral mechanical cleanup**
+
+One checker invariant at a time, add public docstrings, named exception
+messages and printable-range constants; wrap long strings without changing
+runtime bytes; encode the multiplication sign without changing the catalog;
+use a project-relative non-temporary default in the test environment; and run
+Ruff format. Add the top-level schema `description` removal in the same GREEN
+slice as the Pydantic docstrings. A deliberate fault that omits that removal
+must fail the byte-bound catalog assertion.
+
+- [ ] **Step 3: Introduce the typed dependency bundle**
+
+Add `ToolServiceDependencies`, update every direct caller in the authorized
+files, and retain the clock/config behavior. Run the constructor/config/PDF
+tests plus direct mypy and Pyright. As a temporary deliberate fault, cross-wire
+the PDF and downloader fields in the otherwise type-clean runtime caller;
+both type checkers must reject it. Restore the fault and rerun GREEN.
+
+- [ ] **Step 4: Reduce protocol complexity incrementally**
+
+Extract resource-link candidate construction/traversal, modern header versus
+metadata validation, and method-specific dispatch as three separate refactors.
+After each extraction, run its focused conformance nodes and the 66-case replay
+before continuing. Do not change fixture payloads to accommodate a refactor.
+
+- [ ] **Step 5: Inventory the intentional sanitizer suppressions**
+
+Add only the reviewed `BLE001` and `TRY400` directives and extend the closed
+tokenized suppression inventory. Run the existing unexpected-tool-error node.
+Then temporarily replace `logger.error` with `logger.exception`; the sensitive
+fixture canary must appear and the node must fail. Restore the secure call and
+prove GREEN. Never retain the deliberate fault or a traceback-bearing log.
+
+- [ ] **Step 6: Run layered static and behavioral proof**
+
+Run direct Ruff `ALL`, Ruff format, mypy strict, and Pyright strict over every
+touched Python file and require zero diagnostics. Then run the focused service,
+conformance, shared-factory, frozen-baseline, complete Python, capability-Zod,
+and baseline-Zod suites. Record exact commands, exit statuses, and counts.
+
+- [ ] **Step 7: Reconcile the actual eight-command quality ratchet**
+
+Run the repository's real eight-command quality gate without suppressing,
+truncating, or treating parser failure as success. If line/path identities
+changed, use only the reviewed version-2 capture path to refresh
+`quality-baseline.json`; rerun the exact eight commands and record every
+remaining inherited diagnostic rather than claiming project-wide zero.
+
+- [ ] **Step 8: Refresh provenance last and review**
+
+After all code, tests, plan, policy, and report text are final, run one tested
+baseline `--write`, then repeated module and direct-script `--check` paths.
+Require the four behavior payload files and the eight-tool catalog to remain
+byte-identical while `manifest.json` changes only for the new input identity.
+Verify the logical staged-entry digest and refs are unchanged, inspect the
+scoped diff, write the ignored report, and request independent review. Do not
+stage or commit without separate user authorization.
+
 ### Task 2: Generate the complete ASVS 5.0.0 L2 applicability matrix
 
 #### Files
 
-- Create: `security/asvs/requirements-5.0.0.json`
-- Create: `security/asvs/SHA256SUMS`
-- Create: `scripts/build_asvs_matrix.py`
-- Create: `docs/security/asvs-5.0.0-l2-method.md`
-- Create: `docs/security/asvs-evidence-policy.json`
-- Create: `docs/security/asvs-5.0.0-l2-matrix.jsonl`
-- Create: `docs/security/evidence-manifest.jsonl`
-- Create: `docs/security/threat-model.md`
-- Create: `tests/static/test_asvs_evidence.py`
+- Modify: `security/asvs/requirements-5.0.0.json` (transferred pinned source; bytes remain unchanged unless strict regeneration proves byte identity)
+- Modify: `security/asvs/SHA256SUMS` (transferred pinned digest; bytes remain unchanged unless strict regeneration proves byte identity)
+- Modify: `scripts/build_asvs_matrix.py`
+- Modify: `docs/security/asvs-5.0.0-l2-method.md`
+- Modify: `docs/security/asvs-evidence-policy.json`
+- Modify: `docs/security/asvs-5.0.0-l2-matrix.jsonl`
+- Modify: `docs/security/evidence-manifest.jsonl`
+- Create: `docs/security/threat-model.json` (strict machine-readable threat ledger and render source)
+- Modify: `docs/security/threat-model.md`
+- Modify: `tests/static/test_asvs_evidence.py`
+- Create: `tests/unit/test_build_asvs_matrix.py`
+- Create: `tests/property/test_asvs_evidence.py`
+- Create: `contracts/zod/asvs-evidence-contracts.mjs`
+- Create: `tests/contracts/zod_asvs_evidence_contracts.test.mjs`
+- Modify: `tests/contracts/zod_baseline_contracts.test.mjs` (exact package-script policy only, so the existing closed schema admits and mutation-tests the three Task 2 contract entrypoints)
+- Modify: `scripts/baseline_capture_io.py`, `tests/contracts/test_frozen_baseline.py`, `contracts/zod/baseline-contracts.mjs` (bounded provenance repair only: expand Task 1's exact reviewed-untracked-input tuple from eight to thirteen paths so the five new Task 2 truth inputs are blob-bound)
+- Modify: `package.json`, `tsconfig.contracts.json`, `eslint.config.mjs` (only as required to run the independent Zod 4.4.3 oracle)
+- Create: `.superpowers/sdd/2026-08-14-official-mcp-sdk-alpic-tdd-implementation-plan/task-2-report.md`
+- Modify after every Task 2 source/config artifact is frozen: `contracts/baseline/manifest.json` (the Task 1 provenance manifest used by the live capture/check tooling), root `quality-baseline.json`
 
 #### Interfaces
 
 - Consumes: official ASVS JSON from immutable release tag `v5.0.0_release` at commit `5cf9b032440be53ce345ab3c130fda46ba1ce7a2`; the reviewed 149,407-byte artifact SHA-256 is `bcdbec214d70abcfad9284a31d4f9e5134305831d628aad3aa85d7e26626cb35`.
-- Produces: `build_asvs_matrix.py fetch --output security/asvs/requirements-5.0.0.json`, a fail-closed fetcher whose URL contains that full commit rather than a tag. It permits HTTPS only, rejects redirects, credentials, proxies, non-GitHub hosts, non-200 status, compressed/deceptive transfer, and bodies outside the exact reviewed size; it verifies the reviewed SHA-256 before atomically creating a new no-symlink output and writes the matching `SHA256SUMS` entry. The downloader and filesystem operations are injected in tests, so RED/GREEN never require the network.
+- Produces: `build_asvs_matrix.py fetch --output security/asvs/requirements-5.0.0.json`, a fail-closed fetcher whose URL contains that full commit rather than a tag. It permits HTTPS only, rejects redirects, credentials, proxies, non-GitHub hosts, non-200 status, compressed/deceptive transfer, and bodies outside the exact reviewed size; it verifies the reviewed SHA-256 before exclusively publishing a new no-symlink output and matching `SHA256SUMS` entry under one reader-visible transaction lock. No command reports success or leaves either new artifact behind unless both publications and the containing-directory sync succeed; rollback removes only the exact inode published by that transaction. The downloader and filesystem operations are injected in tests, so RED/GREEN never require the network.
 - Produces: `build_asvs_matrix.py verify-ref`, which invokes exact argv `git ls-remote --refs https://github.com/OWASP/ASVS.git refs/tags/v5.0.0_release` with hooks, prompts, credentials, proxies, and user/system Git config disabled, a 30-second timeout, and a 4 KiB output ceiling; the sole accepted record is `5cf9b032440be53ce345ab3c130fda46ba1ce7a2\trefs/tags/v5.0.0_release`. The injected-runner tests reject no/multiple/malformed/abbreviated/changed refs, stderr, timeout, and nonzero exit.
-- Produces: `load_pinned_asvs_requirements() -> tuple[AsvsRequirement, ...]`, `load_evidence_matrix() -> tuple[EvidenceRow, ...]`, `load_evidence_manifest() -> tuple[LocalEvidenceReference | CustodiedEvidenceReference, ...]`, `verify_evidence_reference(reference, *, expected_revision) -> bool`, and exactly 253 L1+L2 rows for each deployment profile.
+- The fetch, Git, filesystem, custody, and approval boundaries return frozen typed results. Production Git uses one reviewed absolute regular executable, exact argv, an allowlisted environment rather than a filtered ambient environment, bounded byte capture with explicit completeness flags, timeout/cancellation and process-group/descendant cleanup. The fetch result binds the exact requested/final URL, status, headers, redirect count, body length, completion flag, and body bytes. Tests inject every boundary and remain offline until the adversarial suite is green.
+- Every persisted Task 2 JSON/JSONL loader consumes bounded raw bytes and rejects non-bytes, invalid UTF-8, BOM, duplicate keys at any depth, non-finite numbers, unknown fields, noncanonical JSON bytes, blank JSONL records, CRLF, a missing final LF, excess line/record/file size, symlinks, special files, hard links, intermediate-directory escapes, and before/after descriptor identity change. Exact byte ceilings are: pinned source 149,407 bytes, `SHA256SUMS` 256 bytes, policy 2 MiB, matrix 2 MiB with exactly 759 records and at most 16 KiB per record, manifest 8 MiB with at most 4,096 records and 64 KiB per record, and threat-ledger JSON/Markdown 2 MiB each. Model fields additionally impose explicit tuple, string, nesting, selector, and identifier bounds. Local files are opened by descriptor through a no-follow walk beneath an already verified candidate root and are never reopened by pathname. Publication is exclusive and fail-closed; a typed injected transaction proves short-write, collision, link/rename, fsync, rollback, and identity-race behavior without overwriting an existing artifact.
+- Produces: `load_pinned_asvs_requirements() -> tuple[AsvsRequirement, ...]`, `load_evidence_matrix() -> tuple[EvidenceRow, ...]`, `load_evidence_manifest() -> tuple[LocalEvidenceReference | CustodiedEvidenceReference, ...]`, `verify_evidence_reference(reference, *, context: EvidenceVerificationContext) -> bool`, and exactly 253 L1+L2 rows for each deployment profile. The frozen context is produced only after the candidate revision/tree/root identity has been verified; callers cannot supply an unbound revision string as sufficient authority.
+- `asvs_source_commit` names only the pinned OWASP source revision. `evidence_revision` names the assessed NPLG candidate and is paired with its independently verified candidate tree/projection identity; neither value may stand in for the other. Local evidence verification binds the open descriptor, digest, selectors, candidate revision/tree, requirement, profile, invariant, and covered surface before and after verification. Verifier text is inert data selected only through a closed typed registry.
+- The initial all-`Not assessed` inventory records the pre-Task-2 assessment baseline commit `da5cc20e4f8bf3e1cacf74c49d5391487cb11cb0` and SHA-256 of its canonical `git ls-tree -rz --full-tree` bytes, `f50987fe97ed12a0da3295929e2ef8dba94693389a0a3bec2b2458a9f87aa32c`. These immutable audit-subject values are not compared to a future live HEAD and are not release evidence; any future evidence-bearing assessment must deliberately regenerate against its separately verified candidate revision/tree.
 - `EvidenceRow` is the strict discriminator `ApplicableEvidenceRow | NotApplicableEvidenceRow`, keyed by `applicability`; it is never two independent applicability/verdict strings. Shared fields are `asvs_version, requirement_id, level, requirement_text, profile, invariant, threat_boundary, required_evidence_kinds, evidence_ids, owner, target_phase, evidence_revision, evidence_date`. `ApplicableEvidenceRow(applicability=Literal["applicable"], applicability_rationale, verdict=Literal["Not assessed", "Fail", "Partial", "Pass", "Risk accepted"], ...)` forbids `N/A` and permits risk fields only for `Risk accepted`. `NotApplicableEvidenceRow(applicability=Literal["not_applicable"], verdict=Literal["N/A"], applicability_rationale, applicability_reviewer, applicability_review_due, absence_evidence_ids)` requires revision/profile-bound absence evidence and structurally forbids every risk/compensating-control/release-approval field. Unknown or contradictory states cannot be loaded or serialized.
-- Evidence is a strict discriminated union, never a bag-shaped path-or-URI plus executable text. Shared fields are `evidence_id, kind, requirement_ids, profiles, asserted_invariant, covered_surface, selectors, sha256, result, source_commit, deployment_id, image_digest, collected_at, reviewer, expires_at`. `LocalEvidenceReference(storage="local", artifact_path: CanonicalRepoRelativePath, verifier: Literal["sha256-file-v1", "json-record-v1", "test-report-v1", "config-symbol-v1"])` resolves only beneath the verified expected revision by descriptor, rejects absolute/empty/dot-dot/backslash/control paths, symlinks/specials/hard-link replacement and before/after inode/digest change, and never reopens by name after validation. `CustodiedEvidenceReference(storage="custodied-uri", immutable_artifact_uri: ApprovedImmutableArtifactUri, artifact_object_version, custody_receipt_id, verifier: Literal["ci-custody-v1"])` is verified only through Task 22's trusted receipt/authority registry; the matrix verifier never fetches an arbitrary URI. Allowed kinds are `design`, `code_config`, `test`, and `operational`; `selectors` are exact test node IDs, configuration/code symbols, or operation/evidence record IDs rather than prose-only labels. Verifier values dispatch through one closed function registry and are never shell, module, URL, or expression text.
+- Evidence is a strict discriminated union, never a bag-shaped path-or-URI plus executable text. Shared fields are `evidence_id, kind, requirement_ids, profiles, asserted_invariant, covered_surface, selectors, sha256, result, evidence_revision, candidate_tree_sha256, deployment_id, image_digest, collected_at, reviewer, expires_at`. `LocalEvidenceReference(storage="local", artifact_path: CanonicalRepoRelativePath, verifier: Literal["sha256-file-v1", "json-record-v1", "test-report-v1", "config-symbol-v1"])` resolves only beneath the verified expected revision by descriptor, rejects absolute/empty/dot-dot/backslash/control paths, symlinks/specials/hard-link replacement and before/after inode/digest change, and never reopens by name after validation. `CustodiedEvidenceReference(storage="custodied-uri", immutable_artifact_uri: ApprovedImmutableArtifactUri, artifact_object_version, custody_receipt_id, verifier: Literal["ci-custody-v1"])` is verified only through Task 22's trusted receipt/authority registry; the matrix verifier never fetches an arbitrary URI. Allowed kinds are `design`, `code_config`, `test`, and `operational`; `selectors` are exact test node IDs, configuration/code symbols, or operation/evidence record IDs rather than prose-only labels. Verifier values dispatch through one closed function registry and are never shell, module, URL, or expression text.
+- The independently loaded evidence policy contains one exact, canonically sorted strict record for every one of the 759 requirement/profile claims; a matrix row may never weaken its required kinds or absence proof. Each record explicitly declares whether `Pass`, `N/A`, or `Risk accepted` is eligible. Initially none is eligible and all rows remain `Not assessed`, avoiding fabricated evidence-kind assignments. Custody receipts bind an allowlisted authority, immutable URI and object version, proof digest, exact candidate/profile/requirement/risk subject, issuance/expiry and nonce. Reverification of the identical immutable subject may be idempotent; nonce reuse for any different subject is replay and fails. Unknown authorities, mutable/rebound subjects, redirects, or locally self-authored approval artifacts fail without URI retrieval.
+- Task 2 expands Task 1's exact reviewed-untracked-input admission tuple from eight to thirteen paths by adding only `contracts/zod/asvs-evidence-contracts.mjs`, `docs/security/threat-model.json`, `tests/contracts/zod_asvs_evidence_contracts.test.mjs`, `tests/property/test_asvs_evidence.py`, and `tests/unit/test_build_asvs_matrix.py`. Python and independent Zod require this exact canonically sorted tuple and prove every declared file's mode, identity, size, bytes, and Git blob in the synthetic input tree; unrelated untracked discovery remains forbidden. The Task 2 report is deliberately excluded because it records the resulting manifest identity and including it would make that provenance claim self-referential.
+- `ReleaseDecision` is a strict typed result. A public decision requires every applicable row to be independently verified `Pass` and every N/A row to have valid absence evidence. A private/staging decision containing `Risk accepted` can only be `do_not_release`; it still requires an externally approved immutable authority artifact. The repository configures no authority in Task 2, so every risk acceptance and release decision remains externally ineligible.
+- The independent Zod 4.4.3 oracle reads raw bytes separately from Python and enforces the same discriminators, exact fields, canonical encodings, ordering, uniqueness, product counts, policy bindings, custody shapes, and release-ineligibility defaults. Python-produced schemas are not imported or translated into the Zod oracle.
+- `docs/security/threat-model.json` is a strict, canonical, bounded ledger with stable threat IDs, DFD nodes and directed edges, trust-boundary crossings, privileges, assets/data classes, every STRIDE category, abuse/misuse cases, affected profiles, mitigations, verification selectors, mapped ASVS requirement IDs, assumed provider controls, residual-risk owner, review date, and invalidation triggers. `threat-model.md` is deterministically rendered from that ledger; tests reject missing required flows/categories/owners/mappings and any render drift.
 
 - [ ] **Step 1: Write the failing matrix-policy tests**
 
@@ -893,17 +1550,17 @@ def test_na_and_pass_verdicts_have_required_evidence() -> None:
 
 Add a table-driven legal-state test over the full Cartesian product of both `applicability` values and every verdict. It must accept only the union branches above; reject `applicable + N/A`, `not_applicable + Pass|Fail|Partial|Not assessed|Risk accepted`, risk fields on `N/A`, N/A-review/absence fields on applicable rows, missing absence evidence, expired review, unknown fields, and serialization that drops the discriminator. Mutate the discriminator, verdict, and conditional field-forbidding validators independently and require every mutant to fail.
 
-Add unit cases for the fetch and ref-verification subcommands using injected responses/runners: exact artifact/ref succeeds; tag/mutable URL, changed/multiple/malformed ref, redirect, proxy use, wrong host/status/length/digest, oversized/chunk-overflow body, preexisting/symlink output, partial write, and rename failure all fail without publishing either artifact. A static assertion fixes the full-commit URL, byte length, reviewed digest, and exact tag record above.
+Add unit cases for the fetch and ref-verification subcommands using injected responses/runners: exact artifact/ref succeeds; tag/mutable URL, changed/multiple/malformed ref, redirect, proxy use, wrong host/status/length/digest, oversized/chunk-overflow body, preexisting/symlink output, partial write, link/fsync/cleanup failure, and inode replacement all fail without publishing either artifact. A static assertion fixes the full-commit URL, byte length, reviewed digest, and exact tag record above.
 
 Add evidence-reference adversarial cases independently: local absolute/dot-dot/empty/control/backslash paths, symlink/hard-link/special file, descriptor/path swap, digest/expected-revision drift, unknown verifier, and verifier strings containing shell/module syntax all fail without executing text. Custodied references reject `file:`, `data:`, plain HTTP, userinfo, fragments, private/loopback/link-local hosts, redirects/rebinding, mutable URLs, missing/wrong object versions, unknown authority, replayed/wrong-subject receipts, and attempts to downgrade them to local verification. A positive URI case verifies a signed/versioned receipt through an injected allowlisted authority without network access in the unit test.
 
-Before Step 2, create a typed behavior-free `build_asvs_matrix.py` scaffold exposing the declared strict models, injected bounded downloader/Git-runner/filesystem protocols, and `fetch`, `verify-ref`, and load/check entry points; every target call deliberately raises `NotImplementedError`. The test module must collect against that scaffold before any fetch/ref behavior is implemented.
+The behavior-free scaffold and its initial `NotImplementedError` RED occurred before the Task 2 snapshot was transferred into MAIN. Do not destroy working transferred artifacts to replay that historical chronology. In MAIN, first characterize the live snapshot, preserve the correct 759 all-`Not assessed` rows and pinned source bytes, and persist one adversarial RED per reproduced boundary before changing its production implementation.
 
 - [ ] **Step 2: Run the policy tests and observe RED**
 
 Run: `.venv/bin/python -m pytest --collect-only tests/static/test_asvs_evidence.py -q`
 Run: `.venv/bin/python -m pytest tests/static/test_asvs_evidence.py -q`
-Expected: collection/imports PASS; injected fetch/ref cases reach the deliberate scaffold `NotImplementedError`, and static artifact assertions fail on the intentionally absent pinned source/matrix/evidence-policy files. A missing module/import/fixture/executable is the wrong RED.
+Expected for the transferred MAIN snapshot: collection/imports PASS; the first audit records substantive behavior/policy failures rather than missing imports. The observed starting snapshot had the correct pinned source and 759 all-`Not assessed` rows, but `--check` was absent, evidence-policy tests were vacuous, and direct Task 2 static gates were nonzero. Each subsequent local/custody/root-binding, downloader/Git/publication, canonical-loader, threat-semantic, Python/Zod-parity, and suppression-inventory defect must be reproduced by a persistent focused test before its GREEN. A missing module/import/fixture/executable remains the wrong RED.
 
 - [ ] **Step 3: Pin the primary source and generate non-overclaiming rows**
 
@@ -920,7 +1577,12 @@ The threat model inventories assets/data classes, actors, entry points, privileg
 Run: `.venv/bin/python scripts/build_asvs_matrix.py verify-ref`
 Run: `.venv/bin/python scripts/build_asvs_matrix.py --check`
 Run: `.venv/bin/python -m pytest tests/static/test_asvs_evidence.py -q`
-Expected: all PASS. The exclusive `fetch` publication occurred exactly once in Step 3; `--check` revalidates the checked-in source length/digest and regenerates the matrix in memory, proving byte identity without trying to overwrite the deliberately preexisting pinned source.
+Run: `.venv/bin/ruff check scripts/build_asvs_matrix.py tests/static/test_asvs_evidence.py tests/unit/test_build_asvs_matrix.py tests/property/test_asvs_evidence.py`
+Run: `.venv/bin/ruff format --check scripts/build_asvs_matrix.py tests/static/test_asvs_evidence.py tests/unit/test_build_asvs_matrix.py tests/property/test_asvs_evidence.py`
+Run: `.venv/bin/mypy --strict scripts/build_asvs_matrix.py tests/static/test_asvs_evidence.py tests/unit/test_build_asvs_matrix.py tests/property/test_asvs_evidence.py`
+Run: `.venv/bin/pyright scripts/build_asvs_matrix.py tests/static/test_asvs_evidence.py tests/unit/test_build_asvs_matrix.py tests/property/test_asvs_evidence.py`
+Run: `npm run test:contracts:asvs && npm run typecheck:contracts && npm run lint:contracts`
+Expected: all PASS with zero Task 2 diagnostics. The exclusive `fetch` publication occurred exactly once in Step 3; `--check` revalidates the checked-in source length/digest, policy, manifest, threat ledger/render, and regenerates the matrix in memory, proving byte identity without trying to overwrite the deliberately preexisting pinned source. Capture before/after hashes for every Task 2 artifact and prove `--check` performs zero writes. Remove all Task 2 identities from the quality baseline rather than rebaselining those diagnostics.
 
 - [ ] **Step 5: Commit checkpoint**
 
@@ -936,20 +1598,124 @@ After explicit authorization, use the mandatory checkpoint protocol with a liter
 
 #### Files
 
+- Modify: `.gitignore`
 - Modify: `pyproject.toml`
+- Modify: `tests/conftest.py`, `tests/unit/test_quality_gate.py`
 - Modify: `requirements-dev.in`, `requirements-dev.lock`, `package.json`, `package-lock.json`
 - Create: `pyrightconfig.json`
 - Create: `quality-baseline.json`
+- Modify: `scripts/bootstrap_toolchain.py` (strict-type spillover only: the
+  quality runner imports its lock validator, so mypy must traverse this module;
+  no bootstrap behavior or accepted lock semantics may change)
 - Create: `scripts/quality_ratchet.py`, `scripts/run_quality_gate.py`
+- Create: `scripts/__init__.py`
 - Create: `tests/unit/test_quality_ratchet.py`, `tests/unit/test_quality_gate.py`
+- Create: `tests/property/test_quality_ratchet.py`
 - Create: `tests/static/test_quality_policy.py`
+- Create: `contracts/zod/quality-baseline-contracts.mjs`, `tests/contracts/zod_quality_baseline_contracts.test.mjs`
+- Modify: `eslint.config.mjs`, `tsconfig.contracts.json`
 - Modify: `tests/__init__.py`, `tests/helpers/__init__.py`
 - Create: `tests/conformance/__init__.py`, `tests/contracts/__init__.py`, `tests/deployment/__init__.py`, `tests/integration/__init__.py`, `tests/property/__init__.py`, `tests/security/__init__.py`, `tests/static/__init__.py`, `tests/unit/__init__.py`
 - Create: `.github/workflows/ci.yml`
+- Modify: `scripts/baseline_capture_io.py`, `tests/contracts/test_frozen_baseline.py`, `contracts/baseline/manifest.json`
+- Modify, format-only to close the non-baselinable Ruff precheck:
+  `src/nplg_mcp/capabilities.py`, `src/nplg_mcp/protocol.py`,
+  `tests/unit/test_bootstrap_toolchain.py`, `tests/unit/test_tools.py`
+- Create: `.superpowers/sdd/2026-08-14-official-mcp-sdk-alpic-tdd-implementation-plan/task-3-quality-ratchet-report.md`
+
+The 2026-08-16 repair of this already-partial Task 3 is limited to the paths
+listed above plus this plan and `quality-baseline.json`. The newly listed
+`scripts/bootstrap_toolchain.py` scope is limited to the nine strict-mypy
+diagnostics reached through the runner's existing lock-validator import. It
+must not clean or
+rebaseline unrelated legacy diagnostics. Adding the two dedicated quality
+baseline Zod files expanded Task 1's closed synthetic-index admission contract
+from six to the then-current exact sorted eight-path tuple; Task 2 subsequently
+expands it to the normative thirteen-path tuple stated in Task 1. No wildcard
+or other untracked discovery is authorized. Because these inputs change the frozen
+capture tree, the final green repair must refresh only provenance-bound baseline
+artifacts using the tested Task 1 writer/checker and must preserve fixture
+payloads, staged entries, refs, and pre-existing object bytes.
+The first real eight-command capture reproduced four pre-existing Ruff-format
+failures in the exact files named above. Because format failures cannot be
+represented safely as diagnostic identities, this repair may apply only Ruff's
+deterministic formatter to those four paths, prove their behavior unchanged,
+and refresh provenance again; no lint/type finding in them is otherwise in
+scope for cleanup.
 
 #### Interfaces
 
-- Produces: `quality_ratchet.py check --base quality-baseline.json`, returning non-zero for a new diagnostic or a higher per-rule/per-file count, and `run_quality_gate.py [--ratchet] [--worktree ROOT --cache-dir EXTERNAL_DIR] [PATH ...]`, the only scoped/global Ruff, format, Pyright, and mypy entry point. In ordinary developer mode it permits a dirty but stable worktree, fingerprints every checked source/config byte before and after, uses a private external temporary cache root, and fails on source mutation. Release mode requires `--worktree`, a new canonical external cache directory outside every registered worktree, `--require-clean`, and `--candidate COMMIT`; it verifies exact HEAD/cleanliness and routes Ruff, mypy, Pyright, Python bytecode, and temporary output outside source. Tests cover relative/preexisting/symlink/contained caches, dirty-release rejection, source mutation, and tool cache leakage.
+- Produces: `quality_ratchet.py check --base quality-baseline.json --input current-diagnostics.json`, returning non-zero for a new diagnostic or a higher exact identity count, and `run_quality_gate.py --node-executable ABSOLUTE [--ratchet BASELINE | --write-baseline BASELINE] [--worktree ROOT --cache-dir EXTERNAL_DIR] [--self-test] [PATH ...]`, the only scoped/global Ruff, format, Pyright, and mypy entry point. The Node argument is mandatory for a real gate run, must resolve to the exact regular executable and SHA-256 recorded by the accepted platform entry in `security/bootstrap-toolchain-lock.json`, and must report exactly `v24.19.0`; the runner invokes the repository's regular `node_modules/pyright/index.js` through that executable instead of trusting the package's `#!/usr/bin/env node` launcher or ambient `PATH`. Omitting the standalone ratchet input, supplying an empty diagnostics input after a diagnostic tool exit, or allowing a baseline filename to be consumed as a positional source path fails closed. In ordinary developer mode it permits a dirty but stable worktree, fingerprints every checked source/config byte before and after, uses a private external temporary cache root, and fails on source mutation. Release mode requires `--worktree`, a new canonical external cache directory outside every registered worktree, `--require-clean`, and `--candidate COMMIT`; it verifies exact HEAD/cleanliness and routes Ruff, mypy, Pyright, Python bytecode, and temporary output outside source. Baseline capture is a developer publication step: combining `--write-baseline` with release mode fails during argument validation, before any Git query, tool execution, or filesystem publication, so a tracked baseline cannot be written after the final clean-state check. Tests cover relative/preexisting/symlink/contained caches, dirty-release rejection, release/capture option permutations, source mutation, and tool cache leakage.
+
+Cache admission obtains the complete registered set with the reviewed absolute
+Git executable and bounded `git worktree list --porcelain -z` bytes before
+creating the cache. Its strict parser accepts only the documented NUL-delimited
+records, rejects malformed/duplicate/missing/noncanonical worktree paths, and
+rejects lexical or canonical cache containment/aliasing against every listed
+root, including sibling worktrees.
+
+Release cleanliness is an inner execution invariant, not only an outer CLI
+preflight. The validated clean-status evidence is rechecked immediately before
+tool execution and after every tool returns; an unstaged or untracked race after
+the outer check, or tool-created dirt outside the selected source paths, fails
+even when `HEAD`, index entries, refs, and selected-byte fingerprints remain
+unchanged.
+
+The diagnostic boundary is machine data only: Ruff 0.16.3 uses one bounded
+UTF-8 JSON array from `--output-format json`; Pyright 1.1.413 uses one bounded
+UTF-8 JSON object from `--outputjson`; mypy 2.3.1 uses bounded UTF-8 JSON Lines
+from `--output json --no-error-summary`. Duplicate object keys, duplicate
+diagnostic identities, invalid UTF-8, extra/missing fields, malformed/truncated
+records, noncanonical severity/code/location values, output overflow, timeout,
+signal exit, and exit/status/count/summary disagreement all fail. Ruff and mypy
+must emit zero stderr bytes; the pinned Pyright may emit only bounded ASCII
+whitespace and no other stderr byte. Strict frozen Pydantic models with
+`extra="forbid"` validate the exact observed record/envelope shapes, and an
+independent Zod 4.4.3 oracle rejects the same adversarial corpus.
+
+`quality-baseline.json` schema version 2 contains an exact ordered scope, the
+exact ordered Python-target tuple `("3.12", "3.13", "3.14")`, tool name and exact version, config and lock paths plus SHA-256,
+capture provenance, and a list of positive-count diagnostic records. Each
+diagnostic identity is exactly `(tool, version, python_target, rule, path, line,
+normalized_message_sha256)`; arbitrary string keys, zero/negative counts,
+duplicates, missing version metadata, and stale config/lock/generator hashes
+fail. A tracked baseline may not require live equality with the commit or full
+index that contains that same baseline: such provenance is self-referential and
+cannot survive staging or publication. The runner retains exact full
+`HEAD`/index/ref snapshots for release validation and before/after mutation
+detection, while persisted baseline provenance binds a canonical staged-entry
+projection that excludes only `quality-baseline.json`, records that closed
+policy as the exact one-element tuple
+`staged_entries_projection_excluded_paths=["quality-baseline.json"]`, and binds
+the exact source/config/lock/generator fingerprint. Python/Pydantic and the
+independent Zod oracle reject an empty tuple, a different path, or any second
+excluded path. Copying a baseline between materially different staged/source
+states therefore fails without making the artifact impossible to commit. Tests
+simulate replacing/staging the baseline blob and prove the excluded projection
+is stable, while a staged source-entry mutation fails. Commit/ref identity
+belongs to an external post-commit release
+attestation, not this self-contained tracked artifact. The immutable runner
+invokes only reviewed absolute executables without a
+shell, uses a closed environment, fixed deadline and byte ceilings, and kills
+and reaps the whole process group including descendants on every timeout,
+overflow, cancellation, or parser failure. Its self-test uses only external
+temporary files/caches, proves a Ruff-only false-green and a strict-type
+false-green are rejected, removes its temporary state, and proves checked
+repository bytes did not change.
+
+No baseline write is permitted until the parser, executor, schema, property,
+Zod, CLI, and self-test RED cases are green. `--write-baseline` then writes one
+canonical schema-v2 baseline from the same validated machine records; it never
+copies a prior total or accepts an unparsed diagnostic. Baseline capture and
+ratchet comparison share the same parser and identity constructor.
+Because `quality-baseline.json` is itself part of Task 1's synthetic-index input
+tree, publishing schema v2 intentionally makes the earlier Task 1 manifest
+provenance stale. After the quality artifact passes its independent Zod oracle
+and an immediate ratchet replay, perform one final Task 1 provenance-only
+refresh with the fixture/index/ref/pre-existing-object preservation proof, then
+rerun both baseline check modes, all Zod tests, and the quality ratchet. This
+final refresh changes no quality-runner source/config/lock input and therefore
+must not invalidate the captured quality baseline.
 
 - [ ] **Step 1: Write the failing policy test**
 
@@ -1049,9 +1815,9 @@ Create bootstrap `ci.yml` with least-privilege permissions, full-SHA Action pins
 - [ ] **Step 4: Verify policy and ratchet behavior**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_quality_ratchet.py tests/unit/test_quality_gate.py tests/static/test_quality_policy.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py --ratchet src tests scripts typings`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" --ratchet quality-baseline.json src tests scripts typings`
 Run: `.venv/bin/python -m pytest tests/contracts/test_frozen_baseline.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py --self-test`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" --self-test`
 Expected: PASS. The self-test creates its own temporary, non-repository Python file containing one Ruff and one strict type diagnostic and proves both the ratchet and final-mode paths exit non-zero; it then deletes the temporary directory. The authorized remote required check passes before Task 4.
 
 - [ ] **Step 5: Commit checkpoint**
@@ -1064,14 +1830,18 @@ Instantiate the mandatory NUL-safe checkpoint protocol with every exact Task 3 `
 
 - Modify: `src/nplg_mcp/__init__.py`, `src/nplg_mcp/__main__.py`, `src/nplg_mcp/config.py`
 - Modify: `tests/unit/test_config.py`, `tests/unit/test_main.py`
+- Modify: `typings/pypdfium2/__init__.pyi`
 
 #### Interfaces
 
 - Preserves configuration defaults/startup behavior; produces fully typed environment parsing and a checked `main() -> int` boundary.
+- The Task 4 edit to `typings/pypdfium2/__init__.pyi` is only the minimum
+  provisional surface needed by this scoped gate. It does not satisfy or
+  receive credit for Task 6A's exact pinned-wheel reflection contract.
 
 - [ ] **Step 1: Run strict gates and record the expected RED diagnostics**
 
-Run: `.venv/bin/python scripts/run_quality_gate.py src/nplg_mcp/__init__.py src/nplg_mcp/__main__.py src/nplg_mcp/config.py tests/unit/test_config.py tests/unit/test_main.py`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src/nplg_mcp/__init__.py src/nplg_mcp/__main__.py src/nplg_mcp/config.py tests/unit/test_config.py tests/unit/test_main.py`
 Expected: non-zero with the audited legacy findings; save the rule/file inventory in the task notes.
 
 - [ ] **Step 2: Add precise annotations and narrow boundary types**
@@ -1081,7 +1851,7 @@ Resolve every Ruff, format, Pyright, and mypy diagnostic in the named cluster, n
 - [ ] **Step 3: Run focused behavior and strict checks**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_{config,main}.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src/nplg_mcp/__init__.py src/nplg_mcp/__main__.py src/nplg_mcp/config.py tests/unit/test_config.py tests/unit/test_main.py`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src/nplg_mcp/__init__.py src/nplg_mcp/__main__.py src/nplg_mcp/config.py tests/unit/test_config.py tests/unit/test_main.py`
 Expected: all PASS/exit 0 for the cluster.
 
 - [ ] **Step 4: Run the full regression suite**
@@ -1104,20 +1874,54 @@ Stage only this task's named source and test files, then: `git commit -m "refact
 #### Interfaces
 
 - Preserves constant-time comparisons, token format, public errors, and admission behavior while eliminating unknown values and untyped decorators.
+- Reject deprecated IPv6 site-local addresses in `fec0::/10` explicitly; Python
+  3.13 can classify those reserved addresses as globally reachable.
+- If an `AppError.safe_details` mapping contains a non-JSON value, a nonfinite
+  number, or otherwise fails strict JSON validation, `to_public_error()` must
+  fail closed to the stable generic `INTERNAL_ERROR` public value. It must not
+  raise or expose the invalid details.
+- Public-detail publication accepts only an exact built-in `dict` root, exact
+  built-in `dict`/`list` containers, and exact `None`/`bool`/`int`/finite
+  `float`/`str` scalars. It takes a detached, non-recursive snapshot without
+  invoking user-defined mapping/container truth, iteration, item access, or
+  serialization behavior. Reject cycles, container depth above 32 (root depth
+  zero), more than 4,096 total values including the root, more than 65,536
+  aggregate string code points including object keys, or integers above 256
+  bits. Shared acyclic containers remain valid and are copied by value at each
+  occurrence. Any rejection returns the exact generic `INTERNAL_ERROR`; an
+  empty exact dictionary retains the existing omission of `details`.
+- DNS-answer-to-TCP-connection pinning is not part of this task's file scope.
+  Treat it as a Task 17 dependency requiring repository/downloader transport
+  scope and dedicated connection-binding tests; pre-check-only DNS
+  validation must not be represented as connection pinning.
 
 - [ ] **Step 1: Run cluster strict gates and observe RED**
 
-Run: `.venv/bin/python scripts/run_quality_gate.py src/nplg_mcp/admission.py src/nplg_mcp/errors.py src/nplg_mcp/rate_limit.py src/nplg_mcp/security.py src/nplg_mcp/tokens.py tests/unit/test_admission.py tests/unit/test_errors.py tests/unit/test_rate_limit.py tests/security/test_security.py tests/security/test_tokens.py`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src/nplg_mcp/admission.py src/nplg_mcp/errors.py src/nplg_mcp/rate_limit.py src/nplg_mcp/security.py src/nplg_mcp/tokens.py tests/unit/test_admission.py tests/unit/test_errors.py tests/unit/test_rate_limit.py tests/security/test_security.py tests/security/test_tokens.py`
 Expected: non-zero from existing diagnostics.
 
 - [ ] **Step 2: Repair types without changing behavior**
 
 Use `Mapping[str, object]` plus type guards for public details, concrete validator signatures for token claims, and typed async context-manager/admission results. Preserve safe error text and reject rather than coerce ambiguous values.
 
+Before either reviewed behavioral security fix, add and observe its focused RED:
+an adversarial resolver case for `fec0::/10`, and invalid `safe_details` cases
+covering non-JSON values and nonfinite numbers. Apply the smallest repair only
+after the corresponding RED fails for the intended reason. Preserve every
+existing valid public error and valid public-details serialization.
+
+Before hardening the complete `safe_details` boundary, add and observe focused
+REDs for a cyclic exact container, depth/value/string/integer bound exhaustion,
+a hostile top-level `Mapping`, a hostile nested container subclass, and a
+shared acyclic container. Seed private exception sentinels and prove they never
+escape or appear in the public result. Implement the bounded exact-built-in
+snapshot directly; do not substitute a broad exception catch or checker
+suppression.
+
 - [ ] **Step 3: Run focused tests and strict gates**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_{admission,errors,rate_limit}.py tests/security/test_{security,tokens}.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src/nplg_mcp/admission.py src/nplg_mcp/errors.py src/nplg_mcp/rate_limit.py src/nplg_mcp/security.py src/nplg_mcp/tokens.py tests/unit/test_admission.py tests/unit/test_errors.py tests/unit/test_rate_limit.py tests/security/test_security.py tests/security/test_tokens.py`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src/nplg_mcp/admission.py src/nplg_mcp/errors.py src/nplg_mcp/rate_limit.py src/nplg_mcp/security.py src/nplg_mcp/tokens.py tests/unit/test_admission.py tests/unit/test_errors.py tests/unit/test_rate_limit.py tests/security/test_security.py tests/security/test_tokens.py`
 Expected: PASS, followed by zero cluster lint/type/format diagnostics. Any runtime-affecting repair first receives its own focused behavioral RED.
 
 - [ ] **Step 4: Run frozen-contract and full regressions**
@@ -1134,27 +1938,55 @@ Stage only the listed files, then: `git commit -m "refactor: type security primi
 
 #### Files
 
-- Modify: `src/nplg_mcp/downloader.py`, `src/nplg_mcp/parsers.py`, `src/nplg_mcp/repository.py`
+- Modify: `src/nplg_mcp/downloader.py`, `src/nplg_mcp/http_types.py`, `src/nplg_mcp/parsers.py`, `src/nplg_mcp/repository.py`
 - Modify: `tests/integration/test_repository.py`, `tests/security/test_downloader.py`, `tests/unit/test_parsers.py`
 
 #### Interfaces
 
 - Preserves bounded upstream behavior and parser outputs while making HTML/XML/HTTP boundaries project-typed.
+- Preserves the pre-refactor accepted date language exactly: after whitespace
+  normalization, dates accepted by `datetime.strptime` against
+  `%d-%b-%Y`, `%Y-%m-%d`, or `%Y-%m-%dT%H:%M:%SZ` are normalized. Do not add a
+  regex/full-match gate. This retains the interpreter's existing
+  case-insensitive alphabetic matching and variable-width numeric directives,
+  including `7-Aug-2025`, `2025-8-7`, and `2025-08-27t23:30:00z`.
+  Offset-bearing timestamps remain unchanged unless a later behavioral task
+  deliberately expands that contract.
+- Public HTTP Protocol annotations remain runtime-resolvable through
+  `typing.get_type_hints`; type-checker cleanup must not hide their referenced
+  names behind `TYPE_CHECKING`. `HttpResponseProtocol` deliberately models the
+  consumed response fields as read-only `property` descriptors: each getter's
+  return annotation, together with the streaming method annotations, is the
+  reflection contract. The class-level `get_type_hints(HttpResponseProtocol)`
+  mapping is intentionally empty for this property-based contract; tests must
+  assert descriptor kind and each getter's resolved return type rather than
+  reconstructing writable data-member annotations.
+- Type-clean HTTP client protocols do not bind a validated DNS answer to the
+  TCP connection. Task 17 owns that transport behavior and its adversarial
+  connection-binding proof; Task 6 must not claim it.
+- Reconciliation retained this refactor because focused baseline/current
+  behavior is equivalent and the seven-file strict gate is zero after the
+  date/introspection repairs. Task 6 remains partial until the full regression,
+  frozen provenance refresh, and independent final review are complete.
 
 - [ ] **Step 1: Run the global strict commands and observe RED**
 
-Run: `.venv/bin/python scripts/run_quality_gate.py src/nplg_mcp/downloader.py src/nplg_mcp/parsers.py src/nplg_mcp/repository.py tests/integration/test_repository.py tests/security/test_downloader.py tests/unit/test_parsers.py`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src/nplg_mcp/downloader.py src/nplg_mcp/http_types.py src/nplg_mcp/parsers.py src/nplg_mcp/repository.py tests/integration/test_repository.py tests/security/test_downloader.py tests/unit/test_parsers.py`
 
 Expected: non-zero from existing upstream/parser diagnostics.
 
 - [ ] **Step 2: Resolve every remaining finding**
 
-Add typed `Protocol` boundaries for resolver, HTTP response streaming, and parsed NPLG records; narrow Beautiful Soup/XML values before use; preserve existing byte/text/node ceilings and error mapping.
+Add the minimum typed `Protocol` boundary for HTTP response streaming and
+typed parsed NPLG records; do not introduce an otherwise unused resolver
+Protocol solely to satisfy a checker. Narrow Beautiful Soup/XML values before
+use; preserve existing byte/text/node ceilings, accepted date formats, private
+helper exception types, and error mapping.
 
 - [ ] **Step 3: Run all strict gates**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_parsers.py tests/integration/test_repository.py tests/security/test_downloader.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src/nplg_mcp/downloader.py src/nplg_mcp/parsers.py src/nplg_mcp/repository.py tests/integration/test_repository.py tests/security/test_downloader.py tests/unit/test_parsers.py`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src/nplg_mcp/downloader.py src/nplg_mcp/http_types.py src/nplg_mcp/parsers.py src/nplg_mcp/repository.py tests/integration/test_repository.py tests/security/test_downloader.py tests/unit/test_parsers.py`
 Expected: PASS with zero diagnostics for this cluster.
 
 - [ ] **Step 4: Run all tests**
@@ -1173,30 +2005,67 @@ Stage only the named upstream source/tests, then: `git commit -m "refactor: type
 
 - Modify: `src/nplg_mcp/storage.py`, `src/nplg_mcp/pdf.py`
 - Modify: `pyproject.toml`, `pyrightconfig.json`
-- Create: `typings/pypdfium2/__init__.pyi`, `typings/pypdfium2/raw.pyi`
+- Modify: `typings/pypdfium2/__init__.pyi`, `typings/pypdfium2/raw.pyi`
+- Delete: `tests/unit/test_pdfium_stubs.py` after its replacement contract is
+  observed RED and collects successfully
 - Create: `tests/unit/test_pdfium_stub_contract.py`
 - Modify: `tests/integration/test_pdf.py`, `tests/unit/test_storage.py`, `tests/unit/test_tiles.py`, `tests/helpers/pdf_factory.py`
 
 #### Interfaces
 
 - Preserves content IDs, atomic publication, render IDs, page classifications, dimensions, and manifest serialization.
-- Produces the smallest exact project-owned `pypdfium2` stub surface used by `pdf.py`; every public stub symbol, callable arity/parameter kind, return protocol, constant type, context/close behavior, page/object iteration, rendering, bitmap/Pillow conversion, and raised `PdfiumError` is runtime-reflection/smoke-tested against the exact pinned wheel. No uncalled vendor API is declared.
+- Produces the smallest exact project-owned `pypdfium2` stub surface used by `pdf.py`; every public stub symbol, callable parameter name/kind/default, return protocol, constant type, context/close behavior, page/object iteration, rendering, bitmap/Pillow conversion, and raised `PdfiumError` is runtime-reflection/smoke-tested against the exact pinned wheel without rewriting either compared signature. No uncalled vendor API is declared.
+- Preserves the explicit keyword-only `PdfProcessor.__init__` compatibility
+  signature used by `src/nplg_mcp/app.py`, `tests/helpers/app_factory.py`,
+  `tests/integration/test_pdf.py`, and `scripts/delete_render.py`. Exactly one
+  statement-local `# noqa: PLR0913` is authorized on that constructor, with an
+  adjacent rationale naming these four surfaces: replacing the signature with
+  a real immutable limits bundle is deferred because it crosses Task 6A and
+  Task 6C scope. The pinned vendor signatures also require the builtin-shadowing
+  public parameter names `PdfDocument(input=...)` and
+  `PdfPage.get_objects(filter=...)`; renaming either is forbidden because it
+  makes valid keyword calls lie. Exactly two statement-local `# noqa: A002`
+  directives are authorized on those stub methods with adjacent pinned-vendor
+  rationale. An executable regression fixes the exact parameter/default
+  surfaces and rejects the prior `path` and `**kwargs` mutants. A closed
+  inventory over every named Task 6A Python/stub file permits exactly these
+  three directives, their owning methods, and rationales; any extra, moved,
+  broadened, type-checker/security ignore, or formatter-disable directive is
+  rejected.
 
 - [ ] **Step 1: Run scoped strict gates and observe RED**
 
-Run: `.venv/bin/python scripts/run_quality_gate.py src/nplg_mcp/storage.py src/nplg_mcp/pdf.py tests/integration/test_pdf.py tests/unit/test_storage.py tests/unit/test_tiles.py tests/helpers/pdf_factory.py`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable /tmp/nplg-phase1-toolchain.sNv6IL/node/node-v24.19.0-linux-x64/bin/node src/nplg_mcp/storage.py src/nplg_mcp/pdf.py tests/integration/test_pdf.py tests/unit/test_storage.py tests/unit/test_tiles.py tests/helpers/pdf_factory.py`
 Run: `.venv/bin/python -m pytest --collect-only tests/unit/test_pdfium_stub_contract.py -q`
 Run: `.venv/bin/python -m pytest tests/unit/test_pdfium_stub_contract.py -q`
-Expected: collection PASS; the stub-contract assertion and scoped strict gate fail on the deliberately absent project stubs/current filesystem/PDFium unknown values, not an untyped import setup failure.
+Expected: collection PASS; the stub-contract assertion and scoped strict gate
+fail against the provisional/lying stub surface, not from an absent file,
+untyped import, or setup failure. The old `test_pdfium_stubs.py` existence
+smoke is insufficient and is removed only after this replacement RED exists.
 
 - [ ] **Step 2: Add project-owned PDFium and filesystem boundary types**
 
-Define the two exact checked stub files plus typed PDFium adapter protocols at the import boundary, configure only `typings/` as the Pyright `stubPath` and mypy path, narrow optional library values, check every filesystem return, and retain existing dataclass output types and limits. The runtime contract test rejects a lying/widened/stale stub before the type checker may trust it.
+Replace and narrow the provisional declarations in the two exact checked stub
+files, plus typed PDFium adapter protocols at the import boundary, configure
+only `typings/` as the Pyright `stubPath` and mypy path, narrow optional library
+values, check every filesystem return, and retain existing dataclass output
+types and limits. Delete `tests/unit/test_pdfium_stubs.py` only after the
+replacement contract has collected successfully and its targeted behavioral
+RED has been observed. The runtime contract test rejects a
+lying/widened/stale stub before the type checker may trust it. Preserve the
+explicit `PdfProcessor` constructor under the authorized PLR0913 compatibility
+exception. Preserve the exact pinned-vendor `input` and `filter` names under
+the two authorized A002 exceptions, and make the exact-signature/default,
+unknown-keyword, prior-mutant, and closed suppression-inventory regressions
+pass.
 
 - [ ] **Step 3: Run focused tests and strict gates**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_pdfium_stub_contract.py tests/unit/test_storage.py tests/unit/test_tiles.py tests/integration/test_pdf.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src/nplg_mcp/storage.py src/nplg_mcp/pdf.py typings/pypdfium2 tests/unit/test_pdfium_stub_contract.py tests/integration/test_pdf.py tests/unit/test_storage.py tests/unit/test_tiles.py tests/helpers/pdf_factory.py`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable /tmp/nplg-phase1-toolchain.sNv6IL/node/node-v24.19.0-linux-x64/bin/node src/nplg_mcp/storage.py src/nplg_mcp/pdf.py tests/unit/test_pdfium_stub_contract.py tests/integration/test_pdf.py tests/unit/test_storage.py tests/unit/test_tiles.py tests/helpers/pdf_factory.py`
+The gate appends the complete `typings/` root itself. Do not also pass
+`typings/pypdfium2`: overlapping roots make mypy report the same stub module
+twice and exit with configuration status 2 rather than running the gate.
 Expected: PASS and zero scoped diagnostics.
 
 - [ ] **Step 4: Run frozen and full regressions**
@@ -1213,26 +2082,47 @@ Stage only the named storage/PDF files, `pyproject.toml`, `pyrightconfig.json`, 
 
 #### Files
 
-- Modify: `src/nplg_mcp/tools.py`, `src/nplg_mcp/protocol.py`, `src/nplg_mcp/app.py`
-- Modify: `tests/unit/test_tools.py`, `tests/conformance/test_mcp_http.py`
+- Verify only; modify only if the literal scoped gate reports a diagnostic:
+  `src/nplg_mcp/tools.py`, `src/nplg_mcp/protocol.py`, `src/nplg_mcp/app.py`,
+  `tests/unit/test_tools.py`
+- Modify: `tests/conformance/test_mcp_http.py`
 
 #### Interfaces
 
 - Preserves the frozen tool catalog, wire cases, public errors, and application routes until the official SDK cutover.
+- Task 1B already closed the direct static debt in `tools.py`, `protocol.py`,
+  `app.py`, and `test_tools.py`. Task 6B is now a residual verification task:
+  rerun the complete literal scope and change only files that still produce
+  diagnostics. A green full-scope gate closes the task without further
+  production edits.
+- For this execution, set `REVIEWED_NODE` to
+  `/tmp/nplg-phase1-toolchain.sNv6IL/node/node-v24.19.0-linux-x64/bin/node`.
+  Before either strict gate, require version `v24.19.0` and SHA-256
+  `bc17c508ffeed0ec622934f9b7fa72f8e78da65350e63c3eceb56fa688aa5e12`;
+  do not substitute an ambient `node` from `PATH`.
 
 - [ ] **Step 1: Run scoped strict gates and observe RED**
 
-Run: `.venv/bin/python scripts/run_quality_gate.py src/nplg_mcp/tools.py src/nplg_mcp/protocol.py src/nplg_mcp/app.py tests/unit/test_tools.py tests/conformance/test_mcp_http.py`
-Expected: non-zero from legacy `Any` and ignored-return diagnostics.
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$REVIEWED_NODE" src/nplg_mcp/tools.py src/nplg_mcp/protocol.py src/nplg_mcp/app.py tests/unit/test_tools.py tests/conformance/test_mcp_http.py`
+Expected: record the actual residual diagnostics from the complete scope; do
+not manufacture the historical `Any`/ignored-return RED. Current audit
+evidence places remaining debt in `tests/conformance/test_mcp_http.py`, while
+direct source/unit checks were already closed by Task 1B. If the full gate is
+already green, record that result and proceed without a source edit.
 
 - [ ] **Step 2: Narrow raw JSON and ASGI boundaries**
 
-Keep `object`/`Mapping[str, object]` only at JSON/ASGI entry points, add explicit type guards, and type current tool definitions/handlers without changing catalog or wire semantics.
+If residual diagnostics remain, keep `object`/`Mapping[str, object]` only at
+JSON/ASGI entry points, add explicit type guards, and change only
+`tests/conformance/test_mcp_http.py` unless the literal gate reports a
+diagnostic elsewhere. Preserve private-boundary coverage through public
+behavior rather than widening production APIs or adding suppressions. Do not
+refactor already-green production files merely to replay the original ordering.
 
 - [ ] **Step 3: Run focused tests and strict gates**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_tools.py tests/conformance/test_mcp_http.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src/nplg_mcp/tools.py src/nplg_mcp/protocol.py src/nplg_mcp/app.py tests/unit/test_tools.py tests/conformance/test_mcp_http.py`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$REVIEWED_NODE" src/nplg_mcp/tools.py src/nplg_mcp/protocol.py src/nplg_mcp/app.py tests/unit/test_tools.py tests/conformance/test_mcp_http.py`
 Expected: PASS and zero scoped diagnostics.
 
 - [ ] **Step 4: Run frozen and full regressions**
@@ -1252,57 +2142,235 @@ Stage only service/transport/app and their tests, then: `git commit -m "refactor
 - Modify: `scripts/delete_render.py`, `scripts/smoke_live.py`, `scripts/verify_deploy.py`
 - Modify: `tests/static/test_deployment.py`, `tests/static/test_skill.py`, `tests/unit/test_verify_deploy.py`
 - Create: `tests/unit/test_delete_render.py`, `tests/unit/test_smoke_live.py`
-- Delete: `quality-baseline.json`, `scripts/quality_ratchet.py`
+- Modify, as proved by the fresh repository-wide direct gate: `src/nplg_mcp/json_types.py`, `scripts/bootstrap_toolchain.py`, `tests/unit/test_bootstrap_toolchain.py`, `tests/contracts/test_oauth_provider_capability.py`, `tests/conftest.py`
+- Modify: `scripts/run_quality_gate.py`, `tests/unit/test_quality_gate.py`
+- Delete: `quality-baseline.json`, `scripts/quality_ratchet.py`, `tests/unit/test_quality_ratchet.py`, `tests/property/test_quality_ratchet.py`
+- Delete: `contracts/zod/quality-baseline-contracts.mjs`, `tests/contracts/zod_quality_baseline_contracts.test.mjs`
+- Modify: `pyproject.toml`, `package.json`, `eslint.config.mjs`, `tsconfig.contracts.json`
 - Modify: `tests/static/test_quality_policy.py`, `.github/workflows/ci.yml`
+- Modify: `scripts/baseline_capture_io.py`, `scripts/capture_baseline.py`, `tests/contracts/test_frozen_baseline.py`
+- Modify: `contracts/zod/baseline-contracts.mjs`, `tests/contracts/zod_baseline_contracts.test.mjs`
+- Regenerate through the tested writer: `contracts/baseline/manifest.json`
 
 #### Interfaces
 
-- Produces a repository-wide zero-diagnostic gate with no baseline suppression. `delete_render.py` and `smoke_live.py` expose typed `main(argv: Sequence[str], *, dependencies: CliDependencies) -> int` boundaries with injected clients, clocks, output sinks, and exit handling; importing either module has no side effects.
+- Produces a repository-wide zero-diagnostic gate with no baseline suppression.
+  `delete_render.py`, `smoke_live.py`, and `verify_deploy.py` preserve their
+  existing success JSON, sanitized failure stderr, and exit codes while
+  exposing typed `main(argv: Sequence[str], *, dependencies: CliDependencies)
+  -> int` boundaries with injected clients, clocks, output sinks, and exit
+  handling; importing a module has no side effects.
+- The 2026-08-16 reconciliation already restored the three accidentally
+  removed output seams and added focused `verify_deploy.main()` output tests.
+  That repair does not complete this task's dependency injection, exhaustive
+  CLI falsification, global-zero gate, or ratchet deletion.
+- Strict Python/Node gates use reviewed Node v24.19.0 only, at
+  `/tmp/nplg-phase1-toolchain.sNv6IL/node/node-v24.19.0-linux-x64/bin/node`.
+  Removing the ratchet is a coordinated deletion: the runner modes and models,
+  Python unit/property tests, Zod contract/test, package aggregates,
+  ESLint/TypeScript inventories, CI/static-policy assertions, and frozen
+  capture inventories are all direct dependants and must close together.
 
-- [ ] **Step 1: Run global strict gates and observe RED**
+#### Reviewed schema-v3 historical-import to candidate transition
 
-```bash
-.venv/bin/python scripts/run_quality_gate.py src tests scripts typings
+- Preserve `recovery.imported_index_tree` as the historical import
+  `6cb461d986c21e4cb2852a07b06f75812ec27bbb`; never relabel it and never use
+  the candidate as the private materialization seed.
+- Set manifest `schema_version` and generator version to `3`, retain
+  `capture_mode: "synthetic-index-staged-recovery"`, and admit exactly:
+
+```json
+{
+  "transition_id": "phase-1-reviewed-index-transition-v1",
+  "imported_index_tree": "6cb461d986c21e4cb2852a07b06f75812ec27bbb",
+  "imported_staged_entries_sha256": "fcfe06d851c83040d860f9f887efe18bde9dbe46c4eeb1aaa3f68b3af8f3ccaf",
+  "candidate_index_tree": "55691718dade75b44a8ed025fcf48dabf87a7969",
+  "candidate_staged_entries_sha256": "9426ba909728d29d2009607264a9ffb1c028c4c645bbacd72f98867132e24f68"
+}
 ```
 
-Expected: only this task's remaining script/static-test diagnostics or ratchet references remain.
+- Require `recovery.imported_index_tree ==
+  index_transition.imported_index_tree`. Validate the copied live index's
+  candidate tree and canonical staged-entry digest before private
+  materialization; after private `read-tree 6cb461d...`, validate the imported
+  staged-entry digest. Materialization then continues from that historical
+  seed with `git add -u -- .`, exact reviewed untracked additions, and the
+  existing output removal/preservation checks.
+- Do not retain the former baseline-excluding projections `b019...` or
+  `d89c...`, add a redundant changed-path/delta digest, write the real index,
+  or mutate refs. Missing, extra, malformed, mismatched, candidate-drift, and
+  imported-digest cases are Python/Zod REDs before implementation.
 
-Before changing either CLI's behavior, add only the typed injected `main` seam and behavior-free dependency records; each new seam deliberately raises `NotImplementedError` while the existing CLI entry remains unchanged. Prove collection, then run one named confirmation/target case for `delete_render` and one bounded-request/redaction case for `smoke_live` to obtain the intended behavioral REDs:
+- [x] **Step 1: Establish the three CLI seams and observe intentional RED**
 
-Run: `.venv/bin/python -m pytest --collect-only tests/unit/test_delete_render.py tests/unit/test_smoke_live.py -q`
-Run: `.venv/bin/python -m pytest tests/unit/test_delete_render.py tests/unit/test_smoke_live.py -q`
-Expected: collection PASS and each test reaches its deliberate seam `NotImplementedError`; import/tool/network/fixture failure is invalid.
+Add only per-script typed dependency records and
+`main(argv: Sequence[str], *, dependencies: CliDependencies) -> int` seams;
+do not add a shared CLI framework. The new seams deliberately raise
+`NotImplementedError` while the existing CLI entry remains unchanged. Prove
+collection, then run one named real-risk case for each CLI. Import, tool,
+network, or fixture failures are invalid REDs.
 
-- [ ] **Step 2: Resolve the final diagnostics and delete suppression**
+Run: `.venv/bin/python -m pytest --collect-only tests/unit/test_delete_render.py tests/unit/test_smoke_live.py tests/unit/test_verify_deploy.py -q`
+Run: `.venv/bin/python -m pytest tests/unit/test_delete_render.py tests/unit/test_smoke_live.py tests/unit/test_verify_deploy.py -q`
+
+- [x] **Step 2: Run the global direct gate and close CLI/static diagnostics**
+
+```bash
+.venv/bin/python scripts/run_quality_gate.py --node-executable /tmp/nplg-phase1-toolchain.sNv6IL/node/node-v24.19.0-linux-x64/bin/node src tests scripts typings
+```
 
 For each independently rejectable CLI invariant below, add one named case, observe its focused RED, make the smallest implementation change, and rerun focused GREEN before adding the next case.
 
-Type CLI argument/result objects, validate subprocess results, make static-test parsers concrete, delete the baseline/ratchet, and change CI/policy tests to require direct zero-error commands. Add injected CLI tests for both retained scripts: argument/help errors, absent/ambiguous target, identifier/path confusion, confirmation mismatch, noninteractive refusal, upstream timeout/nonzero/malformed/oversized response, cancellation, redaction, idempotent not-found, output failure, and exact exit-code propagation. The live smoke tests never use the network; they prove request count/deadline/output bounds and that credentials, response bodies, and query values cannot enter diagnostics. Extend `test_quality_policy.py` to enumerate every tracked regular `*.py` file under `src`, `tests`, and `scripts` plus every tracked regular `*.pyi` under `typings` with NUL-safe Git output and require the exact reviewed notice at the first line or immediately after an executable shebang; symlinks, special files, omissions, and any alternate notice fail.
+Type CLI argument/result objects, validate subprocess results, and make
+static-test parsers concrete. Add only applicable injected cases across the
+three operational scripts: argument/help errors, absent/ambiguous target,
+identifier/path confusion, confirmation mismatch, noninteractive refusal,
+upstream timeout/nonzero/malformed/oversized response, cancellation,
+redaction, idempotent not-found, output failure, success JSON, sanitized
+failure stderr, and exact exit-code propagation. The live smoke tests never
+use the network; they prove request count/deadline/output bounds and that
+credentials, response bodies, and query values cannot enter diagnostics.
+Extend `test_quality_policy.py` to enumerate every tracked regular `*.py` file
+under `src`, `tests`, and `scripts` plus every tracked regular `*.pyi` under
+`typings` with NUL-safe Git output and require the exact reviewed notice at the
+first line or immediately after an executable shebang; symlinks, special
+files, omissions, and any alternate notice fail.
 
-- [ ] **Step 3: Run all strict gates**
+The Task 6C bootstrap cleanup must preserve the Task 0 downloader and process
+trust contracts instead of replacing them to satisfy syntax-only analysis.
+Exactly four statement-local Ruff suppressions are authorized in
+`scripts/bootstrap_toolchain.py`: one `S310` on the already HTTPS-only,
+credential-free, no-proxy, no-redirect, bounded urllib request/open boundary;
+two `S603`
+directives on executable launches whose argv/executable are respectively
+closed by extracted-artifact policy or absolute regular-file, executable-bit,
+SHA-256, and exact-version validation; and one `PLR0913` on
+`install_from_lock`, whose tool/target/destination and downloader,
+version-checker, and dependency-root trust seams must remain explicit. Each
+directive has an adjacent three-line security/compatibility rationale and is
+added to the tokenized closed suppression inventory. Persistent mutants must
+reject a missing/changed rationale, a changed/multi-rule directive, a moved or
+duplicated directive, and any fifth bootstrap suppression. No per-file ignore,
+configuration relaxation, `Any`, typed-kwargs concealment, downloader rewrite,
+or checksum-manifest activation/deletion is authorized. Genuine complexity is
+still split along review-policy, record-validation, archive-validation,
+dependency-validation, and publication boundaries while preserving error
+order and focused behavior.
 
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts typings`
+- [x] **Step 3: Prove literal global zero, then remove the ratchet**
+
+Do not edit or delete ratchet infrastructure until the literal direct gate
+above exits zero. Then add persistent REDs that reject `--ratchet`,
+`--write-baseline`, baseline fields/models, Zod/package/config/CI references,
+and baseline-excluding staged projections. Simplify `run_quality_gate.py` to
+direct zero while retaining bounded execution, repository snapshot/mutation
+checks, release identity validation, and the adversarial real-tool self-test.
+Delete every ratchet/baseline artefact named in Files only after those REDs.
+
+- [x] **Step 4: Implement schema v3 and regenerate the frozen manifest**
+
+Add Python and Zod REDs for missing/extra/malformed transition fields,
+recovery/import mismatch, candidate tree/digest mismatch, live-index drift,
+and imported digest mismatch. Implement the two-identity validation order
+above. After all source/config tests are frozen and no concurrent writer is
+active, regenerate the manifest only through the tested writer while proving
+the four behavior fixtures, real index, refs, and pre-existing object bytes
+remain unchanged.
+
+- [x] **Step 5: Run all strict gates and tests**
+
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable /tmp/nplg-phase1-toolchain.sNv6IL/node/node-v24.19.0-linux-x64/bin/node src tests scripts typings`
 Run: `.venv/bin/python -m pytest tests/unit/test_delete_render.py tests/unit/test_smoke_live.py tests/unit/test_verify_deploy.py -q`
-Expected: exit 0 with zero diagnostics and no formatting diff.
-
-- [ ] **Step 4: Run all tests**
-
+Run the focused frozen Python/Node contract suites and manifest check mode.
 Run: `.venv/bin/python -m pytest -q`
-Expected: all tests PASS.
+Expected: zero diagnostics, no formatting diff, and all tests PASS. Stop before
+Task 7. This task does not authorize stage, reset, index/ref write, commit,
+push, deploy, install, or network activity.
 
-- [ ] **Step 5: Commit checkpoint**
+- [x] **Step 6: Close the scoped Task 6C runtime-review findings**
 
-Stage only the named scripts/static tests/policy/workflow, `tests/unit/test_delete_render.py`, `tests/unit/test_smoke_live.py`, and ratchet deletions, then: `git commit -m "refactor: reach zero strict diagnostics"`.
+Keep argument validation and canonical-output caps local to `smoke_live.py`
+and `verify_deploy.py`; do not add a shared CLI/JSON framework or change the
+existing `json_types.py` API. Validate all numeric arguments before
+constructing an injected/default client. Accept the current CLI timeout contract exactly:
+every finite value greater than zero, with no invented upper bound, and pass
+the value to the injected client unchanged. The smoke CLI additionally accepts
+only search page sizes `1..50`, matching `SearchDocumentsInput` and the
+repository hard maximum, and every render-page number greater than or equal to
+`1`, matching the current public tool schema. Do not expose the processor's
+internal 2000-page default as a caller contract or preempt Task 15's later
+reviewed 10,000-page bound.
+
+Retain the verify adapter's `1_048_576`-byte raw-response limit; that existing
+body ceiling is the parser's resource bound. Before either CLI writes a
+successful canonical JSON document, require its UTF-8 encoding (including the
+terminal newline) to be at most `65_536` bytes; this reuses the public
+error-value aggregate string budget as a conservative operator-output ceiling
+and rejects rather than truncates oversized success. Translate the JSON
+decoder's `ValueError` and `RecursionError` paths, including recursive shape
+validation, to the existing fixed malformed-response failure. Do not invent
+independent depth/node/string/integer policies that could reject a response
+accepted by the current MCP contract.
+
+Add persistent focused REDs before implementation for the review
+reproductions: a roughly 200-kilobyte canonical output; smoke page sizes `0`
+and `-1`; zero, negative, `nan`, and `inf` timeouts; deployment
+responses with 1500 nested arrays and a 5000-digit integer; and
+`delete_render` cancellation raised by interactive `stdin.readline()`.
+Retain high-positive render-page and high-finite timeout compatibility controls
+that prove no arbitrary Task 6C maximum was introduced. The deployment cases
+must prove the response
+and connection close on every path and that secrets do not enter diagnostics;
+the delete cancellation returns `130` with a sanitized failure and never
+constructs the processor. Translate only expected Unicode/JSON syntax,
+recursion, and numeric-conversion failures. Do not add a broad
+catch, truncate output as success, alter provenance/schema semantics, or
+recapture the manifest until all tracked runtime/tests/docs changes are
+frozen. Correct `_PipeState`'s stale nonblocking docstring.
+
+Run the focused three-CLI matrix, the direct global quality gate and its
+self-test, then the full Python suite. Because this plan, scripts, and tests
+are manifest inputs, perform exactly one final controlled schema-v3 manifest
+refresh through the tested writer, preserving the reviewed transition, live
+index, refs, behavior fixtures, and pre-existing object bytes. Rerun manifest
+check mode, frozen Python/Node contracts, and the direct global gate, then
+freeze for scoped re-review and stop before Task 7.
+
+#### Phase 1 temporary-infrastructure exit gate
+
+Before Task 7, stop and review complexity as a first-class acceptance gate:
+
+- Delete `quality-baseline.json` and `scripts/quality_ratchet.py` once the
+  repository-wide direct gate is zero; they are migration scaffolding, not a
+  permanent quality architecture.
+- Retain the four frozen public-behavior fixtures and deterministic replay.
+  After the first clean committed candidate exists, replace the dirty-tree
+  synthetic-index/private-object-database preservation machinery with the
+  smallest digest manifest/checker that still proves those fixtures. This
+  requires its own RED/GREEN review and must not weaken behavior parity.
+- Retain the pinned ASVS source, exact 759-row inventory, threat model, and
+  `do_not_release`. Do not extend inactive custody, authority, risk-acceptance,
+  or transactional-publication machinery until a real approved authority and
+  evidence source exist.
+- If canonical-file, bounded-process, Git-snapshot, or atomic-publication
+  primitives remain necessary in more than one script, consolidate the
+  existing implementations rather than adding another custom framework.
+
+No Phase 2 work begins until this exit gate and the Phase 1 status ledger are
+reviewed again.
 
 ### Task 7: Raise coverage and adversarial test depth
 
 #### Files
 
+- Modify: `.gitignore`
 - Modify: `pyproject.toml`
+- Modify: `src/nplg_mcp/parsers.py`, `scripts/run_quality_gate.py`
+- Modify: `tests/conftest.py`, `tests/contracts/test_frozen_baseline.py`, `tests/contracts/test_oauth_provider_capability.py`
 - Modify: `tests/conformance/test_mcp_http.py`
 - Modify: `tests/integration/test_pdf.py`, `tests/integration/test_repository.py`
 - Modify: `tests/security/test_downloader.py`, `tests/security/test_security.py`, `tests/security/test_tokens.py`
-- Modify: `tests/unit/test_admission.py`, `tests/unit/test_config.py`, `tests/unit/test_errors.py`, `tests/unit/test_main.py`, `tests/unit/test_parsers.py`, `tests/unit/test_rate_limit.py`, `tests/unit/test_storage.py`, `tests/unit/test_tiles.py`, `tests/unit/test_tools.py`, `tests/unit/test_verify_deploy.py`
+- Modify: `tests/unit/test_admission.py`, `tests/unit/test_bootstrap_toolchain.py`, `tests/unit/test_build_asvs_matrix.py`, `tests/unit/test_config.py`, `tests/unit/test_errors.py`, `tests/unit/test_main.py`, `tests/unit/test_parsers.py`, `tests/unit/test_quality_gate.py`, `tests/unit/test_rate_limit.py`, `tests/unit/test_storage.py`, `tests/unit/test_tiles.py`, `tests/unit/test_tools.py`, `tests/unit/test_verify_deploy.py`
 - Modify: `tests/unit/test_delete_render.py`, `tests/unit/test_smoke_live.py`
 - Create: `tests/property/test_parser_properties.py`
 - Create: `tests/property/test_storage_properties.py`
@@ -1313,13 +2381,16 @@ Stage only the named scripts/static tests/policy/workflow, `tests/unit/test_dele
 
 #### Interfaces
 
-- In addition to the 100% changed-line `diff-cover` gate below, `run_test_gate.py` must enforce 100% changed branch-arc coverage from a fresh externally contained Coverage JSON report. Add `diff_branch_arc_floor: 100` to `security/coverage-policy.json`. Intersect Coverage JSON's source-destination `executed_branches`/`missing_branches` pairs with branch-source lines added or modified relative to the verified merge base; a new file treats every arc as changed, and rename/copy classification cannot make an arc disappear. XML and JSON subject/file/counter disagreement, an unmeasured changed file/arc, or any missing changed arc fails even when the changed conditional line executed and `diff-cover` reports 100%.
+- Alongside the 95% changed-line `diff-cover` gate below, `run_test_gate.py` enforces at least 95% changed branch-arc coverage from a fresh externally contained Coverage JSON report. Set `diff_branch_arc_floor: 95` in `security/coverage-policy.json`. Intersect Coverage JSON's source-destination `executed_branches`/`missing_branches` pairs with branch-source lines added or modified relative to the verified merge base; a new file treats every arc as changed, and rename/copy classification cannot make an arc disappear. XML and JSON subject/file/counter disagreement or an unmeasured changed file/branch source fails closed; measured changed-line and changed-arc percentages must each meet their 95% floor.
 
 - Produces deterministic Hypothesis strategies for bounded JSON, handles, redirects, filenames, paths, cursors, page selections, and tile geometry.
-- Release installed-wheel mode extends `run_test_gate.py` with required `--installed-package-root ABSOLUTE_SITE_PACKAGES_NPLG_MCP --package-manifest VERIFIED_JSON`. Before coverage starts, the runner descriptor-inventories the canonical wheel's installed `nplg_mcp` regular files and the candidate's `src/nplg_mcp` files, applies only reviewed wheel transformation rules (`*.py`, `py.typed`, and declared package data; no generated/rewritten Python), and requires a one-to-one path/mode/byte-digest match recorded in `VERIFIED_JSON`. Only then may it generate an external Coverage.py `[paths]` alias mapping that exact site-packages root to the exact candidate source root for report combination. Missing/extra/transformed files, namespace/path escape, editable/source import, symlink, duplicate alias, a second site-packages package, source spoof, coverage outside `src/nplg_mcp`/`scripts`, or a mapping without the manifest equality proof fails. Unit tests prove a covered installed-wheel line maps to its candidate line and that every escape/spoof/mismatch fails; installed-wheel runtime proof and source-bound branch/diff coverage remain separate recorded gates even though the latter consumes the verified alias.
-- Produces `run_test_gate.py --compare-branch REF [--worktree ROOT --output-dir EXTERNAL_DIR] [--require-clean --candidate COMMIT]`, the sole post-Task-7 deterministic branch-coverage gate: all non-network/non-container tests with subprocess-aware XML coverage and a 95% floor, the versioned per-module branch policy below, followed by `diff-cover` at 100%; it rejects missing/shallow refs and propagates any failure. Coverage's exact measured roots are `["src/nplg_mcp", "scripts"]`; tests are not in the coverage denominator, but every project script is. Developer mode permits the task's intentionally dirty but stable named worktree: it records HEAD plus a digest of every tracked/untracked test/source/config byte and the merge-base diff before execution, repeats those digests afterward, and measures/diff-covers exactly that snapshot. It materializes the stable tracked-plus-untracked source snapshot in an external temporary Git repository/index, creates a deterministic ephemeral snapshot commit there, and compares that snapshot with the materialized merge-base tree; it never commits to or changes the index of the user's repository. Thus every line in a new untracked Python source or script is part of the changed-line denominator. Release mode requires both `--require-clean` and `--candidate COMMIT`, then requires clean exact HEAD before and after. An explicit output directory must not exist, is atomically created mode `0700`, must resolve outside every registered worktree, and contains coverage data/XML/JSON, pytest cache/base temp, diff-cover output, and bounded command records. When the external arguments are omitted for an ordinary developer run, the runner uses and removes a private system temporary directory outside the current worktree; it never writes `coverage.xml`, `.coverage*`, `.pytest_cache`, or temp files into source. Tests requiring explicit network, staging, or container authority are never silently skipped: collection must map each exact node ID to the separate external-gate registry below, and an unclassified deselection fails.
-- Produces schema-validated `security/coverage-policy.json` version 1 with `project_branch_floor: 95`, `diff_line_floor: 100`, `diff_branch_arc_floor: 100`, `decision_module_branch_floor: 100`, exact `measured_roots: ["src/nplg_mcp", "scripts"]`, and initial exact `decision_modules` paths `src/nplg_mcp/admission.py`, `src/nplg_mcp/errors.py`, `src/nplg_mcp/rate_limit.py`, `src/nplg_mcp/security.py`, `src/nplg_mcp/tokens.py`, `scripts/delete_render.py`, `scripts/smoke_live.py`, `scripts/run_quality_gate.py`, `scripts/run_test_gate.py`, and `scripts/run_mutation_gate.py`. Missing, duplicate, nonexistent, renamed, unmeasured, or outside-root paths fail. Tasks 8, 11, 13, 15, 16, 16A, 17, 19, 20, and 21 expand the same closed list respectively with `scripts/verify_release.py`/`scripts/bootstrap_external_tools.py`; `mcp_server.py`/`sdk_boundary.py`; `http_security.py`/`json_preflight.py`; `pdf_executor.py`/`pdf_ipc.py`; `scripts/verify_pdf_worker_container.py`/`scripts/verify_private_edge.py`; `malware.py`/`pdf_worker_client.py`/`storage.py`/`scripts/verify_scanner_container.py`/`scripts/verify_pdf_worker_quota.py`/`scripts/verify_private_recovery.py`; `network.py`/`resilience.py`/`scripts/run_live_nplg_canary.py`; `profiles.py`; `auth.py`/`audit.py`; and `scripts/verify_deploy.py`/`scripts/run_alpic_staging_proof.py`. Relative names in this sentence are under `src/nplg_mcp/` unless prefixed `scripts/`. Removing a path requires a reviewed deletion/rename in the same task.
-- Produces strict version-1 `security/external-test-gates.json`, independent of the later release manifest. Each entry is a closed object with an exact `gate_id`, `kind` (`live`, `staging`, or `container`), `execution_mode` (`developer-fixture` or `preexecuted-operational`), `cwd_source` (`verified-candidate-root` only for non-authoritative developer fixtures, otherwise `protected-controller-root`), nonempty `profiles`, owning task, exact release `command_id`, required non-secret authority/broker-descriptor names, timeout, evidence schema ID, and at least one of a nonempty exact `pytest_node_ids` tuple or a closed shell-free `command_spec`. A command spec declares the runtime-bound executable, fixed argv tokens, and ordered runtime bindings to strict source/type schemas; it forbids extra flags, shell evaluation by the plan runner, globs, interpolation, ambient cwd, candidate-controlled executables, or escaping tokens. Before and after execution the runner verifies candidate/controller artifact and policy identities and rejects symlink/path escape or byte change. Every `preexecuted-operational` entry additionally declares its strict result schema, complete command-record schema, freshness window, controller/candidate/deploy-subject bindings, isolation identity, and discriminated authority/credential requirements; it is atomically reserved and executed by its protected authorized orchestrator and later imported, never silently skipped or rerun by a generic candidate process. A `developer-fixture` result can guide engineering but can never satisfy release eligibility. Duplicates, unknown profiles/kinds/modes/sources, missing owners, or an unregistered collected external node fail. Task 7 starts with the audited current inventory (including an explicitly empty `gates` list if none exists); Tasks 16, 16A, 17, and 21 add exactly the rows below in their own commits. Any other task that later adds an external gate must first amend this reviewed inventory. Task 22 requires the selected profile manifest to account exactly once for every applicable registry entry in its declared mode, but ordinary developer gates do not depend on a file that Task 22 has not created yet.
+- Release installed-wheel mode extends `run_test_gate.py` with required `--installed-package-root ABSOLUTE_SITE_PACKAGES_NPLG_MCP --package-manifest VERIFIED_JSON`. Before coverage starts, the runner descriptor-inventories the canonical wheel's installed `nplg_mcp` regular files and the candidate's `src/nplg_mcp` files, applies only reviewed wheel transformation rules (`*.py`, `py.typed`, and declared package data; no generated/rewritten Python), and requires a one-to-one path/mode/byte-digest match recorded in `VERIFIED_JSON`. Only then may it generate an external Coverage.py `[paths]` alias mapping that exact site-packages root to the exact candidate source root for report combination. Missing/extra/transformed files, namespace/path escape, editable/source import, symlink, duplicate alias, a second site-packages package, source spoof, coverage outside `src/nplg_mcp`/`scripts`, or a mapping without the manifest equality proof fails. Unit tests prove a covered installed-wheel line maps to its candidate line and that every escape/spoof/mismatch fails; installed-wheel runtime proof and source-bound branch/diff coverage remain separate recorded gates even though the latter consumes the verified alias. Task 7 implements and locally unit-tests this inventory, equality, and alias boundary with synthetic installed roots; a real canonical-wheel runtime proof requires the protected release environment and is not a local Task 7 completion claim.
+- Produces `run_test_gate.py --compare-branch REF [--worktree ROOT --output-dir EXTERNAL_DIR] [--require-clean --candidate COMMIT]`, the sole post-Task-7 **release-quality branch/diff authority**: all non-network/non-container tests with subprocess-aware XML coverage and a 95% floor, the versioned per-module branch policy below, followed by `diff-cover` at 95%; focused RED/GREEN commands remain permitted for implementation and diagnosis. It rejects missing/shallow refs and propagates any failure. Coverage's exact measured roots are `["src/nplg_mcp", "scripts"]`; tests are not in the coverage denominator, but every project script is. Developer mode permits the task's intentionally dirty but stable named worktree: it records HEAD plus a digest of every tracked/untracked test/source/config byte and the merge-base diff before execution, repeats those digests afterward, and measures/diff-covers exactly that snapshot. It materializes the stable tracked-plus-untracked source snapshot in an external temporary Git repository/index, creates a deterministic ephemeral snapshot commit there, and compares that snapshot with the materialized merge-base tree; it never commits to or changes the index of the user's repository. Thus every line in a new untracked Python source or script is part of the changed-line denominator. Release mode requires both `--require-clean` and `--candidate COMMIT`, then requires clean exact HEAD before and after. An explicit output directory must not exist, is atomically created mode `0700`, must resolve outside every registered worktree, and contains coverage data/XML/JSON, pytest cache/base temp, diff-cover output, and bounded command records. When the external arguments are omitted for an ordinary developer run, the runner uses and removes a private system temporary directory outside the current worktree; it never writes `coverage.xml`, `.coverage*`, `.pytest_cache`, or temp files into source. Tests requiring explicit network, staging, or container authority are never silently skipped: collection must map each exact node ID to the separate external-gate registry below, and an unclassified deselection fails. Task 7 implements the local hard check for a usable comparison ref; Task 8 owns CI checkout depth, explicit base-ref acquisition, and workflow invocation.
+- The final Task 7 adversarial review adds ten mandatory corrections before `run_test_gate.py` may be called an authority. Candidate bytes must not shadow `pytest`, `coverage`, or `diff-cover`: resolve reviewed absolute tool entry points, verify exact pinned versions and import origins in both the parent and every child-side invocation, keep trusted tool imports isolated from candidate import roots, and fail on a candidate `pytest.py`, `coverage.py`, `diff_cover.py`, or equivalent package. Every output-derived Coverage/pytest configuration value must use an injection-safe representation and reject control/newline, interpolation, or section-breaking path bytes. Installed-wheel mode must execute a separately recorded deterministic package suite against the exact verified installed root with snapshot `src` excluded from package resolution; its result is distinct from the source-bound scripts/branch/diff run and remains synthetic locally unless a protected canonical wheel is supplied. Bind and reverify the materialized snapshot commit/tree, every copied input and generated configuration, and the exact external report inventory/bytes before accepting results. This is checkpoint-bound tamper detection in one local user context, not isolation from malicious same-UID tests; stronger isolation and canonical-wheel authority remain protected-environment responsibilities. The owned source/test/config inventory must include ignored regular files under the reviewed roots, excluding only the closed generated/cache set; Git ignored status is not permission to omit executable input. A changed conditional source line with no Coverage branch-pair evidence fails rather than receiving an inferred 100%, and any collection or execution deselection fails even if JUnit totals otherwise agree. Materialization and verification use descriptor-relative no-follow traversal, not repeated pathname parent traversal. In release mode, one `GIT_OPTIONAL_LOCKS=0` evidence bracket must preserve exact candidate commit/tree, raw index bytes, HEAD/symbolic-or-detached state, ref bytes, and object inventory before/after. At least one successful real temporary-repository CLI integration must invoke the pinned pytest/Coverage/diff-cover stack and prove these bindings; injected fakes remain necessary but are not sufficient. Reuse the existing descriptor and bounded-process primitives, delete redundant checks where equivalence is proved, and add no third framework or lint/type suppression.
+- Final re-review adds two further authority blockers before acceptance. Paired XML/JSON agreement is not proof of completeness: descriptor-read the already bound snapshot source without importing or executing candidate code, then use only the exact-origin/version-verified pinned Coverage 7.15.4 `PythonParser(text=..., filename=...)`, `parse_source()`, and `exit_counts()` API to derive every static branch source with more than one exit. Every such source line that intersects the changed-line set must appear in the reports' equal branch-source-line set; jointly omitted changed `if`, loop, or non-irrefutable `match` branches fail even when another line supplies internally consistent branch data and both computed diff percentages would otherwise be 100%. Do not hand-maintain an AST node list or trust an ambient/candidate-shadowable Coverage import. Source and installed-package inventory must bind the canonical package root once, enumerate every directory through descriptor-relative no-follow traversal, and open/stat/read every descendant relative to its already validated parent descriptor; `Path.rglob`, full-path `lstat`, or full-path reopen is not release evidence. Separate public regressions must first expose joint branch-source omission and a parent-component symlink swap, then the smallest GREEN must reuse the exact trusted parser and existing descriptor traversal rather than create another framework.
+- Literal runner self-coverage for that repair must remain public and failure-sensitive rather than fabricate Coverage internals. Exercise the real pinned Coverage cold-load success path, hostile preloaded/orphaned origin rejection, one real cold-load failure with complete `coverage*` binding cleanup, non-UTF-8 and invalid-Python candidate source rejection, and descriptor cleanup after a natural nested-package failure only through `parse_coverage_reports`, `verify_installed_package`, or the public gate. Remove or consolidate guards that can fire only after inventing malformed members or returns from the exact pinned private Coverage API; do not test them with fake modules or parser objects. Installed inventory is closed against the manifest's exact file paths and their directory prefixes, so an unexpected entry fails immediately; this exact closure replaces a separate 100,001-entry branch whose only practical unit test would mutate a private bound.
+- Produces schema-validated `security/coverage-policy.json` version 1 with `project_branch_floor: 95`, `diff_line_floor: 95`, `diff_branch_arc_floor: 95`, `decision_module_branch_floor: 100`, exact `measured_roots: ["src/nplg_mcp", "scripts"]`, and initial exact `decision_modules` paths `src/nplg_mcp/admission.py`, `src/nplg_mcp/errors.py`, `src/nplg_mcp/rate_limit.py`, `src/nplg_mcp/security.py`, `src/nplg_mcp/tokens.py`, `scripts/delete_render.py`, `scripts/smoke_live.py`, `scripts/run_quality_gate.py`, `scripts/run_test_gate.py`, and `scripts/run_mutation_gate.py`. Missing, duplicate, nonexistent, renamed, unmeasured, or outside-root paths fail. Tasks 8, 11, 13, 15, 16, 16A, 17, 19, 20, and 21 expand the same closed list respectively with `scripts/verify_release.py`/`scripts/bootstrap_external_tools.py`; `mcp_server.py`/`sdk_boundary.py`; `http_security.py`/`json_preflight.py`; `pdf_executor.py`/`pdf_ipc.py`; `scripts/verify_pdf_worker_container.py`/`scripts/verify_private_edge.py`; `malware.py`/`pdf_worker_client.py`/`storage.py`/`scripts/verify_scanner_container.py`/`scripts/verify_pdf_worker_quota.py`/`scripts/verify_private_recovery.py`; `network.py`/`resilience.py`/`scripts/run_live_nplg_canary.py`; `profiles.py`; `auth.py`/`audit.py`; and `scripts/verify_deploy.py`/`scripts/run_alpic_staging_proof.py`. Relative names in this sentence are under `src/nplg_mcp/` unless prefixed `scripts/`. Removing a path requires a reviewed deletion/rename in the same task.
+- Produces strict version-1 `security/external-test-gates.json`, independent of the later release manifest. Task 7 owns only the audited empty registry, exactly `{"version":1,"gates":[]}`, and its closed parser/classification tests; a nonempty entry is rejected in Task 7. The detailed entry, protected-controller, command-record, and signed-proof schemas below are future contracts owned by Tasks 16, 16A, 17, and 21, which must amend this reviewed registry/parser before adding their exact rows. Any other task that later adds an external gate must first amend this reviewed inventory. Task 22 requires the selected profile manifest to account exactly once for every applicable registry entry in its declared mode, but ordinary developer gates do not depend on a file that Task 22 has not created yet.
 
 | Owner | `gate_id` / `command_id` | Kind / profiles / mode | Nodes or command | Authority environment / runtime bindings | Timeout / evidence schema |
 | --- | --- | --- | --- | --- | --- |
@@ -1349,15 +2420,27 @@ The Task 21 `pytest_node_ids` are exactly `test_edge_rfc9728_and_route_ownership
 
 - [ ] **Step 1: Observe the already-configured coverage floor RED**
 
-First create typed behavior-free `run_test_gate.py` and `run_mutation_gate.py` scaffolds with immutable policy/command/result records, injected executors/clocks/filesystem/Git adapters, strict XML/result parsers, and target methods that deliberately raise `NotImplementedError`. Prove both unit modules collect, then run their focused fake/XML/temp-repository cases and observe those deliberate behavioral REDs before implementing either authority:
+First create typed behavior-free `run_test_gate.py` and `run_mutation_gate.py` scaffolds with immutable policy/command/result records and narrow injected executor/clock/filesystem/Git protocols. The XML/JSON/result parser entrypoints and target methods deliberately raise `NotImplementedError`; implement none of those behaviors before their focused RED. Prove both unit modules collect, then run their focused fake/XML/temp-repository cases and observe those deliberate behavioral REDs before implementing either authority:
 
 Run: `.venv/bin/python -m pytest --collect-only tests/unit/test_mutation_gate.py tests/unit/test_test_gate.py -q`
 Run: `.venv/bin/python -m pytest tests/unit/test_mutation_gate.py tests/unit/test_test_gate.py -q`
 Expected: collection/imports PASS and focused cases reach `NotImplementedError`; a missing executable, source ref, module, fixture, or pre-created output is the wrong RED.
 
-Task 3 already installed and statically asserted `fail_under = 95` with branch measurement. Do not edit that threshold in this task. Run it against the still-undercovered suite:
-`.venv/bin/python -m pytest --cov=nplg_mcp --cov-branch --cov-report=term-missing --cov-fail-under=95 -q`
-Expected: FAIL near the audited 82% baseline.
+Task 3 already installed and statically asserted `fail_under = 95` with branch measurement. Do not edit that threshold in this task. The prior coverage artifacts are not authoritative because they omit `scripts`; create a fresh absolute external diagnostic root and measure both required roots without writing caches, bytecode, or coverage data into the checkout:
+
+```bash
+TASK7_RED_OUTPUT="$(mktemp -d /tmp/nplg-task7-red.XXXXXX)"
+COVERAGE_FILE="$TASK7_RED_OUTPUT/.coverage" \
+PYTHONPYCACHEPREFIX="$TASK7_RED_OUTPUT/pycache" \
+.venv/bin/python -m pytest \
+  -o "cache_dir=$TASK7_RED_OUTPUT/pytest-cache" \
+  --basetemp="$TASK7_RED_OUTPUT/pytest-tmp" \
+  --hypothesis-profile=ci \
+  --cov=nplg_mcp --cov=scripts --cov-branch \
+  --cov-report=term-missing --cov-fail-under=95 -q
+```
+
+Expected: FAIL below 95%; record the fresh combined result rather than comparing it with the stale source-only 63%, 76%, or 82% observations.
 
 - [ ] **Step 2: Add missing negative and boundary tests**
 
@@ -1371,7 +2454,21 @@ Add real temporary-repository tests in which a newly created, untracked Python m
 
 - [ ] **Step 3: Add mutation checks for decision functions**
 
-Implement and unit-test `scripts/run_mutation_gate.py [--worktree ROOT --output-dir EXTERNAL_DIR] [--require-clean --candidate COMMIT] --targets ...` as a fail-closed wrapper around the exact-pinned `mutmut`: it rejects survived, suspicious, timeout, and uncovered mutations and accepts only killed mutants. The runner snapshots source/config/test bytes, copies the required tracked tree without symlink traversal into a new external disposable mutation workspace, runs mutmut/cache/results only there, and byte-verifies the original worktree afterward. Developer mode permits a stable dirty snapshot; release mode requires clean exact `COMMIT`. Relative/preexisting/contained/symlink output, a copied-input mismatch, candidate mutation, or cache/output in the source worktree fails. Configure initial targets `security.py`, `tokens.py`, `downloader.py`, `storage.py`, `errors.py`, `scripts/delete_render.py`, `scripts/smoke_live.py`, and `scripts/run_quality_gate.py`; Task 22 must rerun it after adding SDK, HTTP, PDF, auth, audit, network, and profile code. The gate is no non-killed mutation in allow/deny, signature, destructive CLI confirmation, live-request confinement, quality-gate source/cache isolation, path, redirect, quota, or public-error decision branches.
+Implement and unit-test `scripts/run_mutation_gate.py [--worktree ROOT --output-dir EXTERNAL_DIR] [--require-clean --candidate COMMIT] --targets ...` as a fail-closed wrapper around the exact-pinned `mutmut`. The runner snapshots source/config/test bytes, copies the required tracked tree without symlink traversal into a new external disposable mutation workspace, runs mutmut/cache/results only there, and byte-verifies the original worktree afterward. Developer mode permits a stable dirty snapshot; release mode requires clean exact `COMMIT`. Relative/preexisting/contained/symlink output, a copied-input mismatch, candidate mutation, or cache/output in the source worktree fails. Configure the exact eight initial targets; Task 22 reruns the gate for its expanded target set. Mutation evidence supplements the unchanged 95% project, changed-line, and changed-arc authorities: require the closed status inventory and at least 65% actual test-failure kills, not a literal zero-survivor target that incentivizes coverage-only tests.
+
+Pinned `mutmut==3.7.0` evidence is limited to mutants the tool actually generates. Require exact nonempty per-target/per-required-function inventory and only raw statuses `1` (actual test-failure kill), `0` (survived), `33` (no associated test), or `-24` (bounded timeout). Unknown, null, skipped, interrupted, suspicious, internal-error, type-check-only, or incomplete statuses fail. Exact status `1` must cover at least 65% of all generated mutants; every other accepted status, including a timeout, counts against the floor. Mutmut 3.7.0 skips decorated classes, so the audited downloader proof remains limited to its two module-level DNS mutants; retain direct adversarial and 100% decision-branch evidence for skipped methods. Do not refactor production or invent a harness to manufacture mutant coverage.
+
+This 65% policy supersedes the older exact-status-`1` sentence embedded in the
+function-inventory paragraph below; the function and target set-equality oracle
+remains unchanged.
+
+Storage's current generated method names are `_cache_full`,
+`_cleanup_incomplete_renders`, and `_cleanup_stale_staging`; these exact names
+supersede the three former non-underscored spellings in that paragraph.
+
+- The Task 7 mutation authority uses the exact ordered eight targets already named above and the following exact generated-function set—no missing or extra function is acceptable: `security.py`: `_default_resolver`, `_invalid`, `_validate_origin`, `build_item_url`, `is_forbidden_address`, `parse_handle_input`, `resolve_approved_addresses`, `validate_upstream_url`; `tokens.py`: `_b64decode`, `_b64encode`, `_validate_asset_claims`, `_validate_path`, `sign_asset_token`, `verify_asset_token`; `downloader.py`: `_validate_nplg_dns` only; `storage.py`: `_cleanup_render_tiles`, `_cleanup_tile_page`, `_fsync_directory`, `_remove_storage_path`, `_render_completion_exists`, `_sha256_path`, every listed `ContentAddressedStore` method (`__init__`, `cache_full`, `cleanup_incomplete_renders`, `cleanup_stale_staging`, `_commit_staged_file`, `_commit_staged_render`, `_delete_render_subtree_locked`, `_discard_staged_file`, `_is_render_id`, `_release_staging_bytes`, `_render_lock_for`, `_render_tree_bytes`, `_reserve_staging_bytes`, `_scan_existing_bytes`, `_validate_filename`, `_validate_media_type`, `_validate_namespace`, `_validate_staged_identity`, `_validated_render_subtree`, `begin_render_transaction`, `delete_render_subtree`, `put_bytes`, `put_render_bytes`, `resolve_asset`, `stage`), `_RenderTransaction.__init__/commit/reset/rollback`, and `_StagedWriter.__enter__/__exit__/__init__/_snapshot/commit/commit_render/write`; `errors.py`: `_checked_string_total`, `_consume_public_detail_value`, `_internal_public_error`, `_snapshot_frame`, `_snapshot_public_details`, `_snapshot_scalar`, `_store_snapshot`, `to_public_error`; `delete_render.py`: `_confirm`, `_default_dependencies`, `_default_processor_factory`, `_delete`, `_parse_arguments`, `_parser`, `_write_failure`, `_write_result`, `main`; `smoke_live.py`: `_add_download_output`, `_add_render_output`, `_argument_failure`, `_arguments_from_values`, `_default_client_factory`, `_default_dependencies`, `_default_verifier`, `_object_list`, `_optional_string`, `_parse_args`, `_parser`, `_required_string`, `_run_smoke`, `_selected_handle`, `_write_failure`, `_write_output`, `first_public_pdf`, `main`; and `run_quality_gate.py`: `_canonical_existing_worktree`, `_canonical_new_cache`, `_canonical_registered_worktrees`, `_checked_paths`, `_closed_environment`, `_consume_pipe_event`, `_decode_bounded_git_field`, `_expand`, `_expand_directory`, `_fail`, `_fingerprint_file`, `_inventory_files`, `_kill_process_group`, `_parse_registered_worktree_block`, `_parser`, `_paths_intersect`, `_read_bounded_streams`, `_resolve_inventory_input`, `_run_quality_commands`, `_selected_paths`, `_stable_regular_file_sha256`, `_stream_evidence`, `_validate_worktree_branch`, `_validate_worktree_optional_fields`, `_validated_executable`, `_validated_git_relative_path`, `_verify_versions`, `cli`, `command_plan`, `fingerprint_paths`, `freeze_input_inventory`, `git_snapshot`, `main`, `parse_arguments`, `parse_porcelain_status`, `parse_registered_worktrees`, `registered_worktree_roots`, `run_bounded_command`, `run_quality_gate`, `run_self_test`, `validate_external_cache`, `validate_managed_node`, `validate_release_arguments`, `validate_release_state`, `verify_exact_version`, `version_probes`. Mutmut keys retain their pinned `x_`/`xǁClassǁ` encoding; tests compare this literal oracle independently rather than deriving expectations from the implementation. In particular, any generated decorated-class downloader function is an unexpected extra and fails rather than silently widening the proof claim. Every `exit_code_by_key` value must be the exact integer `1`; a test fixture must use a canonical valid mutant name so status rejection is not accidentally proved by name rejection. Separately, the outer `mutmut run` process must be healthy exit `0`, within the declared deadline, with bounded complete process evidence; individual mutant code `1` never licenses a nonzero outer command.
+- The mutation CLI reuses the already independently reviewed test-gate evidence implementation through a deliberately narrow public seam rather than copying it. `scripts/run_test_gate.py` exposes direct public aliases of the existing repository, raw-release, registered-worktree, descriptor-bound read/snapshot, external-output, Git-backed materialization, and post-materialization binding functions and their immutable evidence types; identical signatures are aliases, not branch-bearing wrappers, and raw file-descriptor traversal helpers remain private. Mutation-specific `setup.cfg` publication may keep its existing descriptor-safe writer, so the shared seam does not export a generic writer unless a persistent public RED proves that necessary. The trusted isolated child driver gains only one fixed `mutmut` mode and an explicit proof tuple for `mutmut==3.7.0`, `pytest==9.1.1`, and `coverage==7.15.4`; it imports and verifies every trusted tool before appending candidate roots, dispatches only the reviewed mutmut entry point under `-I -B`, and re-verifies exact versions/origins afterward. Legacy test-gate command behavior must remain regression-proven even if the shared driver bytes change. Candidate file/package shadows for mutmut, pytest, Coverage, `sitecustomize`, or `usercustomize`, or a wrong parent/child version or origin, fail. Do not add a second trusted-driver implementation, command-record schema, mutation-summary schema, process framework, suppression, or unrelated refactor. Before the mutation CLI consumes this seam, persistent tests must RED, the full test-gate focused/static/literal-self-coverage proof must return to its accepted state, and the narrow shared change must pass independent re-review.
+- The mutation CLI is exactly `run_mutation_gate.py [--worktree ROOT --output-dir EXTERNAL_DIR] [--require-clean --candidate COMMIT] --targets ...` with real local adapters. It reuses `baseline_capture_io.run_bounded_process` for process containment and the already reviewed test-gate descriptor traversal, trusted-tool proof/isolated driver, external-output binding, and raw release Git/index/HEAD/ref/object evidence rather than creating a third framework. Parent and child must prove exact `mutmut==3.7.0` distribution/version/import origin, reject candidate `mutmut.py`/`mutmut/`/customizer shadows, and invoke the trusted module without candidate-first import resolution. Descriptor-relative no-follow materialization/inventory must bind and reverify the copied workspace, generated configuration, exact meta set and bytes, and closed external output before success. Release mode uses the same `GIT_OPTIONAL_LOCKS=0` raw-evidence bracket and candidate tree binding as the accepted test gate. Public CLI/adversarial/fault tests and literal 100% line/branch self-coverage are required; fake private objects, a second subprocess framework, or lint/type suppressions are not.
 
 Implement and unit-test `run_test_gate.py` with injected command execution before using it. It invokes pytest and `diff-cover` as argv arrays with closed timeouts/output bounds, always writes a fresh externally contained `coverage.xml`, sets `COVERAGE_FILE`, pytest `cache_dir`, `PYTHONPYCACHEPREFIX`, and `--basetemp` into the same output root, verifies the report belongs to the externally materialized named source snapshot/commit, parses branch counters for every exact path in `security/coverage-policy.json`, and fails if the policy/report is malformed or `origin/main` is absent, shallow, or not an ancestor/merge-base suitable for changed-line measurement. The copy uses descriptor-relative no-follow traversal and an explicit include policy; compare the source snapshot digest before/after copying and testing, synthesize the external merge-base/snapshot commits without hooks, signing, credentials, or user Git configuration, and include regular untracked source/test/config files while rejecting symlinks/special files and excluding only reviewed generated/cache paths. Reject relative output paths, preexisting paths, symlinks, aliases/containment under any `git worktree list --porcelain` path, source writes or snapshot drift, and a report whose measured files escape the named root. It first collects the complete suite, classifies every node as deterministic or as an exact `live`, `staging`, or `container` gate ID, validates external nodes against `security/external-test-gates.json`, then runs the deterministic set with no skips/xfails; unknown markers, dynamic deselection, or an absent registry entry fails policy. No later task may substitute a focused suite for this post-task regression gate.
 
@@ -1383,11 +2480,20 @@ Run: `.venv/bin/python -m pytest tests/property -q`
 Run: `.venv/bin/python -m pytest tests/unit/test_mutation_gate.py tests/unit/test_test_gate.py -q`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/security.py src/nplg_mcp/tokens.py src/nplg_mcp/downloader.py src/nplg_mcp/storage.py src/nplg_mcp/errors.py scripts/delete_render.py scripts/smoke_live.py scripts/run_quality_gate.py`
-Expected: PASS at 95% or higher with combined branch measurement, no non-killed targeted mutants, and 100% coverage of changed lines. CI must fetch enough history to resolve `origin/main`; an absent/shallow comparison base is a hard failure.
+Expected: PASS at 95% or higher with combined branch measurement, at least 65% exact test-failure mutation kills over the closed generated inventory, and 100% coverage of changed lines and changed branch arcs. An absent/shallow comparison base is a hard local failure; Task 8 separately wires sufficient CI history and the explicit base ref.
 
-- [ ] **Step 5: Commit checkpoint**
+Phase 1 sequencing correction: Task 7 and Task 8 intentionally modify tracked
+inputs covered by the frozen schema-v3 baseline manifest. Do not publish an
+intermediate manifest merely to make it stale again. Before Task 8, require the
+Task 7 property/unit suites, the real mutation gate, and their independent
+reviews to pass. The only permitted deferred Task 7 result is the integrated
+test gate failing solely at the exact frozen-manifest check; defer that test
+gate and its branch/diff report to the one final post-Task-8 capture below. Any
+other Task 7 failure remains a hard stop.
 
-Stage `pyproject.toml`, `requirements-dev.in`, `requirements-dev.lock`, `security/coverage-policy.json`, `security/external-test-gates.json`, both gate runners/tests, and the test changes, then: `git commit -m "test: enforce adversarial coverage floor"`.
+- [ ] **Step 5: Prepare checkpoint evidence**
+
+Do not stage or commit in this implementation session. Record the exact changed-file inventory and fresh focused/integrated evidence for review while preserving the pre-existing index, refs, object database, and unrelated dirty work.
 
 ### Task 8: Add mandatory CI, supply-chain, and release evidence gates
 
@@ -1397,36 +2503,57 @@ Stage `pyproject.toml`, `requirements-dev.in`, `requirements-dev.lock`, `securit
 - Create: `.github/workflows/security.yml`
 - Create: `.github/dependabot.yml`
 - Create: `SECURITY.md`
-- Modify: `.gitignore`
+- Modify: `deploy/README.md`
 - Create: `security/semgrep/rules.yml`, `security/semgrep/SHA256SUMS`
 - Create: `security/toolchain-lock.json`
 - Create: `security/dependency-risk-policy.json`
 - Create: `security/trusted-package-sources.json`, `security/release-controller-policy.json`
 - Modify: `security/coverage-policy.json`
-- Modify: `THIRD_PARTY_NOTICES.md`
 - Modify: `tests/static/test_deployment.py`
 - Modify: `tests/static/test_quality_policy.py`
 - Create: `scripts/verify_release.py`, `tests/static/test_release_gate.py`
 - Create: `scripts/bootstrap_external_tools.py`, `tests/unit/test_bootstrap_external_tools.py`
+- Verify only: `.gitignore`, `pyproject.toml`, `requirements.in`, `requirements.lock`, `requirements-dev.in`, `requirements-dev.lock`, `requirements-security.in`, `requirements-security.lock`, `package.json`, `package-lock.json`, `security/bootstrap-toolchain-lock.json`
+- Verify only unless Task 8 actually vendors new material: `THIRD_PARTY_NOTICES.md`
+
+#### Entry gate
+
+Task 8 source or test work starts only after the Task 7 property/unit suites,
+real mutation evidence, and independent reviews are recorded in the status
+ledger. Fresh integrated branch/diff evidence is also required unless its sole
+blocker is the expected stale schema-v3 manifest described above; in that one
+case it is deferred to the final Phase 1 capture and is not reported as passed.
+Any other open Task 7 blocker stops Task 8 implementation.
 
 #### Interfaces
 
 - Produces CI jobs `lint`, `types`, `tests`, `contracts`, `package`, `sast`, `sca`, `sbom`, `secrets`, and `container` with uploaded digest-bound evidence artifacts. Produces typed `verify_release.py prepare ...`, `finalize ...`, `draft-attestation ...`, `attest ...`, and `eligibility ...` command scaffolds. The fail-fast orchestrator records every gate's argv, exit, duration, tool version, subject digest, and evidence digest without invoking deployment/signing/publication; Task 22 supplies the final profile manifests, one-use preparation challenge, operational import, and two-revision choreography. Every preparation, staging, custody, and verdict record includes the separately protected release-controller artifact/revision/policy digest; a candidate copy of `verify_release.py`, staging orchestration, or policy is untrusted input and can never be the privileged controller.
-- Produces `verify_release.py source-snapshot --worktree ROOT --output NEW_JSON`, `assert-source-snapshot --worktree ROOT --snapshot JSON`, and `materialize-source --worktree ROOT --output NEW_DIR`. Snapshot modes descriptor-inventory every non-`.git` path including ignored/untracked entries with type/mode/size/digest. Materialization NUL-reads the clean candidate's regular tracked tree, rejects symlinks/submodules/specials, descriptor-copies it into a new external mode-`0700` directory, and verifies mode/blob/complete-inventory equality before atomic publication. All three reject traversal, malformed input, partial publication, or before/after change; their fake-filesystem tests are part of the Task 8 RED/GREEN microcycle. Package backends run only in that external materialized source, because `build --outdir` alone does not prevent backend `build/` or `*.egg-info` writes beside source.
+- Produces `verify_release.py source-snapshot --worktree ROOT --output NEW_JSON`, `assert-source-snapshot --worktree ROOT --snapshot JSON`, and `materialize-source --worktree ROOT --output NEW_DIR`. Snapshot modes descriptor-inventory every candidate path, including ignored/untracked entries, with type/mode/size/digest, while excluding only the closed tool/generated roots `.git`, `.venv`, `node_modules`, `.tools`, `.agents`, `.codex`, `.serena`, `.hypothesis`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, and root names beginning `.codex-request-`; near-miss names and ignored files elsewhere remain included. Materialization NUL-reads the clean candidate's regular tracked tree, rejects symlinks/submodules/specials, descriptor-copies it into a new external mode-`0700` directory, and verifies mode/blob/complete-inventory equality before atomic publication. All three reject traversal, malformed input, partial publication, or before/after change; their fake-filesystem tests are part of the Task 8 RED/GREEN microcycle. Package backends run only in that external materialized source, because `build --outdir` alone does not prevent backend `build/` or `*.egg-info` writes beside source.
 
-- [ ] **Step 1: Write failing static workflow assertions**
+`GateCommand`/`GateResult` plus the injected `CommandRunner` are the sole Task 8 execution seam. They reuse `baseline_capture_io.run_bounded_process` and the Task 7 snapshot/output primitives; no direct scanner shell command, candidate-controlled subprocess path, or third evidence/materialization framework is permitted.
+
+#### Six bounded TDD batches
+
+1. Static workflow/policy RED, including the exact pinned-Node quality-gate invocation and corrected file dispositions.
+2. Thin external-tool adapter reusing `bootstrap_toolchain.install_from_lock`; prove archive/version/platform failures without network access.
+3. Strict dependency, controller, scanner, and signed/fresh external-receipt models with adversarial parser tests.
+4. Typed release runner reusing the accepted bounded-process and Task 7 snapshot/output seams; every checker is a `GateCommand`.
+5. Workflows and `deploy/README.md`; protected-authority verbs remain scaffolds that fail `external_authority_required` locally.
+6. Fresh integrated local gates plus independent review; record external requirements separately and stop before Phase 2.
+
+#### Detailed acceptance criteria: static RED
 
 Assert that candidate CI pins every third-party Action to a full peeled commit SHA and runs exact CPython patches 3.12.14, 3.13.15, and 3.14.7. `actions/checkout` always uses `persist-credentials: false`; repository-code jobs have no `id-token: write`, `ACTIONS_ID_TOKEN_REQUEST_*`, persisted `http.*.extraheader`, credential helper/token/file, or other GitHub credential. If provenance/custody needs OIDC, grant it only after candidate execution to an immutable reusable workflow/controller outside the candidate repository, protected environment/ref, and candidate-controlled YAML/scripts; issuer policy pins the exact `job_workflow_ref`, workflow commit/digest, repository owner, ref/environment, audience, and subject, and the candidate artifact is data only. A same-repository “separate job” is not a protected authority. Canary candidates prove they cannot request OIDC or read Git config/environment/credential files, and receipts bind the external workflow identity. Every patch must create a fresh environment, sync the identical 3.12-lower-bound universal `requirements-dev.lock` with `--require-hashes`, import every direct runtime/test dependency, install the once-built canonical wheel, assert its `Requires-Python` is `>=3.12,<3.15`, run its CLI smoke, and execute the suite; a resolution/import/test failure on any patch invalidates the compatibility claim. A separate scheduled non-release job may float to the latest 3.12/3.13/3.14 patches to warn about drift, but its result never substitutes for candidate evidence and any discovered newer patch requires a reviewed bootstrap/CI-lock update. CI also executes all strict gates, verifies 95% coverage and 100% diff coverage, builds exactly one quarantined comparison wheel/sdist plus one canonical wheel/sdist, requires their reproducibility comparison before canonical digest selection, and preserves canonical test reports/SBOMs/provenance. Static policy rejects any build-system specifier/range, requires exact `setuptools==84.0.0` and `wheel==0.48.0` in both `[build-system].requires` and the hash lock, and rejects a package/release invocation missing `--no-isolation`. Require every exact development-tool pin to map to an executed local, CI, or release-manifest command; an installed-but-unused checker is a policy failure. Reject Semgrep `auto`, mutable registry aliases, an unverified rules digest, shallow history that makes diff coverage indeterminate, or any unexecuted required job. Test `verify_release.py` with injected fake runners: one failing command must stop the battery and no absent/skipped command may be reported as passed.
 
-Before the behavior assertion, create typed, behavior-free release-runner and external-bootstrap scaffolds. The former exposes immutable `GateCommand`/`GateResult` values and an injected `CommandRunner` protocol; its execution method deliberately raises `NotImplementedError`. Prove both new test files collect before asserting behavior. Test the external-tool bootstrap with local fake archives for digest mismatch, archive traversal/symlink entries, wrong embedded version, unsupported platform, partial download, and atomic replacement; tests never need the network. Assert `.gitignore` excludes exactly the local `.tools/` directory so bootstrapping cannot dirty a candidate, without broad executable/archive ignores.
+Before the behavior assertion, create typed, behavior-free release-runner and external-bootstrap scaffolds. The former exposes immutable `GateCommand`/`GateResult` values and an injected `CommandRunner` protocol; its execution method deliberately raises `NotImplementedError`. The bootstrap is only a thin adapter over `bootstrap_toolchain.install_from_lock`, not a second downloader/extractor. Prove both new test files collect before asserting behavior. Test the adapter with local fake archives for digest mismatch, archive traversal/symlink entries, wrong embedded version, unsupported platform, partial download, and atomic replacement; tests never need the network. Verify that `.gitignore` already excludes exactly `/.tools/`; do not rewrite it or add broad executable/archive ignores.
 
-- [ ] **Step 2: Observe RED**
+#### Required RED observation
 
 Run: `.venv/bin/python -m pytest --collect-only tests/static/test_release_gate.py tests/unit/test_bootstrap_external_tools.py -q`
 Run: `.venv/bin/python -m pytest tests/static/test_quality_policy.py tests/static/test_deployment.py tests/static/test_release_gate.py tests/unit/test_bootstrap_external_tools.py -q`
 Expected: collection/imports PASS; focused assertions FAIL because required workflows/`SECURITY.md` are absent and the release runner is deliberately unimplemented, not because a tool or fixture cannot import.
 
-- [ ] **Step 3: Add workflows and security policy**
+#### Detailed workflow and security contract
 
 Use least-privilege workflow permissions, concurrency cancellation, no pull-request secret exposure, immutable evidence retention, and this closed full-SHA Action inventory: `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` (v7.0.1), `actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97` (v7.0.0), `actions/setup-node@820762786026740c76f36085b0efc47a31fe5020` (v7.0.0), `actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` (v7.0.1), `actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c` (v8.0.1), and `github/codeql-action@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd` (v4.37.7 peeled commit). `test_quality_policy.py` rejects an unlisted Action, a tag, annotated-tag object, short SHA, or name/SHA/version/peeled-identity mismatch; every listed Action must occur in a workflow.
 
@@ -1443,9 +2570,9 @@ Represent every scanner as a typed shell-free `GateCommand` with exact executabl
 | Trivy 0.74.0 Linux 64-bit | `https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_Linux-64bit.tar.gz` | `2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a` | `https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_checksums.txt`; `bc701c3c3ee8b9acbea2c23257e41381e3854888f51281616a6ba5dc96963821` |
 | Trivy 0.74.0 Linux ARM64 | `https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_Linux-ARM64.tar.gz` | `b94ce1976bbf3c15b514b605ee88be7c6d94a29be2302847ff01cb794d47aad5` | same manifest and digest |
 
-No template URL or inferred asset name is permitted. The reviewed 2026-08-15 Trivy DB v2 OCI subject is `ghcr.io/aquasecurity/trivy-db@sha256:6c572fd3cd13d8a53dd77769bae83f0e3d01845478d39ce2bf8c163bf01ec5f6`; it is accepted only while its signed metadata is at most 24 hours old. A later release must first update that exact digest through a reviewed dependency-only commit, verify the OCI media/artifact types and signature/attestation, record acquisition time/response digest, download it once to an external cache, and scan offline with `--skip-db-update`; tag-only, auto-update, stale, or network-during-scan behavior fails.
+No template URL or inferred asset name is permitted. The reviewed 2026-08-15 Trivy DB digest `sha256:6c572fd3cd13d8a53dd77769bae83f0e3d01845478d39ce2bf8c163bf01ec5f6` is retained only as stale historical audit evidence and is not an executable pin. A scan may consume only an externally acquired cache plus an independently signed receipt binding the immutable OCI digest, media/artifact types, signer policy, acquisition time, response digest, and a verified age of at most 24 hours. Candidate code cannot mint or refresh that receipt. Missing, stale, unsigned, or upstream-unattested evidence returns `TRIVY_DB_UPSTREAM_PROVENANCE_UNATTESTED` and the terminal verdict `do_not_release`; tag-only, auto-update, or network-during-scan behavior fails.
 
-`bootstrap_external_tools.py` selects only an enumerated OS/architecture, downloads to a temporary file from the exact HTTPS GitHub release host with redirects disabled or same-host pinned, verifies the archive and checksum-file digests before traversal-safe extraction, verifies each embedded version, and atomically installs the three named tools; unsupported platforms stop. Never execute a mutable download script, install Action wrapper, or PATH-global fallback. `security/semgrep/rules.yml` is instead a project-owned closed rule set with exact IDs `nplg.no-subprocess-shell`, `nplg.no-unverified-tls`, `nplg.no-unbounded-http-client`, `nplg.no-path-reopen-after-validation`, `nplg.no-secret-in-log`, and `nplg.strict-pydantic-boundary`; `security/semgrep/SHA256SUMS` records its digest and `test_quality_policy.py` rejects missing/extra IDs or digest drift. Run only pinned `semgrep==1.173.0 --config security/semgrep/rules.yml`; updating rules is a reviewed code/policy change, not an implicit registry pull. The image scan fails on every applicable High/Critical finding regardless of fix availability unless revision-bound reachability analysis and a time-bounded reviewed exception with compensating controls exist in the ASVS matrix.
+`bootstrap_external_tools.py` selects only an enumerated OS/architecture and delegates exact-host, digest, traversal, version, and atomic-install enforcement to `bootstrap_toolchain.install_from_lock`; unsupported platforms stop. Never execute a mutable download script, install Action wrapper, or PATH-global fallback. Semgrep runs only from the verify-only `requirements-security.lock` environment: `semgrep==1.173.0` with its required `mcp==1.29.0`, isolated from the main `mcp==2.0.0` environment, with interpreter/package origins and versions verified before and after execution. `security/semgrep/rules.yml` is a project-owned closed rule set with exact IDs `nplg.no-subprocess-shell`, `nplg.no-unverified-tls`, `nplg.no-unbounded-http-client`, `nplg.no-path-reopen-after-validation`, `nplg.no-secret-in-log`, and `nplg.strict-pydantic-boundary`; `security/semgrep/SHA256SUMS` records its digest and `test_quality_policy.py` rejects missing/extra IDs or digest drift. Updating rules is a reviewed code/policy change, not an implicit registry pull. The image scan fails on every applicable High/Critical finding regardless of fix availability unless revision-bound reachability analysis and a time-bounded reviewed exception with compensating controls exist in the ASVS matrix.
 
 `security/dependency-risk-policy.json` is strict and versioned. It names approved advisory sources, snapshot/digest/freshness rules, owner and review cadence, and maximum triage/remediation windows: known-exploited or Critical findings 24 hours/7 days, High 3/30 days, Medium 14/90 days, and Low 30/180 days. Unknown severity, stale/unavailable source, package without provenance, or finding beyond its window is a release blocker. An exception requires a revision/subject-bound reachability analysis, owner, compensating controls, creation/expiry no longer than the underlying window, and separate verified risk acceptance; it can support only a named non-public staging/private `Risk accepted` verdict whose terminal recommendation is `do not release`, never public eligibility or ASVS L2 conformance. Candidate SCA captures exact pip/npm/Trivy source URL or OCI subject, acquisition time, response/database digest, scanner version/argv, package-lock identities, and raw-to-redacted evidence binding. Tests inject stale, truncated, replayed, unknown-source/severity, breached-package, expired-exception, and clock-rollback records and prove fail-closed behavior. `SECURITY.md` states these windows and the response/notification path; Dependabot is only discovery and never evidence that a finding was assessed or remediated.
 
@@ -1455,9 +2582,16 @@ No template URL or inferred asset name is permitted. The reviewed 2026-08-15 Tri
 
 The final release runner performs source-only lint/type/schema checks first, then creates one noncanonical comparison build and one canonical package/image build from the same clean candidate commit in independent fresh external directories, each synchronized from the same preverified offline caches and hash locks and built with `python -m build --no-isolation`. Both builds use `SOURCE_DATE_EPOCH` equal to the candidate commit timestamp, `TZ=UTC`, a fixed UTF-8 locale, `PYTHONHASHSEED=0`, mode-`022` umask, a closed no-secret environment, and materialized tracked-file mtimes normalized to that epoch. The runner records raw artifact digests and separately compares a specified canonical archive-entry view; “normalized equality” without the exact algorithm is forbidden. It requires raw equality unless a reviewed format limitation names the permitted metadata normalization, then quarantines comparison artifacts from every scan, deploy, sign, SBOM, and provenance input. A mismatch fails before the canonical subject digest is selected. Only the canonical build is subsequently installed, scanned, deployed, signed, or attested, so no subject is rebuilt after digest selection. The runner creates a fresh test environment outside the checkout, syncs the hash-locked test dependencies, installs the canonical wheel with no editable/source install, clears `PYTHONPATH`, overrides the repository's pytest `pythonpath` setting to empty, and asserts `nplg_mcp.__file__` resolves inside that environment before running the applicable full/coverage suites. Scan, generate SBOMs for, and attest the exact canonical wheel/image digests. Container attack tests receive the already-built canonical image digest and run with `--no-build`; a Compose rebuild is a failure. Record both build environments/results, commit/tree, lock/source/controller-policy digests, workflow file digest, CI run/attempt, builder identity, canonical artifact digest, and provenance-attestation identity. Where the deployment provider exposes an immutable subject binding, the deployed digest must equal the tested/attested subject; otherwise the report must state that equality is unproven and cannot use it as ASVS evidence. Signing, registry publication, and production deployment remain separately authorized external actions.
 
-- [ ] **Step 4: Validate locally and in a draft branch**
+#### Integrated local proof
 
 Create a new external mode-`0700` output directory before running any build/report command; the directory must be outside every registered worktree and byte-snapshot the candidate before/after. All build, wheel-check, SBOM, cache, and report outputs below live there, never under `dist/`, the repository root, or an ignored source path.
+
+After Task 8 source, tests, policies, workflows, and documentation are frozen,
+run exactly one controlled `python -m scripts.capture_baseline --write` using
+the already-tested preservation bracket. Then require
+`python -m scripts.capture_baseline --check` and the deferred Task 7
+`run_test_gate.py --compare-branch origin/main` invocation to pass on those
+final Phase 1 bytes. Do not recapture again in this phase.
 
 Run:
 
@@ -1475,46 +2609,20 @@ done < <(git worktree list --porcelain -z)
 export TASK8_OUTPUT="$(mktemp -d -p "$TASK8_OUTPUT_PARENT" nplg-task8.XXXXXXXX)"
 chmod 700 "$TASK8_OUTPUT"
 mkdir -m 700 "$TASK8_OUTPUT/build"
-.venv/bin/python scripts/verify_release.py source-snapshot --worktree . --output "$TASK8_OUTPUT/source-before.json"
-.venv/bin/python scripts/verify_release.py materialize-source --worktree . --output "$TASK8_OUTPUT/source"
+export REVIEWED_NODE="$(realpath -e -- "${REVIEWED_NODE:?set the Task 0-verified Node v24.19.0 executable}")"
 .venv/bin/python -m pytest tests/static/test_quality_policy.py tests/static/test_deployment.py tests/static/test_release_gate.py tests/unit/test_bootstrap_external_tools.py -q
-.venv/bin/python scripts/bootstrap_external_tools.py --lock security/toolchain-lock.json --tool actionlint --tool gitleaks --tool trivy --destination "$TASK8_OUTPUT/tools"
-.venv/bin/python scripts/bootstrap_external_tools.py --lock security/toolchain-lock.json --tool trivy-db --destination "$TASK8_OUTPUT/trivy-cache"
-"$TASK8_OUTPUT/tools/actionlint" -version
-"$TASK8_OUTPUT/tools/actionlint" .github/workflows/*.yml
-"$TASK8_OUTPUT/tools/gitleaks" version
-"$TASK8_OUTPUT/tools/trivy" --version
-.venv/bin/bandit -r "$TASK8_OUTPUT/source/src" "$TASK8_OUTPUT/source/scripts" -f json -o "$TASK8_OUTPUT/bandit.json"
-SEMGREP_SEND_METRICS=off .venv/bin/semgrep scan --config "$TASK8_OUTPUT/source/security/semgrep/rules.yml" --error --strict --metrics=off --disable-version-check --json --output "$TASK8_OUTPUT/semgrep.json" "$TASK8_OUTPUT/source/src" "$TASK8_OUTPUT/source/scripts"
-"$TASK8_OUTPUT/tools/gitleaks" dir --no-banner --redact --report-format json --report-path "$TASK8_OUTPUT/gitleaks-dir.json" "$TASK8_OUTPUT/source"
-"$TASK8_OUTPUT/tools/trivy" filesystem --cache-dir "$TASK8_OUTPUT/trivy-cache" --skip-db-update --offline-scan --scanners vuln,misconfig,secret --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 --format json --output "$TASK8_OUTPUT/trivy-filesystem.json" "$TASK8_OUTPUT/source"
-.venv/bin/zizmor --persona=pedantic .github/workflows
-.venv/bin/check-jsonschema --builtin-schema vendor.github-workflows .github/workflows/*.yml
-.venv/bin/codespell src tests scripts docs README.md SECURITY.md
-.venv/bin/python scripts/run_quality_gate.py src tests scripts typings
-.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main
-.venv/bin/python scripts/run_mutation_gate.py --targets scripts/verify_release.py scripts/bootstrap_external_tools.py
-TASK8_PYTHON="$(realpath -e -- .venv/bin/python)"
-(
-  cd "$TASK8_OUTPUT/source"
-  "$TASK8_PYTHON" -m build --no-isolation --outdir "$TASK8_OUTPUT/build"
-)
-.venv/bin/check-wheel-contents "$TASK8_OUTPUT"/build/*.whl
-.venv/bin/cyclonedx-py requirements requirements.lock --output-file "$TASK8_OUTPUT/python-sbom.json"
-.venv/bin/pip-audit --require-hashes -r requirements.lock
-.venv/bin/pip-audit --require-hashes -r requirements-dev.lock
-.venv/bin/python scripts/verify_release.py assert-source-snapshot --worktree . --snapshot "$TASK8_OUTPUT/source-before.json"
+.venv/bin/python scripts/verify_release.py local-gates --worktree . --output "$TASK8_OUTPUT/run" --node-executable "$REVIEWED_NODE" --compare-branch origin/main
 ```
 
-Assert the external `actionlint -version` is exactly `1.7.12`, gitleaks reports exactly `8.30.1`, and Trivy reports exactly `0.74.0`; assert Bandit and Semgrep match their hash-locked Python package versions. The trusted bootstrap verifies the exact signed/fresh Trivy DB OCI subject before copying it to the external cache; every Trivy scan is then network-disabled and uses only that cache. CI runs the additional full-history `gitleaks git --no-banner --redact --log-opts=--all --report-format json --report-path GITLEAKS_JSON VERIFIED_CANDIDATE_REPOSITORY` and Task 22 runs digest-only Trivy image commands under the same typed command policy. The checked-in `/.tools/` ignore supports an optional developer cache but this write-contained proof never creates or reads it. The static test proves `TASK8_OUTPUT` is new, external, mode `0700`, contains all four non-version scanner reports plus the complete expected inventory, and the candidate including ignored paths is byte-identical after the run. Pin zizmor in the development lock. After push authorization, require every named job on protected `main` and forbid direct pushes.
+The typed runner asserts exact actionlint 1.7.12, gitleaks 8.30.1, Trivy 0.74.0, and hash-locked Bandit/Semgrep versions and origins. It accepts Trivy data only from an external cache matching the signed/fresh receipt and then scans offline. CI adds full-history Gitleaks; Task 22 later adds digest-only image scans under the same command policy. Verify the existing `/.tools/` ignore and exact zizmor lock pin without modifying either. `deploy/README.md` must describe immutable-digest/offline scans and the external receipt, and remove connected/tag-only/`--ignore-unfixed` guidance. The output inventory and candidate-byte invariants remain mandatory.
 
-Expected: PASS locally and on the authorized draft branch; protected `main` reports every named job as required.
+Expected locally: all locally authoritative checks PASS, while eligibility remains `do_not_release` with `external_authority_required` until exact-three-minor CI, protected required-check evidence, a signed/fresh Trivy DB receipt, and protected-controller/OIDC custody evidence are supplied. No local command may report those absent checks as passed.
 
-- [ ] **Step 5: Commit checkpoint**
+#### Authorized future checkpoint
 
-Stage only workflow, policy, `.gitignore`, pinned Semgrep rules/digest, `security/coverage-policy.json`, external-tool lock/bootstrap/tests, `scripts/verify_release.py`, and static-test paths; never stage `.tools/`. Then: `git commit -m "ci: enforce strict release evidence"`.
+After explicit authorization, stage only the Task 8 workflow/policy files, `deploy/README.md`, pinned Semgrep rules/digest, `security/coverage-policy.json`, external-tool adapter/tests, `scripts/verify_release.py`, and static-test paths. Do not stage `.tools/`, verify-only locks/manifests, `.gitignore`, or `THIRD_PARTY_NOTICES.md` unless actual vendoring changed its inventory. Then: `git commit -m "ci: enforce strict release evidence"`.
 
-**Phase 1 exit gate:** full repository Ruff/Pyright/mypy gates are clean, branch-enabled coverage is at least 95%, changed-line and changed branch-arc coverage are both 100%, and CI/security workflows are required before merge.
+**Phase 1 local exit gate:** full repository Ruff/Pyright/mypy gates are clean, branch-enabled project, changed-line, and changed branch-arc coverage are each at least 95%, every closed decision module has 100% branch coverage, and the CI/security workflow and policy files pass their local static/adversarial checks. Protected required-check state, exact-three-minor CI results, signed/fresh Trivy DB custody, protected-controller/OIDC evidence, signing, publication, deployment, and ASVS closure remain external authority and keep release eligibility `do_not_release`; Phase 2 does not begin as part of this task.
 
 ---
 
@@ -1741,7 +2849,7 @@ Derive field names and bounds from the frozen fixtures, not from convenience. Us
 - [ ] **Step 4: Run contract, service, and baseline suites**
 
 Run: `.venv/bin/python -m pytest tests/contracts/test_pydantic_contracts.py tests/property/test_contract_properties.py tests/unit/test_tools.py tests/contracts/test_frozen_baseline.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/contracts/base.py src/nplg_mcp/contracts/inputs.py src/nplg_mcp/contracts/outputs.py src/nplg_mcp/contracts/catalog.py src/nplg_mcp/tools.py`
 Expected: PASS; schemas include closed output definitions and frozen semantic values are unchanged.
@@ -1761,7 +2869,9 @@ Stage contracts, `services.py`, `profiles.py`, `tools.py`, compatibility `protoc
 - Create: `contracts/zod/models.ts`
 - Create: `contracts/zod/contract.test.ts`
 - Modify: `package.json`, `package-lock.json`
-- Create: `tsconfig.contracts.json`, `eslint.config.mjs`, `.markdownlint-cli2.mjs`
+- Modify: `tsconfig.contracts.json`, `eslint.config.mjs` (created and initially
+  owned by Task 1's baseline-only strict closure)
+- Create: `.markdownlint-cli2.mjs`
 - Create: `tests/contracts/test_zod_contracts.py`
 - Modify: `.github/workflows/ci.yml`, `.github/workflows/security.yml`
 - Modify: `tests/static/test_quality_policy.py`
@@ -1820,7 +2930,7 @@ Run: `npm run docs:lint`
 Run: `.venv/bin/python scripts/export_contracts.py --check`
 Run: `.venv/bin/check-jsonschema --check-metaschema contracts/generated/tool-contracts.schema.json`
 Run: `.venv/bin/python -m pytest tests/contracts/test_zod_contracts.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/contracts/schema.py scripts/export_contracts.py`
 Expected: all PASS; generated Pydantic and independent Zod schemas agree semantically; all closed object nodes remain closed; npm is absent from runtime/image dependencies.
@@ -1899,7 +3009,7 @@ Every low-level tool handler catches expected actionable `AppError` values and c
 - [ ] **Step 4: Run modern and legacy in-memory clients**
 
 Run: `.venv/bin/python -m pytest tests/contracts/test_sdk_client.py tests/contracts/test_sdk_boundary.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/mcp_server.py src/nplg_mcp/sdk_boundary.py src/nplg_mcp/errors.py`
 Expected: PASS for list, successful call, strict raw-argument rejection, unknown tool, resource read, cancellation, project-owned unexpected-exception sanitization, and exact-client-schema Zod parity; neither canary reaches the client.
@@ -1938,7 +3048,7 @@ Keep semantic parity, not private envelope quirks. Preserve MCP-standard codes a
 - [ ] **Step 4: Run differential and official-client suites**
 
 Run: `.venv/bin/python -m pytest tests/contracts/test_{sdk_parity,sdk_client,frozen_baseline,pydantic_contracts}.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/errors.py`
 Expected: PASS; any accepted difference is named and justified in `ADR-001`.
@@ -2012,7 +3122,7 @@ Implement `run_mcp_conformance.py` as orchestration only: it starts only the exp
 
 Run: `.venv/bin/python -m pytest tests/conformance/test_mcp_http.py tests/contracts/test_sdk_parity.py tests/unit/test_app_lifespan.py tests/unit/test_json_preflight.py tests/unit/test_run_mcp_conformance.py tests/property/test_json_preflight_properties.py -q`
 Run: `.venv/bin/python scripts/run_mcp_conformance.py --scenario server-stateless --spec-version 2026-07-28`
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/sdk_boundary.py src/nplg_mcp/http_security.py src/nplg_mcp/json_preflight.py src/nplg_mcp/config.py src/nplg_mcp/app.py src/nplg_mcp/__main__.py`
 Expected: PASS; the SDK session manager is live before the first request and cleanly stopped, malformed/ambiguous inputs never reach SDK dispatch, bounded preflight never constructs a decoded request tree, strict invalid tool arguments never reach handlers, valid original bytes reach the official SDK unchanged, and a real disconnect either cancels promptly through the SSE path or remains bounded by the 20-second deadline with the limitation documented.
@@ -2055,7 +3165,7 @@ Use the constructor-supplied official `on_list_resources`, `on_list_resource_tem
 - [ ] **Step 4: Run all protocol and strict gates**
 
 Run: `.venv/bin/python -m pytest tests/contracts/test_sdk_client.py tests/contracts/test_sdk_parity.py tests/contracts/test_frozen_baseline.py tests/conformance/test_mcp_http.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/mcp_server.py src/nplg_mcp/sdk_boundary.py src/nplg_mcp/errors.py`
 Run: `rg -n "McpProtocol|from .*protocol" src tests`
@@ -2221,7 +3331,7 @@ Spawn a new process group, close inherited file descriptors, clear proxy/environ
 - [ ] **Step 4: Run focused, PDF, and cancellation suites**
 
 Run: `.venv/bin/python -m pytest tests/security/test_pdf_worker.py tests/property/test_pdf_ipc_properties.py tests/integration/test_pdf.py tests/unit/test_tools.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/pdf_executor.py src/nplg_mcp/pdf_ipc.py`
 Expected: PASS; timeout/cancellation tests observe the worker PID no longer exists.
@@ -2274,7 +3384,7 @@ Configure Caddy to proxy only `https://app.internal:8443` (or the exact reviewed
 
 Create only small, redistributable synthetic fixtures with deterministic generators. The strict manifest records fixture ID, generator/source provenance, license, SHA-256, size, expected verdict, and limits exercised; tests fail on unlisted or digest-mismatched corpus files. Test malformed, encrypted, deeply nested, huge-page, high-object-count, truncated, crash-inducing, decompression-bomb-like, timeout, and concurrent inputs. Verify resource ceilings and cleanup after worker restart.
 
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/pdf_worker_client.py src/nplg_mcp/pdf_worker_main.py src/nplg_mcp/pdf_ipc.py scripts/verify_pdf_worker_container.py scripts/verify_private_edge.py`
 
@@ -2518,7 +3628,7 @@ Reserve the prospective worst-case byte/logical-object/physical-inode budget ato
 - [ ] **Step 4: Run deterministic adversarial, storage, and verifier tests**
 
 Run: `.venv/bin/python -m pytest tests/unit/test_scanner_container_verifier.py tests/unit/test_pdf_worker_quota_verifier.py tests/unit/test_private_recovery_verifier.py tests/security/test_malware.py tests/security/test_downloader.py tests/security/test_pdf_worker.py tests/unit/test_storage.py tests/integration/test_pdf.py tests/static/test_deployment.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/malware.py src/nplg_mcp/downloader.py src/nplg_mcp/storage.py src/nplg_mcp/tools.py src/nplg_mcp/pdf_worker_client.py scripts/verify_scanner_container.py scripts/verify_pdf_worker_quota.py scripts/verify_private_recovery.py`
 Expected: PASS through deterministic and injected/fake verifier authorities; infected or unscanned files never reach publication/PDFium, stale definitions alert and fail closed, pruning never removes a leased object, and unresolved byte/inode pressure cannot be reported as success or admit new ingest. No release-registered container command runs against dirty pre-checkpoint source.
@@ -2545,12 +3655,13 @@ The Task 16A checkpoint adds candidate scanner/worker/recovery configuration, sl
 - Create: `src/nplg_mcp/resilience.py`
 - Modify: `security/coverage-policy.json`
 - Modify: `security/external-test-gates.json`
-- Modify: `src/nplg_mcp/security.py`, `src/nplg_mcp/repository.py`, `src/nplg_mcp/downloader.py`
+- Modify: `src/nplg_mcp/app.py`, `src/nplg_mcp/http_types.py`, `src/nplg_mcp/security.py`, `src/nplg_mcp/repository.py`, `src/nplg_mcp/downloader.py`
 - Modify: `.env.example`
 - Create: `tests/security/test_ssrf_binding.py`
 - Create: `tests/unit/test_upstream_resilience.py`
 - Create: `scripts/run_live_nplg_canary.py`, `tests/unit/test_live_nplg_canary.py`
 - Modify: `tests/security/test_downloader.py`, `tests/integration/test_repository.py`
+- Modify: `tests/conformance/test_mcp_http.py` for application-assembly proof
 
 #### Interfaces
 
@@ -2568,34 +3679,40 @@ The live oracle is exactly one ordered probe, `nplg.simple-search.bound-origin.v
 
 Cover mixed public/private A and AAAA answers, CNAME changes, address changes between validation and connect, redirects to a second host, IPv4-mapped IPv6, zone identifiers, proxy environment variables, resolver timeout, TTL below/at/above the 1-60-second clamp, raw timeout `None`/bool/int/string/negative/zero/NaN/infinity/over-ceiling values for TCP, Unix sockets, and sleep, expired validity, clock regression, and every unusual/noncanonical IP text form. Seed an inbound bearer-token canary and prove the generic purpose-specific outbound-header builder and actual NPLG client never forward it or any client-supplied proxy/forwarding header. Task 20 repeats the proof for its later JWKS consumer; Tasks 15/16A own worker/scanner secret/environment/IPC isolation when the optional private-full branch is selected.
 
+Add the exact conformance assembly node
+`tests/conformance/test_mcp_http.py::test_application_assembles_nplg_client_with_pinned_transport`
+proving the application constructs the NPLG client with the pinned backend and
+`trust_env=False`; isolated backend tests do not prove that the production
+application uses the secure transport.
+
 Add the one separately authorized classification node with the exact name `tests/integration/test_repository.py::test_live_nplg_canary_uses_bound_public_endpoint`; it exercises the same injected canary operation, requires `NPLG_ALLOW_LIVE_TESTS=1`, and is the only Task 17 node the deterministic gate deselects. Candidate pytest progress/stdout and `run_live_nplg_canary.py` output are non-authoritative developer diagnostics. Release evidence comes only from the registered protected-controller `live.nplg-bound-endpoint.v2` command and its signed controller/broker/candidate-bound result.
 
 With injected fake clock/randomness and scripted NPLG responses, test bulkhead saturation, timeout/connection error/429/5xx thresholds, excluded caller 4xx and validation failures, open-state fail-fast behavior, bounded/jittered `Retry-After`, exactly one bounded half-open probe, concurrent recovery races, failed-probe backoff, successful recovery, cancellation cleanup, and independent state for unrelated upstreams. A sustained outage must not occupy all global admission slots or create a half-open stampede; metrics/logs must not contain queries, tokens, or response bodies.
 
 - [ ] **Step 2: Observe RED**
 
-Run: `.venv/bin/python -m pytest --collect-only tests/unit/test_live_nplg_canary.py tests/security/test_ssrf_binding.py tests/unit/test_upstream_resilience.py -q`
+Run: `.venv/bin/python -m pytest --collect-only tests/unit/test_live_nplg_canary.py tests/security/test_ssrf_binding.py tests/unit/test_upstream_resilience.py tests/conformance/test_mcp_http.py::test_application_assembles_nplg_client_with_pinned_transport -q`
 Expected: collection PASS through the typed behavior-free scaffolds.
-Run: `.venv/bin/python -m pytest tests/unit/test_live_nplg_canary.py tests/security/test_ssrf_binding.py tests/unit/test_upstream_resilience.py -q`
+Run: `.venv/bin/python -m pytest tests/unit/test_live_nplg_canary.py tests/security/test_ssrf_binding.py tests/unit/test_upstream_resilience.py tests/conformance/test_mcp_http.py::test_application_assembles_nplg_client_with_pinned_transport -q`
 Expected: collection/imports PASS through typed scaffolds; focused tests FAIL because validation and HTTPX connection resolution are separate and no upstream bulkhead/circuit policy exists.
 
 - [ ] **Step 3: Add a pinned httpcore network backend**
 
-Resolve once per connection attempt, reject the entire answer set if any address is unsafe, pass a selected validated IP to TCP connect, retain the original canonical host for HTTP Host and TLS SNI, set `trust_env=False`, and re-resolve/revalidate every redirect hop. Build each downstream header set from a closed purpose-specific allowlist; never copy the inbound `Authorization`, cookie, forwarding, MCP metadata, or arbitrary request headers. Do not fall back to the system resolver after validation failure.
+Resolve once per connection attempt, reject the entire answer set if any address is unsafe, pass a selected validated IP to TCP connect, retain the original canonical host for HTTP Host and TLS SNI, and set `trust_env=False`. Re-admit and re-resolve/revalidate every redirect hop before following it. A same-origin redirected request may reuse an existing keep-alive connection only when its pinned peer belongs to the hop's newly validated all-public answer set and the endpoint validity has not expired; otherwise it must establish a new pinned connection. Do not represent keep-alive reuse as a new TCP connection or silently reuse an expired/unmatched peer. Build each downstream header set from a closed purpose-specific allowlist; never copy the inbound `Authorization`, cookie, forwarding, MCP metadata, or arbitrary request headers. Do not fall back to the system resolver after validation failure.
 
 Wrap NPLG calls in a separate, small concurrency bulkhead and monotonic circuit breaker. Count only classified transient failures (timeouts, connection failures, 429, and reviewed 5xx); do not let caller errors, local validation, cancellations, or security rejections poison the circuit. Use bounded exponential open intervals with capped jitter, one half-open probe per instance, atomic state transitions, a maximum attempt deadline below the tool deadline, and guaranteed permit release. Emit only low-cardinality state/transition metrics. Fail fast with a stable public upstream-unavailable code and sanitized capped `Retry-After`; never replay non-idempotent work. Document that state is instance-local and do not present it as a distributed quota.
 
 - [ ] **Step 4: Run deterministic security and repository tests**
 
-Run: `.venv/bin/python -m pytest -m 'not live' tests/security/test_ssrf_binding.py tests/unit/test_upstream_resilience.py tests/unit/test_live_nplg_canary.py tests/security/test_downloader.py tests/integration/test_repository.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts`
+Run: `.venv/bin/python -m pytest -m 'not live' tests/security/test_ssrf_binding.py tests/unit/test_upstream_resilience.py tests/unit/test_live_nplg_canary.py tests/security/test_downloader.py tests/integration/test_repository.py tests/conformance/test_mcp_http.py -q`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
-Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/security.py src/nplg_mcp/network.py src/nplg_mcp/resilience.py src/nplg_mcp/downloader.py scripts/run_live_nplg_canary.py`
+Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/app.py src/nplg_mcp/http_types.py src/nplg_mcp/security.py src/nplg_mcp/network.py src/nplg_mcp/resilience.py src/nplg_mcp/downloader.py scripts/run_live_nplg_canary.py`
 Expected: all deterministic suites, strict gates, and mutation targets PASS. No live command runs from the dirty pre-checkpoint worktree.
 
 - [ ] **Step 5: Commit checkpoint**
 
-Stage network/security/repository/downloader files, `.env.example`, `security/coverage-policy.json`, `security/external-test-gates.json`, `scripts/run_live_nplg_canary.py`, `tests/unit/test_live_nplg_canary.py`, and the named tests, then: `git commit -m "security: bind outbound connections to validated DNS"`.
+Stage app/HTTP/network/security/repository/downloader files, `.env.example`, `security/coverage-policy.json`, `security/external-test-gates.json`, `scripts/run_live_nplg_canary.py`, `tests/unit/test_live_nplg_canary.py`, and the named security, unit, integration, and conformance tests, then: `git commit -m "security: bind outbound connections to validated DNS"`.
 
 - [ ] **Step 6: Register the protected live oracle; optionally run a non-authoritative developer diagnostic**
 
@@ -2631,7 +3748,7 @@ Normalize the query exactly once, hash its canonical UTF-8 form, bind all pagina
 - [ ] **Step 4: Run unit, property, and integration suites**
 
 Run: `.venv/bin/python -m pytest -m 'not live' tests/unit/test_parsers.py tests/integration/test_repository.py tests/property/test_parser_properties.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/parsers.py src/nplg_mcp/repository.py src/nplg_mcp/tokens.py`
 Expected: focused, global strict, branch/diff-coverage, and decision-module mutation gates PASS with deterministic clocks, hardened XML parsing, and no external network.
@@ -2698,7 +3815,7 @@ Parse one exact profile enum at startup, instantiate only required services, and
 - [ ] **Step 4: Run profile, official-client, and configuration suites**
 
 Run: `.venv/bin/python -m pytest tests/integration/test_profiles.py tests/contracts/test_sdk_client.py tests/unit/test_config.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/profiles.py`
 Expected: PASS with exact catalog snapshots for both executable profiles plus the exact `distributed-full` startup-rejection, no-service-construction, and no-method/catalog proof.
@@ -2779,7 +3896,7 @@ Create a strict cryptographic inventory covering cursor and audit HMAC roots, JW
 
 Run: `.venv/bin/python -m pytest tests/security/test_auth.py tests/security/test_audit.py tests/security/test_tokens.py tests/property/test_auth_properties.py tests/conformance/test_mcp_http.py tests/unit/test_admission.py tests/contracts/test_sdk_client.py -q`
 Run: `.venv/bin/python scripts/run_mcp_conformance.py --requirements 2026-07-28`
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/auth.py src/nplg_mcp/audit.py src/nplg_mcp/http_security.py src/nplg_mcp/admission.py src/nplg_mcp/tokens.py src/nplg_mcp/mcp_server.py src/nplg_mcp/sdk_boundary.py src/nplg_mcp/config.py src/nplg_mcp/errors.py src/nplg_mcp/app.py`
 Expected: PASS for profile-specific coarse OIDC connection authentication, identity, audit, configuration, and unauthenticated metadata routing; every static/legacy credential configuration is rejected, and captured logs contain required event fields and none of the seeded secrets/content. The official conformance result is labelled unauthenticated fixture/SDK integration only. The expected unsupported dynamic-scope capability record is also GREEN as a truthful structural verdict and keeps `MCP_DYNAMIC_SCOPE_403_UNSUPPORTED` open; this task does not require or pretend that an operation-level 403 succeeded.
@@ -2870,7 +3987,7 @@ Run: `.venv/bin/python -m pytest tests/static/test_deployment.py tests/integrati
 Run: `npm run deployment:evidence:lint`
 Run: `npm run deployment:evidence:typecheck`
 Run: `npm run deployment:evidence:test`
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets scripts/verify_deploy.py scripts/run_alpic_staging_proof.py`
 Expected: all deterministic deployment, profile, Python/TypeScript strict, branch/diff-coverage, and verifier/orchestrator mutation gates PASS. After explicit commit authorization, stage only Alpic config/docs, `.gitignore`, `security/external-test-gates.json`, the Task-21 update to `security/toolchain-lock.json`, locked package files (including the direct `@alpic-ai/api` pin), the typed provider-binding helper/config/test, `deploy/alpic-audit-dispositions.json`, `deploy/alpic-runtime-manifest.json`, `deploy/alpic-environment-manifest.json`, `deploy/alpic-submission-versions.json`, verifier/orchestrator and their tests, `tests/property/test_deployment_evidence_properties.py`, and static/edge tests, then commit `deploy: prepare authenticated Alpic metadata candidate`. Do not create or stage the staging report yet.
@@ -3016,7 +4133,7 @@ Implement only the candidate-side strict schema/fixture helpers and expected thi
 The metadata manifest additionally consumes the authorized Task 21 staging/two-hop evidence and proves private edge/app/PDF/store/scanner non-construction. It does not require Tasks 15-16A or a container runtime. The private-full manifest additionally requires Task 15-16A code/evidence and performs one quarantined comparison build plus one canonical build for each app, Caddy edge, PDF-worker, and scanner image from the same immutable context, exact base-image digests, locked builder, and reproducibility inputs. It requires the reviewed reproducibility comparison before selecting each canonical image ID/digest; comparison images never reach scans, tests, deployment, SBOM, provenance, or any external proof. Every Trivy and attack-suite invocation then receives only the canonical digest with rebuild disabled. Edge/recovery proofs must observe those exact subjects before and after their probes. If a provider cannot bind the deployed runtime to the tested subject digest, the manifest records an unproven control rather than asserting equality.
 
 Run: `.venv/bin/python -m pytest tests/static/test_release_gate.py tests/static/test_asvs_evidence.py -q`
-Run: `.venv/bin/python scripts/run_quality_gate.py src tests scripts`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets scripts/verify_release.py`
 Expected: all verification-machinery, integrity, global strict, branch/diff coverage, and mutation gates PASS in non-closure mode. Then, after explicit commit authorization, stage only `security/release-command-manifests.json`, `scripts/verify_release.py`, and their tests and commit `test: add profile-aware release verification`. The resulting clean commit may become the candidate; evidence rows remain incomplete at this point.
@@ -3293,7 +4410,11 @@ This candidate is outside the executable scope of this plan. Its separate provid
 
 ## 6. Rollback Boundaries
 
-- Phase 1 is configuration/refactoring only; revert its commits if behavior fixtures change.
+- Phase 1 is primarily quality/configuration refactoring but includes the
+  explicitly reviewed Task 5 security hardening. Preserve those TDD-backed
+  behavior changes and their adversarial tests; revert only unintended frozen
+  contract drift or a refactor that cannot reproduce its prior public
+  behavior.
 - Phase 2 can revert to frozen dictionary serialization while retaining its tests.
 - Phase 3 keeps the custom protocol until Task 13 is green; cutover rollback is one commit until Task 14 deletes it.
 - Phase 4 retains `PDF_EXECUTOR=serialized` only for development/compatibility. Production rollback disables PDF tools or returns to `alpic-metadata`; it never moves untrusted PDFium back into the credential-bearing control plane and never returns to parallel `to_thread()` execution.
@@ -3379,10 +4500,17 @@ Recheck these primary sources at the start of the task that consumes them; exact
 Recommended execution uses `superpowers:subagent-driven-development` with a fresh implementation worker and two-stage review per task:
 
 1. Task 0 creates the reproducible environment/typed test fixtures and revalidates the frozen-revision baseline; no later RED runs before it passes.
-2. Task 1 freezes the complete digest-bound oracle, root `SPEC.md`, and ADR after explicit profile confirmation.
-3. Task 1A lands immediately as the first production-code repair; do not begin parallel PDF work before it is green.
-4. Task 2 creates the evidence inventory, then Task 3 installs the bootstrap CI/ratchet gate before broad cleanup.
-5. Tasks 4, 5, 6, 6A, 6B, 6C, 7, and 8 run sequentially because they share modules and quality configuration.
+2. Task 1 freezes the complete digest-bound oracle, root `SPEC.md`, and ADR
+   after explicit profile confirmation.
+3. Task 1A lands immediately as the first production-code repair, followed by
+   the explicitly scoped Task 1B legacy-static closure.
+4. Task 2 creates the evidence inventory, then Task 3 installs the temporary
+   CI/ratchet gate before broad cleanup.
+5. Tasks 4, 5, 6, 6A, residual 6B, 6C, 7, and 8 run sequentially because they
+   share modules and quality configuration. Apply the Phase 1
+   temporary-infrastructure exit gate before Task 7. The 2026-08-16
+   reconciliation stops at the Phase 0-1 audit boundary; continuing beyond it
+   requires a new user direction.
 6. Tasks 9–10 establish strict contracts and the cross-language oracle.
 7. Tasks 11–14 perform the official SDK cutover. Task 13's auth-disabled version ordering is provisional; before any protected deployment, Task 20 must consume the Task 0 Alpic capability record and prove one supported auth-before-version composition or stop with the named blockers.
 8. Tasks 15, 16, and 16A run only after Task 9 and follow the dependency chain Task 15 → Task 16 → Task 16A. Tasks 17–18 also require Task 9. These branches may proceed alongside SDK work only when their declared write sets do not overlap; integrate one branch at a time.

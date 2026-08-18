@@ -1,0 +1,259 @@
+name: Security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nplg-security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sast:
+    name: SAST and workflow analysis
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out the complete candidate history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.13.15
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          languages: python
+
+      - name: Install hash-locked local gates
+        run: |
+          python -m pip install --require-hashes -r requirements-dev.lock
+          npm ci --ignore-scripts
+
+      - name: Run the typed local security battery
+        run: python scripts/verify_release.py local-gates --worktree "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/nplg-security-sast" --node-executable "$(command -v node)" --compare-branch origin/main
+
+      - name: Analyze with CodeQL
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          category: /language:python
+
+      - name: Bind SAST evidence to its bytes
+        if: always()
+        run: |
+          find "$RUNNER_TEMP/nplg-security-sast" -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/nplg-security-sast.SHA256SUMS"
+          test -s "$RUNNER_TEMP/nplg-security-sast.SHA256SUMS"
+
+      - name: Upload SAST evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sast-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/nplg-security-sast
+            ${{ runner.temp }}/nplg-security-sast.SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+
+  sca:
+    name: Software composition analysis
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the complete candidate history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.13.15
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+
+      - name: Install hash-locked local gates
+        run: |
+          python -m pip install --require-hashes -r requirements-dev.lock
+          npm ci --ignore-scripts
+
+      - name: Run the typed local SCA battery
+        run: python scripts/verify_release.py local-gates --worktree "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/nplg-security-sca" --node-executable "$(command -v node)" --compare-branch origin/main
+
+      - name: Bind SCA evidence to its bytes
+        if: always()
+        run: |
+          find "$RUNNER_TEMP/nplg-security-sca" -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/nplg-security-sca.SHA256SUMS"
+          test -s "$RUNNER_TEMP/nplg-security-sca.SHA256SUMS"
+
+      - name: Upload SCA evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sca-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/nplg-security-sca
+            ${{ runner.temp }}/nplg-security-sca.SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+
+  sbom:
+    name: Canonical SBOM evidence
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the complete candidate history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.13.15
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+
+      - name: Install hash-locked local gates
+        run: |
+          python -m pip install --require-hashes -r requirements-dev.lock
+          npm ci --ignore-scripts
+
+      - name: Run the typed local SBOM battery
+        run: python scripts/verify_release.py local-gates --worktree "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/nplg-security-sbom" --node-executable "$(command -v node)" --compare-branch origin/main
+
+      - name: Bind SBOM evidence to its bytes
+        if: always()
+        run: |
+          find "$RUNNER_TEMP/nplg-security-sbom" -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/nplg-security-sbom.SHA256SUMS"
+          test -s "$RUNNER_TEMP/nplg-security-sbom.SHA256SUMS"
+
+      - name: Upload SBOM evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/nplg-security-sbom
+            ${{ runner.temp }}/nplg-security-sbom.SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+
+  secrets:
+    name: Full-history secret scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the complete candidate history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.13.15
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+
+      - name: Install hash-locked local gates
+        run: |
+          python -m pip install --require-hashes -r requirements-dev.lock
+          npm ci --ignore-scripts
+
+      - name: Run the typed full-history secret battery
+        run: python scripts/verify_release.py local-gates --worktree "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/nplg-security-secrets" --node-executable "$(command -v node)" --compare-branch origin/main
+
+      - name: Bind secret-scan evidence to its bytes
+        if: always()
+        run: |
+          find "$RUNNER_TEMP/nplg-security-secrets" -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/nplg-security-secrets.SHA256SUMS"
+          test -s "$RUNNER_TEMP/nplg-security-secrets.SHA256SUMS"
+
+      - name: Upload secret-scan evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: secrets-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/nplg-security-secrets
+            ${{ runner.temp }}/nplg-security-secrets.SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+
+  container:
+    name: Container eligibility boundary
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the complete candidate history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.13.15
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+
+      - name: Install hash-locked local gates
+        run: |
+          python -m pip install --require-hashes -r requirements-dev.lock
+          npm ci --ignore-scripts
+
+      - name: Record the fail-closed container eligibility boundary
+        run: python scripts/verify_release.py local-gates --worktree "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/nplg-security-container" --node-executable "$(command -v node)" --compare-branch origin/main
+
+      - name: Bind container evidence to its bytes
+        if: always()
+        run: |
+          find "$RUNNER_TEMP/nplg-security-container" -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/nplg-security-container.SHA256SUMS"
+          test -s "$RUNNER_TEMP/nplg-security-container.SHA256SUMS"
+
+      - name: Upload container evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: container-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/nplg-security-container
+            ${{ runner.temp }}/nplg-security-container.SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false

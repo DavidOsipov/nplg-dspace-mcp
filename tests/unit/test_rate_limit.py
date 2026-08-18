@@ -1,3 +1,6 @@
+# Copyright (c) 2026 David Osipov
+"""Unit tests for bounded request rate limiting."""
+
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +11,9 @@ from nplg_mcp.rate_limit import AsyncRateLimiter
 
 
 @pytest.mark.asyncio
-async def test_rate_limiter_spaces_sequential_acquisitions_without_delaying_first() -> None:
+async def test_rate_limiter_spaces_sequential_acquisitions_without_delaying_first() -> (
+    None
+):
     current = 10.0
     delays: list[float] = []
 
@@ -45,12 +50,14 @@ async def test_rate_limiter_serializes_concurrent_callers() -> None:
 
     limiter = AsyncRateLimiter(rate_per_second=1.0, clock=clock, sleeper=sleeper)
 
-    await asyncio.gather(*(limiter.acquire() for _ in range(3)))
+    tasks = tuple(asyncio.create_task(limiter.acquire()) for _ in range(3))
+    for task in tasks:
+        await task
 
     assert delays == [1.0, 1.0]
 
 
 @pytest.mark.parametrize("rate", [0, -1, True, float("inf"), float("nan")])
 def test_rate_limiter_rejects_invalid_rates(rate: float) -> None:
-    with pytest.raises(ValueError):
-        AsyncRateLimiter(rate_per_second=rate)
+    with pytest.raises(ValueError, match="finite positive number"):
+        _ = AsyncRateLimiter(rate_per_second=rate)

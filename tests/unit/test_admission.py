@@ -1,15 +1,20 @@
+# Copyright (c) 2026 David Osipov
+"""Unit tests for the admission gate and middleware."""
+
 import pytest
+from starlette.types import Message, Receive, Scope, Send
 
 from nplg_mcp.admission import AdmissionGate, PathAdmissionMiddleware
 
 
 def test_admission_gate_is_fail_fast_and_releases_capacity() -> None:
-    gate = AdmissionGate(2)
+    capacity = 2
+    gate = AdmissionGate(capacity)
 
     assert gate.try_acquire() is True
     assert gate.try_acquire() is True
     assert gate.try_acquire() is False
-    assert gate.active == 2
+    assert gate.active == capacity
 
     gate.release()
     assert gate.try_acquire() is True
@@ -21,11 +26,12 @@ def test_admission_gate_is_fail_fast_and_releases_capacity() -> None:
 def test_admission_gate_rejects_invalid_capacity_and_unbalanced_release() -> None:
     for invalid in (0, -1, True):
         try:
-            AdmissionGate(invalid)  # type: ignore[arg-type]
+            _ = AdmissionGate(invalid)
         except ValueError:
             pass
         else:
-            raise AssertionError("invalid admission capacity was accepted")
+            msg = "invalid admission capacity was accepted"
+            raise AssertionError(msg)
 
     gate = AdmissionGate(1)
     try:
@@ -33,31 +39,38 @@ def test_admission_gate_rejects_invalid_capacity_and_unbalanced_release() -> Non
     except RuntimeError:
         pass
     else:
-        raise AssertionError("unbalanced admission release was accepted")
+        msg = "unbalanced admission release was accepted"
+        raise AssertionError(msg)
 
 
 async def test_path_admission_releases_permit_when_response_send_fails() -> None:
-    async def app(scope, receive, send) -> None:  # type: ignore[no-untyped-def]
-        await send({"type": "http.response.start", "status": 200, "headers": []})
+    async def app(_scope: Scope, _receive: Receive, send: Send) -> None:
+        response_start: dict[str, object] = {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [],
+        }
+        await send(response_start)
 
     middleware = PathAdmissionMiddleware(app, capacity=1, path_prefix="/assets/")
-    scope = {"type": "http", "path": "/assets/token"}
+    scope: Scope = {"type": "http", "path": "/assets/token"}
 
-    async def receive() -> dict[str, str]:
+    async def receive() -> Message:
         return {"type": "http.disconnect"}
 
-    async def failing_send(message) -> None:  # type: ignore[no-untyped-def]
-        raise RuntimeError("peer send failed")
+    async def failing_send(_message: Message) -> None:
+        msg = "peer send failed"
+        raise RuntimeError(msg)
 
     with pytest.raises(RuntimeError, match="peer send failed"):
-        await middleware(scope, receive, failing_send)  # type: ignore[arg-type]
+        await middleware(scope, receive, failing_send)
     assert middleware.gate.active == 0
 
-    sent: list[dict[str, object]] = []
+    sent: list[Message] = []
 
-    async def collecting_send(message: dict[str, object]) -> None:
+    async def collecting_send(message: Message) -> None:
         sent.append(message)
 
-    await middleware(scope, receive, collecting_send)  # type: ignore[arg-type]
+    await middleware(scope, receive, collecting_send)
     assert middleware.gate.active == 0
     assert sent == [{"type": "http.response.start", "status": 200, "headers": []}]

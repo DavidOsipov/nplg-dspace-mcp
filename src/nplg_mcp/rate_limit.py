@@ -1,3 +1,6 @@
+# Copyright (c) 2026 David Osipov
+"""Bounded in-process request rate limiting."""
+
 from __future__ import annotations
 
 import asyncio
@@ -12,7 +15,11 @@ Sleeper = Callable[[float], Awaitable[None]]
 
 
 class RateLimiter(Protocol):
-    async def acquire(self) -> None: ...
+    """Structural interface for an asynchronous rate limiter."""
+
+    async def acquire(self) -> None:
+        """Wait until the caller may start its operation."""
+        ...
 
 
 @dataclass(slots=True)
@@ -32,12 +39,19 @@ class AsyncRateLimiter:
     _next_allowed: float = field(default=0.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        """Reject ambiguous, nonfinite, and non-positive rates."""
         rate = self.rate_per_second
-        if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate <= 0:
-            raise ValueError("rate_per_second must be a finite positive number")
-        self.rate_per_second = float(rate)
+        if type(rate) not in {int, float}:
+            msg = "rate_per_second must be a finite positive number"
+            raise ValueError(msg)
+        numeric_rate = float(rate)
+        if not math.isfinite(numeric_rate) or numeric_rate <= 0:
+            msg = "rate_per_second must be a finite positive number"
+            raise ValueError(msg)
+        self.rate_per_second = numeric_rate
 
     async def acquire(self) -> None:
+        """Wait for and reserve the next start time."""
         interval = 1.0 / self.rate_per_second
         async with self._lock:
             now = self.clock()

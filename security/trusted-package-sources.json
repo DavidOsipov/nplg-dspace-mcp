@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "python": {
+    "index_url": "https://pypi.org/simple",
+    "artifact_hosts": [
+      "files.pythonhosted.org"
+    ],
+    "require_hashes": true,
+    "wheels_preferred": true,
+    "sdist_mode": "isolated_no_secret_no_network"
+  },
+  "npm": {
+    "registry_url": "https://registry.npmjs.org/",
+    "resolved_hosts": [
+      "registry.npmjs.org"
+    ],
+    "require_integrity": true
+  },
+  "acquisition": {
+    "cache_root": "external_mode_0700",
+    "candidate_network": "offline",
+    "ambient_extra_index": false,
+    "ambient_registry_override": false,
+    "ambient_proxy": false,
+    "ambient_credentials": false,
+    "verify_before_candidate_code": true,
+    "hostile_sdist_canary_required": true,
+    "sitecustomize_canary_required": true
+  },
+  "unknown_host_action": "fail_before_package_code"
+}

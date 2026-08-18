@@ -1,0 +1,21 @@
+{
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.12",
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": ["src", "tests", "scripts", "typings"],
+  "stubPath": "typings",
+  "enableTypeIgnoreComments": false,
+  "reportMissingTypeStubs": "error",
+  "reportCallInDefaultInitializer": "error",
+  "reportImplicitOverride": "error",
+  "reportImplicitStringConcatenation": "error",
+  "reportImportCycles": "error",
+  "reportMissingModuleSource": "error",
+  "reportMissingSuperCall": "error",
+  "reportPropertyTypeMismatch": "error",
+  "reportUninitializedInstanceVariable": "error",
+  "reportUnnecessaryTypeIgnoreComment": "error",
+  "reportUnreachable": "error",
+  "reportUnusedCallResult": "error"
+}

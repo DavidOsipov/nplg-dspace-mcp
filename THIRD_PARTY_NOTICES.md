@@ -16,7 +16,7 @@ This notice is a routing summary, not a replacement for the complete license tex
 
 ## Synthetic-PDF test dependencies
 
-The optional test environment uses `reportlab==4.4.9` and `pypdf==5.9.0` to generate deterministic PDF fixtures. Both are permissively licensed. PyMuPDF/MuPDF is not a runtime or test dependency of this project.
+The optional test environment uses `reportlab==4.4.9` and `pypdf==6.16.1` to generate deterministic PDF fixtures. Both are permissively licensed. PyMuPDF/MuPDF is not a runtime or test dependency of this project.
 
 ## Other dependencies
 

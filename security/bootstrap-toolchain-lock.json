@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "records": [
+    {
+      "tool": "node",
+      "target": "x86_64-unknown-linux-gnu",
+      "publisher": "Node.js",
+      "runtime_trust_policy": "repository_pinned_sha256",
+      "lock_review_status": "accepted",
+      "materialized_link_wrappers": [
+        {
+          "archive_path": "node-v24.19.0-linux-x64/bin/corepack",
+          "target": "../lib/node_modules/corepack/dist/corepack.js"
+        },
+        {
+          "archive_path": "node-v24.19.0-linux-x64/bin/npx",
+          "target": "../lib/node_modules/npm/bin/npx-cli.js"
+        },
+        {
+          "archive_path": "node-v24.19.0-linux-x64/bin/npm",
+          "target": "../lib/node_modules/npm/bin/npm-cli.js"
+        }
+      ],
+      "chosen_version": "24.19.0",
+      "current_version": "24.19.0",
+      "hold_rationale": "Node.js v24.19.0 is the reviewed Node 24 release used by the npm/Pyright toolchain.",
+      "artifact_url": "https://nodejs.org/dist/v24.19.0/node-v24.19.0-linux-x64.tar.gz",
+      "artifact_sha256": "f625d97cd707df4ff96254916fbc5ff014f09c09effe5a1e0ca8f6d41a8789d4",
+      "signature_url": "https://nodejs.org/dist/v24.19.0/SHASUMS256.txt.sig",
+      "signature_sha256": "801534e2d4c769c087e2e3eec89e879032872357e64e82336f86f03e72ece630",
+      "archive_format": "tar.gz",
+      "allowed_top_level_entries": [
+        "node-v24.19.0-linux-x64"
+      ],
+      "embedded_version_command": [
+        "{path}/bin/node",
+        "--version"
+      ],
+      "max_artifact_bytes": 268435456,
+      "max_signature_bytes": 16384,
+      "checksum_url": "https://nodejs.org/dist/v24.19.0/SHASUMS256.txt",
+      "checksum_sha256": "be0629ee2bcd8e40bb856abdd3407f0762101b76bd60a36b8867f637733631c0",
+      "signature_key_fingerprint": "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356",
+      "signature_reason": "Lock review verified the signed Node.js checksum manifest against the recorded release-key fingerprint; runtime authorization uses only the repository-pinned artifact SHA-256.",
+      "max_archive_members": 20000,
+      "max_extracted_bytes": 536870912,
+      "upstream_integrity": null,
+      "runtime_dependencies": [],
+      "regular_entrypoints": []
+    },
+    {
+      "tool": "uv",
+      "target": "x86_64-unknown-linux-gnu",
+      "publisher": "Astral Software Inc.",
+      "runtime_trust_policy": "repository_pinned_sha256",
+      "lock_review_status": "accepted",
+      "materialized_link_wrappers": [],
+      "chosen_version": "0.12.5",
+      "current_version": "0.12.5",
+      "hold_rationale": "uv v0.12.5 is the reviewed bootstrap resolver; the official direct PyPI wheel is selected to preserve the no-redirect runtime policy.",
+      "artifact_url": "https://files.pythonhosted.org/packages/93/22/dacc9a0bc8604187a1ba954a3aef8329e4104eb0af772d2c3c634893bd9b/uv-0.12.5-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "artifact_sha256": "3e195ccf1ed60c8bb24a6447ce306441a4181d54b602407e09bc56e963911c15",
+      "signature_url": null,
+      "signature_sha256": null,
+      "archive_format": "wheel",
+      "allowed_top_level_entries": [
+        "uv-0.12.5.data",
+        "uv",
+        "uv-0.12.5.dist-info"
+      ],
+      "embedded_version_command": [
+        "{path}/scripts/uv",
+        "--version"
+      ],
+      "max_artifact_bytes": 67108864,
+      "max_signature_bytes": 8192,
+      "checksum_url": "https://pypi.org/pypi/uv/0.12.5/json",
+      "checksum_sha256": "20afb0abecf6acdd33855952424ffefd8c857e23ed3cc75744641c108f0e0969",
+      "signature_key_fingerprint": null,
+      "signature_reason": "Lock review matched the direct PyPI wheel to the repository-pinned SHA-256 published in version-specific PyPI metadata; PyPI provides no detached signature for this wheel and runtime performs no upstream-evidence fetch.",
+      "max_archive_members": 1024,
+      "max_extracted_bytes": 134217728,
+      "upstream_integrity": null,
+      "runtime_dependencies": [],
+      "regular_entrypoints": []
+    },
+    {
+      "tool": "npm",
+      "target": "x86_64-unknown-linux-gnu",
+      "publisher": "npm, Inc.",
+      "runtime_trust_policy": "repository_pinned_sha256",
+      "lock_review_status": "accepted",
+      "materialized_link_wrappers": [],
+      "chosen_version": "11.18.0",
+      "current_version": "11.18.0",
+      "hold_rationale": "npm 11.18.0 is independently locked because Node.js v24.19.0 bundles npm 11.17.0, which does not satisfy the repository toolchain record.",
+      "artifact_url": "https://registry.npmjs.org/npm/-/npm-11.18.0.tgz",
+      "artifact_sha256": "73f6155215ebabf4ed96dca1f567c2372cc713c33af2e5b9b62fde4e92373e2e",
+      "signature_url": null,
+      "signature_sha256": null,
+      "archive_format": "tar.gz",
+      "allowed_top_level_entries": [
+        "package"
+      ],
+      "embedded_version_command": [
+        "{dependency:node}",
+        "{path}/bin/npm-cli.js",
+        "--version"
+      ],
+      "max_artifact_bytes": 8388608,
+      "max_signature_bytes": 8192,
+      "checksum_url": "https://registry.npmjs.org/npm/11.18.0",
+      "checksum_sha256": "ec61b012150789bfbf8a7132b46251ba9a841a0e1aa5902163cf60c72c0160c2",
+      "signature_key_fingerprint": null,
+      "signature_reason": "Lock review matched the direct registry tarball SHA-256 and the registry-published sha512 integrity value; npm publishes no detached signature for this artifact and runtime performs no upstream-evidence fetch.",
+      "max_archive_members": 4096,
+      "max_extracted_bytes": 33554432,
+      "upstream_integrity": "sha512-T67M4L5wNm0cZ7EBLErcEkY1SmzEW/WJ+SADBzsFUY1UdAPfFHXFQtZ6SEXiK0+vzXysCvAsepbMaBTwnrAD+w==",
+      "runtime_dependencies": [
+        {
+          "tool": "node",
+          "chosen_version": "24.19.0",
+          "executable_path": "node-v24.19.0-linux-x64/bin/node",
+          "executable_sha256": "bc17c508ffeed0ec622934f9b7fa72f8e78da65350e63c3eceb56fa688aa5e12"
+        }
+      ],
+      "regular_entrypoints": [
+        {
+          "path": "bin/npm",
+          "target": "package/bin/npm-cli.js",
+          "dependency_tool": "node"
+        },
+        {
+          "path": "bin/npx",
+          "target": "package/bin/npx-cli.js",
+          "dependency_tool": "node"
+        }
+      ]
+    }
+  ]
+}

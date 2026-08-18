@@ -1,0 +1,5 @@
+# Semgrep is intentionally isolated from the MCP feasibility environment:
+# semgrep==1.173.0 has a hard dependency on mcp==1.29.0, while this project
+# pins the official MCP feasibility SDK at mcp==2.0.0.  Combining them would
+# make the development lock unsatisfiable and would weaken the SDK decision.
+semgrep==1.173.0

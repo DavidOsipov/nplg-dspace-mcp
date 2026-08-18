@@ -14,7 +14,7 @@ Recommended starting point for the default limits:
 - inbound TCP 80 and 443;
 - outbound DNS and TCP 443 to `dspace.nplg.gov.ge`.
 
-The application container is capped at 4 GiB. Lower-memory hosts must also lower `MAX_PAGE_PIXELS`, `MAX_RENDER_PIXELS`, and `MAX_CONCURRENT_PDF_JOBS` rather than relying on the OOM killer. `MAX_CONCURRENT_MCP_REQUESTS` is a fail-fast, zero-queue MCP limit (default 16); `MAX_CONCURRENT_ASSET_STREAMS` separately holds permits for complete signed-file response lifecycles (default 8); and `MAX_CONCURRENT_HTTP_REQUESTS` supplies a larger Uvicorn-wide ceiling (default 128) for all HTTP work, including probes. Saturated gates return HTTP 503 rather than queueing unbounded work. `REQUEST_BODY_TIMEOUT_SECONDS` (default 10) releases an MCP permit when a client stalls while uploading JSON. These are process-capacity controls, not client-aware edge rate limits.
+The application container is capped at 4 GiB. The compatibility PDF backend is explicitly `PDF_EXECUTOR=serialized` and requires `MAX_CONCURRENT_PDF_JOBS=1`; this is a temporary concurrency-risk reduction, not process isolation. Lower-memory hosts must also lower `MAX_PAGE_PIXELS` and `MAX_RENDER_PIXELS` rather than relying on the OOM killer. `MAX_CONCURRENT_MCP_REQUESTS` is a fail-fast, zero-queue MCP limit (default 16); `MAX_CONCURRENT_ASSET_STREAMS` separately holds permits for complete signed-file response lifecycles (default 8); and `MAX_CONCURRENT_HTTP_REQUESTS` supplies a larger Uvicorn-wide ceiling (default 128) for all HTTP work, including probes. Saturated gates return HTTP 503 rather than queueing unbounded work. `REQUEST_BODY_TIMEOUT_SECONDS` (default 10) releases an MCP permit when a client stalls while uploading JSON. These are process-capacity controls, not client-aware edge rate limits.
 
 Create an A and/or AAAA record for the MCP hostname and point it at the VPS before starting Caddy.
 
@@ -62,9 +62,8 @@ Never commit `.env`, expose the bearer token in shell history, or reuse `ASSET_S
 ```bash
 docker compose --env-file .env config --quiet
 docker compose build --pull
-# Before promotion, scan the exact built application image with your approved
-# scanner (for example Trivy, Grype, or Docker Scout) and review every
-# HIGH/CRITICAL result for exploitability.
+# Before promotion, resolve the canonical application and proxy subjects to
+# immutable image digests and complete the offline scan procedure below.
 docker compose up -d
 docker compose ps
 docker compose logs --tail=100 app caddy
@@ -223,25 +222,37 @@ python3 scripts/verify_deploy.py --base-url "$PUBLIC_BASE_URL"
 
 Rollback by checking out the prior reviewed commit and rebuilding. Do not use a floating application image tag in production.
 
-## Connected image scan and CVE triage
+## Offline immutable-digest image scan and CVE triage
 
-Digest pinning prevents silent image drift, but it does not make an image vulnerability-free. Run a platform-specific scan after building and before exposing the service:
+Digest pinning prevents silent image drift, but it does not make an image vulnerability-free. Scan only an immutable image digest selected from the canonical build; a mutable tag or a locally inferred Compose image name is not a release subject.
+
+The Trivy cache must be externally acquired by a protected process. It must arrive with an independently signed receipt that binds the immutable database OCI digest, media and artifact types, signer policy, acquisition time, and response digest. Verify the signature and require the receipt to be no more than 24 hours old before candidate code runs. The candidate repository cannot mint, refresh, or replace that receipt. Missing, stale, unsigned, or upstream-unattested database evidence produces `TRIVY_DB_UPSTREAM_PROVENANCE_UNATTESTED` and keeps the terminal result `do_not_release`.
+
+After those checks, perform an offline scan with Trivy's database updates disabled. Supply both values as protected-controller inputs, never as a tag resolved by the candidate:
 
 ```bash
-docker compose build --pull app
-APP_IMAGE="$(docker compose images -q app)"
-CADDY_IMAGE="$(docker compose images -q caddy)"
+export TRIVY_CACHE_DIR='/absolute/path/to/verified-external-cache'
+export APPLICATION_IMAGE_DIGEST='registry.example/nplg@sha256:REPLACE_WITH_64_HEX'
+export PROXY_IMAGE_DIGEST='caddy@sha256:REPLACE_WITH_64_HEX'
 
-# Full HIGH/CRITICAL report, including unfixed findings. Keep as release evidence.
-trivy image --severity HIGH,CRITICAL --exit-code 0 "$APP_IMAGE" | tee app-image-cves.txt
-trivy image --severity HIGH,CRITICAL --exit-code 0 "$CADDY_IMAGE" | tee caddy-image-cves.txt
+trivy image \
+  --cache-dir "$TRIVY_CACHE_DIR" \
+  --skip-db-update \
+  --offline-scan \
+  --severity HIGH,CRITICAL \
+  --exit-code 1 \
+  "$APPLICATION_IMAGE_DIGEST"
 
-# Automated gate for findings for which a fixed package is available.
-trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$APP_IMAGE"
-trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$CADDY_IMAGE"
+trivy image \
+  --cache-dir "$TRIVY_CACHE_DIR" \
+  --skip-db-update \
+  --offline-scan \
+  --severity HIGH,CRITICAL \
+  --exit-code 1 \
+  "$PROXY_IMAGE_DIGEST"
 ```
 
-Do not treat `--ignore-unfixed` as acceptance. Every remaining HIGH or CRITICAL result still needs documented CVE triage against the actual attack surface, an explicit temporary exception with owner/expiry, or a different rebuilt base image. Generate an SBOM for the exact deployed digest and retain it with both scan reports.
+Keep the complete machine-readable reports, their SHA-256 digests, the verified database receipt, and an SBOM for each exact image digest. The gate includes unfixed findings: every applicable HIGH or CRITICAL result requires CVE triage against the actual attack surface and blocks release unless the revision-bound, time-bounded exception policy is satisfied.
 
 The production wheel uses pypdfium2/PDFium and the synthetic test corpus uses ReportLab/pypdf; PyMuPDF/MuPDF is not a project dependency. Preserve the license files bundled in the pypdfium2 wheel and the repository's `THIRD_PARTY_NOTICES.md` when redistributing the image.
 

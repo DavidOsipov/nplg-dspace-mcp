@@ -1,4 +1,8 @@
-# NPLG Iverieli DSpace MCP Server — Design Specification
+# NPLG Iverieli DSpace MCP Server — Historical Design Specification
+
+> **Superseded for the official-SDK migration:** `SPEC.md` and
+> `docs/architecture/2026-08-14-official-python-sdk-adr.md` are the current
+> phase 0–1 sources of truth. This document remains historical evidence.
 
 **Status:** Approved design, awaiting written-spec review  
 **Date:** 2026-08-14  

@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "status": "external_authority_required",
+  "candidate_may_supply_controller": false,
+  "expected_controller": {
+    "configured": false,
+    "artifact_digest": null,
+    "revision": null,
+    "policy_digest": null,
+    "authority_identity": null,
+    "dependency_lock_digest": null,
+    "command_manifest_digest": null,
+    "isolation_version": null,
+    "credential_broker_identities": []
+  },
+  "protected_authority": {
+    "required": true,
+    "same_repository_allowed": false,
+    "candidate_controlled_workflow_allowed": false,
+    "required_oidc_claims": [
+      "job_workflow_ref",
+      "workflow_commit_digest",
+      "repository_owner",
+      "ref_or_environment",
+      "audience",
+      "subject"
+    ],
+    "immutable_workflow_identity_required": true
+  },
+  "isolation": {
+    "candidate_network": "bounded_offline",
+    "candidate_secrets": "none",
+    "helper_uids": "distinct",
+    "close_inherited_descriptors": true,
+    "same_uid_holds_both_credential_classes": false,
+    "proc_parent_environment_canary_required": true,
+    "proc_parent_fd_canary_required": true
+  },
+  "required_credential_broker_classes": [
+    "deployment_provider",
+    "mcp"
+  ],
+  "allowed_outputs": [
+    "digest_bound_gate_results",
+    "canonical_artifact_digests",
+    "sbom_digests",
+    "provenance_receipts",
+    "terminal_verdict"
+  ],
+  "local_terminal_verdict": "do_not_release",
+  "local_error": "external_authority_required"
+}

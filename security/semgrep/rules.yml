@@ -1,0 +1,67 @@
+rules:
+  - id: nplg.no-subprocess-shell
+    message: Subprocess execution must not enable a command shell.
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern: subprocess.$METHOD(..., shell=True, ...)
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: ^(run|Popen|call|check_call|check_output)$
+
+  - id: nplg.no-unverified-tls
+    message: HTTP clients must retain TLS certificate verification.
+    severity: ERROR
+    languages: [python]
+    pattern-either:
+      - pattern: httpx.$METHOD(..., verify=False, ...)
+      - pattern: httpx.Client(..., verify=False, ...)
+      - pattern: httpx.AsyncClient(..., verify=False, ...)
+
+  - id: nplg.no-unbounded-http-client
+    message: Network HTTP calls must declare a finite timeout.
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern: httpx.$METHOD(...)
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: ^(get|post|put|patch|delete|head|options|request|stream)$
+      - pattern-not: httpx.$METHOD(..., timeout=$TIMEOUT, ...)
+
+  - id: nplg.no-path-reopen-after-validation
+    message: Do not reopen a path after validation; retain and use its descriptor.
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern-inside: |
+          $PATH = Path(...).resolve(...)
+          ...
+      - pattern: $PATH.open(...)
+
+  - id: nplg.no-secret-in-log
+    message: Secret-bearing values must not be passed to logging calls.
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern: logging.getLogger(...).$LEVEL(..., $SECRET, ...)
+      - metavariable-regex:
+          metavariable: $LEVEL
+          regex: ^(debug|info|warning|error|critical|exception)$
+      - metavariable-regex:
+          metavariable: $SECRET
+          regex: (?i).*(secret|token|password|credential|api_?key).*
+
+  - id: nplg.strict-pydantic-boundary
+    message: Direct Pydantic boundary models must declare strict closed configuration.
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern: |
+          class $MODEL(BaseModel):
+            ...
+      - pattern-not-inside: |
+          class $MODEL(BaseModel):
+            ...
+            model_config = ConfigDict(...)
+            ...

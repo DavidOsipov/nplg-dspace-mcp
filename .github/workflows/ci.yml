@@ -1,0 +1,258 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nplg-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Strict quality (${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12.14", "3.13.15", "3.14.7"]
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+
+      - name: Install hash-locked tools
+        run: |
+          python -m pip install --require-hashes -r requirements-dev.lock
+          npm ci --ignore-scripts
+
+      - name: Run the isolated quality self-test
+        run: python scripts/run_quality_gate.py --node-executable "$(command -v node)" --self-test
+
+      - name: Run the zero-diagnostic quality gate
+        run: python scripts/run_quality_gate.py --node-executable "$(command -v node)" --worktree "$GITHUB_WORKSPACE" --cache-dir "$RUNNER_TEMP/nplg-quality-${{ matrix.python-version }}" --require-clean --candidate "$GITHUB_SHA" src tests scripts typings
+
+      - name: Bind lint evidence to its bytes
+        run: |
+          mkdir -p "$RUNNER_TEMP/nplg-lint"
+          python --version > "$RUNNER_TEMP/nplg-lint/python-version.txt"
+          node --version > "$RUNNER_TEMP/nplg-lint/node-version.txt"
+          sha256sum "$RUNNER_TEMP/nplg-lint/"*.txt > "$RUNNER_TEMP/nplg-lint/SHA256SUMS"
+
+      - name: Upload lint evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lint-${{ matrix.python-version }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nplg-lint
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+
+  types:
+    name: Strict Python types
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.13.15
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+
+      - name: Install hash-locked tools
+        run: |
+          python -m pip install --require-hashes -r requirements-dev.lock
+          npm ci --ignore-scripts
+
+      - name: Run the strict type gate
+        run: python scripts/run_quality_gate.py --node-executable "$(command -v node)" --worktree "$GITHUB_WORKSPACE" --cache-dir "$RUNNER_TEMP/nplg-quality-types" --require-clean --candidate "$GITHUB_SHA" src tests scripts typings
+
+      - name: Bind type evidence to its bytes
+        run: |
+          mkdir -p "$RUNNER_TEMP/nplg-types"
+          python --version > "$RUNNER_TEMP/nplg-types/python-version.txt"
+          node --version > "$RUNNER_TEMP/nplg-types/node-version.txt"
+          sha256sum "$RUNNER_TEMP/nplg-types/"*.txt > "$RUNNER_TEMP/nplg-types/SHA256SUMS"
+
+      - name: Upload type evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: types-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nplg-types
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+
+  contracts:
+    name: Independent Zod contracts
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.13.15
+
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+
+      - name: Install hash-locked tools
+        run: |
+          python -m pip install --require-hashes -r requirements-dev.lock
+          npm ci --ignore-scripts
+
+      - name: Type-check and lint the independent Zod oracle
+        run: npm run contracts:baseline-static
+
+      - name: Run every independent Zod oracle
+        run: npm run contracts:zod:all
+
+      - name: Bind contract evidence to its bytes
+        run: |
+          mkdir -p "$RUNNER_TEMP/nplg-contracts"
+          sha256sum contracts/zod/*.mjs tests/contracts/*.mjs > "$RUNNER_TEMP/nplg-contracts/SHA256SUMS"
+
+      - name: Upload contract evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: contracts-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nplg-contracts
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+
+  package:
+    name: Reproducible canonical package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: 3.13.15
+
+      - name: Install hash-locked build tools
+        run: python -m pip install --require-hashes -r requirements-dev.lock
+
+      - name: Build and compare two isolated package subjects
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          export TZ=UTC
+          export PYTHONHASHSEED=0
+          mkdir -p "$RUNNER_TEMP/nplg-package/comparison" "$RUNNER_TEMP/nplg-package/canonical"
+          python scripts/verify_release.py materialize-source --worktree "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/nplg-package/comparison-source"
+          python scripts/verify_release.py materialize-source --worktree "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/nplg-package/canonical-source"
+          (cd "$RUNNER_TEMP/nplg-package/comparison-source" && python -m build --no-isolation --outdir "$RUNNER_TEMP/nplg-package/comparison")
+          (cd "$RUNNER_TEMP/nplg-package/canonical-source" && python -m build --no-isolation --outdir "$RUNNER_TEMP/nplg-package/canonical")
+          (cd "$RUNNER_TEMP/nplg-package/comparison" && sha256sum * | sort) > "$RUNNER_TEMP/nplg-package/comparison.SHA256SUMS"
+          (cd "$RUNNER_TEMP/nplg-package/canonical" && sha256sum * | sort) > "$RUNNER_TEMP/nplg-package/canonical.SHA256SUMS"
+          diff -u "$RUNNER_TEMP/nplg-package/comparison.SHA256SUMS" "$RUNNER_TEMP/nplg-package/canonical.SHA256SUMS"
+          sha256sum "$RUNNER_TEMP/nplg-package/canonical/"* > "$RUNNER_TEMP/nplg-package/SHA256SUMS"
+
+      - name: Upload the canonical package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: canonical-package-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/nplg-package/canonical
+            ${{ runner.temp }}/nplg-package/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+
+  tests:
+    name: Installed-wheel tests (${{ matrix.python-version }})
+    needs: package
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12.14", "3.13.15", "3.14.7"]
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install hash-locked test tools
+        run: python -m pip install --require-hashes -r requirements-dev.lock
+
+      - name: Download the once-built canonical package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: canonical-package-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/canonical-package
+
+      - name: Install and identify the canonical wheel
+        run: |
+          set -euo pipefail
+          wheel_path="$(find "$RUNNER_TEMP/canonical-package" -type f -name '*.whl' -print -quit)"
+          test -n "$wheel_path"
+          python -m pip install --no-deps --force-reinstall "$wheel_path"
+          python -c 'from importlib.metadata import metadata; requires_python = metadata("nplg-dspace-mcp")["Requires-Python"]; assert requires_python == ">=3.12,<3.15"'
+          python -c 'from nplg_mcp.__main__ import main; assert callable(main)'
+
+      - name: Run the installed-wheel regression suite
+        run: python -m pytest --override-ini=pythonpath= -q
+
+      - name: Run branch and diff coverage against complete history
+        run: python scripts/run_test_gate.py --compare-branch origin/main --worktree "$GITHUB_WORKSPACE"
+
+      - name: Bind test evidence to its bytes
+        run: |
+          mkdir -p "$RUNNER_TEMP/nplg-tests"
+          python --version > "$RUNNER_TEMP/nplg-tests/python-version.txt"
+          sha256sum "$RUNNER_TEMP/nplg-tests/python-version.txt" "$RUNNER_TEMP/canonical-package/SHA256SUMS" > "$RUNNER_TEMP/nplg-tests/SHA256SUMS"
+
+      - name: Upload test evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tests-${{ matrix.python-version }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nplg-tests
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false

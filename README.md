@@ -36,34 +36,90 @@ No OCR is performed. The companion skill tells agents to verify Georgian text vi
 
 ## Local development
 
-Python 3.13 is the verified development runtime.
+The supported Python range is `>=3.12,<3.15`. The reviewed bootstrap lock is
+for `uv 0.12.5`, Node `24.19.0`, npm `11.18.0`, and the x86_64 Linux target;
+runtime downloads only immutable direct artifacts and authenticates them with
+the repository-pinned SHA-256 after accepted upstream-evidence review. Runtime
+and development dependencies are hash-pinned.
+
+`requirements-security.in` is intentionally separate from
+`requirements-dev.in`: Semgrep `1.173.0` hard-pins `mcp==1.29.0`, which is
+incompatible with the required official `mcp==2.0.0`. Combining those inputs
+would produce an unsatisfiable lock rather than a stricter environment.
 
 ```bash
-python -m venv .venv
-. .venv/bin/activate
-python -m pip install -e '.[test]'
+set -euo pipefail
+
+# Choose an absolute path outside this checkout. The caller creates and owns it.
+TOOL_ROOT=/absolute/external/path/nplg-toolchain
+mkdir -m 0700 "$TOOL_ROOT"
+
+python3 scripts/bootstrap_toolchain.py \
+  --lock security/bootstrap-toolchain-lock.json \
+  --tool uv \
+  --target x86_64-unknown-linux-gnu \
+  --destination "$TOOL_ROOT/uv"
+python3 scripts/bootstrap_toolchain.py \
+  --lock security/bootstrap-toolchain-lock.json \
+  --tool node \
+  --target x86_64-unknown-linux-gnu \
+  --destination "$TOOL_ROOT/node"
+python3 scripts/bootstrap_toolchain.py \
+  --lock security/bootstrap-toolchain-lock.json \
+  --tool npm \
+  --target x86_64-unknown-linux-gnu \
+  --destination "$TOOL_ROOT/npm" \
+  --dependency "node=$TOOL_ROOT/node"
+
+UV_BIN="$TOOL_ROOT/uv/uv-0.12.5.data/scripts"
+NODE_BIN="$TOOL_ROOT/node/node-v24.19.0-linux-x64/bin"
+NPM_BIN="$TOOL_ROOT/npm/bin"
+export PATH="$UV_BIN:$NPM_BIN:$NODE_BIN:/usr/bin:/bin"
+
+test "$(uv --version)" = "uv 0.12.5 (x86_64-unknown-linux-gnu)"
+test "$(node --version)" = "v24.19.0"
+test "$(npm --version)" = "11.18.0"
+
+uv venv --python "$(uv python find 3.13.15)" .venv
+uv pip sync --python .venv/bin/python --require-hashes requirements-dev.lock
+npm ci --ignore-scripts
+test "$(.venv/bin/python -c 'import platform; print(platform.python_version())')" = "3.13.15"
+test "$(npm exec --offline -- pyright --version)" = "pyright 1.1.413"
+```
+
+The exact Python `3.13.15` claim is established only after the checks above
+pass. Do not substitute an ambient package installer or editable checkout.
+
+Start the local service from the synchronized environment:
+
+```bash
+set -euo pipefail
 
 export NODE_ENV=development
-export ASSET_SIGNING_SECRET="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+export ASSET_SIGNING_SECRET="$(.venv/bin/python -c 'import secrets; print(secrets.token_hex(32))')"
 export ALLOW_ANONYMOUS=true
 export PUBLIC_BASE_URL=http://127.0.0.1:8000
-python -m nplg_mcp
+.venv/bin/python -m nplg_mcp
 ```
 
 In another shell:
 
 ```bash
-python scripts/verify_deploy.py --base-url http://127.0.0.1:8000
+.venv/bin/python scripts/verify_deploy.py --base-url http://127.0.0.1:8000
 ```
 
 Run tests:
 
 ```bash
-python -m pytest -q
-python -m compileall -q src scripts
+.venv/bin/python -m pytest -q
+.venv/bin/python -m compileall -q src scripts
 ```
 
 Offline tests use pinned HTML/OAI fixtures and a synthetic PDF corpus. Live NPLG checks are deliberately opt-in.
+
+The phase 0–1 capability records under `contracts/` are negative evidence,
+not OAuth support: dynamic operation-scope 403, exact Alpic detector replay,
+route compatibility, and provider selection remain explicit blockers.
 
 ## Production deployment
 
