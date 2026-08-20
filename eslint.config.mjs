@@ -5,8 +5,10 @@ import typescriptEslint from "typescript-eslint";
 const contractFiles = [
   "contracts/zod/baseline-contracts.mjs",
   "contracts/zod/asvs-evidence-contracts.mjs",
+  "contracts/zod/capability-contracts.mjs",
   "tests/contracts/zod_baseline_contracts.test.mjs",
   "tests/contracts/zod_asvs_evidence_contracts.test.mjs",
+  "tests/contracts/zod_contracts.test.mjs",
 ];
 const forbiddenJSDocAnyKinds = new Set([
   typescript.SyntaxKind.AnyKeyword,

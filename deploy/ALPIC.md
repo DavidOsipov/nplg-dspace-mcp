@@ -19,14 +19,16 @@ Add these environment variables:
 
 ```text
 NODE_ENV=production
+DEPLOYMENT_PROFILE=alpic-metadata
 ASSET_SIGNING_SECRET=<at least 32 random bytes>
-API_KEY=<at least 32 random bytes>
+API_PRINCIPALS_JSON=[{"principal_id":"alpic-client","api_key":"<at least 32 random bytes>"}]
 ALLOW_ANONYMOUS=false
+MAX_CONCURRENT_MCP_REQUESTS_PER_PRINCIPAL=4
 ```
 
-Alpic supplies `ALPIC_HOST`; the server derives `PUBLIC_BASE_URL=https://<ALPIC_HOST>` automatically. Its cache defaults to `/tmp/nplg-dspace-mcp-cache` in this environment. Do not add `PUBLIC_BASE_URL` unless a custom domain is already active.
+`DEPLOYMENT_PROFILE=alpic-metadata` is mandatory and exposes only `search_documents`, `get_document_metadata`, and `list_document_files`; it does not initialize the downloader, content store, scanner, or PDF runtime. Alpic supplies `ALPIC_HOST`; the server derives `PUBLIC_BASE_URL=https://<ALPIC_HOST>` automatically, but `ALPIC_HOST` never selects a deployment profile. Do not add `PUBLIC_BASE_URL` unless a custom domain is already active.
 
-Configure the Alpic client/trusted-client policy to send the same secret in the `x-api-key` request header. The server compares that header exactly and in constant time. Do **not** enable anonymous access merely because this profile is not an OAuth protected-resource implementation. The API key is still a shared secret, not per-user OAuth; rotate it if exposed and keep Alpic's trusted-client/IP controls enabled where available. Do not treat obscurity of the generated URL as access control.
+Configure the Alpic client/trusted-client policy to send the credential for its stable principal in the `x-api-key` request header. The server compares that header exactly and in constant time and applies both per-principal and global admission ceilings. Give other callers separate registry entries; do **not** enable anonymous access merely because this profile is not an OAuth protected-resource implementation. Static keys are not per-user OAuth, so rotate an entry if exposed and keep Alpic's trusted-client/IP controls enabled where available. Do not treat obscurity of the generated URL as access control.
 
 ## What this fixes
 
@@ -49,17 +51,19 @@ Not yet production-supported on Alpic:
 - runtime-generated page or tile URLs under `/assets/`;
 - large downloads or PDF renders that can exceed the 30-second invocation limit.
 
-Use the Docker/VPS deployment in `deploy/README.md` for the complete server. A proper Alpic-native full profile would require an object store, MCP-native binary resources instead of runtime `/assets/` routes, and Tasks-based long-running PDF work.
+The Docker/VPS production deployment is also metadata-only. A future full profile requires an object store, authenticated MCP-native binary resources, and a separately deployed least-privilege worker for long-running PDF work.
 
 ## Post-deploy check
 
-After Alpic reports a successful deployment, verify the public MCP endpoint with MCP Inspector or Alpic's playground. Test `tools/list`, `search_documents`, `get_document_metadata`, and `list_document_files` before attempting the PDF tools.
+After Alpic reports a successful deployment, verify the public MCP endpoint with MCP Inspector or Alpic's playground. Test `tools/list`, `search_documents`, `get_document_metadata`, and `list_document_files`.
 
 For the bundled verifier, read the key silently into the environment so it is neither placed in process arguments nor copied into shell history:
 
 ```bash
-read -rsp 'Alpic API key: ' API_KEY
+read -rsp 'Alpic principal API key: ' API_KEY
 printf '\n'
 export API_KEY
 python scripts/verify_deploy.py --base-url "https://$ALPIC_HOST"
 ```
+
+This public check validates the `alpic-metadata` MCP catalog and does not request health or readiness endpoints. The verifier accepts `--probe-base-url` only for a loopback HTTP origin, so omit it for an external Alpic deployment and verify private probes from the application network namespace instead.

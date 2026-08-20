@@ -17,6 +17,7 @@ dependencies = [
   "click==8.3.3",
   "uvicorn==0.48.0",
   "pydantic==2.13.4",
+  "httpcore==1.0.9",
   "httpx==0.28.1",
   "beautifulsoup4==4.14.3",
   "lxml==6.1.1",

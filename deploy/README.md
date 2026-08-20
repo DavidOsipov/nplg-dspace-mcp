@@ -1,6 +1,6 @@
 # Production deployment: Docker Compose + Caddy
 
-This is the supported first deployment for the NPLG DSpace MCP. It assumes a dedicated Linux VPS, a public DNS name, Docker Engine, and Docker Compose v2. Caddy terminates TLS and forwards only to the private application container.
+This is the supported first deployment for the metadata-only NPLG DSpace MCP. It assumes a dedicated Linux VPS, a public DNS name, Docker Engine, and Docker Compose v2. Caddy terminates TLS and forwards only to the private application container.
 
 ## 1. Capacity and prerequisites
 
@@ -14,7 +14,7 @@ Recommended starting point for the default limits:
 - inbound TCP 80 and 443;
 - outbound DNS and TCP 443 to `dspace.nplg.gov.ge`.
 
-The application container is capped at 4 GiB. The compatibility PDF backend is explicitly `PDF_EXECUTOR=serialized` and requires `MAX_CONCURRENT_PDF_JOBS=1`; this is a temporary concurrency-risk reduction, not process isolation. Lower-memory hosts must also lower `MAX_PAGE_PIXELS` and `MAX_RENDER_PIXELS` rather than relying on the OOM killer. `MAX_CONCURRENT_MCP_REQUESTS` is a fail-fast, zero-queue MCP limit (default 16); `MAX_CONCURRENT_ASSET_STREAMS` separately holds permits for complete signed-file response lifecycles (default 8); and `MAX_CONCURRENT_HTTP_REQUESTS` supplies a larger Uvicorn-wide ceiling (default 128) for all HTTP work, including probes. Saturated gates return HTTP 503 rather than queueing unbounded work. `REQUEST_BODY_TIMEOUT_SECONDS` (default 10) releases an MCP permit when a client stalls while uploading JSON. These are process-capacity controls, not client-aware edge rate limits.
+The application container is capped at 4 GiB. Production accepts only `DEPLOYMENT_PROFILE=alpic-metadata`; `private-full` remains disabled until PDF/native-code work is moved behind a separately deployed least-privilege OS authority. `MAX_CONCURRENT_MCP_REQUESTS` is a fail-fast global emergency ceiling (default 16), while `MAX_CONCURRENT_MCP_REQUESTS_PER_PRINCIPAL` (default 4) prevents one configured credential from consuming every MCP permit. `MAX_CONCURRENT_HTTP_REQUESTS` supplies a larger Uvicorn-wide ceiling (default 128). Saturated gates return HTTP 503 instead of queueing unbounded work, and `REQUEST_BODY_TIMEOUT_SECONDS` (default 10) releases permits when a client stalls while uploading JSON.
 
 Create an A and/or AAAA record for the MCP hostname and point it at the VPS before starting Caddy.
 
@@ -28,6 +28,7 @@ chmod 600 .env
 
 python3 - <<'PY'
 from pathlib import Path
+import json
 import secrets
 
 path = Path('.env')
@@ -38,14 +39,17 @@ text = text.replace(
     f'ASSET_SIGNING_SECRET={secrets.token_hex(32)}',
 )
 text = text.replace(
-    'API_BEARER_TOKEN=replace-with-at-least-32-random-characters',
-    f'API_BEARER_TOKEN={secrets.token_hex(32)}',
+    'API_PRINCIPALS_JSON=[{"principal_id":"primary","bearer_token":"replace-with-at-least-32-random-characters"}]',
+    'API_PRINCIPALS_JSON=' + json.dumps(
+        [{"principal_id": "primary", "bearer_token": secrets.token_hex(32)}],
+        separators=(",", ":"),
+    ),
 )
 path.write_text(text)
 PY
 ```
 
-Review `.env`. `MCP_DOMAIN` must contain only the host name. `PUBLIC_BASE_URL` must be the matching HTTPS origin. Keep `ALLOW_ANONYMOUS=false` for Internet deployment.
+Review `.env`. `MCP_DOMAIN` must contain only the host name. `PUBLIC_BASE_URL` must be the matching HTTPS origin. Keep `DEPLOYMENT_PROFILE=alpic-metadata` and `ALLOW_ANONYMOUS=false` for this Internet deployment. Give each client or operator a distinct registry entry and credential. `private-full` and `distributed-full` fail production startup until their separate worker/storage authority boundaries are implemented.
 
 Load the values into the current shell when running verification commands:
 
@@ -55,7 +59,7 @@ set -a
 set +a
 ```
 
-Never commit `.env`, expose the bearer token in shell history, or reuse `ASSET_SIGNING_SECRET` as the bearer token.
+Never commit `.env`, expose a principal credential in shell history, share one credential across callers, or reuse `ASSET_SIGNING_SECRET` as an API credential.
 
 ## 3. Validate and start
 
@@ -80,7 +84,9 @@ python3 scripts/verify_deploy.py \
   --base-url "$PUBLIC_BASE_URL"
 ```
 
-It checks health, readiness, the sessionless MCP `2026-07-28` envelope, discovery, the exact tool catalog, cache metadata, and resources.
+It checks the sessionless MCP `2026-07-28` envelope, discovery, and the exact metadata-only tool catalog. It does not query the public probe paths because Caddy deliberately returns 404 for them. Before running it, export `API_BEARER_TOKEN` with the bearer value for one configured verification principal; this variable is a verifier input and is not present in the application container.
+
+Probe verification is opt-in and accepts only a loopback HTTP URL, for example `--probe-base-url http://127.0.0.1:8000` when the verifier runs in the application network namespace. The verifier compares canonical origins, including default ports and host case, and rejects reuse of the public `--base-url` origin. The separate private-network commands in the operations section remain the default Docker procedure.
 
 Then run a live, non-downloading NPLG smoke test:
 
@@ -90,19 +96,7 @@ python3 scripts/smoke_live.py \
   --query "ივერია"
 ```
 
-After choosing a known public and reasonably small issue, exercise download and visual rendering explicitly:
-
-```bash
-python3 scripts/smoke_live.py \
-  --base-url "$PUBLIC_BASE_URL" \
-  --handle '1234/REPLACE_ME' \
-  --query "ივერია" \
-  --download \
-  --render-page 1 \
-  --tiles
-```
-
-The second command can transfer a large PDF. Check available disk space first.
+Download, render, tile, runtime asset, and persistent-cache checks do not apply to the production metadata profile and must not be used as release evidence for it.
 
 ## 5. Connect an MCP client
 
@@ -111,10 +105,10 @@ Use:
 ```text
 Endpoint: https://mcp.your-domain.example/mcp
 Transport: Streamable HTTP
-Authorization: Bearer <API_BEARER_TOKEN>
+Authorization: Bearer <credential for this client's principal_id>
 ```
 
-The server is stateless and does not issue an `Mcp-Session-Id`. The signed `/assets/...` URLs expire according to `ASSET_TTL_SECONDS`.
+The server is stateless and does not issue an `Mcp-Session-Id`. The production metadata profile has no downloadable runtime assets.
 
 ### ChatGPT developer mode
 
@@ -126,11 +120,13 @@ Transport: Streamable HTTP
 Authentication: the supported mechanism matching your deployment
 ```
 
-Then select **Scan Tools**. The public MCP catalog is read/fetch-style with respect to the upstream NPLG archive, and render cleanup is not exposed to the model. Three tools populate the server's local cache and therefore advertise `readOnlyHint=false`; they still cannot mutate NPLG. ChatGPT Pro currently supports custom MCPs with read/fetch permissions, which is the intended deployment profile for this server.
+Then select **Scan Tools**. The public MCP catalog is read/fetch-style with respect to the upstream NPLG archive and exposes exactly search, metadata, and file inventory. It cannot mutate NPLG and does not construct the downloader, cache, scanner, or PDF runtime.
 
-This release implements a static bearer token, not an OAuth authorization server. Use `Authorization: Bearer <API_BEARER_TOKEN>` where the client can send custom headers. The OpenAI Responses API supports custom HTTP headers for remote MCP authentication, so the same deployment can be used there without changing the server.
+Before configuring ChatGPT Pro or the Responses API, verify that the selected client can send the required per-principal header; product support and authentication surfaces can change independently of this server.
 
-The ChatGPT custom-app UI may require an authentication mechanism different from a raw shared bearer token. When that happens, place a reviewed OAuth gateway in front of `/mcp` or add standards-compliant OAuth resource-server support. The gateway must validate the user/access token and inject the private upstream bearer token; it must not forward arbitrary caller-supplied authorization headers. **Do not set `ALLOW_ANONYMOUS=true` merely to make ChatGPT connect.**
+This release implements a registry of static bearer/API-key credentials bound to stable principal IDs, not an OAuth authorization server. Issue a distinct credential to each caller and revoke/rotate that registry entry if exposed. Use `Authorization: Bearer <principal credential>` where the client can send custom headers.
+
+The ChatGPT custom-app UI may require a different authentication mechanism. When that happens, place a reviewed OAuth gateway in front of `/mcp` or add standards-compliant OAuth resource-server support. The gateway must validate the user/access token and map it to a stable backend principal; it must not collapse all callers into one shared credential or forward arbitrary caller-supplied authorization headers. **Do not set `ALLOW_ANONYMOUS=true` merely to make ChatGPT connect.**
 
 ChatGPT connects to remote MCP servers. For a private VPS or on-premises deployment, use OpenAI's Secure MCP Tunnel rather than publishing an anonymous endpoint. After every incompatible tool-schema change, rescan or republish the custom app because approved tool definitions may be snapshotted by the host.
 
@@ -146,22 +142,22 @@ Apply an infrastructure egress policy that permits the application container onl
 
 Reconcile the permitted addresses when NPLG DNS changes. A provider-level firewall, host `DOCKER-USER` rules, or a dedicated network-policy layer is preferable. **Docker may bypass UFW** rules that only cover the host input/output paths; verify effective rules from inside the running container.
 
-PDF parsing occurs in the non-root application container with a read-only root filesystem, dropped capabilities, `no-new-privileges`, PID, CPU, memory, page, pixel, file-size, and concurrency limits. There is no independently verified nested process sandbox. The container/VM boundary is therefore the principal isolation boundary. For hostile-document workloads, use a dedicated VPS with no cloud credentials or sensitive mounts.
-
-This is the material residual risk: a memory-safety bug in PDFium/Pillow or a decompression-bomb class PDF may terminate the application container. Compose will restart it, but availability can still be affected.
+PDF/native-code execution is not reachable in the production metadata profile. Production `private-full` deliberately fails startup until a separately deployed, no-network, least-privilege worker and its recovery evidence exist.
 
 ## 7. Operations
 
-Health and internal metrics:
+Health, readiness, and metrics are deliberately blocked at the public Caddy edge. Query them only on the private application network:
 
 ```bash
-curl -fsS "$PUBLIC_BASE_URL/healthz"
-curl -fsS "$PUBLIC_BASE_URL/readyz"
 docker compose exec -T app python -c \
-  'import os, urllib.parse, urllib.request; h=urllib.parse.urlsplit(os.environ["PUBLIC_BASE_URL"]).netloc; r=urllib.request.Request("http://127.0.0.1:8000/metrics", headers={"Host": h, "Authorization": "Bearer " + os.environ["API_BEARER_TOKEN"]}); print(urllib.request.urlopen(r, timeout=3).read().decode()[:2000])'
+  'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8000/healthz", timeout=3).read().decode())'
+docker compose exec -T app python -c \
+  'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8000/readyz", timeout=3).read().decode())'
+docker compose exec -T app python -c \
+  'import json, os, urllib.parse, urllib.request; p=json.loads(os.environ["API_PRINCIPALS_JSON"])[0]; v=p.get("bearer_token"); h=urllib.parse.urlsplit(os.environ["PUBLIC_BASE_URL"]).netloc; headers={"Host":h, "Authorization":"Bearer "+v} if v else {"Host":h, "x-api-key":p["api_key"]}; r=urllib.request.Request("http://127.0.0.1:8000/metrics",headers=headers); print(urllib.request.urlopen(r,timeout=3).read().decode()[:2000])'
 ```
 
-Metrics are not exposed through Caddy, and the raw application route returns 404 without the configured API credential. Caddy request access logs and Uvicorn access logs are disabled deliberately because signed asset tokens are bearer capabilities embedded in `/assets/...` paths and must not be copied into routine log streams. Application and proxy process/error logs remain available. Use MCP counters plus infrastructure telemetry for monitoring; add a redacting log pipeline before enabling request logs.
+Metrics are not exposed through Caddy; probes are also private, and the raw metrics route returns 404 without a configured API credential. Caddy request access logs and Uvicorn access logs are disabled deliberately; this also prevents future signed asset tokens from entering routine log streams. Application and proxy process/error logs remain available. Use MCP counters plus infrastructure telemetry for monitoring; add a redacting log pipeline before enabling request logs.
 
 Logs and resource use:
 

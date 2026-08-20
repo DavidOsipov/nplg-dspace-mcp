@@ -7,10 +7,12 @@ import asyncio
 import base64
 import json
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, TypeVar
 from urllib.parse import urljoin
 
 import httpx
 
+from .bounded_work import DNS_WORK, PARSER_WORK, BlockingWorkCapacityError
 from .errors import AppError, ErrorCode
 from .http_types import HttpClientProtocol, HttpResponseProtocol
 from .json_types import JsonObject, dump_json, load_json_value, require_json_object
@@ -33,6 +35,9 @@ from .security import (
     validate_upstream_url,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 _RUNTIME_ANNOTATION_TYPES = (
     HttpClientProtocol,
     HttpResponseProtocol,
@@ -53,6 +58,7 @@ _HTTP_TOO_MANY_REQUESTS = 429
 _REQUEST_DEADLINE_MESSAGE = (
     "The repository request did not complete within the configured deadline."
 )
+_ParsedT = TypeVar("_ParsedT")
 
 
 def _validate_nplg_dns() -> None:
@@ -111,7 +117,14 @@ class NplgRepository:
 
     async def _ensure_dns(self) -> None:
         if self.validate_dns:
-            await asyncio.to_thread(_validate_nplg_dns)
+            try:
+                await DNS_WORK.run(_validate_nplg_dns)
+            except BlockingWorkCapacityError as exc:
+                raise AppError(
+                    ErrorCode.RATE_LIMITED,
+                    "The DNS resolver is at capacity.",
+                    http_status=503,
+                ) from exc
 
     async def _get_text(
         self,
@@ -119,15 +132,46 @@ class NplgRepository:
         *,
         params: dict[str, str | int] | None = None,
         accepted_types: tuple[str, ...],
+        deadline: float | None = None,
     ) -> tuple[str, str]:
+        effective_deadline = (
+            asyncio.get_running_loop().time() + self.total_timeout_seconds
+            if deadline is None
+            else deadline
+        )
         try:
-            async with asyncio.timeout(self.total_timeout_seconds):
+            async with asyncio.timeout_at(effective_deadline):
                 return await self._get_text_within_deadline(
                     url,
                     params=params,
                     accepted_types=accepted_types,
                 )
         except (TimeoutError, httpx.RequestError) as exc:
+            raise AppError(
+                ErrorCode.UPSTREAM_FAILURE,
+                _REQUEST_DEADLINE_MESSAGE,
+                http_status=502,
+            ) from exc
+
+    def _new_deadline(self) -> float:
+        return asyncio.get_running_loop().time() + self.total_timeout_seconds
+
+    async def _parse_within_deadline(
+        self,
+        parser: Callable[[], _ParsedT],
+        *,
+        deadline: float,
+    ) -> _ParsedT:
+        try:
+            async with asyncio.timeout_at(deadline):
+                return await PARSER_WORK.run(parser)
+        except BlockingWorkCapacityError as exc:
+            raise AppError(
+                ErrorCode.RATE_LIMITED,
+                "The metadata parser is at parser capacity.",
+                http_status=503,
+            ) from exc
+        except TimeoutError as exc:
             raise AppError(
                 ErrorCode.UPSTREAM_FAILURE,
                 _REQUEST_DEADLINE_MESSAGE,
@@ -305,6 +349,7 @@ class NplgRepository:
         cursor: str | None = None,
     ) -> SearchPage:
         """Search public NPLG records with an opaque bounded cursor."""
+        deadline = self._new_deadline()
         normalized_query = " ".join(query.split())
         if not normalized_query or len(normalized_query) > _MAX_QUERY_LENGTH:
             raise AppError(
@@ -326,38 +371,61 @@ class NplgRepository:
             url,
             params={"query": normalized_query, "rpp": page_size, "start": offset},
             accepted_types=("text/html", "application/xhtml+xml"),
+            deadline=deadline,
         )
-        page = parse_search_results(text, source_url=final_url)
+        page = await self._parse_within_deadline(
+            lambda: parse_search_results(
+                text,
+                source_url=final_url,
+                page_size=page_size,
+            ),
+            deadline=deadline,
+        )
         return page.with_cursor(
             encode_cursor(page.next_offset) if page.next_offset is not None else None
         )
 
     async def get_item(self, handle: str) -> DocumentRecord:
         """Return one validated public HTML item record."""
+        deadline = self._new_deadline()
         canonical = parse_handle_input(handle)
         url = build_item_url(canonical)
         text, final_url = await self._get_text(
-            url, accepted_types=("text/html", "application/xhtml+xml")
+            url,
+            accepted_types=("text/html", "application/xhtml+xml"),
+            deadline=deadline,
         )
-        return parse_item_page(text, expected_handle=canonical, source_url=final_url)
+        return await self._parse_within_deadline(
+            lambda: parse_item_page(
+                text,
+                expected_handle=canonical,
+                source_url=final_url,
+            ),
+            deadline=deadline,
+        )
 
     async def list_files(self, handle: str) -> tuple[Bitstream, ...]:
         """List public files discovered on a validated item page."""
         return (await self.get_item(handle)).bitstreams
 
-    async def _metadata_formats(self) -> tuple[str, ...]:
+    async def _metadata_formats(self, *, deadline: float) -> tuple[str, ...]:
         text, _ = await self._get_text(
             f"{NPLG_ORIGIN}/oai/request",
             params={"verb": "ListMetadataFormats"},
             accepted_types=("text/xml", "application/xml"),
+            deadline=deadline,
         )
-        return parse_metadata_formats(text)
+        return await self._parse_within_deadline(
+            lambda: parse_metadata_formats(text),
+            deadline=deadline,
+        )
 
     async def get_metadata(self, handle: str) -> DocumentRecord:
         """Return OAI-PMH metadata with a validated full-HTML fallback."""
+        deadline = self._new_deadline()
         canonical = parse_handle_input(handle)
         try:
-            formats = await self._metadata_formats()
+            formats = await self._metadata_formats(deadline=deadline)
             prefix = _require_metadata_prefix(formats)
             text, _ = await self._get_text(
                 f"{NPLG_ORIGIN}/oai/request",
@@ -367,18 +435,33 @@ class NplgRepository:
                     "identifier": f"oai:dspace.nplg.gov.ge:{canonical}",
                 },
                 accepted_types=("text/xml", "application/xml"),
+                deadline=deadline,
             )
-            return parse_oai_record(
-                text, expected_handle=canonical, metadata_prefix=prefix
+            return await self._parse_within_deadline(
+                lambda: parse_oai_record(
+                    text,
+                    expected_handle=canonical,
+                    metadata_prefix=prefix,
+                ),
+                deadline=deadline,
             )
         except AppError as error:
             if error.code not in {ErrorCode.UPSTREAM_FAILURE, ErrorCode.NOT_FOUND}:
                 raise
         url = build_item_url(canonical, full=True)
         text, final_url = await self._get_text(
-            url, accepted_types=("text/html", "application/xhtml+xml")
+            url,
+            accepted_types=("text/html", "application/xhtml+xml"),
+            deadline=deadline,
         )
-        return parse_item_page(text, expected_handle=canonical, source_url=final_url)
+        return await self._parse_within_deadline(
+            lambda: parse_item_page(
+                text,
+                expected_handle=canonical,
+                source_url=final_url,
+            ),
+            deadline=deadline,
+        )
 
 
 def _require_metadata_prefix(formats: tuple[str, ...]) -> str:

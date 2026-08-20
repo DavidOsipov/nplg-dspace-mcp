@@ -161,6 +161,14 @@ _GIVEN_ROW_COUNT = cast(
     given(row_count=_ROW_COUNT_STRATEGY),
 )
 
+_GIVEN_ROW_COUNT_AND_PAGE_SIZE = cast(
+    "Callable[[Callable[[int, int], None]], Callable[[], None]]",
+    given(
+        row_count=_ROW_COUNT_STRATEGY,
+        page_size=st.integers(min_value=1, max_value=_MAX_GENERATED_ROWS),
+    ),
+)
+
 
 @_GIVEN_ROW_COUNT
 def test_search_result_cardinality_is_bounded_by_generated_rows(
@@ -179,6 +187,35 @@ def test_search_result_cardinality_is_bounded_by_generated_rows(
     assert len(page.items) == row_count
     assert page.total == row_count
     assert len(page.items) <= _MAX_GENERATED_ROWS
+
+
+@_GIVEN_ROW_COUNT_AND_PAGE_SIZE
+def test_search_result_cardinality_never_exceeds_requested_page_size(
+    row_count: int,
+    page_size: int,
+) -> None:
+    rows = "".join(
+        _search_row(handle=f"1234/{index + 1}", title="Title", authors=[])
+        for index in range(row_count)
+    )
+    document = _search_document(rows=rows)
+
+    if row_count > page_size:
+        with pytest.raises(AppError) as captured:
+            _ = parse_search_results(
+                document,
+                source_url=_SEARCH_SOURCE,
+                page_size=page_size,
+            )
+        assert captured.value.code is ErrorCode.UPSTREAM_FAILURE
+        return
+
+    page = parse_search_results(
+        document,
+        source_url=_SEARCH_SOURCE,
+        page_size=page_size,
+    )
+    assert len(page.items) == row_count
 
 
 _GIVEN_PREFIXES = cast(

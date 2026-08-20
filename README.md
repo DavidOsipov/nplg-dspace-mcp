@@ -96,6 +96,7 @@ Start the local service from the synchronized environment:
 set -euo pipefail
 
 export NODE_ENV=development
+export DEPLOYMENT_PROFILE=private-full
 export ASSET_SIGNING_SECRET="$(.venv/bin/python -c 'import secrets; print(secrets.token_hex(32))')"
 export ALLOW_ANONYMOUS=true
 export PUBLIC_BASE_URL=http://127.0.0.1:8000

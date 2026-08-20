@@ -19,6 +19,8 @@ from .json_types import load_json_value, require_json_object
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+HARD_MAX_ASSET_TOKEN_TTL_SECONDS = 86_400
+
 
 @dataclass(frozen=True, slots=True)
 class AssetGrant:
@@ -112,6 +114,7 @@ def verify_asset_token(
     secret: bytes,
     token: str,
     *,
+    max_ttl_seconds: int = HARD_MAX_ASSET_TOKEN_TTL_SECONDS,
     now: datetime | None = None,
 ) -> AssetGrant:
     """Verify a token in constant time and return its validated claims."""
@@ -145,9 +148,24 @@ def verify_asset_token(
         raise AppError(
             ErrorCode.UNAUTHORIZED, "The asset token is invalid.", http_status=401
         ) from exc
+    if type(max_ttl_seconds) is not int or not (
+        1 <= max_ttl_seconds <= HARD_MAX_ASSET_TOKEN_TTL_SECONDS
+    ):
+        msg = (
+            "max_ttl_seconds must be an integer between 1 and "
+            f"{HARD_MAX_ASSET_TOKEN_TTL_SECONDS}"
+        )
+        raise ValueError(msg)
     current = now or datetime.now(UTC)
-    if int(current.astimezone(UTC).timestamp()) >= expires_at:
+    current_timestamp = int(current.astimezone(UTC).timestamp())
+    if current_timestamp >= expires_at:
         raise AppError(
             ErrorCode.UNAUTHORIZED, "The asset token has expired.", http_status=401
+        )
+    if expires_at - current_timestamp > max_ttl_seconds:
+        raise AppError(
+            ErrorCode.UNAUTHORIZED,
+            "The asset token lifetime is invalid.",
+            http_status=401,
         )
     return AssetGrant(path=path, media_type=media_type, expires_at=expires_at)

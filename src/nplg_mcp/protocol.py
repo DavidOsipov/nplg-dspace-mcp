@@ -10,10 +10,10 @@ import logging
 import math
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Never, Protocol, cast, runtime_checkable
 from urllib.parse import urlsplit
 
-from .errors import AppError, to_public_error
+from .errors import AppError, ErrorCode, to_public_error
 from .json_types import (
     JsonObject,
     JsonValue,
@@ -60,8 +60,102 @@ HEADER_MISMATCH = -32020
 UNSUPPORTED_PROTOCOL_VERSION = -32022
 _ASCII_PRINTABLE_START = 0x20
 _ASCII_PRINTABLE_END = 0x7E
+_MAX_TOOL_RESULT_BYTES = 1_048_576
+_MAX_TOOL_RESULT_DEPTH = 64
+_MAX_TOOL_RESULT_VALUES = 16_384
+_MAX_TOOL_RESULT_TEXT_CODE_POINTS = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+
+def _tool_result_limit_failure() -> AppError:
+    return AppError(
+        ErrorCode.UPSTREAM_FAILURE,
+        "The upstream-derived tool result exceeded its response limit.",
+        http_status=502,
+    )
+
+
+def _raise_invalid_tool_result(message: str) -> Never:
+    raise TypeError(message)
+
+
+def _register_tool_result_container(
+    value: object,
+    *,
+    seen_containers: set[int],
+) -> None:
+    identity = id(value)
+    if identity in seen_containers:
+        raise _tool_result_limit_failure()
+    seen_containers.add(identity)
+
+
+def _tool_result_container_children(
+    value: object,
+    *,
+    depth: int,
+    seen_containers: set[int],
+) -> tuple[list[tuple[object, int]], int] | None:
+    if isinstance(value, dict):
+        entries = cast("dict[object, object]", value)
+        _register_tool_result_container(entries, seen_containers=seen_containers)
+        children: list[tuple[object, int]] = []
+        key_code_points = 0
+        for key, child in entries.items():
+            if type(key) is not str:
+                _raise_invalid_tool_result("tool result object keys must be strings")
+            key_code_points += len(key)
+            children.append((child, depth + 1))
+        return children, key_code_points
+    if isinstance(value, list):
+        items = cast("list[object]", value)
+        _register_tool_result_container(items, seen_containers=seen_containers)
+        return [(child, depth + 1) for child in items], 0
+    return None
+
+
+def _tool_result_scalar_text_code_points(value: object) -> int:
+    if type(value) is str:
+        return len(value)
+    if (
+        value is None
+        or type(value) in {bool, int}
+        or (type(value) is float and math.isfinite(value))
+    ):
+        return 0
+    _raise_invalid_tool_result("tool result must contain only finite JSON values")
+
+
+def _bounded_tool_result_text(value: JsonObject) -> str:
+    stack: list[tuple[object, int]] = [(value, 1)]
+    seen_containers: set[int] = set()
+    value_count = 0
+    text_code_points = 0
+    while stack:
+        current, depth = stack.pop()
+        if depth > _MAX_TOOL_RESULT_DEPTH:
+            raise _tool_result_limit_failure()
+        value_count += 1
+        if value_count > _MAX_TOOL_RESULT_VALUES:
+            raise _tool_result_limit_failure()
+        container = _tool_result_container_children(
+            current,
+            depth=depth,
+            seen_containers=seen_containers,
+        )
+        if container is None:
+            text_code_points += _tool_result_scalar_text_code_points(current)
+        else:
+            children, key_code_points = container
+            text_code_points += key_code_points
+            stack.extend(children)
+        if text_code_points > _MAX_TOOL_RESULT_TEXT_CODE_POINTS:
+            raise _tool_result_limit_failure()
+    serialized = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if len(serialized.encode("utf-8")) > _MAX_TOOL_RESULT_BYTES:
+        raise _tool_result_limit_failure()
+    return serialized
 
 
 @runtime_checkable
@@ -541,13 +635,12 @@ class McpProtocol:
             raise ProtocolFailure(INVALID_PARAMS, "Unknown tool name", 400)
         try:
             structured = await self.tools.call(name, arguments)
+            serialized = _bounded_tool_result_text(structured)
             values: JsonObject = {
                 "content": [
                     {
                         "type": "text",
-                        "text": json.dumps(
-                            structured, ensure_ascii=False, sort_keys=True
-                        ),
+                        "text": serialized,
                     },
                     *self._resource_links(structured),
                 ],
@@ -561,7 +654,9 @@ class McpProtocol:
                     {
                         "type": "text",
                         "text": json.dumps(
-                            structured, ensure_ascii=False, sort_keys=True
+                            structured,
+                            ensure_ascii=False,
+                            sort_keys=True,
                         ),
                     }
                 ],

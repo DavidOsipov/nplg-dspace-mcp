@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import re
 import unicodedata
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, cast
+from html.parser import HTMLParser
+from typing import TYPE_CHECKING, cast, override
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 from bs4 import BeautifulSoup, Tag
@@ -20,6 +22,8 @@ from .security import NPLG_ORIGIN, parse_handle_input, validate_upstream_url
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from xml.etree.ElementTree import Element
+
+    from bs4.element import NavigableString
 
 _TOTAL_RE = re.compile(r"\bof\s+([\d,]+)\b", re.IGNORECASE)
 _SIZE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?B)\s*$", re.IGNORECASE)
@@ -37,6 +41,33 @@ _MIN_METADATA_CELLS = 2
 _SIZE_CELL_INDEX = 2
 _LANGUAGE_CELL_INDEX = 2
 _FORMAT_CELL_INDEX = 3
+_MAX_SEARCH_ITEMS = 50
+_MAX_HTML_ELEMENTS = 20_000
+_MAX_XML_ELEMENTS = 10_000
+_MAX_TREE_DEPTH = 128
+_MAX_AGGREGATE_TEXT_CODE_POINTS = 1_000_000
+_MAX_METADATA_FIELDS = 512
+_MAX_BITSTREAMS = 256
+_MAX_METADATA_FORMATS = 64
+_MAX_COLLECTIONS = 256
+_VOID_HTML_ELEMENTS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +194,204 @@ def _upstream_failure(
     )
 
 
+def _validate_text_budget(
+    current: int,
+    value: str | None,
+    *,
+    source_url: str | None = None,
+) -> int:
+    updated = current + (len(value) if value is not None else 0)
+    if updated > _MAX_AGGREGATE_TEXT_CODE_POINTS:
+        msg = "The repository response exceeded the aggregate text limit."
+        raise _upstream_failure(msg, source_url=source_url)
+    return updated
+
+
+class _HtmlBudgetParser(HTMLParser):
+    """Reject excessive HTML structure before a complete tree is allocated."""
+
+    def __init__(self, *, source_url: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self._elements = 0
+        self._open_elements: list[str] = []
+        self._source_url = source_url
+        self._text_code_points = 0
+
+    def _add_element(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._elements += 1
+        if self._elements > _MAX_HTML_ELEMENTS:
+            msg = "The repository response exceeded the HTML element limit."
+            raise _upstream_failure(msg, source_url=self._source_url)
+        for key, value in attrs:
+            self._text_code_points = _validate_text_budget(
+                self._text_code_points,
+                key,
+                source_url=self._source_url,
+            )
+            self._text_code_points = _validate_text_budget(
+                self._text_code_points,
+                value,
+                source_url=self._source_url,
+            )
+        if tag not in _VOID_HTML_ELEMENTS:
+            self._open_elements.append(tag)
+            if len(self._open_elements) > _MAX_TREE_DEPTH:
+                msg = "The repository response exceeded the tree depth limit."
+                raise _upstream_failure(msg, source_url=self._source_url)
+
+    @override
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        self._add_element(tag, attrs)
+
+    @override
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        del tag
+        self._elements += 1
+        if self._elements > _MAX_HTML_ELEMENTS:
+            msg = "The repository response exceeded the HTML element limit."
+            raise _upstream_failure(msg, source_url=self._source_url)
+        for key, value in attrs:
+            self._text_code_points = _validate_text_budget(
+                self._text_code_points,
+                key,
+                source_url=self._source_url,
+            )
+            self._text_code_points = _validate_text_budget(
+                self._text_code_points,
+                value,
+                source_url=self._source_url,
+            )
+
+    @override
+    def handle_endtag(self, tag: str) -> None:
+        if tag not in self._open_elements:
+            return
+        while self._open_elements[-1] != tag:
+            _ = self._open_elements.pop()
+        _ = self._open_elements.pop()
+
+    @override
+    def handle_data(self, data: str) -> None:
+        self._text_code_points = _validate_text_budget(
+            self._text_code_points,
+            data,
+            source_url=self._source_url,
+        )
+
+    @override
+    def handle_comment(self, data: str) -> None:
+        self.handle_data(data)
+
+
+def _preflight_html(html: str, *, source_url: str) -> None:
+    parser = _HtmlBudgetParser(source_url=source_url)
+    try:
+        parser.feed(html)
+        parser.close()
+    except AppError:
+        raise
+    except (AssertionError, ValueError) as exc:
+        msg = "The repository returned malformed HTML."
+        raise _upstream_failure(msg, source_url=source_url, cause=exc) from exc
+
+
+def _preflight_xml(xml: str) -> None:
+    elements = 0
+    depth = 0
+    text_code_points = 0
+    try:
+        parsed_events = cast(
+            "Iterable[tuple[str, Element]]",
+            DefusedElementTree.iterparse(
+                io.StringIO(xml),
+                events=("start", "end"),
+            ),
+        )
+        for event, current in parsed_events:
+            if event == "start":
+                depth += 1
+                elements += 1
+                if depth > _MAX_TREE_DEPTH:
+                    msg = "The repository response exceeded the tree depth limit."
+                    raise _upstream_failure(msg)
+                if elements > _MAX_XML_ELEMENTS:
+                    msg = "The repository response exceeded the XML element limit."
+                    raise _upstream_failure(msg)
+                for key, value in current.attrib.items():
+                    text_code_points = _validate_text_budget(text_code_points, key)
+                    text_code_points = _validate_text_budget(text_code_points, value)
+            else:
+                text_code_points = _validate_text_budget(
+                    text_code_points,
+                    current.text,
+                )
+                text_code_points = _validate_text_budget(
+                    text_code_points,
+                    current.tail,
+                )
+                current.clear()
+                depth -= 1
+    except AppError:
+        raise
+    except (DefusedElementTree.ParseError, ValueError) as exc:
+        msg = "The repository returned malformed OAI-PMH XML."
+        raise _upstream_failure(msg, cause=exc) from exc
+
+
+def _validate_html_tree(soup: BeautifulSoup, *, source_url: str) -> None:
+    elements = 0
+    text_code_points = 0
+    stack: list[tuple[Tag, int]] = [(soup, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > _MAX_TREE_DEPTH:
+            msg = "The repository response exceeded the tree depth limit."
+            raise _upstream_failure(msg, source_url=source_url)
+        elements += 1
+        if elements > _MAX_HTML_ELEMENTS:
+            msg = "The repository response exceeded the HTML element limit."
+            raise _upstream_failure(msg, source_url=source_url)
+        for child in current.children:
+            if isinstance(child, Tag):
+                stack.append((child, depth + 1))
+            else:
+                text = cast("NavigableString", child)
+                text_code_points = _validate_text_budget(
+                    text_code_points,
+                    str(text),
+                    source_url=source_url,
+                )
+
+
+def _validate_xml_tree(root: Element) -> None:
+    elements = 0
+    text_code_points = 0
+    stack: list[tuple[Element, int]] = [(root, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > _MAX_TREE_DEPTH:
+            msg = "The repository response exceeded the tree depth limit."
+            raise _upstream_failure(msg)
+        elements += 1
+        if elements > _MAX_XML_ELEMENTS:
+            msg = "The repository response exceeded the XML element limit."
+            raise _upstream_failure(msg)
+        text_code_points = _validate_text_budget(text_code_points, current.text)
+        text_code_points = _validate_text_budget(text_code_points, current.tail)
+        for key, value in current.attrib.items():
+            text_code_points = _validate_text_budget(text_code_points, key)
+            text_code_points = _validate_text_budget(text_code_points, value)
+        stack.extend((child, depth + 1) for child in current)
+
+
 def _tag_text(tag: Tag | None) -> str:
     return _normalize(tag.get_text(" ", strip=True)) if tag is not None else ""
 
@@ -241,10 +470,18 @@ def _search_columns(table: Tag, *, source_url: str) -> _SearchColumns:
 
 
 def _search_items(
-    table: Tag, *, columns: _SearchColumns, source_url: str
+    table: Tag,
+    *,
+    columns: _SearchColumns,
+    source_url: str,
+    maximum_items: int,
 ) -> tuple[SearchItem, ...]:
     items: list[SearchItem] = []
-    for row in table.select("tbody tr"):
+    rows = table.select("tbody tr")
+    if len(rows) > maximum_items:
+        msg = "The repository search response exceeded the search item limit."
+        raise _upstream_failure(msg, source_url=source_url)
+    for row in rows:
         cells = row.find_all("td", recursive=False)
         if columns.title >= len(cells):
             continue
@@ -347,9 +584,21 @@ def _next_search_offset(container: Tag, *, source_url: str) -> int | None:
     return parsed_offset
 
 
-def parse_search_results(html: str, *, source_url: str) -> SearchPage:
+def parse_search_results(
+    html: str,
+    *,
+    source_url: str,
+    page_size: int = _MAX_SEARCH_ITEMS,
+) -> SearchPage:
     """Parse one bounded DSpace search response into normalized records."""
+    if type(page_size) is not int or not 1 <= page_size <= _MAX_SEARCH_ITEMS:
+        raise AppError(
+            ErrorCode.INVALID_INPUT,
+            f"page_size must be between 1 and {_MAX_SEARCH_ITEMS}.",
+        )
+    _preflight_html(html, source_url=source_url)
     soup = BeautifulSoup(html, "lxml")
+    _validate_html_tree(soup, source_url=source_url)
     container = soup.find(id="aspect_discovery_SimpleSearch_div_search-results")
     if not isinstance(container, Tag):
         msg = (
@@ -369,7 +618,12 @@ def parse_search_results(html: str, *, source_url: str) -> SearchPage:
         )
 
     columns = _search_columns(table, source_url=source_url)
-    items = _search_items(table, columns=columns, source_url=source_url)
+    items = _search_items(
+        table,
+        columns=columns,
+        source_url=source_url,
+        maximum_items=page_size,
+    )
 
     return SearchPage(
         items=items,
@@ -429,6 +683,9 @@ def _parse_bitstreams(
             )
         if absolute in seen_urls:
             continue
+        if len(result) >= _MAX_BITSTREAMS:
+            msg = "The item response exceeded the bitstream limit."
+            raise _upstream_failure(msg, source_url=source_url)
         row = link.find_parent("tr")
         cells = (
             cast("list[Tag]", row.find_all("td", recursive=False))
@@ -563,6 +820,9 @@ def _summary_fields(soup: BeautifulSoup) -> tuple[RawMetadataField, ...]:
             continue
         value = _tag_text(cells[1])
         if value:
+            if len(fields) >= _MAX_METADATA_FIELDS:
+                msg = "The item response exceeded the metadata field limit."
+                raise _upstream_failure(msg)
             fields.append(RawMetadataField(key=key, value=value))
     return tuple(fields)
 
@@ -584,6 +844,9 @@ def _full_fields(soup: BeautifulSoup) -> tuple[RawMetadataField, ...]:
         )
         if not value:
             continue
+        if len(fields) >= _MAX_METADATA_FIELDS:
+            msg = "The item response exceeded the metadata field limit."
+            raise _upstream_failure(msg)
         fields.append(
             RawMetadataField(
                 key=key,
@@ -611,7 +874,11 @@ def _collections(soup: BeautifulSoup) -> tuple[str, ...]:
                 links = [_tag_text(link) for link in paragraph.find_all("a")]
                 values.extend(links or [text.split(":", 1)[1]])
                 break
-    return _unique(values)
+    collections = _unique(values)
+    if len(collections) > _MAX_COLLECTIONS:
+        msg = "The item response exceeded the collection limit."
+        raise _upstream_failure(msg)
+    return collections
 
 
 def parse_item_page(
@@ -619,7 +886,9 @@ def parse_item_page(
 ) -> DocumentRecord:
     """Parse one validated DSpace item HTML response."""
     expected = parse_handle_input(expected_handle)
+    _preflight_html(html, source_url=source_url)
     soup = BeautifulSoup(html, "lxml")
+    _validate_html_tree(soup, source_url=source_url)
     container = soup.find(id="aspect_artifactbrowser_ItemViewer_div_item-view")
     if not isinstance(container, Tag):
         msg = "The item response did not match the expected DSpace contract."
@@ -687,11 +956,14 @@ def _local_name(tag: str) -> str:
 
 
 def _parse_xml(xml: str) -> Element:
+    _preflight_xml(xml)
     try:
-        return DefusedElementTree.fromstring(xml)
+        root = DefusedElementTree.fromstring(xml)
     except (DefusedElementTree.ParseError, ValueError) as exc:
         msg = "The repository returned malformed OAI-PMH XML."
         raise _upstream_failure(msg, cause=exc) from exc
+    _validate_xml_tree(root)
+    return root
 
 
 def _first_descendant(root: Element, name: str) -> Element | None:
@@ -712,6 +984,9 @@ def parse_metadata_formats(xml: str) -> tuple[str, ...]:
         for element in root.iter()
         if _local_name(element.tag) == "metadataPrefix"
     )
+    if len(formats) > _MAX_METADATA_FORMATS:
+        msg = "The repository response exceeded the metadata format limit."
+        raise _upstream_failure(msg)
     if not formats:
         msg = "The repository returned no OAI-PMH metadata formats."
         raise _upstream_failure(msg)
@@ -754,6 +1029,9 @@ def _dim_fields(root: Element) -> tuple[RawMetadataField, ...]:
         key = f"{schema}.{field_element}" + (f".{qualifier}" if qualifier else "")
         value = _normalize(element.text or "")
         if value:
+            if len(fields) >= _MAX_METADATA_FIELDS:
+                msg = "The OAI-PMH record exceeded the metadata field limit."
+                raise _upstream_failure(msg)
             fields.append(
                 RawMetadataField(
                     key=key, value=value, language=element.attrib.get("lang")
@@ -774,6 +1052,9 @@ def _dc_fields(root: Element) -> tuple[RawMetadataField, ...]:
             continue
         value = _normalize(element.text or "")
         if value:
+            if len(fields) >= _MAX_METADATA_FIELDS:
+                msg = "The OAI-PMH record exceeded the metadata field limit."
+                raise _upstream_failure(msg)
             fields.append(
                 RawMetadataField(
                     key=f"dc.{name}",

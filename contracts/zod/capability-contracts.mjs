@@ -2,6 +2,11 @@ import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 
+/** @typedef {import("zod").JSONType} JsonValue */
+/** @typedef {{ [key: string]: JsonValue }} JsonObject */
+/** @typedef {{ name: string, value: string }} Header */
+/** @typedef {{ body_base64: string, body_sha256: string }} BodyEvidence */
+
 const MAX_EXTERNAL_TEXT_LENGTH = 4096;
 const MAX_PERSISTED_ITEMS = 64;
 const MAX_RAW_CONTRACT_BYTES = 2_097_152;
@@ -26,13 +31,24 @@ const base64Bytes = z.string()
   .max(1_048_576)
   .regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/);
 const nonEmpty = z.string().min(1).max(MAX_EXTERNAL_TEXT_LENGTH);
-const verifierToken = z.string().min(1).max(256).regex(/^[^\u0000-\u0020\u007f]+$/);
+const verifierToken = z.string().min(1).max(256).refine(
+  (value) => Array.from(value).every((character) => {
+    const codePoint = character.codePointAt(0);
+    return codePoint !== undefined && codePoint > 0x20 && codePoint !== 0x7f;
+  }),
+  "verifier token contains whitespace or control characters",
+);
 const reviewDate = z.string().regex(/^20[0-9]{2}-[0-9]{2}-[0-9]{2}$/);
 const header = z.strictObject({
   name: z.string().min(1).max(128).regex(/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/),
   value: z.string().min(1).max(4096).regex(/^[^\r\n]+$/),
 });
 
+/**
+ * @param {[string, unknown]} leftEntry
+ * @param {[string, unknown]} rightEntry
+ * @returns {number}
+ */
 function compareKeys([left], [right]) {
   if (left < right) {
     return -1;
@@ -40,6 +56,10 @@ function compareKeys([left], [right]) {
   return Number(left > right);
 }
 
+/**
+ * @param {unknown} value
+ * @returns {unknown}
+ */
 function canonicalize(value) {
   if (Array.isArray(value)) {
     return value.map(canonicalize);
@@ -54,57 +74,92 @@ function canonicalize(value) {
   return value;
 }
 
+/**
+ * @param {unknown} value
+ * @returns {string}
+ */
 function digestJson(value) {
   return createHash("sha256")
     .update(JSON.stringify(canonicalize(value)), "utf8")
     .digest("hex");
 }
 
+/**
+ * @param {unknown} left
+ * @param {unknown} right
+ * @returns {boolean}
+ */
 function sameJson(left, right) {
   return JSON.stringify(canonicalize(left)) === JSON.stringify(canonicalize(right));
 }
 
+/**
+ * @param {BodyEvidence} value
+ * @returns {boolean}
+ */
 function bodyDigestMatches(value) {
   const decoded = Buffer.from(value.body_base64, "base64");
   return decoded.toString("base64") === value.body_base64
     && createHash("sha256").update(decoded).digest("hex") === value.body_sha256;
 }
 
+/**
+ * @param {{ verdict_digest: string } & Record<string, unknown>} value
+ * @returns {boolean}
+ */
 function verdictDigestMatches(value) {
   const { verdict_digest: verdictDigest, ...payload } = value;
   return verdictDigest === digestJson(payload);
 }
 
+/**
+ * @param {string} source
+ * @returns {JsonValue}
+ */
 function parseJsonRejectingDuplicateKeys(source) {
   let offset = 0;
 
+  /**
+   * @param {string} message
+   * @returns {never}
+   */
   function fail(message) {
-    throw new SyntaxError(`${message} at byte ${Buffer.byteLength(source.slice(0, offset), "utf8")}`);
+    throw new SyntaxError(`${message} at byte ${String(Buffer.byteLength(source.slice(0, offset), "utf8"))}`);
   }
 
+  /** @returns {void} */
   function skipWhitespace() {
-    while (offset < source.length && /[\u0009\u000a\u000d\u0020]/.test(source[offset])) {
+    while (offset < source.length) {
+      const codePoint = source.charCodeAt(offset);
+      if (codePoint !== 0x09 && codePoint !== 0x0a && codePoint !== 0x0d && codePoint !== 0x20) {
+        break;
+      }
       offset += 1;
     }
   }
 
+  /** @returns {string} */
   function parseString() {
-    if (source[offset] !== '"') {
+    if (source.charAt(offset) !== '"') {
       fail("expected JSON string");
     }
     const start = offset;
     offset += 1;
     while (offset < source.length) {
-      const character = source[offset];
+      const character = source.charAt(offset);
       offset += 1;
       if (character === '"') {
-        return JSON.parse(source.slice(start, offset));
+        const parsed = /** @type {unknown} */ (JSON.parse(source.slice(start, offset)));
+        if (typeof parsed !== "string") {
+          fail("JSON string token decoded to a non-string value");
+        }
+        return parsed;
       }
       if (character === "\\") {
         if (offset >= source.length) {
           fail("unterminated JSON escape");
         }
-        const escape = source[offset];
+        const escape = source.charAt(offset);
         offset += 1;
         if (escape === "u") {
           const codePoint = source.slice(offset, offset + 4);
@@ -122,6 +177,7 @@ function parseJsonRejectingDuplicateKeys(source) {
     fail("unterminated JSON string");
   }
 
+  /** @returns {number} */
   function parseNumber() {
     const match = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/.exec(
       source.slice(offset),
@@ -133,22 +189,24 @@ function parseJsonRejectingDuplicateKeys(source) {
     return Number(match[0]);
   }
 
+  /** @returns {JsonValue[]} */
   function parseArray() {
+    /** @type {JsonValue[]} */
     const result = [];
     offset += 1;
     skipWhitespace();
-    if (source[offset] === "]") {
+    if (source.charAt(offset) === "]") {
       offset += 1;
       return result;
     }
     while (offset < source.length) {
       result.push(parseValue());
       skipWhitespace();
-      if (source[offset] === "]") {
+      if (source.charAt(offset) === "]") {
         offset += 1;
         return result;
       }
-      if (source[offset] !== ",") {
+      if (source.charAt(offset) !== ",") {
         fail("expected JSON array separator");
       }
       offset += 1;
@@ -157,12 +215,14 @@ function parseJsonRejectingDuplicateKeys(source) {
     fail("unterminated JSON array");
   }
 
+  /** @returns {JsonObject} */
   function parseObject() {
+    /** @type {JsonObject} */
     const result = {};
     const keys = new Set();
     offset += 1;
     skipWhitespace();
-    if (source[offset] === "}") {
+    if (source.charAt(offset) === "}") {
       offset += 1;
       return result;
     }
@@ -173,17 +233,17 @@ function parseJsonRejectingDuplicateKeys(source) {
       }
       keys.add(key);
       skipWhitespace();
-      if (source[offset] !== ":") {
+      if (source.charAt(offset) !== ":") {
         fail("expected JSON object colon");
       }
       offset += 1;
       result[key] = parseValue();
       skipWhitespace();
-      if (source[offset] === "}") {
+      if (source.charAt(offset) === "}") {
         offset += 1;
         return result;
       }
-      if (source[offset] !== ",") {
+      if (source.charAt(offset) !== ",") {
         fail("expected JSON object separator");
       }
       offset += 1;
@@ -192,9 +252,10 @@ function parseJsonRejectingDuplicateKeys(source) {
     fail("unterminated JSON object");
   }
 
+  /** @returns {JsonValue} */
   function parseValue() {
     skipWhitespace();
-    const character = source[offset];
+    const character = source.charAt(offset);
     if (character === '"') {
       return parseString();
     }
@@ -204,7 +265,9 @@ function parseJsonRejectingDuplicateKeys(source) {
     if (character === "[") {
       return parseArray();
     }
-    for (const [literal, value] of [["true", true], ["false", false], ["null", null]]) {
+    /** @type {readonly (readonly [string, JsonValue])[]} */
+    const literals = [["true", true], ["false", false], ["null", null]];
+    for (const [literal, value] of literals) {
       if (source.startsWith(literal, offset)) {
         offset += literal.length;
         return value;
@@ -221,6 +284,12 @@ function parseJsonRejectingDuplicateKeys(source) {
   return result;
 }
 
+/**
+ * @template T
+ * @param {unknown} raw
+ * @param {import("zod").ZodType<T>} schema
+ * @returns {T}
+ */
 export function parseCanonicalCapabilityContract(raw, schema) {
   if (typeof raw !== "string") {
     throw new TypeError("capability contract must be supplied as UTF-8 text");
@@ -284,6 +353,12 @@ const sdkHttpObservation = z.strictObject({
   }
 });
 
+/** @typedef {z.infer<typeof rawHttpRequest>} RawHttpRequest */
+/** @typedef {z.infer<typeof rawHttpResponse>} RawHttpResponse */
+/** @typedef {z.infer<typeof sdkHttpObservation>} SdkHttpObservation */
+/** @typedef {z.infer<typeof sdkCaseId>} SdkCaseId */
+/** @typedef {readonly [SdkCaseId, string, readonly string[], readonly string[]]} ExpectedSdkCase */
+
 const scopeChallenge = z.strictObject({
   status_code: z.literal(403),
   header_value: z.literal(INSUFFICIENT_SCOPE_CHALLENGE),
@@ -291,6 +366,10 @@ const scopeChallenge = z.strictObject({
   advertised_scope: z.null(),
 });
 
+/**
+ * @param {Buffer} body
+ * @returns {BodyEvidence}
+ */
 function bodyEvidence(body) {
   return {
     body_base64: body.toString("base64"),
@@ -298,6 +377,10 @@ function bodyEvidence(body) {
   };
 }
 
+/**
+ * @param {string} toolName
+ * @returns {Buffer}
+ */
 function toolBody(toolName) {
   return Buffer.from(JSON.stringify(canonicalize({
     jsonrpc: "2.0",
@@ -314,6 +397,11 @@ function toolBody(toolName) {
   })), "utf8");
 }
 
+/**
+ * @param {Buffer} body
+ * @param {Header[]} extraHeaders
+ * @returns {RawHttpRequest}
+ */
 function expectedRequest(body, extraHeaders) {
   return {
     method: "POST",
@@ -330,6 +418,11 @@ function expectedRequest(body, extraHeaders) {
   };
 }
 
+/**
+ * @param {string} toolName
+ * @param {readonly string[]} authorization
+ * @returns {RawHttpRequest}
+ */
 function expectedToolRequest(toolName, authorization) {
   const body = toolBody(toolName);
   return expectedRequest(body, [
@@ -342,6 +435,7 @@ function expectedToolRequest(toolName, authorization) {
   ]);
 }
 
+/** @returns {RawHttpRequest} */
 function expectedInitializeRequest() {
   const body = Buffer.from('{"id":1,"jsonrpc":"2.0","method":"initialize","params":{}}', "utf8");
   return expectedRequest(body, [
@@ -350,6 +444,13 @@ function expectedInitializeRequest() {
   ]);
 }
 
+/**
+ * @param {number} statusCode
+ * @param {string} error
+ * @param {string} description
+ * @param {string} challenge
+ * @returns {RawHttpResponse}
+ */
 function expectedErrorResponse(statusCode, error, description, challenge) {
   const body = Buffer.from(`{"error": "${error}", "error_description": "${description}"}`, "utf8");
   return {
@@ -363,6 +464,7 @@ function expectedErrorResponse(statusCode, error, description, challenge) {
   };
 }
 
+/** @returns {RawHttpResponse} */
 function expectedDispatchResponse() {
   const body = Buffer.from(
     '{"jsonrpc":"2.0","id":1,"result":{"content":[{"text":"fixture-dispatched","type":"text"}],"isError":false,"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"nplg-capability-probe","version":""}}}}',
@@ -378,27 +480,42 @@ function expectedDispatchResponse() {
   };
 }
 
+/**
+ * @param {readonly Header[]} headers
+ * @param {string} name
+ * @returns {string[]}
+ */
 function headerValues(headers, name) {
   return headers
     .filter(({ name: candidate }) => candidate.toLowerCase() === name)
     .map(({ value }) => value);
 }
 
+/**
+ * @param {string} value
+ * @returns {Record<string, string>}
+ */
 function parseBearerChallenge(value) {
   if (!value.startsWith("Bearer ")) {
     throw new Error("challenge is not Bearer");
   }
   const source = value.slice("Bearer ".length);
   const pattern = /([A-Za-z][A-Za-z0-9_-]{0,63})="([^"\\\r\n]*)"/y;
+  /** @type {Record<string, string>} */
   const result = {};
   let offset = 0;
   while (offset < source.length) {
     pattern.lastIndex = offset;
     const match = pattern.exec(source);
-    if (match === null || Object.hasOwn(result, match[1])) {
+    if (match === null) {
       throw new Error("malformed Bearer challenge");
     }
-    result[match[1]] = match[2];
+    const key = match[1];
+    const item = match[2];
+    if (key === undefined || item === undefined || Object.hasOwn(result, key)) {
+      throw new Error("malformed Bearer challenge");
+    }
+    result[key] = item;
     offset = pattern.lastIndex;
     if (offset === source.length) {
       break;
@@ -414,6 +531,11 @@ function parseBearerChallenge(value) {
   return result;
 }
 
+/**
+ * @param {string} value
+ * @param {Record<string, string>} expected
+ * @returns {boolean}
+ */
 function bearerChallengeMatches(value, expected) {
   try {
     return sameJson(parseBearerChallenge(value), expected);
@@ -461,6 +583,7 @@ export const sdkAuthorizationCapabilitySchema = z.strictObject({
   reviewed_date: z.literal(REVIEWED_DATE),
   verdict_digest: sha256,
 }).superRefine((value, context) => {
+  /** @type {readonly SdkHttpObservation[]} */
   const observations = [
     value.missing_authorization_observation,
     value.basic_authorization_observation,
@@ -471,6 +594,7 @@ export const sdkAuthorizationCapabilitySchema = z.strictObject({
     value.sufficient_scope_control,
     value.duplicate_authorization_observation,
   ];
+  /** @type {readonly ExpectedSdkCase[]} */
   const expectedCases = [
     ["authorization.missing", "search_documents", [], []],
     ["authorization.basic", "search_documents", ["Basic Zml4dHVyZTphdXRo"], []],
@@ -483,6 +607,10 @@ export const sdkAuthorizationCapabilitySchema = z.strictObject({
   ];
   expectedCases.forEach(([caseId, toolName, authorization, verifierTokens], index) => {
     const observation = observations[index];
+    if (observation === undefined) {
+      context.addIssue({ code: "custom", path: ["missing_authorization_observation"], message: "closed SDK request/verifier matrix mismatch" });
+      return;
+    }
     if (
       observation.case_id !== caseId
       || !sameJson(observation.request, expectedToolRequest(toolName, authorization))
@@ -493,19 +621,26 @@ export const sdkAuthorizationCapabilitySchema = z.strictObject({
   });
   const unauthorized = expectedErrorResponse(401, "invalid_token", "Authentication required", INVALID_TOKEN_CHALLENGE);
   const insufficient = expectedErrorResponse(403, "insufficient_scope", "Required scope: nplg:search", INSUFFICIENT_SCOPE_CHALLENGE);
+  const sufficientControl = observations[6];
+  const duplicateAuthorization = observations[7];
+  const weakScopeObservation = observations[4];
   if (
-    observations.slice(0, 4).some(({ response, downstream_dispatch_count: count }) => !sameJson(response, unauthorized) || count !== 0)
+    sufficientControl === undefined
+    || duplicateAuthorization === undefined
+    || weakScopeObservation === undefined
+    || observations.slice(0, 4).some(({ response, downstream_dispatch_count: count }) => !sameJson(response, unauthorized) || count !== 0)
     || observations.slice(4, 6).some(({ response, downstream_dispatch_count: count }) => !sameJson(response, insufficient) || count !== 0)
-    || !sameJson(observations[6].response, expectedDispatchResponse())
-    || observations[6].downstream_dispatch_count !== 1
-    || !sameJson(observations[7].response, insufficient)
-    || observations[7].downstream_dispatch_count !== 0
-    || !sameJson(headerValues(observations[7].request.headers, "authorization"), ["Bearer weak-fixture-token", "Bearer strong-fixture-token"])
+    || !sameJson(sufficientControl.response, expectedDispatchResponse())
+    || sufficientControl.downstream_dispatch_count !== 1
+    || !sameJson(duplicateAuthorization.response, insufficient)
+    || duplicateAuthorization.downstream_dispatch_count !== 0
+    || !sameJson(headerValues(duplicateAuthorization.request.headers, "authorization"), ["Bearer weak-fixture-token", "Bearer strong-fixture-token"])
   ) {
     context.addIssue({ code: "custom", path: ["weak_scope_observation"], message: "closed SDK response/dispatch matrix mismatch" });
   }
   if (
-    !sameJson(headerValues(observations[4].response.headers, "www-authenticate"), [value.scope_challenge.header_value])
+    weakScopeObservation === undefined
+    || !sameJson(headerValues(weakScopeObservation.response.headers, "www-authenticate"), [value.scope_challenge.header_value])
     || !bearerChallengeMatches(value.scope_challenge.header_value, {
       error: "insufficient_scope",
       error_description: "Required scope: nplg:search",
@@ -604,9 +739,11 @@ export const alpicOAuthDiscoveryCapabilitySchema = z.strictObject({
     context.addIssue({ code: "custom", path: ["local_sdk_observation"], message: "closed local SDK observation mismatch" });
   }
   const challenges = headerValues(local.response.headers, "www-authenticate");
+  const challenge = challenges[0];
   if (
     !sameJson(challenges, [INVALID_TOKEN_CHALLENGE])
-    || !bearerChallengeMatches(challenges[0], {
+    || challenge === undefined
+    || !bearerChallengeMatches(challenge, {
       error: "invalid_token",
       error_description: "Authentication required",
       resource_metadata: value.route_bindings.challenge_resource_metadata,

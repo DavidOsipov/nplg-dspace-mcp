@@ -101,10 +101,12 @@ class SmokeArguments:
 
 
 def _parser(environ: Mapping[str, str]) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     _ = parser.add_argument("--base-url", required=True)
-    _ = parser.add_argument("--token", default=environ.get("API_BEARER_TOKEN"))
-    _ = parser.add_argument("--api-key", default=environ.get("API_KEY"))
+    parser.set_defaults(
+        token=environ.get("API_BEARER_TOKEN"),
+        api_key=environ.get("API_KEY"),
+    )
     _ = parser.add_argument("--query", default="ივერია")
     _ = parser.add_argument("--scope-handle")
     _ = parser.add_argument(
@@ -172,6 +174,14 @@ def _arguments_from_values(values: Mapping[str, object]) -> SmokeArguments:
 def _parse_args(
     argv: Sequence[str], dependencies: CliDependencies
 ) -> SmokeArguments | int:
+    if any(
+        argument.partition("=")[0].startswith(("--tok", "--api")) for argument in argv
+    ):
+        return _write_failure(
+            dependencies,
+            "credentials must be supplied through environment variables",
+            exit_code=2,
+        )
     try:
         with (
             redirect_stdout(dependencies.stdout),

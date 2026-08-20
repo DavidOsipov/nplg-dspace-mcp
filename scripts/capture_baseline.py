@@ -10,7 +10,7 @@ import stat
 import sys
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Final, Literal, cast
 
 if __name__ == "__main__" and not __package__:
     script_package_root = Path(__file__).resolve().parents[1]
@@ -69,6 +69,30 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 BASELINE_DIR = Path("contracts/baseline")
+BASELINE_FAILURE_STATUS: Final = 2
+COMMITTED_MANIFEST_SCHEMA_VERSION: Final = 4
+SINGLE_PARENT_RECORD_FIELDS: Final = 2
+HISTORICAL_MANIFEST_FILE: Literal["historical-manifest-v3.json"] = (
+    "historical-manifest-v3.json"
+)
+COMMITTED_BASELINE_DIRECTORY_FILES = (
+    *BASELINE_FILES,
+    HISTORICAL_MANIFEST_FILE,
+    BASELINE_MANIFEST_FILE,
+)
+MANIFEST_REPOSITORY_PATH: Literal["contracts/baseline/manifest.json"] = (
+    "contracts/baseline/manifest.json"
+)
+HISTORICAL_MANIFEST_REPOSITORY_PATH: Literal[
+    "contracts/baseline/historical-manifest-v3.json"
+] = "contracts/baseline/historical-manifest-v3.json"
+ATTESTATION_PATHS: tuple[
+    Literal["contracts/baseline/manifest.json"],
+    Literal["contracts/baseline/historical-manifest-v3.json"],
+] = (
+    MANIFEST_REPOSITORY_PATH,
+    HISTORICAL_MANIFEST_REPOSITORY_PATH,
+)
 RESPONSE_NUMBER_CANONICALIZATION: Literal["nplg-response-semantic-numbers-v1"] = (
     "nplg-response-semantic-numbers-v1"
 )
@@ -145,6 +169,45 @@ class BaselineManifest(_BaselineModel):
     release_blockers: Annotated[
         tuple[Literal["BASELINE_CAPTURE_NOT_COMMIT_REACHABLE"], ...],
         Field(min_length=1, max_length=1),
+    ]
+
+
+class HistoricalManifestIdentity(_BaselineModel):
+    """Digest identity for the archived one-time recovery manifest."""
+
+    path: Literal["historical-manifest-v3.json"]
+    schema_version: Literal[3]
+    sha256: HexDigest
+
+
+class AttestationPolicy(_BaselineModel):
+    """Closed rule for the commit that attests the clean candidate."""
+
+    scheme: Literal["current-head-single-parent-manifest-delta-v1"]
+    allowed_paths: tuple[
+        Literal["contracts/baseline/manifest.json"],
+        Literal["contracts/baseline/historical-manifest-v3.json"],
+    ]
+
+
+class CommittedBaselineManifest(_BaselineModel):
+    """Small digest manifest for a clean committed candidate."""
+
+    schema_version: Literal[4]
+    capture_mode: Literal["committed-candidate-attestation"]
+    candidate: GitSourceIdentity
+    historical_provenance: HistoricalManifestIdentity
+    attestation: AttestationPolicy
+    canonicalization: Literal["nplg-json-sort-utf8-lf-v1"]
+    response_canonicalization: Literal["nplg-response-semantic-numbers-v1"]
+    entries: Annotated[tuple[BaselineEntry, ...], Field(min_length=4, max_length=4)]
+    required_tool_names: Annotated[
+        tuple[CaseId, ...],
+        Field(min_length=8, max_length=8),
+    ]
+    required_case_ids: Annotated[
+        tuple[CaseId, ...],
+        Field(min_length=1, max_length=512),
     ]
 
 
@@ -252,6 +315,350 @@ def validate_baseline_directory(root: Path) -> BaselineManifest:
         msg = "baseline case inventory does not match the manifest"
         raise BaselineCaptureError(msg)
     _validate_manifest_digests(root, manifest)
+    return manifest
+
+
+def _load_committed_manifest(root: Path) -> CommittedBaselineManifest:
+    manifest_value = load_canonical_json(root / BASELINE_MANIFEST_FILE)
+    try:
+        return CommittedBaselineManifest.model_validate_json(
+            canonical_json_bytes(manifest_value),
+            strict=True,
+        )
+    except ValidationError as exc:
+        msg = "baseline manifest does not satisfy the closed v4 schema"
+        raise BaselineCaptureError(msg) from exc
+
+
+def _load_historical_manifest(root: Path) -> BaselineManifest:
+    manifest_value = load_canonical_json(root / HISTORICAL_MANIFEST_FILE)
+    try:
+        return BaselineManifest.model_validate_json(
+            canonical_json_bytes(manifest_value),
+            strict=True,
+        )
+    except ValidationError as exc:
+        msg = "historical baseline manifest does not satisfy the closed v3 schema"
+        raise BaselineCaptureError(msg) from exc
+
+
+def _validate_historical_bundle(
+    root: Path,
+    loaded: Mapping[BaselineFileName, Mapping[str, object]],
+) -> tuple[BaselineManifest, set[str]]:
+    historical = _load_historical_manifest(root)
+    _validate_manifest_input(historical)
+    _validate_manifest_allocation(historical, loaded)
+    captured_case_ids = _captured_case_ids(loaded)
+    if captured_case_ids != set(historical.required_case_ids):
+        msg = "historical baseline case inventory does not match the manifest"
+        raise BaselineCaptureError(msg)
+    _validate_manifest_digests(root, historical)
+    return historical, captured_case_ids
+
+
+def _validate_committed_allocation(
+    manifest: CommittedBaselineManifest,
+    historical: BaselineManifest,
+    captured_case_ids: set[str],
+) -> None:
+    entry_paths = tuple(entry.path for entry in manifest.entries)
+    if entry_paths != BASELINE_FILES or len(set(entry_paths)) != len(entry_paths):
+        msg = "committed baseline entries must name the four fixtures exactly once"
+        raise BaselineCaptureError(msg)
+    if manifest.required_tool_names != tuple(sorted(EXPECTED_TOOL_NAMES)):
+        msg = "committed baseline tool inventory is incomplete or reordered"
+        raise BaselineCaptureError(msg)
+    if manifest.required_case_ids != tuple(sorted(captured_case_ids)):
+        msg = "committed baseline case inventory does not match the fixtures"
+        raise BaselineCaptureError(msg)
+    if manifest.required_case_ids != historical.required_case_ids:
+        msg = "committed and historical baseline case inventories differ"
+        raise BaselineCaptureError(msg)
+    if manifest.attestation.allowed_paths != ATTESTATION_PATHS:
+        msg = "committed baseline attestation paths are incomplete or reordered"
+        raise BaselineCaptureError(msg)
+
+
+def validate_committed_baseline_directory(root: Path) -> CommittedBaselineManifest:
+    """Validate the closed v4 digest bundle without consulting Git."""
+    root_stat = root.lstat()
+    if not stat.S_ISDIR(root_stat.st_mode):
+        msg = f"baseline root must be a directory, not a link or special file: {root}"
+        raise BaselineCaptureError(msg)
+    actual_names = tuple(sorted(entry.name for entry in root.iterdir()))
+    expected_names = tuple(sorted(COMMITTED_BASELINE_DIRECTORY_FILES))
+    if actual_names != expected_names:
+        msg = "committed baseline directory has an unknown or missing file"
+        raise BaselineCaptureError(msg)
+    loaded = _load_baseline_files(root)
+    historical, captured_case_ids = _validate_historical_bundle(root, loaded)
+    manifest = _load_committed_manifest(root)
+    _validate_committed_allocation(manifest, historical, captured_case_ids)
+    historical_raw = read_regular_bytes(root / HISTORICAL_MANIFEST_FILE)
+    if hashlib.sha256(historical_raw).hexdigest() != (
+        manifest.historical_provenance.sha256
+    ):
+        msg = "historical baseline manifest digest mismatch"
+        raise BaselineCaptureError(msg)
+    for entry in manifest.entries:
+        digest = hashlib.sha256(read_regular_bytes(root / entry.path)).hexdigest()
+        if digest != entry.sha256:
+            msg = f"committed baseline fixture digest mismatch: {entry.path}"
+            raise BaselineCaptureError(msg)
+    return manifest
+
+
+def _require_repository(repository: Path) -> Path:
+    absolute = repository.absolute()
+    repository_stat = absolute.lstat()
+    if not stat.S_ISDIR(repository_stat.st_mode) or absolute.resolve() != absolute:
+        msg = "baseline repository must be an absolute non-symlink directory"
+        raise BaselineCaptureError(msg)
+    return absolute
+
+
+def _git_source_identity(repository: Path, commit_spec: str) -> GitSourceIdentity:
+    try:
+        return GitSourceIdentity(
+            commit=baseline_capture_io.git_text(
+                repository,
+                "rev-parse",
+                "--verify",
+                f"{commit_spec}^{{commit}}",
+            ),
+            tree=baseline_capture_io.git_text(
+                repository,
+                "rev-parse",
+                "--verify",
+                f"{commit_spec}^{{tree}}",
+            ),
+            src_tree=baseline_capture_io.git_text(
+                repository,
+                "rev-parse",
+                "--verify",
+                f"{commit_spec}:src",
+            ),
+        )
+    except ValidationError as exc:
+        msg = "Git returned a malformed committed baseline identity"
+        raise BaselineCaptureError(msg) from exc
+
+
+def _require_clean_worktree(repository: Path, *, context: str) -> None:
+    status = baseline_capture_io.git_bytes(
+        repository,
+        ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+    )
+    if status:
+        msg = f"{context} worktree must be clean"
+        raise BaselineCaptureError(msg)
+
+
+def _build_committed_manifest_bytes(
+    root: Path,
+    *,
+    candidate: GitSourceIdentity,
+    historical_raw: bytes,
+    historical: BaselineManifest,
+) -> bytes:
+    manifest = CommittedBaselineManifest(
+        schema_version=COMMITTED_MANIFEST_SCHEMA_VERSION,
+        capture_mode="committed-candidate-attestation",
+        candidate=candidate,
+        historical_provenance=HistoricalManifestIdentity(
+            path=HISTORICAL_MANIFEST_FILE,
+            schema_version=3,
+            sha256=hashlib.sha256(historical_raw).hexdigest(),
+        ),
+        attestation=AttestationPolicy(
+            scheme="current-head-single-parent-manifest-delta-v1",
+            allowed_paths=ATTESTATION_PATHS,
+        ),
+        canonicalization="nplg-json-sort-utf8-lf-v1",
+        response_canonicalization=RESPONSE_NUMBER_CANONICALIZATION,
+        entries=tuple(
+            BaselineEntry(
+                path=name,
+                sha256=hashlib.sha256(read_regular_bytes(root / name)).hexdigest(),
+            )
+            for name in BASELINE_FILES
+        ),
+        required_tool_names=historical.required_tool_names,
+        required_case_ids=historical.required_case_ids,
+    )
+    return canonical_json_bytes(cast("object", manifest.model_dump(mode="json")))
+
+
+def _publish_committed_manifests(
+    root: Path,
+    *,
+    historical_raw: bytes,
+    manifest_raw: bytes,
+) -> None:
+    """Publish only provenance files; never rewrite behavior fixtures."""
+    manifest_path = root / BASELINE_MANIFEST_FILE
+    historical_path = root / HISTORICAL_MANIFEST_FILE
+    manifest_state = manifest_path.lstat()
+    if not stat.S_ISREG(manifest_state.st_mode):
+        msg = "baseline manifest must be a regular file"
+        raise BaselineCaptureError(msg)
+    if historical_path.exists() or historical_path.is_symlink():
+        msg = "historical baseline manifest already exists"
+        raise BaselineCaptureError(msg)
+    with tempfile.TemporaryDirectory(
+        prefix=".baseline-attestation-",
+        dir=root.parent,
+    ) as temporary:
+        transaction = Path(temporary)
+        staged_historical = transaction / HISTORICAL_MANIFEST_FILE
+        staged_manifest = transaction / BASELINE_MANIFEST_FILE
+        backup_manifest = transaction / "manifest-v3.backup"
+        write_staged_file(staged_historical, historical_raw)
+        write_staged_file(staged_manifest, manifest_raw)
+        write_staged_file(backup_manifest, historical_raw)
+
+        validation = transaction / "validation"
+        validation.mkdir(mode=0o700)
+        for name in BASELINE_FILES:
+            write_staged_file(validation / name, read_regular_bytes(root / name))
+        write_staged_file(validation / HISTORICAL_MANIFEST_FILE, historical_raw)
+        write_staged_file(validation / BASELINE_MANIFEST_FILE, manifest_raw)
+        _ = validate_committed_baseline_directory(validation)
+
+        historical_published = False
+        manifest_published = False
+        try:
+            replace_path(staged_historical, historical_path)
+            historical_published = True
+            current = manifest_path.lstat()
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_dev != manifest_state.st_dev
+                or current.st_ino != manifest_state.st_ino
+            ):
+                msg = "baseline manifest changed during attestation publication"
+                raise BaselineCaptureError(msg)
+            replace_path(staged_manifest, manifest_path)
+            manifest_published = True
+            _ = validate_committed_baseline_directory(root)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            try:
+                if manifest_published:
+                    replace_path(backup_manifest, manifest_path)
+                if historical_published:
+                    historical_path.unlink()
+            except OSError as rollback_exc:
+                msg = "baseline attestation publication rollback failed"
+                raise BaselineCaptureError(msg) from rollback_exc
+            if isinstance(exc, BaselineCaptureError):
+                raise
+            msg = "baseline attestation publication failed"
+            raise BaselineCaptureError(msg) from exc
+
+
+def write_committed_candidate_manifest(repository: Path) -> None:
+    """Migrate a clean committed v3 candidate to an unattested v4 manifest."""
+    repository = _require_repository(repository)
+    _require_clean_worktree(repository, context="candidate")
+    baseline_root = repository / BASELINE_DIR
+    historical = validate_baseline_directory(baseline_root)
+    historical_raw = read_regular_bytes(baseline_root / BASELINE_MANIFEST_FILE)
+    candidate = _git_source_identity(repository, "HEAD")
+    manifest_raw = _build_committed_manifest_bytes(
+        baseline_root,
+        candidate=candidate,
+        historical_raw=historical_raw,
+        historical=historical,
+    )
+    if _git_source_identity(repository, "HEAD") != candidate:
+        msg = "candidate commit changed during baseline migration"
+        raise BaselineCaptureError(msg)
+    _require_clean_worktree(repository, context="candidate")
+    _publish_committed_manifests(
+        baseline_root,
+        historical_raw=historical_raw,
+        manifest_raw=manifest_raw,
+    )
+
+
+def _attestation_delta(repository: Path, candidate: str, head: str) -> tuple[str, ...]:
+    raw = baseline_capture_io.git_bytes(
+        repository,
+        (
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-z",
+            "-r",
+            candidate,
+            head,
+            "--",
+        ),
+    )
+    if not raw or not raw.endswith(b"\0"):
+        msg = "baseline attestation commit has a malformed or empty delta"
+        raise BaselineCaptureError(msg)
+    try:
+        encoded_paths = raw[:-1].split(b"\0")
+        paths = tuple(part.decode("utf-8", errors="strict") for part in encoded_paths)
+    except UnicodeDecodeError as exc:
+        msg = "baseline attestation commit contains a non-UTF-8 path"
+        raise BaselineCaptureError(msg) from exc
+    return paths
+
+
+def verify_committed_candidate_attestation(
+    repository: Path,
+) -> CommittedBaselineManifest:
+    """Verify that HEAD only attests the exact clean candidate named by v4."""
+    repository = _require_repository(repository)
+    baseline_root = repository / BASELINE_DIR
+    active_value = require_string_object(
+        load_canonical_json(baseline_root / BASELINE_MANIFEST_FILE),
+        context="baseline manifest",
+    )
+    if active_value.get("schema_version") != COMMITTED_MANIFEST_SCHEMA_VERSION:
+        msg = "committed baseline attestation required"
+        raise BaselineCaptureError(msg)
+    manifest = validate_committed_baseline_directory(baseline_root)
+    _require_clean_worktree(repository, context="attestation")
+    head = _git_source_identity(repository, "HEAD")
+    parent_record = baseline_capture_io.git_text(
+        repository,
+        "rev-list",
+        "--parents",
+        "-n",
+        "1",
+        "HEAD",
+    ).split()
+    if (
+        len(parent_record) != SINGLE_PARENT_RECORD_FIELDS
+        or parent_record[0] != head.commit
+    ):
+        msg = "baseline attestation must be the current single-parent commit"
+        raise BaselineCaptureError(msg)
+    if parent_record[1] != manifest.candidate.commit:
+        msg = "baseline attestation parent does not match the committed candidate"
+        raise BaselineCaptureError(msg)
+    candidate_identity = _git_source_identity(
+        repository,
+        manifest.candidate.commit,
+    )
+    if candidate_identity != manifest.candidate:
+        msg = "committed baseline candidate identity does not match Git"
+        raise BaselineCaptureError(msg)
+    paths = _attestation_delta(repository, manifest.candidate.commit, head.commit)
+    if MANIFEST_REPOSITORY_PATH not in paths:
+        msg = "baseline attestation commit does not update the active manifest"
+        raise BaselineCaptureError(msg)
+    if len(set(paths)) != len(paths) or not set(paths).issubset(ATTESTATION_PATHS):
+        msg = "attestation commit changes an unauthorized path"
+        raise BaselineCaptureError(msg)
+    if _git_source_identity(repository, "HEAD") != head:
+        msg = "baseline attestation commit changed during verification"
+        raise BaselineCaptureError(msg)
+    _require_clean_worktree(repository, context="attestation")
     return manifest
 
 
@@ -447,10 +854,12 @@ def _argument_parser() -> argparse.ArgumentParser:
     _ = mode.add_argument(
         "--check",
         action="store_true",
-        help="verify exact fixture bytes",
+        help="verify the committed candidate attestation and fixture digests",
     )
     _ = mode.add_argument(
-        "--write", action="store_true", help="publish regenerated fixtures"
+        "--write",
+        action="store_true",
+        help="migrate a clean committed v3 candidate to an unattested v4 manifest",
     )
     return parser
 
@@ -465,14 +874,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = cast("_Arguments", _argument_parser().parse_args(argv))
     try:
         repository = Path(__file__).resolve().parents[1]
-        run_capture_mode(
-            repository,
-            policy=DEFAULT_CAPTURE_POLICY,
-            write=arguments.write,
-        )
+        if arguments.write:
+            write_committed_candidate_manifest(repository)
+        else:
+            _ = verify_committed_candidate_attestation(repository)
     except BaselineCaptureError as exc:
         _ = os.write(2, f"baseline capture failed: {exc}\n".encode())
-        return 2
+        return BASELINE_FAILURE_STATUS
     return 0
 
 

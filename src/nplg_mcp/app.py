@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import importlib
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import partial
 from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
 from typing import TYPE_CHECKING, Protocol, cast, override, runtime_checkable
 from urllib.parse import urlsplit
@@ -17,23 +19,24 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from prometheus_client import CollectorRegistry, Counter, generate_latest
 
-from .admission import AdmissionGate, PathAdmissionMiddleware
-from .config import AppConfig, load_config
-from .downloader import DocumentDownloader
+from .admission import AdmissionGate, PathAdmissionMiddleware, PrincipalAdmission
+from .bounded_work import STORAGE_WORK, BlockingWorkCapacityError
+from .config import AppConfig, load_config, validate_deployment_profile
 from .errors import AppError, ErrorCode, to_public_error
-from .pdf import PdfProcessor
+from .network import create_bound_http_transport
 from .protocol import McpProtocol, ProtocolFailure, ProtocolResponse, ToolSurface
 from .rate_limit import AsyncRateLimiter
 from .repository import NplgRepository
-from .storage import ContentAddressedStore
 from .tokens import verify_asset_token
 from .tools import ToolService, ToolServiceDependencies
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Mapping
+    from contextlib import AbstractContextManager
+    from pathlib import Path
     from urllib.request import Request as UrlRequest
 
-    from starlette.types import Receive, Scope, Send
+    from starlette.types import Message, Receive, Scope, Send
 
     from .http_types import HttpClientProtocol
     from .json_types import JsonObject
@@ -71,8 +74,19 @@ class AppServices:
     """Runtime services owned by one application instance."""
 
     tools: ToolSurface
-    store: ContentAddressedStore
+    store: _AssetStore | None
     http_client: HttpClientProtocol | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _McpBoundary:
+    """Immutable dependencies for one admitted MCP request."""
+
+    config: AppConfig
+    protocol: McpProtocol
+    admission: AdmissionGate
+    principal_admission: PrincipalAdmission
+    request_counter: Counter
 
 
 class NplgFastAPI(FastAPI):
@@ -85,6 +99,60 @@ class NplgFastAPI(FastAPI):
 @runtime_checkable
 class _HeaderList(Protocol):
     def getlist(self, name: str) -> list[str]: ...
+
+
+class _AssetStore(Protocol):
+    """Narrow asset/readiness store surface used by the HTTP application."""
+
+    def resolve_asset(self, relative_path: str) -> Path:
+        """Resolve one validated relative asset path."""
+        ...
+
+    def stage(
+        self,
+        *,
+        suffix: str = ".tmp",
+    ) -> AbstractContextManager[object, bool | None]:
+        """Create one bounded readiness staging file."""
+        ...
+
+
+@runtime_checkable
+class _ReadinessSurface(Protocol):
+    """Optional runtime readiness hook for stateful tool dependencies."""
+
+    def ensure_ready(self) -> None:
+        """Raise a sanitized application error when traffic is unsafe."""
+        ...
+
+
+class _FullRuntimeModule(Protocol):
+    """Lazily imported full-profile composition boundary."""
+
+    def build_full_services(
+        self,
+        *,
+        config: AppConfig,
+        repository: NplgRepository,
+        client: HttpClientProtocol,
+        limiter: AsyncRateLimiter,
+    ) -> tuple[ToolSurface, _AssetStore]:
+        """Construct private-full-only storage, download, and PDF services."""
+        ...
+
+
+def _full_runtime_module() -> _FullRuntimeModule:
+    module = importlib.import_module("nplg_mcp.full_runtime")
+    return cast("_FullRuntimeModule", module)
+
+
+def _ensure_runtime_ready(runtime: AppServices) -> None:
+    """Check storage and optional stateful dependencies without network I/O."""
+    if runtime.store is not None:
+        with runtime.store.stage(suffix=".ready"):
+            pass
+    if isinstance(runtime.tools, _ReadinessSurface):
+        runtime.tools.ensure_ready()
 
 
 class _RejectAllCookiesPolicy(DefaultCookiePolicy):
@@ -107,8 +175,29 @@ class _RejectAllCookiesPolicy(DefaultCookiePolicy):
         return False
 
 
+@dataclass(frozen=True, slots=True)
+class _AssetStreamTimeouts:
+    idle_seconds: float
+    total_seconds: float
+
+
 class _DisconnectAwareFileResponse(FileResponse):
-    """Stop local file reads promptly when the ASGI peer disconnects."""
+    """Bound file delivery by disconnect, per-send, and total deadlines."""
+
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        headers: Mapping[str, str],
+        media_type: str,
+        timeouts: _AssetStreamTimeouts,
+    ) -> None:
+        super().__init__(
+            path,
+            headers=headers,
+            media_type=media_type,
+        )
+        self._timeouts = timeouts
 
     @staticmethod
     async def _wait_for_disconnect(receive: Receive) -> None:
@@ -121,7 +210,27 @@ class _DisconnectAwareFileResponse(FileResponse):
 
     @override
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        stream = asyncio.create_task(super().__call__(scope, receive, send))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._timeouts.total_seconds
+
+        async def bounded_send(message: Message) -> None:
+            remaining = deadline - loop.time()
+            timeout = max(0.0, min(self._timeouts.idle_seconds, remaining))
+            async with asyncio.timeout(timeout):
+                await send(message)
+
+        async def stream_file() -> None:
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await super(_DisconnectAwareFileResponse, self).__call__(
+                        scope,
+                        receive,
+                        cast("Send", bounded_send),
+                    )
+            except TimeoutError:
+                return
+
+        stream = asyncio.create_task(stream_file())
         disconnect = asyncio.create_task(self._wait_for_disconnect(receive))
         try:
             completed, _ = await asyncio.wait(
@@ -226,31 +335,67 @@ def _require_public_host(request: Request, config: AppConfig) -> None:
         raise AppError(ErrorCode.UNAUTHORIZED, "Host is not allowed.", http_status=403)
 
 
-def _has_valid_api_credential(request: Request, config: AppConfig) -> bool:
+def _api_principal(request: Request, config: AppConfig) -> str | None:
     bearer_values = request.headers.getlist("authorization")
     api_key_values = request.headers.getlist("x-api-key")
     if len(bearer_values) + len(api_key_values) != 1:
-        return False
-    if bearer_values:
-        expected = f"Bearer {config.api_bearer_token or ''}"
-        return config.api_bearer_token is not None and hmac.compare_digest(
-            bearer_values[0].encode("utf-8"),
-            expected.encode("utf-8"),
+        return None
+    presented = bearer_values[0] if bearer_values else api_key_values[0]
+    matched_principal: str | None = None
+    for principal in config.api_principals:
+        secret = (
+            principal.bearer_value() if bearer_values else principal.api_key_value()
         )
-    expected_api_key = config.api_key or ""
-    return config.api_key is not None and hmac.compare_digest(
-        api_key_values[0].encode("utf-8"),
-        expected_api_key.encode("utf-8"),
-    )
+        expected = (
+            f"Bearer {secret}" if bearer_values and secret is not None else secret or ""
+        )
+        if secret is not None and hmac.compare_digest(
+            presented.encode("utf-8"), expected.encode("utf-8")
+        ):
+            matched_principal = principal.principal_id
+    if bearer_values and config.api_bearer_token is not None:
+        expected = f"Bearer {config.api_bearer_token}"
+        if hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8")):
+            matched_principal = "legacy-bearer"
+    if (
+        api_key_values
+        and config.api_key is not None
+        and hmac.compare_digest(
+            presented.encode("utf-8"),
+            config.api_key.encode("utf-8"),
+        )
+    ):
+        matched_principal = "legacy-api-key"
+    return matched_principal
+
+
+def _has_valid_api_credential(request: Request, config: AppConfig) -> bool:
+    return _api_principal(request, config) is not None
+
+
+def _configured_principal_ids(config: AppConfig) -> tuple[str, ...]:
+    identifiers = [principal.principal_id for principal in config.api_principals]
+    if config.api_bearer_token is not None:
+        identifiers.append("legacy-bearer")
+    if config.api_key is not None:
+        identifiers.append("legacy-api-key")
+    if config.allow_anonymous:
+        identifiers.append("anonymous")
+    return tuple(identifiers)
 
 
 def _runtime_services(config: AppConfig) -> AppServices:
-    store = ContentAddressedStore(config.cache_dir, max_bytes=config.cache_max_bytes)
+    profile = validate_deployment_profile(config.deployment_profile)
+    if profile == "distributed-full":
+        msg = "distributed-full is not implemented and must remain disabled"
+        raise ValueError(msg)
+    limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(config.upstream_timeout_seconds),
         follow_redirects=False,
         trust_env=False,
-        limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        limits=limits,
+        transport=create_bound_http_transport(limits=limits),
         headers={
             "User-Agent": "nplg-dspace-mcp/0.1.0 (+read-only research connector)",
             "Accept-Encoding": "identity",
@@ -265,33 +410,20 @@ def _runtime_services(config: AppConfig) -> AppServices:
         limiter=limiter,
         total_timeout_seconds=config.upstream_timeout_seconds,
     )
-    downloader = DocumentDownloader(
-        client=client,
-        store=store,
-        max_bytes=config.max_download_bytes,
-        max_redirects=config.max_redirects,
-        limiter=limiter,
-        total_timeout_seconds=config.upstream_timeout_seconds,
-    )
-    pdf = PdfProcessor(
-        store=store,
-        max_pages_per_render=config.max_render_pages,
-        max_page_pixels=config.max_page_pixels,
-        max_render_pixels=config.max_render_pixels,
-        tile_width=config.tile_width,
-        tile_height=config.tile_height,
-        tile_overlap=config.tile_overlap,
-    )
-    tools = ToolService(
-        dependencies=ToolServiceDependencies(
-            repository=repository,
-            downloader=downloader,
-            pdf=pdf,
-            store=store,
-        ),
+    if profile == "alpic-metadata":
+        tools = ToolService(
+            dependencies=ToolServiceDependencies(repository=repository),
+            config=config,
+        )
+        return AppServices(tools=tools, store=None, http_client=client)
+
+    full_tools, store = _full_runtime_module().build_full_services(
         config=config,
+        repository=repository,
+        client=client,
+        limiter=limiter,
     )
-    return AppServices(tools=tools, store=store, http_client=client)
+    return AppServices(tools=full_tools, store=store, http_client=client)
 
 
 async def _bounded_body(request: Request, maximum: int) -> bytes:
@@ -377,13 +509,20 @@ def _require_allowed_origin(request: Request, config: AppConfig) -> None:
         )
 
 
-def _require_api_authentication(request: Request, config: AppConfig) -> None:
-    if not config.allow_anonymous and not _has_valid_api_credential(request, config):
-        raise AppError(
-            ErrorCode.UNAUTHORIZED,
-            "API authentication is required.",
-            http_status=401,
-        )
+def _require_api_authentication(request: Request, config: AppConfig) -> str:
+    principal_id = _api_principal(request, config)
+    if principal_id is not None:
+        return principal_id
+    credential_count = len(request.headers.getlist("authorization")) + len(
+        request.headers.getlist("x-api-key")
+    )
+    if config.allow_anonymous and credential_count == 0:
+        return "anonymous"
+    raise AppError(
+        ErrorCode.UNAUTHORIZED,
+        "API authentication is required.",
+        http_status=401,
+    )
 
 
 def _require_json_content_type(request: Request) -> None:
@@ -448,71 +587,79 @@ def _busy_response(request_counter: Counter, method_label: str) -> JSONResponse:
 
 async def _admitted_mcp_response(
     request: Request,
+    boundary: _McpBoundary,
     *,
-    config: AppConfig,
-    protocol: McpProtocol,
-    admission: AdmissionGate,
-    request_counter: Counter,
+    principal_id: str,
 ) -> Response:
     method_label = "unknown"
     try:
-        raw = await _receive_request_body(request, config)
+        raw = await _receive_request_body(request, boundary.config)
         try:
-            payload = protocol.parse_json(raw)
+            payload = boundary.protocol.parse_json(raw)
         except ProtocolFailure as failure:
             response = McpProtocol.error_response(None, failure)
-            _record_request(request_counter, method=method_label, outcome="error")
+            _record_request(
+                boundary.request_counter,
+                method=method_label,
+                outcome="error",
+            )
             return _protocol_http_response(response)
 
         raw_method = payload.get("method")
         method_label = _metric_method_label(
             raw_method if isinstance(raw_method, str) else None
         )
-        response = await protocol.handle(payload, request.headers)
+        response = await boundary.protocol.handle(payload, request.headers)
         _record_request(
-            request_counter,
+            boundary.request_counter,
             method=method_label,
             outcome=_metric_outcome(response.status, response.payload),
         )
         return _protocol_http_response(response)
     except AppError as exc:
-        _record_request(request_counter, method=method_label, outcome="error")
+        _record_request(
+            boundary.request_counter,
+            method=method_label,
+            outcome="error",
+        )
         return _json_response(
             status_code=exc.http_status,
             content={"error": to_public_error(exc)},
         )
     finally:
-        admission.release()
+        boundary.admission.release()
+        boundary.principal_admission.release(principal_id)
 
 
 async def _mcp_response(
     request: Request,
-    *,
-    config: AppConfig,
-    protocol: McpProtocol,
-    admission: AdmissionGate,
-    request_counter: Counter,
+    boundary: _McpBoundary,
 ) -> Response:
     method_label = "unknown"
     try:
-        _require_public_host(request, config)
-        _require_allowed_origin(request, config)
-        _require_api_authentication(request, config)
+        _require_public_host(request, boundary.config)
+        _require_allowed_origin(request, boundary.config)
+        principal_id = _require_api_authentication(request, boundary.config)
         _require_json_content_type(request)
-        if not admission.try_acquire():
-            return _busy_response(request_counter, method_label)
+        if not boundary.principal_admission.try_acquire(principal_id):
+            return _busy_response(boundary.request_counter, method_label)
+        if not boundary.admission.try_acquire():
+            boundary.principal_admission.release(principal_id)
+            return _busy_response(boundary.request_counter, method_label)
     except AppError as exc:
-        _record_request(request_counter, method=method_label, outcome="error")
+        _record_request(
+            boundary.request_counter,
+            method=method_label,
+            outcome="error",
+        )
         return _json_response(
             status_code=exc.http_status,
             content={"error": to_public_error(exc)},
         )
     return await _admitted_mcp_response(
         request,
-        config=config,
-        protocol=protocol,
-        admission=admission,
-        request_counter=request_counter,
+        boundary,
+        principal_id=principal_id,
     )
 
 
@@ -526,7 +673,11 @@ def _metrics_response(
         _require_public_host(request, config)
     except AppError:
         return PlainTextResponse("Not Found", status_code=404)
-    credentials_missing = config.api_bearer_token is None and config.api_key is None
+    credentials_missing = (
+        not config.api_principals
+        and config.api_bearer_token is None
+        and config.api_key is None
+    )
     if credentials_missing or not _has_valid_api_credential(request, config):
         return PlainTextResponse("Not Found", status_code=404)
     return Response(
@@ -543,8 +694,19 @@ def _asset_response(
     services: AppServices,
 ) -> Response:
     _require_public_host(request, config)
-    grant = verify_asset_token(config.asset_signing_secret, token)
-    path = services.store.resolve_asset(grant.path)
+    grant = verify_asset_token(
+        config.asset_signing_secret,
+        token,
+        max_ttl_seconds=config.asset_ttl_seconds,
+    )
+    store = services.store
+    if store is None:
+        raise AppError(
+            ErrorCode.NOT_FOUND,
+            "The requested asset was not found.",
+            http_status=404,
+        )
+    path = store.resolve_asset(grant.path)
     filename = path.name.replace('"', "")
     headers = {
         "Cache-Control": "private, no-store",
@@ -557,7 +719,44 @@ def _asset_response(
         path,
         media_type=grant.media_type,
         headers=headers,
+        timeouts=_AssetStreamTimeouts(
+            idle_seconds=config.asset_stream_idle_timeout_seconds,
+            total_seconds=config.asset_stream_total_timeout_seconds,
+        ),
     )
+
+
+def _validate_startup_config(config: AppConfig) -> None:
+    """Reject unsafe or unavailable profiles before constructing services."""
+    profile = validate_deployment_profile(config.deployment_profile)
+    if config.environment == "production" and config.allow_anonymous:
+        msg = "anonymous authorization is forbidden in production"
+        raise ValueError(msg)
+    if config.environment == "production" and not config.api_principals:
+        msg = "production requires a named API principal registry"
+        raise ValueError(msg)
+    if (
+        config.environment == "production"
+        and config.max_concurrent_mcp_requests_per_principal
+        >= config.max_concurrent_mcp_requests
+    ):
+        msg = "production per-principal admission must reserve global capacity"
+        raise ValueError(msg)
+    if profile == "distributed-full":
+        msg = "distributed-full is not implemented and must remain disabled"
+        raise ValueError(msg)
+    if config.environment == "production" and profile == "private-full":
+        msg = "private-full production requires an OS-isolated PDF worker backend"
+        raise ValueError(msg)
+    if config.asset_stream_idle_timeout_seconds <= 0:
+        msg = "asset stream idle timeout must be positive"
+        raise ValueError(msg)
+    if (
+        config.asset_stream_total_timeout_seconds
+        < config.asset_stream_idle_timeout_seconds
+    ):
+        msg = "asset stream total timeout must cover the idle timeout"
+        raise ValueError(msg)
 
 
 def create_app(
@@ -565,15 +764,27 @@ def create_app(
 ) -> NplgFastAPI:
     """Create one configured FastAPI application and its bounded routes."""
     cfg = config or load_config(os.environ)
+    _validate_startup_config(cfg)
     runtime = services or _runtime_services(cfg)
     protocol = McpProtocol(runtime.tools)
     admission = AdmissionGate(cfg.max_concurrent_mcp_requests)
+    principal_admission = PrincipalAdmission(
+        _configured_principal_ids(cfg),
+        cfg.max_concurrent_mcp_requests_per_principal,
+    )
     registry = CollectorRegistry(auto_describe=True)
     request_counter = Counter(
         "nplg_mcp_requests_total",
         "MCP HTTP requests by method and outcome.",
         labelnames=("method", "outcome"),
         registry=registry,
+    )
+    mcp_boundary = _McpBoundary(
+        config=cfg,
+        protocol=protocol,
+        admission=admission,
+        principal_admission=principal_admission,
+        request_counter=request_counter,
     )
 
     @asynccontextmanager
@@ -611,21 +822,23 @@ def create_app(
         return {"status": "ok"}
 
     async def ready() -> dict[str, str]:
-        with runtime.store.stage(suffix=".ready"):
-            pass
+        try:
+            await STORAGE_WORK.run_to_completion(
+                partial(_ensure_runtime_ready, runtime)
+            )
+        except BlockingWorkCapacityError as exc:
+            raise AppError(
+                ErrorCode.RATE_LIMITED,
+                "The readiness storage check is at capacity.",
+                http_status=503,
+            ) from exc
         return {"status": "ready"}
 
     async def metrics(request: Request) -> Response:
         return _metrics_response(request, config=cfg, registry=registry)
 
     async def mcp_endpoint(request: Request) -> Response:
-        return await _mcp_response(
-            request,
-            config=cfg,
-            protocol=protocol,
-            admission=admission,
-            request_counter=request_counter,
-        )
+        return await _mcp_response(request, mcp_boundary)
 
     async def asset(token: str, request: Request) -> Response:
         return _asset_response(token, request, config=cfg, services=runtime)

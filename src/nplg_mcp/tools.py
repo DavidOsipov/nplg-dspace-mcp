@@ -9,7 +9,8 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Protocol, cast
+from uuid import uuid4
 
 from pydantic import (
     BaseModel,
@@ -20,11 +21,17 @@ from pydantic import (
     field_validator,
 )
 
-from .config import HARD_MAX_TILE_DIMENSION, HARD_MAX_TILE_OVERLAP, AppConfig
+from .config import (
+    HARD_MAX_TILE_DIMENSION,
+    HARD_MAX_TILE_OVERLAP,
+    AppConfig,
+    validate_deployment_profile,
+)
 from .errors import AppError, ErrorCode
 from .json_types import (
     JsonObject,
     dataclass_to_json,
+    load_json_value,
     require_json_object,
     validation_details,
 )
@@ -35,11 +42,13 @@ if TYPE_CHECKING:
 
     from .downloader import DownloadResult
     from .parsers import Bitstream, DocumentRecord, SearchPage
-    from .pdf import PdfInspection, RenderManifest, TileManifest
+    from .pdf_executor import PdfExecutor
+    from .pdf_ipc import PdfCommand, PdfSuccess, RenderPagesOutput
     from .storage import ContentAddressedStore
 
 _DOCUMENT_ID_RE = re.compile(r"^doc_[0-9a-f]{64}$")
 _RENDER_ID_RE = re.compile(r"^rnd_[0-9a-f]{32}$")
+_PDF_JOB_TIMEOUT_SECONDS = 35.0
 
 
 class StrictInput(BaseModel):
@@ -142,6 +151,14 @@ def _json_integer(value: object, *, context: str) -> int:
     return value
 
 
+def _model_json(value: BaseModel, *, context: str) -> JsonObject:
+    """Serialize one validated Pydantic model and recheck its JSON shape."""
+    return require_json_object(
+        load_json_value(value.model_dump_json()),
+        context=context,
+    )
+
+
 class RepositoryProtocol(Protocol):
     """Repository operations consumed by the tool service."""
 
@@ -173,42 +190,7 @@ class DownloaderProtocol(Protocol):
         ...
 
 
-class PdfProtocol(Protocol):
-    """Serialized PDF operations consumed by the tool service."""
-
-    def inspect(self, pdf_path: Path) -> PdfInspection:
-        """Inspect one content-addressed PDF."""
-        ...
-
-    def render_pages(
-        self, pdf_path: Path, *, pages: tuple[int, ...], mode: str
-    ) -> RenderManifest:
-        """Render selected pages with deterministic geometry."""
-        ...
-
-    def render_tiles(
-        self,
-        render_id: str,
-        *,
-        page_number: int,
-        tile_width: int | None = None,
-        tile_height: int | None = None,
-        overlap: int | None = None,
-    ) -> TileManifest:
-        """Crop deterministic tiles from one rendered page."""
-        ...
-
-    def get_manifest(self, render_id: str) -> RenderManifest:
-        """Read a deterministic render manifest."""
-        ...
-
-    def delete_render(self, render_id: str) -> bool:
-        """Delete one completed render."""
-        ...
-
-
 Handler = Callable[[BaseModel], Awaitable[JsonObject]]
-PdfResultT = TypeVar("PdfResultT")
 UtcClock = Callable[[], datetime]
 
 
@@ -235,9 +217,9 @@ class ToolServiceDependencies:
     """Immutable typed collaborators used by the tool service."""
 
     repository: RepositoryProtocol
-    downloader: DownloaderProtocol
-    pdf: PdfProtocol
-    store: ContentAddressedStore
+    downloader: DownloaderProtocol | None = None
+    pdf: PdfExecutor | None = None
+    store: ContentAddressedStore | None = None
 
 
 class ToolService:
@@ -252,19 +234,65 @@ class ToolService:
     ) -> None:
         """Bind validated configuration and typed runtime collaborators."""
         super().__init__()
+        self.repository = dependencies.repository
+        self.config = config
+        self._utc_now = utc_now
+        profile = validate_deployment_profile(config.deployment_profile)
+        self._profile = profile
+        if profile == "alpic-metadata":
+            metadata_definitions: dict[
+                str,
+                tuple[str, str, type[StrictInput], Handler],
+            ] = {
+                "get_document_metadata": (
+                    "Read full document metadata",
+                    _joined_text(
+                        "Read rich Dublin Core metadata for an NPLG item, preferring",
+                        "OAI-DIM and falling back to the full XMLUI/Manakin record.",
+                    ),
+                    HandleInput,
+                    self._get_metadata,
+                ),
+                "list_document_files": (
+                    "List document files",
+                    _joined_text(
+                        "List public or restricted bitstreams bound to a canonical",
+                        "NPLG item handle.",
+                    ),
+                    HandleInput,
+                    self._list_files,
+                ),
+                "search_documents": (
+                    "Search NPLG Iverieli",
+                    _joined_text(
+                        "Search the NPLG DSpace repository, optionally within a",
+                        "canonical collection handle, and return an opaque",
+                        "continuation cursor.",
+                    ),
+                    SearchDocumentsInput,
+                    self._search,
+                ),
+            }
+            self._definitions = metadata_definitions
+            return
+        if profile == "distributed-full":
+            msg = "distributed-full is not implemented and must remain disabled"
+            raise ValueError(msg)
+        downloader = dependencies.downloader
+        pdf = dependencies.pdf
+        store = dependencies.store
+        if downloader is None or pdf is None or store is None:
+            msg = "private-full requires downloader, PDF, and store dependencies"
+            raise ValueError(msg)
         max_concurrent_pdf_jobs = _validated_serialized_pdf_capacity(
             config.pdf_executor,
             config.max_concurrent_pdf_jobs,
         )
-        self.repository = dependencies.repository
-        self.downloader = dependencies.downloader
-        self.pdf = dependencies.pdf
-        self.store = dependencies.store
-        self.config = config
-        self._utc_now = utc_now
+        self.downloader = downloader
+        self.pdf = pdf
+        self.store = store
         self._pdf_jobs = asyncio.Semaphore(max_concurrent_pdf_jobs)
-        self._pdf_worker_tasks: set[asyncio.Task[object]] = set()
-        self._definitions: dict[str, tuple[str, str, type[StrictInput], Handler]] = {
+        definitions: dict[str, tuple[str, str, type[StrictInput], Handler]] = {
             "download_document_file": (
                 "Download a public PDF",
                 _joined_text(
@@ -341,6 +369,7 @@ class ToolService:
                 self._search,
             ),
         }
+        self._definitions = definitions
 
     def list_tools(self) -> list[JsonObject]:
         """Return the deterministic tool catalog and strict input schemas."""
@@ -381,6 +410,24 @@ class ToolService:
                 }
             )
         return tools
+
+    def ensure_ready(self) -> None:
+        """Fail readiness when the private PDF worker circuit is open."""
+        if (
+            validate_deployment_profile(self.config.deployment_profile)
+            != "private-full"
+        ):
+            return
+        from .pdf_executor import PdfWorkerUnavailableError  # noqa: PLC0415
+
+        try:
+            self.pdf.ensure_ready()
+        except PdfWorkerUnavailableError as exc:
+            raise AppError(
+                ErrorCode.PDF_PROCESSING_FAILED,
+                "The PDF worker is temporarily unavailable.",
+                http_status=503,
+            ) from exc
 
     async def call(self, name: str, arguments: JsonObject) -> JsonObject:
         """Validate arguments and invoke one advertised tool handler."""
@@ -442,6 +489,13 @@ class ToolService:
                 "text": json.dumps(payload, ensure_ascii=False, sort_keys=True),
             }
 
+        if self._profile != "private-full":
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                "The requested MCP resource was not found.",
+                http_status=404,
+            )
+
         document_match = re.fullmatch(r"nplg://artifact/(doc_[0-9a-f]{64})", uri)
         if document_match:
             artifact_id = uri.removeprefix("nplg://artifact/")
@@ -497,8 +551,8 @@ class ToolService:
             )
         return self.store.resolve_asset(f"documents/{artifact_id}/source.pdf")
 
-    def _manifest_dict(self, manifest: RenderManifest) -> JsonObject:
-        payload = dataclass_to_json(manifest, context="render manifest")
+    def _manifest_dict(self, manifest: RenderPagesOutput) -> JsonObject:
+        payload = _model_json(manifest, context="render manifest")
         pages_value = payload.get("pages")
         if not isinstance(pages_value, list):
             msg = "render manifest pages must be an array"
@@ -515,14 +569,13 @@ class ToolService:
                 context="page_number",
             )
             page["resource_uri"] = f"nplg://render/{render_id}/page/{page_number}"
-        if "manifest_relative_path" in payload:
-            payload["manifest_asset_url"] = self._signed_asset_url(
-                _json_string(
-                    payload.get("manifest_relative_path"),
-                    context="manifest_relative_path",
-                ),
-                "application/json",
-            )
+        payload["manifest_asset_url"] = self._signed_asset_url(
+            _json_string(
+                payload.get("manifest_relative_path"),
+                context="manifest_relative_path",
+            ),
+            "application/json",
+        )
         render_id = _json_string(payload.get("render_id"), context="render_id")
         payload["resource_uri"] = f"nplg://render/{render_id}/manifest"
         return payload
@@ -583,61 +636,135 @@ class ToolService:
 
     async def _run_pdf_job(
         self,
-        function: Callable[[], PdfResultT],
-    ) -> PdfResultT:
-        _ = await self._pdf_jobs.acquire()
+        command: PdfCommand,
+    ) -> PdfSuccess:
+        from .pdf_executor import (  # noqa: PLC0415
+            MonotonicDeadline,
+            PdfWorkerError,
+            PdfWorkerUnavailableError,
+        )
+        from .pdf_ipc import PdfFailure  # noqa: PLC0415
+
+        deadline = MonotonicDeadline.after(_PDF_JOB_TIMEOUT_SECONDS)
+        acquired = False
         try:
-            worker = asyncio.create_task(asyncio.to_thread(function))
-        except BaseException:
-            self._pdf_jobs.release()
-            raise
+            try:
+                async with asyncio.timeout(deadline.remaining()):
+                    _ = await self._pdf_jobs.acquire()
+            except TimeoutError as exc:
+                raise AppError(
+                    ErrorCode.PDF_PROCESSING_FAILED,
+                    "The PDF worker is temporarily unavailable.",
+                    http_status=503,
+                ) from exc
+            acquired = True
+            result = await self.pdf.execute(
+                command,
+                deadline=deadline,
+            )
+        except PdfWorkerUnavailableError as exc:
+            raise AppError(
+                ErrorCode.PDF_PROCESSING_FAILED,
+                "The PDF worker is temporarily unavailable.",
+                http_status=503,
+            ) from exc
+        except PdfWorkerError as exc:
+            raise AppError(
+                ErrorCode.PDF_PROCESSING_FAILED,
+                "The PDF operation could not be completed safely.",
+                http_status=422,
+            ) from exc
+        finally:
+            if acquired:
+                self._pdf_jobs.release()
+        if isinstance(result, PdfFailure):
+            raise AppError(result.payload.code, result.payload.message)
+        return result
 
-        self._pdf_worker_tasks.add(worker)
-
-        def finish(completed: asyncio.Task[object]) -> None:
-            self._pdf_worker_tasks.discard(completed)
-            self._pdf_jobs.release()
-            if not completed.cancelled():
-                _ = completed.exception()
-
-        worker.add_done_callback(finish)
-        return await asyncio.shield(worker)
+    @staticmethod
+    def _document_relative_path(artifact_id: str) -> str:
+        return f"documents/{artifact_id}/source.pdf"
 
     async def _inspect_pdf(self, parsed: BaseModel) -> JsonObject:
+        from .pdf_executor import PdfWorkerError  # noqa: PLC0415
+        from .pdf_ipc import (  # noqa: PLC0415
+            InspectCommand,
+            InspectParams,
+            InspectPayload,
+        )
+
         values = ArtifactInput.model_validate(parsed)
-        path = self._resolve_document(values.artifact_id)
-        inspection = await self._run_pdf_job(lambda: self.pdf.inspect(path))
-        payload = dataclass_to_json(inspection, context="PDF inspection")
+        _ = self._resolve_document(values.artifact_id)
+        result = await self._run_pdf_job(
+            InspectCommand(
+                request_id=uuid4(),
+                operation="inspect",
+                source_relative_path=self._document_relative_path(values.artifact_id),
+                parameters=InspectParams(),
+            )
+        )
+        if not isinstance(result.payload, InspectPayload):
+            message = "PDF worker returned an unexpected inspect payload"
+            raise PdfWorkerError(message)
+        payload = _model_json(result.payload.value, context="PDF inspection")
         payload["artifact_id"] = values.artifact_id
         payload["resource_uri"] = f"nplg://artifact/{values.artifact_id}"
         return payload
 
     async def _render_pages(self, parsed: BaseModel) -> JsonObject:
+        from .pdf_executor import PdfWorkerError  # noqa: PLC0415
+        from .pdf_ipc import (  # noqa: PLC0415
+            RenderPagesCommand,
+            RenderPagesParams,
+            RenderPagesPayload,
+        )
+
         values = RenderPagesInput.model_validate(parsed)
-        path = self._resolve_document(values.artifact_id)
-        manifest = await self._run_pdf_job(
-            lambda: self.pdf.render_pages(
-                path,
-                pages=tuple(values.pages),
-                mode=values.mode,
+        _ = self._resolve_document(values.artifact_id)
+        result = await self._run_pdf_job(
+            RenderPagesCommand(
+                request_id=uuid4(),
+                operation="render_pages",
+                source_relative_path=self._document_relative_path(values.artifact_id),
+                parameters=RenderPagesParams(
+                    pages=tuple(values.pages),
+                    mode="native",
+                ),
             )
         )
-        payload = self._manifest_dict(manifest)
+        if not isinstance(result.payload, RenderPagesPayload):
+            message = "PDF worker returned an unexpected render payload"
+            raise PdfWorkerError(message)
+        payload = self._manifest_dict(result.payload.value)
         payload["artifact_id"] = values.artifact_id
         return payload
 
     async def _render_tiles(self, parsed: BaseModel) -> JsonObject:
+        from .pdf_executor import PdfWorkerError  # noqa: PLC0415
+        from .pdf_ipc import (  # noqa: PLC0415
+            RenderTilesCommand,
+            RenderTilesParams,
+            RenderTilesPayload,
+        )
+
         values = RenderTilesInput.model_validate(parsed)
-        manifest = await self._run_pdf_job(
-            lambda: self.pdf.render_tiles(
-                values.render_id,
-                page_number=values.page_number,
-                tile_width=values.tile_width,
-                tile_height=values.tile_height,
-                overlap=values.overlap,
+        result = await self._run_pdf_job(
+            RenderTilesCommand(
+                request_id=uuid4(),
+                operation="render_tiles",
+                parameters=RenderTilesParams(
+                    render_id=values.render_id,
+                    page_number=values.page_number,
+                    tile_width=values.tile_width,
+                    tile_height=values.tile_height,
+                    overlap=values.overlap,
+                ),
             )
         )
-        payload = dataclass_to_json(manifest, context="tile manifest")
+        if not isinstance(result.payload, RenderTilesPayload):
+            message = "PDF worker returned an unexpected tile payload"
+            raise PdfWorkerError(message)
+        payload = _model_json(result.payload.value, context="tile manifest")
         tiles_value = payload.get("tiles")
         if not isinstance(tiles_value, list):
             msg = "tile manifest tiles must be an array"
@@ -669,8 +796,22 @@ class ToolService:
         return payload
 
     async def _get_render_manifest(self, parsed: BaseModel) -> JsonObject:
-        values = RenderIdInput.model_validate(parsed)
-        manifest = await self._run_pdf_job(
-            lambda: self.pdf.get_manifest(values.render_id)
+        from .pdf_executor import PdfWorkerError  # noqa: PLC0415
+        from .pdf_ipc import (  # noqa: PLC0415
+            ManifestCommand,
+            ManifestParams,
+            ManifestPayload,
         )
-        return self._manifest_dict(manifest)
+
+        values = RenderIdInput.model_validate(parsed)
+        result = await self._run_pdf_job(
+            ManifestCommand(
+                request_id=uuid4(),
+                operation="manifest",
+                parameters=ManifestParams(render_id=values.render_id),
+            )
+        )
+        if not isinstance(result.payload, ManifestPayload):
+            message = "PDF worker returned an unexpected manifest payload"
+            raise PdfWorkerError(message)
+        return self._manifest_dict(result.payload.value)

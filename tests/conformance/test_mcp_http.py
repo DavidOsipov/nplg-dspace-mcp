@@ -14,10 +14,11 @@ from typing import TYPE_CHECKING, cast, override
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
 import nplg_mcp.app as app_module
 from nplg_mcp.app import AppServices, create_app
-from nplg_mcp.config import AppConfig
+from nplg_mcp.config import ApiPrincipalCredential, AppConfig
 from nplg_mcp.errors import AppError, ErrorCode
 from nplg_mcp.json_types import dump_json, load_json_value, require_json_object
 from nplg_mcp.protocol import McpProtocol, ProtocolFailure
@@ -51,6 +52,36 @@ _FINITE_RATIO = 1.25
 
 class StubTools:
     """Small typed tool-service double for HTTP protocol behavior."""
+
+    @staticmethod
+    def _bounded_adversarial_result(value: object) -> JsonObject | None:
+        if value == "deep-result":
+            root: JsonObject = {}
+            node = root
+            for _ in range(65):
+                child: JsonObject = {}
+                node["child"] = child
+                node = child
+            return root
+        if value == "cycle-result":
+            cyclic: JsonObject = {}
+            cyclic["self"] = cast("JsonValue", cyclic)
+            return cyclic
+        if value == "many-values-result":
+            values: list[JsonValue] = [None for _ in range(16_385)]
+            return {"values": values}
+        if value == "multibyte-result":
+            return {"value": "\U0001f600" * 300_000}
+        return None
+
+    @staticmethod
+    def _invalid_adversarial_result(value: object) -> JsonObject | None:
+        if value == "invalid-key-result":
+            invalid: dict[object, object] = {1: "value"}
+            return cast("JsonObject", invalid)
+        if value == "nonfinite-result":
+            return {"value": float("inf")}
+        return None
 
     def list_tools(self) -> list[JsonObject]:
         return [
@@ -106,6 +137,14 @@ class StubTools:
                     },
                 ]
             }
+        if arguments.get("value") == "oversized-result":
+            return {"value": "x" * (2 * 1024 * 1024)}
+        bounded = self._bounded_adversarial_result(arguments.get("value"))
+        if bounded is not None:
+            return bounded
+        invalid = self._invalid_adversarial_result(arguments.get("value"))
+        if invalid is not None:
+            return invalid
         return {"echo": arguments["value"]}
 
     def list_resources(self) -> list[JsonObject]:
@@ -125,6 +164,17 @@ class StubTools:
             "mime_type": "application/json",
             "text": dump_json({"read_only": True}),
         }
+
+
+class UnreadyStubTools(StubTools):
+    """Expose a sanitized stateful-dependency readiness failure."""
+
+    def ensure_ready(self) -> None:
+        raise AppError(
+            ErrorCode.PDF_PROCESSING_FAILED,
+            "The PDF worker is temporarily unavailable.",
+            http_status=503,
+        )
 
 
 def config(
@@ -589,6 +639,66 @@ async def test_tool_domain_error_is_a_successful_call_result_with_is_error(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value",
+    [
+        "oversized-result",
+        "deep-result",
+        "cycle-result",
+        "many-values-result",
+        "multibyte-result",
+    ],
+)
+async def test_tool_results_fail_closed_before_duplicate_serialization(
+    app: FastAPI,
+    value: str,
+) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://mcp.example.test"
+    ) as client:
+        response = await client.post(
+            "/mcp",
+            headers=modern_headers("tools/call", name="echo"),
+            json=modern_body(
+                "tools/call",
+                {"name": "echo", "arguments": {"value": value}},
+            ),
+        )
+
+    assert response.status_code == HTTPStatus.OK
+    assert _response_value(response, "result", "isError") is True
+    assert _response_value(response, "result", "structuredContent", "code") == (
+        ErrorCode.UPSTREAM_FAILURE.value
+    )
+    assert len(response.content) < REQUEST_BODY_LIMIT_BYTES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["invalid-key-result", "nonfinite-result"])
+async def test_non_json_tool_results_are_sanitized_as_internal_errors(
+    app: FastAPI,
+    value: str,
+) -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://mcp.example.test"
+    ) as client:
+        response = await client.post(
+            "/mcp",
+            headers=modern_headers("tools/call", name="echo"),
+            json=modern_body(
+                "tools/call",
+                {"name": "echo", "arguments": {"value": value}},
+            ),
+        )
+
+    assert response.status_code == HTTPStatus.INTERNAL_SERVER_ERROR
+    assert _response_value(response, "error") == {
+        "code": -32603,
+        "message": "Internal error",
+    }
+
+
+@pytest.mark.asyncio
 async def test_tool_assets_are_exposed_as_standard_resource_links(app: FastAPI) -> None:
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="https://mcp.example.test"
@@ -751,6 +861,102 @@ async def test_modern_decodes_base64_sentinel_mcp_name_header(app: FastAPI) -> N
 
 
 @pytest.mark.asyncio
+async def test_readiness_fails_when_a_stateful_tool_dependency_is_open(
+    tmp_path: Path,
+) -> None:
+    application = create_app(
+        config(tmp_path),
+        services=AppServices(
+            tools=UnreadyStubTools(),
+            store=ContentAddressedStore(tmp_path),
+        ),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="https://mcp.example.test",
+    ) as client:
+        health = await client.get("/healthz")
+        ready = await client.get("/readyz")
+
+    assert health.status_code == HTTPStatus.OK
+    assert ready.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert load_json_value(ready.text) == {
+        "error": {
+            "code": ErrorCode.PDF_PROCESSING_FAILED.value,
+            "message": "The PDF worker is temporarily unavailable.",
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_metadata_only_runtime_is_ready_without_storage_and_has_no_assets(
+    tmp_path: Path,
+) -> None:
+    cfg = replace(config(tmp_path), deployment_profile="alpic-metadata")
+    application = create_app(
+        cfg,
+        services=AppServices(tools=StubTools(), store=None),
+    )
+    token = sign_asset_token(
+        cfg.asset_signing_secret,
+        path="renders/rnd_" + ("0" * 32) + "/manifest.json",
+        media_type="application/json",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="https://mcp.example.test",
+    ) as client:
+        ready = await client.get("/readyz")
+        asset = await client.get(f"/assets/{token}")
+
+    assert ready.status_code == HTTPStatus.OK
+    assert load_json_value(ready.text) == {"status": "ready"}
+    assert asset.status_code == HTTPStatus.NOT_FOUND
+    assert _response_value(asset, "error", "code") == ErrorCode.NOT_FOUND.value
+
+
+def test_header_mapping_fallback_is_case_insensitive() -> None:
+    attribute_name = "_header_values"
+    header_values = cast(
+        "Callable[[dict[str, str], str], list[str]]",
+        getattr(app_module, attribute_name),
+    )
+    values = header_values(
+        {"HOST": "mcp.example.test", "Other": "ignored"},
+        "host",
+    )
+
+    assert values == ["mcp.example.test"]
+
+
+def test_runtime_composition_rejects_distributed_profile_before_construction(
+    tmp_path: Path,
+) -> None:
+    cfg = replace(config(tmp_path), deployment_profile="distributed-full")
+    attribute_name = "_runtime_services"
+    runtime_services = cast(
+        "Callable[[AppConfig], AppServices]",
+        getattr(app_module, attribute_name),
+    )
+
+    with pytest.raises(ValueError, match="distributed-full"):
+        _ = runtime_services(cfg)
+
+
+def test_app_error_response_rejects_wrong_exception_type() -> None:
+    attribute_name = "_app_error_response"
+    app_error_response = cast(
+        "Callable[[Exception], object]",
+        getattr(app_module, attribute_name),
+    )
+
+    with pytest.raises(TypeError, match="another exception type"):
+        _ = app_error_response(RuntimeError("must not be disclosed"))
+
+
+@pytest.mark.asyncio
 async def test_bearer_auth_origin_request_limit_health_and_metrics(
     tmp_path: Path,
 ) -> None:
@@ -774,6 +980,14 @@ async def test_bearer_auth_origin_request_limit_health_and_metrics(
         unauthorized = await client.post(
             "/mcp",
             headers=modern_headers("tools/list"),
+            json=modern_body("tools/list"),
+        )
+        wrong_bearer = await client.post(
+            "/mcp",
+            headers={
+                **modern_headers("tools/list"),
+                "Authorization": "Bearer " + ("x" * 32),
+            },
             json=modern_body("tools/list"),
         )
         bad_origin = await client.post(
@@ -825,6 +1039,7 @@ async def test_bearer_auth_origin_request_limit_health_and_metrics(
     assert authorized_metrics.status_code == HTTPStatus.OK
     assert "nplg_mcp_requests_total" in authorized_metrics.text
     assert unauthorized.status_code == HTTPStatus.UNAUTHORIZED
+    assert wrong_bearer.status_code == HTTPStatus.UNAUTHORIZED
     assert (
         bad_origin.status_code == malformed_origin.status_code == HTTPStatus.FORBIDDEN
     )
@@ -958,6 +1173,32 @@ async def test_signed_asset_delivery_is_bound_to_path_and_media_type(
 
 
 @pytest.mark.asyncio
+async def test_signed_asset_delivery_rejects_expiry_beyond_configured_ttl(
+    tmp_path: Path,
+) -> None:
+    cfg = replace(config(tmp_path), asset_ttl_seconds=60)
+    store = ContentAddressedStore(tmp_path)
+    artifact = store.put_bytes(
+        b"jpeg", namespace="renders", filename="page.jpg", media_type="image/jpeg"
+    )
+    app = create_app(cfg, services=AppServices(tools=StubTools(), store=store))
+    token = sign_asset_token(
+        cfg.asset_signing_secret,
+        path=artifact.relative_path,
+        media_type="image/jpeg",
+        expires_at=datetime.now(UTC) + timedelta(minutes=2),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://mcp.example.test"
+    ) as client:
+        response = await client.get(f"/assets/{token}")
+
+    assert response.status_code == HTTPStatus.UNAUTHORIZED
+    assert _response_value(response, "error", "code") == ErrorCode.UNAUTHORIZED.value
+
+
+@pytest.mark.asyncio
 async def test_asset_admission_is_held_until_stream_completion(
     tmp_path: Path,
 ) -> None:
@@ -1065,6 +1306,136 @@ async def test_asset_response_stops_reading_after_client_disconnect(
 
     assert receive_calls >= 1
     assert sent_bytes < len(payload)
+
+
+@pytest.mark.asyncio
+async def test_asset_stream_idle_timeout_releases_its_admission_permit(
+    tmp_path: Path,
+) -> None:
+    never_disconnect = asyncio.Event()
+    send_entered = asyncio.Event()
+
+    async def receive_message() -> dict[str, object]:
+        _ = await never_disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    async def stalled_send(_message: dict[str, object]) -> None:
+        send_entered.set()
+        _ = await asyncio.Event().wait()
+
+    cfg = replace(
+        config(tmp_path),
+        max_concurrent_asset_streams=1,
+        asset_stream_idle_timeout_seconds=0.01,
+        asset_stream_total_timeout_seconds=0.1,
+    )
+    store = ContentAddressedStore(tmp_path)
+    artifact = store.put_bytes(
+        b"asset", namespace="renders", filename="page.jpg", media_type="image/jpeg"
+    )
+    app = create_app(cfg, services=AppServices(tools=StubTools(), store=store))
+    token = sign_asset_token(
+        cfg.asset_signing_secret,
+        path=artifact.relative_path,
+        media_type="image/jpeg",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+
+    await asyncio.wait_for(
+        app(
+            cast("Scope", _http_scope(f"/assets/{token}", method="GET")),
+            cast("Receive", receive_message),
+            cast("Send", stalled_send),
+        ),
+        timeout=0.5,
+    )
+    assert send_entered.is_set()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="https://mcp.example.test"
+    ) as client:
+        response = await client.get(f"/assets/{token}")
+
+    assert response.status_code == HTTPStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_asset_stream_total_timeout_stops_a_slow_reader(
+    tmp_path: Path,
+) -> None:
+    payload = b"x" * (3 * 1024 * 1024)
+    never_disconnect = asyncio.Event()
+    sent_bytes = 0
+
+    async def receive_message() -> dict[str, object]:
+        _ = await never_disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    async def slow_send(message: dict[str, object]) -> None:
+        nonlocal sent_bytes
+        body = message.get("body")
+        if isinstance(body, bytes):
+            sent_bytes += len(body)
+        await asyncio.sleep(0.01)
+
+    cfg = replace(
+        config(tmp_path),
+        asset_stream_idle_timeout_seconds=0.02,
+        asset_stream_total_timeout_seconds=0.05,
+    )
+    store = ContentAddressedStore(tmp_path)
+    artifact = store.put_bytes(
+        payload,
+        namespace="renders",
+        filename="large-asset.bin",
+        media_type="application/octet-stream",
+    )
+    app = create_app(cfg, services=AppServices(tools=StubTools(), store=store))
+    token = sign_asset_token(
+        cfg.asset_signing_secret,
+        path=artifact.relative_path,
+        media_type="application/octet-stream",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+
+    await asyncio.wait_for(
+        app(
+            cast("Scope", _http_scope(f"/assets/{token}", method="GET")),
+            cast("Receive", receive_message),
+            cast("Send", slow_send),
+        ),
+        timeout=0.5,
+    )
+
+    assert 0 < sent_bytes < len(payload)
+
+
+@pytest.mark.parametrize(
+    ("idle_timeout", "total_timeout", "message"),
+    [
+        (0.0, 120.0, "idle timeout"),
+        (10.0, 5.0, "total timeout"),
+    ],
+)
+def test_app_rejects_forged_asset_stream_timeouts(
+    tmp_path: Path,
+    idle_timeout: float,
+    total_timeout: float,
+    message: str,
+) -> None:
+    cfg = replace(
+        config(tmp_path),
+        asset_stream_idle_timeout_seconds=idle_timeout,
+        asset_stream_total_timeout_seconds=total_timeout,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        _ = create_app(
+            cfg,
+            services=AppServices(
+                tools=StubTools(), store=ContentAddressedStore(tmp_path)
+            ),
+        )
 
 
 @pytest.mark.asyncio
@@ -1222,6 +1593,90 @@ async def test_mcp_admission_rejects_excess_work_without_queueing(
 
     assert third.status_code == HTTPStatus.OK
     assert tools.calls == EXPECTED_ADMITTED_TOOL_CALLS
+
+
+@pytest.mark.asyncio
+async def test_principal_admission_prevents_one_credential_from_starving_another(
+    tmp_path: Path,
+) -> None:
+    class BlockingTools(StubTools):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        @override
+        async def call(self, name: str, arguments: JsonObject) -> JsonObject:
+            del name
+            self.entered.set()
+            _ = await self.release.wait()
+            return {"echo": arguments["value"]}
+
+    first_token = "a" * 32
+    second_token = "b" * 32
+    cfg = replace(
+        config(tmp_path, anonymous=False),
+        api_principals=(
+            ApiPrincipalCredential(
+                principal_id="researcher-a",
+                bearer_token=SecretStr(first_token),
+            ),
+            ApiPrincipalCredential(
+                principal_id="researcher-b",
+                bearer_token=SecretStr(second_token),
+            ),
+        ),
+        max_concurrent_mcp_requests=2,
+        max_concurrent_mcp_requests_per_principal=1,
+    )
+    tools = BlockingTools()
+    application = create_app(
+        cfg,
+        services=AppServices(tools=tools, store=ContentAddressedStore(tmp_path)),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="https://mcp.example.test",
+    ) as client:
+        first = asyncio.create_task(
+            client.post(
+                "/mcp",
+                headers={
+                    **modern_headers("tools/call", name="echo"),
+                    "Authorization": f"Bearer {first_token}",
+                },
+                json=modern_body(
+                    "tools/call",
+                    {"name": "echo", "arguments": {"value": "first"}},
+                ),
+            )
+        )
+        async with asyncio.timeout(1):
+            _ = await tools.entered.wait()
+
+        same_principal = await client.post(
+            "/mcp",
+            headers={
+                **modern_headers("tools/list"),
+                "Authorization": f"Bearer {first_token}",
+            },
+            json=modern_body("tools/list"),
+        )
+        other_principal = await client.post(
+            "/mcp",
+            headers={
+                **modern_headers("tools/list"),
+                "Authorization": f"Bearer {second_token}",
+            },
+            json=modern_body("tools/list"),
+        )
+        tools.release.set()
+        first_response = await first
+
+    assert same_principal.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert same_principal.headers["retry-after"] == "1"
+    assert other_principal.status_code == HTTPStatus.OK
+    assert first_response.status_code == HTTPStatus.OK
 
 
 @pytest.mark.asyncio

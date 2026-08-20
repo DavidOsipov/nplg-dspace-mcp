@@ -14,17 +14,21 @@ import pytest
 
 import scripts.verify_deploy as verify_deploy_module
 from scripts.verify_deploy import (
+    ALPIC_METADATA_TOOLS,
     CACHE_WRITING_TOOLS,
     EXPECTED_TOOLS,
     MAX_RESPONSE_BYTES,
+    PRIVATE_FULL_TOOLS,
     PROTOCOL,
     CliDependencies,
     DeploymentClient,
+    DeploymentProfile,
     JsonObject,
     JsonValue,
     McpClient,
     VerificationError,
     verify,
+    verify_probes,
 )
 
 if TYPE_CHECKING:
@@ -43,14 +47,17 @@ OVERSIZED_OUTPUT_CHARS = 200_000
 HIGH_FINITE_TIMEOUT = 10_000.0
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class FakeClient:
     """Return a complete, controllable deployment contract."""
 
     read_only: bool | None
+    tool_names: frozenset[str] = ALPIC_METADATA_TOOLS
+    get_paths: list[str] = field(default_factory=list[str])
 
     def get(self, path: str) -> JsonObject:
         """Return the expected health object."""
+        self.get_paths.append(path)
         return {"status": "ok"} if path == "/healthz" else {"status": "ready"}
 
     def rpc(
@@ -81,7 +88,7 @@ class FakeClient:
                         "destructiveHint": False,
                     },
                 }
-                for tool_name in sorted(EXPECTED_TOOLS)
+                for tool_name in sorted(self.tool_names)
             ]
             return {"tools": tools, "cacheScope": "private"}, headers
         if method == "resources/list":
@@ -241,24 +248,49 @@ def _complete_rpc_response(*, request_id: int = 1) -> bytes:
     return json.dumps(payload).encode()
 
 
-def _success(_client: DeploymentClient) -> JsonObject:
+def _success(
+    _client: DeploymentClient,
+    *,
+    profile: DeploymentProfile,
+) -> JsonObject:
+    del profile
     return {"status": "pass", "tool_count": len(EXPECTED_TOOLS)}
 
 
-def _reviewed_failure(_client: DeploymentClient) -> JsonObject:
+def _reviewed_failure(
+    _client: DeploymentClient,
+    *,
+    profile: DeploymentProfile,
+) -> JsonObject:
+    del profile
     msg = "reviewed failure"
     raise VerificationError(msg)
 
 
-def _cancel(_client: DeploymentClient) -> JsonObject:
+def _cancel(
+    _client: DeploymentClient,
+    *,
+    profile: DeploymentProfile,
+) -> JsonObject:
+    del profile
     raise KeyboardInterrupt
 
 
-def _oversized_success(_client: DeploymentClient) -> JsonObject:
+def _oversized_success(
+    _client: DeploymentClient,
+    *,
+    profile: DeploymentProfile,
+) -> JsonObject:
+    del profile
     return {"status": "pass", "detail": "x" * OVERSIZED_OUTPUT_CHARS}
 
 
-def _health_only(client: DeploymentClient) -> JsonObject:
+def _health_only(
+    client: DeploymentClient,
+    *,
+    profile: DeploymentProfile,
+) -> JsonObject:
+    del profile
     return client.get("/healthz")
 
 
@@ -285,13 +317,47 @@ def test_deployment_verifier_preserves_baseline_result_fields() -> None:
     expected: JsonObject = {
         "status": "pass",
         "protocol": PROTOCOL,
-        "tool_count": len(EXPECTED_TOOLS),
-        "health": {"status": "ok"},
-        "ready": {"status": "ready"},
+        "profile": "alpic-metadata",
+        "tool_count": len(ALPIC_METADATA_TOOLS),
+        "probes_checked": False,
         "sessionless": True,
     }
+    client = FakeClient(read_only=None)
 
-    assert verify(FakeClient(read_only=None)) == expected
+    assert verify(client) == expected
+    assert client.get_paths == []
+
+
+def test_deployment_verifier_is_profile_aware() -> None:
+    client = FakeClient(read_only=None, tool_names=PRIVATE_FULL_TOOLS)
+
+    result = verify(client, profile="private-full")
+
+    assert result["profile"] == "private-full"
+    assert result["tool_count"] == len(PRIVATE_FULL_TOOLS)
+    assert client.get_paths == []
+
+
+def test_deployment_verifier_rejects_unknown_profile_before_requests() -> None:
+    client = FakeClient(read_only=None)
+
+    with pytest.raises(VerificationError, match="profile is unsupported"):
+        _ = verify(
+            client,
+            profile=cast("DeploymentProfile", "unknown-profile"),
+        )
+
+    assert client.get_paths == []
+
+
+def test_private_probe_verification_is_explicit() -> None:
+    client = FakeClient(read_only=None)
+
+    assert verify_probes(client) == {
+        "health": {"status": "ok"},
+        "ready": {"status": "ready"},
+    }
+    assert client.get_paths == ["/healthz", "/readyz"]
 
 
 def test_deployment_verifier_rejects_misclassified_tool_catalog() -> None:
@@ -528,7 +594,7 @@ def test_main_sanitizes_pathological_json_and_closes_default_adapter(
     stdout = io.StringIO()
     stderr = io.StringIO()
     dependencies = CliDependencies(
-        environ={},
+        environ={"API_BEARER_TOKEN": AUTH_VALUE},
         stdout=stdout,
         stderr=stderr,
         client_factory=_real_client_factory,
@@ -540,8 +606,6 @@ def test_main_sanitizes_pathological_json_and_closes_default_adapter(
             [
                 "--base-url",
                 "https://mcp.example",
-                "--token",
-                AUTH_VALUE,
             ],
             dependencies=dependencies,
         )
@@ -560,7 +624,7 @@ def test_main_prints_success_json_and_exact_client_configuration() -> None:
     stderr = io.StringIO()
     factory = StaticClientFactory(FakeClient(read_only=None))
     dependencies = CliDependencies(
-        environ={},
+        environ={"API_BEARER_TOKEN": "token"},
         stdout=stdout,
         stderr=stderr,
         client_factory=factory,
@@ -572,8 +636,6 @@ def test_main_prints_success_json_and_exact_client_configuration() -> None:
             [
                 "--base-url",
                 "https://mcp.example",
-                "--token",
-                "token",
                 "--timeout",
                 "10000",
             ],
@@ -586,7 +648,7 @@ def test_main_prints_success_json_and_exact_client_configuration() -> None:
     ]
     expected_output = (
         json.dumps(
-            _success(factory.client),
+            _success(factory.client, profile="alpic-metadata"),
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
@@ -595,6 +657,212 @@ def test_main_prints_success_json_and_exact_client_configuration() -> None:
     )
     assert stdout.getvalue() == expected_output
     assert stderr.getvalue() == ""
+
+
+def test_main_selects_profile_and_queries_probes_only_on_distinct_private_url() -> None:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    client = FakeClient(read_only=None, tool_names=PRIVATE_FULL_TOOLS)
+    factory = StaticClientFactory(client)
+    observed_profiles: list[DeploymentProfile] = []
+
+    def profile_verifier(
+        _client: DeploymentClient,
+        *,
+        profile: DeploymentProfile,
+    ) -> JsonObject:
+        observed_profiles.append(profile)
+        return {
+            "status": "pass",
+            "profile": profile,
+            "probes_checked": False,
+        }
+
+    dependencies = CliDependencies(
+        environ={"API_BEARER_TOKEN": "token"},
+        stdout=stdout,
+        stderr=stderr,
+        client_factory=factory,
+        verifier=profile_verifier,
+    )
+
+    assert (
+        verify_deploy_module.main(
+            [
+                "--base-url",
+                "https://mcp.example",
+                "--profile",
+                "private-full",
+                "--probe-base-url",
+                "http://127.0.0.1:8000",
+            ],
+            dependencies=dependencies,
+        )
+        == 0
+    )
+    assert observed_profiles == ["private-full"]
+    assert factory.calls == [
+        ("https://mcp.example", "token", 30.0, None),
+        ("http://127.0.0.1:8000", None, 30.0, None),
+    ]
+    assert client.get_paths == ["/healthz", "/readyz"]
+    expected_result: JsonObject = {
+        "health": {"status": "ok"},
+        "probes_checked": True,
+        "profile": "private-full",
+        "ready": {"status": "ready"},
+        "status": "pass",
+    }
+    expected_output = (
+        json.dumps(
+            expected_result,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    assert stdout.getvalue() == expected_output
+    assert stderr.getvalue() == ""
+
+
+@pytest.mark.parametrize(
+    ("base_url", "probe_base_url"),
+    [
+        ("https://mcp.example/", "https://mcp.example"),
+        ("https://mcp.example", "https://MCP.EXAMPLE/"),
+        ("https://mcp.example", "https://mcp.example:443"),
+        ("http://localhost/gateway", "http://LOCALHOST:80"),
+    ],
+)
+def test_main_rejects_public_origin_reuse_for_private_probes(
+    base_url: str,
+    probe_base_url: str,
+) -> None:
+    factory = StaticClientFactory(FakeClient(read_only=None))
+    stderr = io.StringIO()
+    dependencies = CliDependencies(
+        environ={},
+        stdout=io.StringIO(),
+        stderr=stderr,
+        client_factory=factory,
+        verifier=_success,
+    )
+
+    assert (
+        verify_deploy_module.main(
+            [
+                "--base-url",
+                base_url,
+                "--probe-base-url",
+                probe_base_url,
+            ],
+            dependencies=dependencies,
+        )
+        == ARGUMENT_ERROR_EXIT
+    )
+    assert factory.calls == []
+    assert stderr.getvalue() == (
+        "FAIL: --probe-base-url must be distinct from --base-url\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "probe_base_url",
+    [
+        "https://private.example",
+        "http://10.0.0.1:8000",
+        "http://app:8000",
+    ],
+)
+def test_main_restricts_private_probe_target_to_loopback_http(
+    probe_base_url: str,
+) -> None:
+    factory = StaticClientFactory(FakeClient(read_only=None))
+    stderr = io.StringIO()
+    dependencies = CliDependencies(
+        environ={},
+        stdout=io.StringIO(),
+        stderr=stderr,
+        client_factory=factory,
+        verifier=_success,
+    )
+
+    assert (
+        verify_deploy_module.main(
+            [
+                "--base-url",
+                "https://mcp.example",
+                "--probe-base-url",
+                probe_base_url,
+            ],
+            dependencies=dependencies,
+        )
+        == ARGUMENT_ERROR_EXIT
+    )
+    assert factory.calls == []
+    assert stderr.getvalue() == (
+        "FAIL: --probe-base-url must use a loopback HTTP origin\n"
+    )
+
+
+def test_main_rejects_non_string_environment_credential_before_client() -> None:
+    factory = StaticClientFactory(FakeClient(read_only=None))
+    dependencies = CliDependencies(
+        environ=cast("Mapping[str, str]", {"API_BEARER_TOKEN": 7}),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+        client_factory=factory,
+        verifier=_success,
+    )
+
+    assert (
+        verify_deploy_module.main(
+            ["--base-url", "https://mcp.example"],
+            dependencies=dependencies,
+        )
+        == ARGUMENT_ERROR_EXIT
+    )
+    assert factory.calls == []
+
+
+@pytest.mark.parametrize(
+    "credential_arguments",
+    [
+        ["--token", AUTH_VALUE],
+        [f"--token={AUTH_VALUE}"],
+        ["--api-key", SECOND_AUTH_VALUE],
+        [f"--api-key={SECOND_AUTH_VALUE}"],
+    ],
+)
+def test_main_rejects_credential_argv_without_echoing_values(
+    credential_arguments: list[str],
+) -> None:
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    factory = StaticClientFactory(FakeClient(read_only=None))
+    dependencies = CliDependencies(
+        environ={},
+        stdout=stdout,
+        stderr=stderr,
+        client_factory=factory,
+        verifier=_success,
+    )
+
+    assert (
+        verify_deploy_module.main(
+            ["--base-url", "https://mcp.example", *credential_arguments],
+            dependencies=dependencies,
+        )
+        == ARGUMENT_ERROR_EXIT
+    )
+    assert factory.calls == []
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == (
+        "FAIL: credentials must be supplied through environment variables\n"
+    )
+    assert AUTH_VALUE not in stderr.getvalue()
+    assert SECOND_AUTH_VALUE not in stderr.getvalue()
 
 
 def test_main_prints_sanitized_failure_with_exit_one() -> None:
@@ -776,7 +1044,6 @@ class ContractMutationClient:
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        ("health", "Health or readiness"),
         ("protocol", "requested protocol"),
         ("catalog-not-list", "not a list"),
         ("catalog-entry", "invalid entry"),
@@ -797,6 +1064,11 @@ def test_deployment_verifier_fails_closed_for_contract_mutations(
 ) -> None:
     with pytest.raises(VerificationError, match=message):
         _ = verify(ContractMutationClient(mutation))
+
+
+def test_private_probe_verifier_fails_closed() -> None:
+    with pytest.raises(VerificationError, match="Health or readiness"):
+        _ = verify_probes(ContractMutationClient("health"))
 
 
 def test_default_adapter_accepts_finite_json_float_and_rejects_nonfinite(
@@ -920,7 +1192,12 @@ def test_call_tool_rejects_failed_or_unstructured_results(
         _ = McpClient("https://mcp.example").call_tool("inspect_pdf", {})
 
 
-def _invalid_json_output(_client: DeploymentClient) -> JsonObject:
+def _invalid_json_output(
+    _client: DeploymentClient,
+    *,
+    profile: DeploymentProfile,
+) -> JsonObject:
+    del profile
     return {"status": float("nan")}
 
 

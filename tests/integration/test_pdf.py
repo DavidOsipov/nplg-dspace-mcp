@@ -42,6 +42,7 @@ _DEFAULT_TILE_COUNT = 4
 _UNPROCESSABLE_ENTITY = 422
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -80,6 +81,20 @@ def processor(
         store=ContentAddressedStore(tmp_path / "cache", max_bytes=cache_max_bytes),
         **values,
     )
+
+
+def test_render_identifier_rejects_an_unimplemented_mode(tmp_path: Path) -> None:
+    service = processor(tmp_path)
+    attribute_name = "_render_id"
+    render_id = cast(
+        "Callable[[str, tuple[int, ...], str], str]",
+        getattr(service, attribute_name),
+    )
+
+    with pytest.raises(AppError, match="Render mode is invalid") as raised:
+        _ = render_id("0" * 64, (1,), "untrusted-mode")
+
+    assert raised.value.code is ErrorCode.INVALID_INPUT
 
 
 def _manifest_payload(

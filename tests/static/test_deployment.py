@@ -18,6 +18,7 @@ from nplg_mcp.json_types import (
     load_json_value,
     require_json_object,
 )
+from scripts.verify_deploy import ALPIC_METADATA_TOOLS
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -26,6 +27,7 @@ ROOT = Path(__file__).parents[2]
 OPERATOR_SCRIPT_MODE = 0o755
 MAX_CONTAINER_PIDS = 256
 DEPENDABOT_POLICY_VERSION = 2
+MIN_DEPENDABOT_COOLDOWN_DAYS = 7
 EXPECTED_DOCKER_BASE = (
     "FROM python:3.13.14-slim-trixie@sha256:"
     "6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91"
@@ -109,14 +111,18 @@ def test_environment_example_matches_strict_runtime_configuration() -> None:
         "HOST=0.0.0.0",
         "PORT=8000",
         "ALLOW_ANONYMOUS=false",
-        "API_BEARER_TOKEN=replace-with-at-least-32-random-characters",
+        "DEPLOYMENT_PROFILE=alpic-metadata",
+        'API_PRINCIPALS_JSON=[{"principal_id":"primary","bearer_token":',
         "UPSTREAM_RATE_PER_SECOND=1.0",
         "MAX_REQUEST_BODY_BYTES=1048576",
         "REQUEST_BODY_TIMEOUT_SECONDS=10",
         "PDF_EXECUTOR=serialized",
         "MAX_CONCURRENT_PDF_JOBS=1",
         "MAX_CONCURRENT_MCP_REQUESTS=16",
+        "MAX_CONCURRENT_MCP_REQUESTS_PER_PRINCIPAL=4",
         "MAX_CONCURRENT_ASSET_STREAMS=8",
+        "ASSET_STREAM_IDLE_TIMEOUT_SECONDS=10",
+        "ASSET_STREAM_TOTAL_TIMEOUT_SECONDS=120",
         "MAX_CONCURRENT_HTTP_REQUESTS=128",
         "CACHE_MAX_BYTES=21474836480",
         "TILE_WIDTH=2048",
@@ -238,6 +244,8 @@ def test_caddy_and_guide_cover_operations_and_residual_egress_risk() -> None:
     assert "strict-transport-security" in caddy
     assert "@private_metrics path /metrics" in caddy
     assert "respond @private_metrics 404" in caddy
+    assert "@private_probes path /healthz /readyz" in caddy
+    assert "respond @private_probes 404" in caddy
     assert "\n    log {" not in caddy
     for phrase in (
         "docker compose config",
@@ -300,6 +308,20 @@ def test_public_tool_verifier_expects_a_read_only_catalog() -> None:
     text = (ROOT / "scripts" / "verify_deploy.py").read_text(encoding="utf-8")
     assert '"delete_render"' not in text
     assert "EXPECTED_TOOLS" in text
+
+
+def test_public_edge_and_verifier_share_the_metadata_profile_boundary() -> None:
+    caddy = (ROOT / "deploy" / "Caddyfile").read_text(encoding="utf-8")
+    guide = (ROOT / "deploy" / "README.md").read_text(encoding="utf-8")
+
+    assert {
+        "get_document_metadata",
+        "list_document_files",
+        "search_documents",
+    } == ALPIC_METADATA_TOOLS
+    assert "respond @private_probes 404" in caddy
+    assert "--probe-base-url" in guide
+    assert "does not query the public probe paths" in guide
 
 
 def test_operator_guide_covers_chatgpt_and_openai_auth_boundaries() -> None:
@@ -428,6 +450,10 @@ def test_dependabot_covers_each_reviewed_dependency_ecosystem_weekly() -> None:
         assert update["directory"] == "/"
         schedule = require_json_object(update["schedule"], context="schedule")
         assert schedule["interval"] == "weekly"
+        cooldown = require_json_object(update["cooldown"], context="cooldown")
+        default_days = cooldown["default-days"]
+        assert type(default_days) is int
+        assert default_days >= MIN_DEPENDABOT_COOLDOWN_DAYS
 
 
 def test_security_policy_has_private_reporting_and_closed_response_windows() -> None:

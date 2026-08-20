@@ -3,10 +3,23 @@
 
 from __future__ import annotations
 
+import hmac
+import json
 from dataclasses import dataclass
+from ipaddress import ip_address
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Annotated, Literal, cast
 from urllib.parse import urlsplit
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    SecretStr,
+    StringConstraints,
+    TypeAdapter,
+    ValidationError,
+    model_validator,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -21,9 +34,78 @@ DEFAULT_CACHE_MAX_BYTES = 20 * 1024 * 1024 * 1024
 HARD_MAX_CACHE_BYTES = 1024 * 1024 * 1024 * 1024
 HARD_MAX_TILE_DIMENSION = 4096
 HARD_MAX_TILE_OVERLAP = 512
+HARD_MAX_TILES_PER_PAGE = 100
 _DOCUMENTED_PLACEHOLDER = "replace-with-at-least-32-random-characters"
 _MIN_CREDENTIAL_BYTES = 32
+_MAX_CREDENTIAL_BYTES = 512
+_MAX_API_PRINCIPALS = 64
 PdfExecutor = Literal["serialized"]
+DeploymentProfile = Literal["alpic-metadata", "distributed-full", "private-full"]
+PrincipalId = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z][a-z0-9_-]{0,63}$",
+    ),
+]
+
+
+class ApiPrincipalCredential(BaseModel):
+    """One closed, secret-safe API credential bound to a stable principal."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    principal_id: PrincipalId
+    bearer_token: SecretStr | None = None
+    api_key: SecretStr | None = None
+
+    def bearer_value(self) -> str | None:
+        """Return the bearer value only at the authentication boundary."""
+        secret = self.bearer_token
+        return None if secret is None else secret.get_secret_value()
+
+    def api_key_value(self) -> str | None:
+        """Return the API-key value only at the authentication boundary."""
+        secret = self.api_key
+        return None if secret is None else secret.get_secret_value()
+
+    def credential_value(self) -> str:
+        """Return the model-validated credential for invariant checks."""
+        bearer = self.bearer_value()
+        if bearer is not None:
+            return bearer
+        api_key = self.api_key_value()
+        if api_key is None:
+            msg = "API principal credential invariant was violated"
+            raise RuntimeError(msg)
+        return api_key
+
+    @model_validator(mode="after")
+    def _validate_credential(self) -> ApiPrincipalCredential:
+        credentials = tuple(
+            value for value in (self.bearer_token, self.api_key) if value is not None
+        )
+        if len(credentials) != 1:
+            msg = "each API principal must define exactly one credential"
+            raise ValueError(msg)
+        raw = credentials[0].get_secret_value()
+        byte_length = len(raw.encode("utf-8"))
+        if not _MIN_CREDENTIAL_BYTES <= byte_length <= _MAX_CREDENTIAL_BYTES:
+            msg = "API principal credentials must be between 32 and 512 bytes"
+            raise ValueError(msg)
+        if raw == _DOCUMENTED_PLACEHOLDER:
+            msg = "API principal credentials must replace the documented placeholder"
+            raise ValueError(msg)
+        if any(character in raw for character in ("\r", "\n", "\x00")):
+            msg = "API principal credentials must not contain control delimiters"
+            raise ValueError(msg)
+        return self
+
+
+_API_PRINCIPALS_ADAPTER = TypeAdapter(list[ApiPrincipalCredential])
+_RESERVED_PRINCIPAL_IDS = frozenset({"anonymous", "legacy-api-key", "legacy-bearer"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +139,11 @@ class AppConfig:
     max_concurrent_http_requests: int = 128
     cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES
     request_body_timeout_seconds: float = 10.0
+    asset_stream_idle_timeout_seconds: float = 10.0
+    asset_stream_total_timeout_seconds: float = 120.0
+    deployment_profile: DeploymentProfile = "private-full"
+    api_principals: tuple[ApiPrincipalCredential, ...] = ()
+    max_concurrent_mcp_requests_per_principal: int = 4
 
 
 def _bool(env: Mapping[str, str], name: str, *, default: bool) -> bool:
@@ -149,6 +236,42 @@ def _environment(env: Mapping[str, str]) -> str:
     return environment
 
 
+def _is_loopback_host(value: str) -> bool:
+    normalized = value.strip().rstrip(".").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _deployment_profile(
+    env: Mapping[str, str],
+    *,
+    production: bool,
+) -> DeploymentProfile:
+    configured = env.get("DEPLOYMENT_PROFILE")
+    if configured is None:
+        if production:
+            msg = "DEPLOYMENT_PROFILE is required in production"
+            raise ValueError(msg)
+        return "private-full"
+    return validate_deployment_profile(configured.strip())
+
+
+def validate_deployment_profile(value: object) -> DeploymentProfile:
+    """Validate one exact deployment profile without string coercion."""
+    if type(value) is str and value == "alpic-metadata":
+        return "alpic-metadata"
+    if type(value) is str and value == "distributed-full":
+        return "distributed-full"
+    if type(value) is str and value == "private-full":
+        return "private-full"
+    msg = "DEPLOYMENT_PROFILE must be alpic-metadata, distributed-full, or private-full"
+    raise ValueError(msg)
+
+
 def _signing_secret(env: Mapping[str, str], *, production: bool) -> bytes:
     secret = env.get("ASSET_SIGNING_SECRET", "")
     secret_bytes = secret.encode("utf-8")
@@ -165,12 +288,20 @@ def _authorization(
     env: Mapping[str, str],
     *,
     production: bool,
-) -> tuple[str | None, str | None, bool]:
+) -> tuple[
+    str | None,
+    str | None,
+    bool,
+    tuple[ApiPrincipalCredential, ...],
+]:
     allow_anonymous = _bool(
         env,
         "ALLOW_ANONYMOUS",
-        default=not production,
+        default=False,
     )
+    if production and allow_anonymous:
+        msg = "ALLOW_ANONYMOUS must be false in production"
+        raise ValueError(msg)
     api_bearer_token = env.get("API_BEARER_TOKEN") or None
     if (
         api_bearer_token is not None
@@ -188,10 +319,118 @@ def _authorization(
     if production and api_key == _DOCUMENTED_PLACEHOLDER:
         msg = "API_KEY must be replaced before production deployment"
         raise ValueError(msg)
-    if not allow_anonymous and api_bearer_token is None and api_key is None:
-        msg = "API_BEARER_TOKEN or API_KEY is required unless ALLOW_ANONYMOUS=true"
+    api_principals = _api_principal_registry(env)
+    if api_principals and (api_bearer_token is not None or api_key is not None):
+        msg = "API_PRINCIPALS_JSON cannot be combined with API_BEARER_TOKEN or API_KEY"
         raise ValueError(msg)
-    return api_bearer_token, api_key, allow_anonymous
+    if production and not api_principals:
+        msg = (
+            "API_PRINCIPALS_JSON is required in production; legacy "
+            "API_BEARER_TOKEN and API_KEY are development-only"
+        )
+        raise ValueError(msg)
+    if (
+        not allow_anonymous
+        and not api_principals
+        and api_bearer_token is None
+        and api_key is None
+    ):
+        msg = (
+            "API_BEARER_TOKEN or API_KEY, or API_PRINCIPALS_JSON, is required unless "
+            "ALLOW_ANONYMOUS=true"
+        )
+        raise ValueError(msg)
+    return api_bearer_token, api_key, allow_anonymous, api_principals
+
+
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            msg = f"duplicate JSON key: {key}"
+            raise ValueError(msg)
+        result[key] = value
+    return result
+
+
+def _api_principal_registry(
+    env: Mapping[str, str],
+) -> tuple[ApiPrincipalCredential, ...]:
+    raw = env.get("API_PRINCIPALS_JSON")
+    if raw is None:
+        return ()
+    try:
+        decoded = cast(
+            "object",
+            json.loads(raw, object_pairs_hook=_reject_duplicate_json_keys),
+        )
+        principals = _API_PRINCIPALS_ADAPTER.validate_python(decoded, strict=True)
+    except (TypeError, ValueError, ValidationError) as exc:
+        msg = "API_PRINCIPALS_JSON must be a strict closed JSON array"
+        raise ValueError(msg) from exc
+    if not 1 <= len(principals) <= _MAX_API_PRINCIPALS:
+        msg = f"API_PRINCIPALS_JSON must contain 1 to {_MAX_API_PRINCIPALS} principals"
+        raise ValueError(msg)
+    principal_ids = [principal.principal_id for principal in principals]
+    if len(set(principal_ids)) != len(principal_ids):
+        msg = "API_PRINCIPALS_JSON principal_id values must be unique"
+        raise ValueError(msg)
+    if _RESERVED_PRINCIPAL_IDS.intersection(principal_ids):
+        msg = "API_PRINCIPALS_JSON uses a reserved principal_id"
+        raise ValueError(msg)
+    credentials = [principal.credential_value() for principal in principals]
+    if len(set(credentials)) != len(credentials):
+        msg = "API_PRINCIPALS_JSON credentials must be unique"
+        raise ValueError(msg)
+    return tuple(principals)
+
+
+def _validate_anonymous_scope(
+    env: Mapping[str, str],
+    *,
+    public_base_url: str,
+    allow_anonymous: bool,
+) -> None:
+    if not allow_anonymous:
+        return
+    public_host = urlsplit(public_base_url).hostname
+    bind_host = env.get("HOST", "127.0.0.1")
+    if (
+        public_host is None
+        or not _is_loopback_host(public_host)
+        or not _is_loopback_host(bind_host)
+    ):
+        msg = "ALLOW_ANONYMOUS requires loopback-only HOST and PUBLIC_BASE_URL"
+        raise ValueError(msg)
+
+
+def _validate_credential_separation(
+    secret: bytes,
+    *,
+    api_bearer_token: str | None,
+    api_key: str | None,
+    api_principals: tuple[ApiPrincipalCredential, ...],
+) -> None:
+    credentials: list[tuple[str, str | None]] = [
+        ("API_BEARER_TOKEN", api_bearer_token),
+        ("API_KEY", api_key),
+    ]
+    credentials.extend(
+        (
+            f"API_PRINCIPALS_JSON[{principal.principal_id}]",
+            principal.credential_value(),
+        )
+        for principal in api_principals
+    )
+    for name, credential in credentials:
+        if credential is not None and hmac.compare_digest(
+            secret,
+            credential.encode("utf-8"),
+        ):
+            msg = f"ASSET_SIGNING_SECRET and {name} must differ"
+            raise ValueError(msg)
 
 
 def _tile_geometry(env: Mapping[str, str]) -> tuple[int, int, int]:
@@ -238,6 +477,9 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
 
     configured_public_base_url = env.get("PUBLIC_BASE_URL")
     alpic_host = env.get("ALPIC_HOST", "").strip()
+    if alpic_host and not production:
+        msg = "ALPIC_HOST requires explicit NODE_ENV=production"
+        raise ValueError(msg)
     if configured_public_base_url is None and alpic_host:
         configured_public_base_url = (
             alpic_host if "://" in alpic_host else f"https://{alpic_host}"
@@ -246,12 +488,67 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
         configured_public_base_url or "http://127.0.0.1:8000",
         production=production,
     )
-    api_bearer_token, api_key, allow_anonymous = _authorization(
+    deployment_profile = _deployment_profile(env, production=production)
+    api_bearer_token, api_key, allow_anonymous, api_principals = _authorization(
         env,
         production=production,
     )
+    _validate_anonymous_scope(
+        env,
+        public_base_url=public_base_url,
+        allow_anonymous=allow_anonymous,
+    )
+    _validate_credential_separation(
+        secret,
+        api_bearer_token=api_bearer_token,
+        api_key=api_key,
+        api_principals=api_principals,
+    )
     tile_width, tile_height, tile_overlap = _tile_geometry(env)
     pdf_executor, max_concurrent_pdf_jobs = _pdf_settings(env)
+    asset_stream_idle_timeout_seconds = _float(
+        env,
+        "ASSET_STREAM_IDLE_TIMEOUT_SECONDS",
+        10.0,
+        minimum=1.0,
+        maximum=60.0,
+    )
+    asset_stream_total_timeout_seconds = _float(
+        env,
+        "ASSET_STREAM_TOTAL_TIMEOUT_SECONDS",
+        120.0,
+        minimum=1.0,
+        maximum=600.0,
+    )
+    if asset_stream_total_timeout_seconds < asset_stream_idle_timeout_seconds:
+        msg = (
+            "ASSET_STREAM_TOTAL_TIMEOUT_SECONDS must be greater than or equal to "
+            "ASSET_STREAM_IDLE_TIMEOUT_SECONDS"
+        )
+        raise ValueError(msg)
+    max_concurrent_mcp_requests = _int(
+        env,
+        "MAX_CONCURRENT_MCP_REQUESTS",
+        16,
+        minimum=1,
+        maximum=64,
+    )
+    max_concurrent_mcp_requests_per_principal = _int(
+        env,
+        "MAX_CONCURRENT_MCP_REQUESTS_PER_PRINCIPAL",
+        4,
+        minimum=1,
+        maximum=64,
+    )
+    if (
+        production
+        and max_concurrent_mcp_requests_per_principal >= max_concurrent_mcp_requests
+    ):
+        msg = (
+            "MAX_CONCURRENT_MCP_REQUESTS_PER_PRINCIPAL must be smaller than "
+            "MAX_CONCURRENT_MCP_REQUESTS in production"
+        )
+        raise ValueError(msg)
 
     return AppConfig(
         environment=environment,
@@ -269,6 +566,7 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
         api_bearer_token=api_bearer_token,
         api_key=api_key,
         allow_anonymous=allow_anonymous,
+        api_principals=api_principals,
         max_download_bytes=_int(
             env,
             "MAX_DOWNLOAD_BYTES",
@@ -327,12 +625,9 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
         max_redirects=_int(env, "MAX_REDIRECTS", 3, minimum=0, maximum=5),
         pdf_executor=pdf_executor,
         max_concurrent_pdf_jobs=max_concurrent_pdf_jobs,
-        max_concurrent_mcp_requests=_int(
-            env,
-            "MAX_CONCURRENT_MCP_REQUESTS",
-            16,
-            minimum=1,
-            maximum=64,
+        max_concurrent_mcp_requests=max_concurrent_mcp_requests,
+        max_concurrent_mcp_requests_per_principal=(
+            max_concurrent_mcp_requests_per_principal
         ),
         max_concurrent_asset_streams=_int(
             env,
@@ -362,4 +657,7 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
             minimum=1.0,
             maximum=60.0,
         ),
+        asset_stream_idle_timeout_seconds=asset_stream_idle_timeout_seconds,
+        asset_stream_total_timeout_seconds=asset_stream_total_timeout_seconds,
+        deployment_profile=deployment_profile,
     )

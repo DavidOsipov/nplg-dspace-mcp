@@ -2,6 +2,7 @@
 """Unit tests for bounded repository parsers."""
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -20,6 +21,15 @@ _EXPECTED_REPORTED_SIZE = 13_900_000
 _SEARCH_SOURCE = "https://dspace.nplg.gov.ge/simple-search?query=test"
 _ITEM_HANDLE = "1234/499564"
 _ITEM_SOURCE = f"https://dspace.nplg.gov.ge/handle/{_ITEM_HANDLE}"
+_EXCESSIVE_SEARCH_ROWS = 51
+_EXCESSIVE_METADATA_FIELDS = 513
+_EXCESSIVE_BITSTREAMS = 257
+_EXCESSIVE_METADATA_FORMATS = 65
+_EXCESSIVE_TEXT_CODE_POINTS = 1_000_001
+_EXCESSIVE_TREE_DEPTH = 257
+_EXCESSIVE_HTML_ELEMENTS = 20_001
+_EXCESSIVE_XML_ELEMENTS = 10_001
+_EXCESSIVE_COLLECTIONS = 257
 
 
 def fixture(name: str) -> str:
@@ -569,3 +579,345 @@ def test_oai_record_rejects_missing_dc_metadata_or_unsupported_prefix(
         )
 
     assert raised.value.code is expected_code
+
+
+def test_search_parser_rejects_more_items_than_the_requested_page_size() -> None:
+    rows = "".join(
+        (
+            f'<tr><td><a href="/handle/1234/{index + 1}">Title {index}</a></td>'
+            "<td></td><td></td></tr>"
+        )
+        for index in range(_EXCESSIVE_SEARCH_ROWS)
+    )
+
+    with pytest.raises(AppError, match="search item limit") as raised:
+        _ = parse_search_results(
+            _search_document(rows=rows),
+            source_url=_SEARCH_SOURCE,
+            page_size=_EXCESSIVE_SEARCH_ROWS - 1,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_full_item_parser_rejects_excessive_metadata_cardinality() -> None:
+    rows = "".join(
+        f"<tr><td>dc.subject</td><td>Subject {index}</td></tr>"
+        for index in range(_EXCESSIVE_METADATA_FIELDS)
+    )
+
+    with pytest.raises(AppError, match="metadata field limit") as raised:
+        _ = parse_item_page(
+            _item_document(rows=rows, extra="Show full metadata record"),
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_item_parser_rejects_excessive_bitstream_cardinality() -> None:
+    links = "".join(
+        (
+            f'<a href="/bitstream/{_ITEM_HANDLE}/{index}/file-{index}.pdf">'
+            f"file-{index}.pdf</a>"
+        )
+        for index in range(_EXCESSIVE_BITSTREAMS)
+    )
+
+    with pytest.raises(AppError, match="bitstream limit") as raised:
+        _ = parse_item_page(
+            _item_document(extra=links),
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_metadata_format_parser_rejects_excessive_cardinality() -> None:
+    formats = "".join(
+        (
+            "<metadataFormat><metadataPrefix>"
+            f"format_{index}"
+            "</metadataPrefix></metadataFormat>"
+        )
+        for index in range(_EXCESSIVE_METADATA_FORMATS)
+    )
+    document = (
+        f"<OAI-PMH><ListMetadataFormats>{formats}</ListMetadataFormats></OAI-PMH>"
+    )
+
+    with pytest.raises(AppError, match="metadata format limit") as raised:
+        _ = parse_metadata_formats(document)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_item_parser_rejects_excessive_aggregate_text() -> None:
+    rows = f"<tr><td>Title:</td><td>{'x' * _EXCESSIVE_TEXT_CODE_POINTS}</td></tr>"
+
+    with pytest.raises(AppError, match="aggregate text limit") as raised:
+        _ = parse_item_page(
+            _item_document(rows=rows),
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_item_parser_rejects_excessive_tree_depth() -> None:
+    nested = (
+        "<div>" * _EXCESSIVE_TREE_DEPTH + "payload" + "</div>" * _EXCESSIVE_TREE_DEPTH
+    )
+
+    with pytest.raises(AppError, match="tree depth limit") as raised:
+        _ = parse_item_page(
+            _item_document(extra=nested),
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_html_preflight_handles_self_closing_comments_and_mismatched_end_tags() -> None:
+    extra = (
+        '<custom data-key="value" /></not-open><!--budgeted-comment--><div><span></div>'
+    )
+
+    item = parse_item_page(
+        _item_document(extra=extra),
+        expected_handle=_ITEM_HANDLE,
+        source_url=_ITEM_SOURCE,
+    )
+
+    assert item.handle == _ITEM_HANDLE
+
+
+def test_html_preflight_rejects_excessive_self_closing_elements_before_tree_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    elements = "<custom />" * _EXCESSIVE_HTML_ELEMENTS
+
+    def forbidden_tree_builder(*_args: object, **_kwargs: object) -> object:
+        msg = "unbounded HTML tree construction was reached"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr("nplg_mcp.parsers.BeautifulSoup", forbidden_tree_builder)
+
+    with pytest.raises(AppError, match="HTML element limit") as raised:
+        _ = parse_item_page(
+            _item_document(extra=elements),
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_item_parser_rejects_excessive_html_element_count_before_tree_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    elements = "<span></span>" * _EXCESSIVE_HTML_ELEMENTS
+
+    def forbidden_tree_builder(*_args: object, **_kwargs: object) -> object:
+        msg = "unbounded HTML tree construction was reached"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr("nplg_mcp.parsers.BeautifulSoup", forbidden_tree_builder)
+
+    with pytest.raises(AppError, match="HTML element limit") as raised:
+        _ = parse_item_page(
+            _item_document(extra=elements),
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param(
+            "<div>" * _EXCESSIVE_TREE_DEPTH
+            + "payload"
+            + "</div>" * _EXCESSIVE_TREE_DEPTH,
+            id="depth",
+        ),
+        pytest.param(
+            "<span></span>" * _EXCESSIVE_HTML_ELEMENTS,
+            id="elements",
+        ),
+    ],
+)
+def test_html_post_parse_budget_remains_a_defense_in_depth_check(
+    monkeypatch: pytest.MonkeyPatch,
+    extra: str,
+) -> None:
+    def skip_preflight(_html: str, *, source_url: str) -> None:
+        del source_url
+
+    monkeypatch.setattr("nplg_mcp.parsers._preflight_html", skip_preflight)
+
+    with pytest.raises(AppError, match=r"tree depth limit|HTML element limit"):
+        _ = parse_item_page(
+            _item_document(extra=extra),
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+
+def test_metadata_parser_rejects_excessive_xml_element_count_before_tree_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    elements = "<entry />" * _EXCESSIVE_XML_ELEMENTS
+    document = (
+        f"<OAI-PMH><ListMetadataFormats>{elements}</ListMetadataFormats></OAI-PMH>"
+    )
+
+    def forbidden_tree_builder(_xml: str) -> object:
+        msg = "unbounded XML tree construction was reached"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(
+        "nplg_mcp.parsers.DefusedElementTree.fromstring",
+        forbidden_tree_builder,
+    )
+
+    with pytest.raises(AppError, match="XML element limit") as raised:
+        _ = parse_metadata_formats(document)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_metadata_parser_rejects_excessive_xml_tree_depth() -> None:
+    nested = "<wrapper>" * _EXCESSIVE_TREE_DEPTH
+    closing = "</wrapper>" * _EXCESSIVE_TREE_DEPTH
+    document = (
+        f"<OAI-PMH>{nested}<metadataPrefix>dim</metadataPrefix>{closing}</OAI-PMH>"
+    )
+
+    with pytest.raises(AppError, match="tree depth limit") as raised:
+        _ = parse_metadata_formats(document)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        pytest.param(
+            "<OAI-PMH>"
+            + "<wrapper>" * _EXCESSIVE_TREE_DEPTH
+            + "<metadataPrefix>dim</metadataPrefix>"
+            + "</wrapper>" * _EXCESSIVE_TREE_DEPTH
+            + "</OAI-PMH>",
+            id="depth",
+        ),
+        pytest.param(
+            "<OAI-PMH><ListMetadataFormats>"
+            + "<entry />" * _EXCESSIVE_XML_ELEMENTS
+            + "</ListMetadataFormats></OAI-PMH>",
+            id="elements",
+        ),
+    ],
+)
+def test_xml_post_parse_budget_remains_a_defense_in_depth_check(
+    monkeypatch: pytest.MonkeyPatch,
+    document: str,
+) -> None:
+    def skip_preflight(_xml: str) -> None:
+        return
+
+    monkeypatch.setattr("nplg_mcp.parsers._preflight_xml", skip_preflight)
+
+    with pytest.raises(AppError, match=r"tree depth limit|XML element limit"):
+        _ = parse_metadata_formats(document)
+
+
+def test_summary_item_parser_rejects_excessive_metadata_cardinality() -> None:
+    rows = "".join(
+        f"<tr><td>Subject:</td><td>Subject {index}</td></tr>"
+        for index in range(_EXCESSIVE_METADATA_FIELDS)
+    )
+
+    with pytest.raises(AppError, match="metadata field limit") as raised:
+        _ = parse_item_page(
+            _item_document(rows=rows),
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_item_parser_rejects_excessive_collection_cardinality() -> None:
+    links = "".join(
+        f'<a href="/handle/1234/{index + 1}">Collection {index}</a>'
+        for index in range(_EXCESSIVE_COLLECTIONS)
+    )
+    rows = (
+        "<tr><td>Title:</td><td>Title</td></tr>"
+        f"<tr><td>Appears in Collections:</td><td>{links}</td></tr>"
+    )
+
+    with pytest.raises(AppError, match="collection limit") as raised:
+        _ = parse_item_page(
+            _item_document(rows=rows),
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+@pytest.mark.parametrize("metadata_prefix", ["dim", "oai_dc"])
+def test_oai_parser_rejects_excessive_metadata_cardinality(
+    metadata_prefix: str,
+) -> None:
+    if metadata_prefix == "dim":
+        fields = "".join(
+            f'<field mdschema="dc" element="subject">Subject {index}</field>'
+            for index in range(_EXCESSIVE_METADATA_FIELDS)
+        )
+        metadata = f"<metadata>{fields}</metadata>"
+    else:
+        fields = "".join(
+            f"<terms:subject>Subject {index}</terms:subject>"
+            for index in range(_EXCESSIVE_METADATA_FIELDS)
+        )
+        metadata = (
+            '<metadata><dc xmlns="http://www.openarchives.org/OAI/2.0/oai_dc/" '
+            'xmlns:terms="http://purl.org/dc/elements/1.1/">'
+            f"{fields}</dc></metadata>"
+        )
+    document = _oai_document(
+        identifier=f"oai:dspace:{_ITEM_HANDLE}",
+        metadata=metadata,
+    )
+
+    with pytest.raises(AppError, match="metadata field limit") as raised:
+        _ = parse_oai_record(
+            document,
+            expected_handle=_ITEM_HANDLE,
+            metadata_prefix=metadata_prefix,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+@pytest.mark.parametrize("page_size", [0, 51, True, 1.0])
+def test_search_parser_rejects_invalid_page_size_types_and_bounds(
+    page_size: object,
+) -> None:
+    with pytest.raises(AppError, match="page_size") as raised:
+        _ = parse_search_results(
+            _search_document(),
+            source_url=_SEARCH_SOURCE,
+            page_size=cast("int", page_size),
+        )
+
+    assert raised.value.code is ErrorCode.INVALID_INPUT

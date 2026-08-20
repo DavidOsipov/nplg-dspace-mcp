@@ -14,15 +14,22 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Mapping, Sequence
     from typing import TextIO, TypeGuard
 
 PROTOCOL = "2026-07-28"
-EXPECTED_TOOLS: frozenset[str] = frozenset(
+ALPIC_METADATA_TOOLS: frozenset[str] = frozenset(
+    {
+        "get_document_metadata",
+        "list_document_files",
+        "search_documents",
+    }
+)
+PRIVATE_FULL_TOOLS: frozenset[str] = frozenset(
     {
         "download_document_file",
         "get_document_metadata",
@@ -34,6 +41,7 @@ EXPECTED_TOOLS: frozenset[str] = frozenset(
         "search_documents",
     }
 )
+EXPECTED_TOOLS: frozenset[str] = ALPIC_METADATA_TOOLS
 CACHE_WRITING_TOOLS: frozenset[str] = frozenset(
     {
         "download_document_file",
@@ -50,10 +58,58 @@ _ASCII_PRINTABLE_MAX = 0x7E
 type JsonPrimitive = bool | int | float | str | None
 type JsonValue = JsonPrimitive | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
+type DeploymentProfile = Literal["alpic-metadata", "private-full"]
+
+DEPLOYMENT_PROFILES: tuple[DeploymentProfile, ...] = (
+    "alpic-metadata",
+    "private-full",
+)
+EXPECTED_TOOLS_BY_PROFILE: dict[DeploymentProfile, frozenset[str]] = {
+    "alpic-metadata": ALPIC_METADATA_TOOLS,
+    "private-full": PRIVATE_FULL_TOOLS,
+}
 
 
 class VerificationError(RuntimeError):
     """Sanitized deployment-verification failure."""
+
+
+def _origin_identity(value: str) -> tuple[str, str, int]:
+    """Return a canonical scheme, host, and effective port for one URL."""
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        message = "deployment URLs must be valid HTTP(S) URLs"
+        raise VerificationError(message)
+    try:
+        explicit_port = parsed.port
+    except ValueError as exc:
+        message = "deployment URLs must contain a valid port"
+        raise VerificationError(message) from exc
+    default_port = 443 if parsed.scheme == "https" else 80
+    return parsed.scheme, parsed.hostname.lower(), explicit_port or default_port
+
+
+def _validate_probe_base_url(*, base_url: str, probe_base_url: str) -> None:
+    """Keep unauthenticated probes on a distinct loopback HTTP origin."""
+    if _origin_identity(probe_base_url) == _origin_identity(base_url):
+        message = "--probe-base-url must be distinct from --base-url"
+        raise VerificationError(message)
+    parsed = urlsplit(probe_base_url)
+    hostname = parsed.hostname
+    if (
+        parsed.scheme != "http"
+        or hostname is None
+        or hostname.lower() not in _HTTP_LOCAL_HOSTS
+    ):
+        message = "--probe-base-url must use a loopback HTTP origin"
+        raise VerificationError(message)
 
 
 def _is_json_value(value: object) -> TypeGuard[JsonValue]:
@@ -318,6 +374,20 @@ class ClientFactory(Protocol):
         ...
 
 
+class DeploymentVerifier(Protocol):
+    """Verify one selected deployment profile."""
+
+    def __call__(
+        self,
+        client: DeploymentClient,
+        /,
+        *,
+        profile: DeploymentProfile,
+    ) -> JsonObject:
+        """Return one bounded verification result."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class CliDependencies:
     """Injected environment and effects for ``main``."""
@@ -326,7 +396,7 @@ class CliDependencies:
     stdout: TextIO
     stderr: TextIO
     client_factory: ClientFactory
-    verifier: Callable[[DeploymentClient], JsonObject]
+    verifier: DeploymentVerifier
 
 
 def _tool_catalog(listed: JsonObject) -> dict[str, JsonObject]:
@@ -371,10 +441,16 @@ def _require_nonempty_list(value: JsonValue | None, *, context: str) -> None:
         raise VerificationError(msg)
 
 
-def verify(client: DeploymentClient) -> JsonObject:
-    """Verify the deployed health and public MCP contract."""
-    health = client.get("/healthz")
-    ready = client.get("/readyz")
+def verify(
+    client: DeploymentClient,
+    *,
+    profile: DeploymentProfile = "alpic-metadata",
+) -> JsonObject:
+    """Verify the sessionless MCP contract for one explicit profile."""
+    expected_tools = EXPECTED_TOOLS_BY_PROFILE.get(profile)
+    if expected_tools is None:
+        msg = "Deployment profile is unsupported"
+        raise VerificationError(msg)
     discover, discover_headers = client.rpc("server/discover")
     listed, list_headers = client.rpc("tools/list")
     resources, _ = client.rpc("resources/list")
@@ -382,15 +458,12 @@ def verify(client: DeploymentClient) -> JsonObject:
         "resources/read", {"uri": "nplg://about"}, name="nplg://about"
     )
 
-    if health != {"status": "ok"} or ready != {"status": "ready"}:
-        msg = "Health or readiness response was unexpected"
-        raise VerificationError(msg)
     versions = discover.get("supportedVersions")
     if not isinstance(versions, list) or PROTOCOL not in versions:
         msg = "server/discover did not advertise the requested protocol"
         raise VerificationError(msg)
     catalog = _tool_catalog(listed)
-    if frozenset(catalog) != EXPECTED_TOOLS:
+    if frozenset(catalog) != expected_tools:
         msg = "Tool catalog mismatch"
         raise VerificationError(msg)
     _verify_annotations(catalog)
@@ -420,11 +493,21 @@ def verify(client: DeploymentClient) -> JsonObject:
     return {
         "status": "pass",
         "protocol": PROTOCOL,
+        "profile": profile,
         "tool_count": len(catalog),
-        "health": health,
-        "ready": ready,
+        "probes_checked": False,
         "sessionless": True,
     }
+
+
+def verify_probes(client: DeploymentClient) -> JsonObject:
+    """Verify private health probes through an explicitly separate client."""
+    health = client.get("/healthz")
+    ready = client.get("/readyz")
+    if health != {"status": "ok"} or ready != {"status": "ready"}:
+        msg = "Health or readiness response was unexpected"
+        raise VerificationError(msg)
+    return {"health": health, "ready": ready}
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,32 +518,45 @@ class VerifyArguments:
     token: str | None
     api_key: str | None
     timeout: float
+    profile: DeploymentProfile
+    probe_base_url: str | None
 
 
 def _parser(environ: Mapping[str, str]) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     _ = parser.add_argument(
         "--base-url",
         required=True,
         help="Deployment base URL, for example https://mcp.example.com",
     )
-    _ = parser.add_argument(
-        "--token",
-        default=environ.get("API_BEARER_TOKEN"),
-        help="Bearer token; defaults to API_BEARER_TOKEN",
-    )
-    _ = parser.add_argument(
-        "--api-key",
-        default=environ.get("API_KEY"),
-        help="API key; defaults to API_KEY",
+    parser.set_defaults(
+        token=environ.get("API_BEARER_TOKEN"),
+        api_key=environ.get("API_KEY"),
     )
     _ = parser.add_argument("--timeout", type=float, default=30.0)
+    _ = parser.add_argument(
+        "--profile",
+        choices=DEPLOYMENT_PROFILES,
+        default="alpic-metadata",
+    )
+    _ = parser.add_argument(
+        "--probe-base-url",
+        help="Distinct private application URL used only for health probes",
+    )
     return parser
 
 
 def _parse_args(
     argv: Sequence[str], dependencies: CliDependencies
 ) -> VerifyArguments | int:
+    if any(
+        argument.partition("=")[0].startswith(("--tok", "--api")) for argument in argv
+    ):
+        return _write_failure(
+            dependencies,
+            "credentials must be supplied through environment variables",
+            exit_code=2,
+        )
     try:
         with (
             redirect_stdout(dependencies.stdout),
@@ -476,13 +572,26 @@ def _parse_args(
     token = values["token"]
     api_key = values["api_key"]
     timeout = values["timeout"]
+    profile = values["profile"]
+    probe_base_url = values["probe_base_url"]
     if not isinstance(base_url, str) or type(timeout) is not float:
         return 2
-    if token is not None and not isinstance(token, str):
+    if (
+        (token is not None and not isinstance(token, str))
+        or (api_key is not None and not isinstance(api_key, str))
+        or not isinstance(profile, str)
+        or profile not in EXPECTED_TOOLS_BY_PROFILE
+        or (probe_base_url is not None and not isinstance(probe_base_url, str))
+    ):
         return 2
-    if api_key is not None and not isinstance(api_key, str):
-        return 2
-    return VerifyArguments(base_url, token, api_key, timeout)
+    return VerifyArguments(
+        base_url,
+        token,
+        api_key,
+        timeout,
+        profile,
+        probe_base_url,
+    )
 
 
 def _default_client_factory(
@@ -552,6 +661,14 @@ def main(argv: Sequence[str], *, dependencies: CliDependencies) -> int:
             "--timeout must be a positive finite number",
             exit_code=2,
         )
+    if parsed.probe_base_url is not None:
+        try:
+            _validate_probe_base_url(
+                base_url=parsed.base_url,
+                probe_base_url=parsed.probe_base_url,
+            )
+        except VerificationError as exc:
+            return _write_failure(dependencies, str(exc), exit_code=2)
     try:
         client = dependencies.client_factory(
             base_url=parsed.base_url,
@@ -559,7 +676,16 @@ def main(argv: Sequence[str], *, dependencies: CliDependencies) -> int:
             timeout=parsed.timeout,
             api_key=parsed.api_key,
         )
-        result = dependencies.verifier(client)
+        result = dependencies.verifier(client, profile=parsed.profile)
+        if parsed.probe_base_url is not None:
+            probe_client = dependencies.client_factory(
+                base_url=parsed.probe_base_url,
+                bearer_token=None,
+                timeout=parsed.timeout,
+                api_key=None,
+            )
+            result.update(verify_probes(probe_client))
+            result["probes_checked"] = True
     except VerificationError as exc:
         return _write_failure(dependencies, str(exc))
     except KeyboardInterrupt:

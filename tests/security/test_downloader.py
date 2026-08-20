@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, cast, get_type_hints, override
 
 import httpx
@@ -16,7 +18,7 @@ from nplg_mcp.parsers import Bitstream
 from nplg_mcp.storage import ContentAddressedStore
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Generator
     from pathlib import Path
 
 _DEFAULT_SOURCE_URL = (
@@ -372,6 +374,66 @@ async def test_downloader_enforces_total_response_deadline(tmp_path: Path) -> No
     assert captured.value.code is ErrorCode.UPSTREAM_FAILURE
     assert captured.value.http_status == _HTTP_BAD_GATEWAY
     assert list((tmp_path / ".staging").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_slow_storage_write_does_not_block_the_event_loop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"%PDF-1.7\nevent-loop-storage",
+            headers={"content-type": "application/pdf"},
+        )
+
+    store = ContentAddressedStore(tmp_path)
+    real_stage = store.stage
+    heartbeat = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    heartbeat_seen_during_write = False
+
+    @contextmanager
+    def delayed_stage(*, suffix: str = "") -> Generator[object, None, None]:
+        with real_stage(suffix=suffix) as destination:
+
+            class DelayedWriter:
+                def write(self, data: bytes) -> int:
+                    nonlocal heartbeat_seen_during_write
+                    _ = loop.call_soon_threadsafe(heartbeat.set)
+                    time.sleep(0.2)
+                    heartbeat_seen_during_write = heartbeat.is_set()
+                    return destination.write(data)
+
+                def commit(
+                    self,
+                    *,
+                    namespace: str,
+                    filename: str,
+                    media_type: str,
+                ) -> object:
+                    return destination.commit(
+                        namespace=namespace,
+                        filename=filename,
+                        media_type=media_type,
+                    )
+
+            yield DelayedWriter()
+
+    monkeypatch.setattr(store, "stage", delayed_stage)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        downloader = DocumentDownloader(
+            client=client,
+            store=store,
+            max_bytes=1024,
+            validate_dns=False,
+        )
+        result = await downloader.download(bitstream())
+
+    assert result.bytes_downloaded > 0
+    assert heartbeat_seen_during_write is True
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from nplg_mcp.config import load_config
 from nplg_mcp.tools import ToolService
@@ -15,6 +15,8 @@ from tests.helpers.app_factory import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from nplg_mcp.storage import ContentAddressedStore
 
 
 def test_shared_factories_reproduce_current_service_defaults(tmp_path: Path) -> None:
@@ -28,5 +30,7 @@ def test_shared_factories_reproduce_current_service_defaults(tmp_path: Path) -> 
     assert service.config.pdf_executor == "serialized"
     assert service.config.max_concurrent_pdf_jobs == 1
     assert service.list_tools() == services.tools.list_tools()
-    assert services.store.root == tmp_path
+    assert services.store is not None
+    store = cast("ContentAddressedStore", services.store)
+    assert store.root == tmp_path
     assert services.http_client is None

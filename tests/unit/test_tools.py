@@ -8,13 +8,15 @@ import json
 import threading
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeVar, cast, override
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
-from nplg_mcp.config import AppConfig, PdfExecutor
+import nplg_mcp.tools as tools_module
+from nplg_mcp.config import AppConfig
 from nplg_mcp.downloader import DownloadResult
 from nplg_mcp.errors import AppError, ErrorCode
 from nplg_mcp.json_types import load_json_value, require_json_object
@@ -26,6 +28,7 @@ from nplg_mcp.pdf import (
     RenderManifest,
     TileManifest,
 )
+from nplg_mcp.pdf_executor import PdfWorkerError, PdfWorkerUnavailableError
 from nplg_mcp.storage import ContentAddressedStore
 from nplg_mcp.tokens import verify_asset_token
 from nplg_mcp.tools import (
@@ -33,14 +36,23 @@ from nplg_mcp.tools import (
     ToolService,
     ToolServiceDependencies,
 )
+from tests.helpers.inline_pdf_executor import InlinePdfExecutor
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine
+    from collections.abc import Callable
 
+    from nplg_mcp.config import PdfExecutor as PdfExecutorMode
     from nplg_mcp.json_types import JsonObject, JsonValue
+    from nplg_mcp.pdf_executor import MonotonicDeadline
+    from nplg_mcp.pdf_ipc import PdfCommand, PdfResult, PdfSuccess
 ControlledResultT = TypeVar("ControlledResultT")
 _EXPECTED_SERIALIZED_CALL_COUNT = 2
 _EXPECTED_DEFAULT_TILE_OVERLAP = 128
+_METADATA_TOOL_NAMES = {
+    "get_document_metadata",
+    "list_document_files",
+    "search_documents",
+}
 
 
 def _json_string(value: JsonValue | None, *, context: str) -> str:
@@ -223,7 +235,22 @@ class FakePdfProcessor:
             tile_width=tile_width or 2048,
             tile_height=tile_height or 2048,
             overlap=128 if overlap is None else overlap,
-            tiles=(),
+            tiles=(
+                RenderedTile(
+                    tile_id="x0000-y0000-w2048-h2048",
+                    page_number=page_number,
+                    x=0,
+                    y=0,
+                    width=2048,
+                    height=2048,
+                    full_page_width=2048,
+                    full_page_height=2048,
+                    overlap=128 if overlap is None else overlap,
+                    relative_path=self.page_path,
+                    sha256="b" * 64,
+                    media_type="image/jpeg",
+                ),
+            ),
             manifest_relative_path=f"renders/{render_id}/tiles/page-{page_number:04d}/manifest.json",
         )
 
@@ -307,6 +334,75 @@ class CancelOncePdfProcessor(FakePdfProcessor):
         return super().inspect(pdf_path)
 
 
+class FailOncePdfExecutor(InlinePdfExecutor):
+    """Fail before one operation, then delegate normally."""
+
+    def __init__(
+        self,
+        *,
+        processor: FakePdfProcessor,
+        store: ContentAddressedStore,
+    ) -> None:
+        """Bind a delegate and arm one deterministic startup failure."""
+        super().__init__(processor=processor, store=store)
+        self._fail_next = True
+
+    @override
+    async def execute(
+        self,
+        command: PdfCommand,
+        *,
+        deadline: MonotonicDeadline,
+    ) -> PdfResult:
+        if self._fail_next:
+            self._fail_next = False
+            message = "executor start failed"
+            raise RuntimeError(message)
+        return await super().execute(command, deadline=deadline)
+
+
+class CancellationAwarePdfExecutor(InlinePdfExecutor):
+    """Prove cancellation cleanup completes before the executor returns."""
+
+    def __init__(
+        self,
+        *,
+        processor: FakePdfProcessor,
+        store: ContentAddressedStore,
+    ) -> None:
+        """Bind a delegate and one cancellation-cleanup observation."""
+        super().__init__(processor=processor, store=store)
+        self.started = asyncio.Event()
+        self.cleaned_up = asyncio.Event()
+        self._cancel_first = True
+
+    @override
+    async def execute(
+        self,
+        command: PdfCommand,
+        *,
+        deadline: MonotonicDeadline,
+    ) -> PdfResult:
+        if self._cancel_first:
+            self._cancel_first = False
+            self.started.set()
+            try:
+                _ = await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cleaned_up.set()
+                raise
+        return await super().execute(command, deadline=deadline)
+
+
+class UnreadyPdfExecutor(InlinePdfExecutor):
+    """Expose one open worker circuit to the ToolService readiness hook."""
+
+    @override
+    def ensure_ready(self) -> None:
+        message = "PDF worker is temporarily unavailable"
+        raise PdfWorkerUnavailableError(message)
+
+
 class PopulatedTilePdfProcessor(FakePdfProcessor):
     """Return one persisted tile to exercise the normal tool result shape."""
 
@@ -376,6 +472,14 @@ class ObservedPdfJobLimiter:
         _ = await self._delegate.acquire()
 
     def release(self) -> None:
+        self._delegate.release()
+
+    async def occupy(self) -> None:
+        """Occupy the real test semaphore before a public tool call."""
+        _ = await self._delegate.acquire()
+
+    def release_occupied(self) -> None:
+        """Release a permit acquired by ``occupy``."""
         self._delegate.release()
 
     async def wait_for_attempt(self, attempt_number: int) -> None:
@@ -508,7 +612,7 @@ def test_tool_service_dependencies_are_frozen_and_slotted(tmp_path: Path) -> Non
     dependencies = ToolServiceDependencies(
         repository=FakeRepository(),
         downloader=FakeDownloader(store),
-        pdf=FakePdfProcessor(store),
+        pdf=InlinePdfExecutor(processor=FakePdfProcessor(store), store=store),
         store=store,
     )
 
@@ -516,6 +620,48 @@ def test_tool_service_dependencies_are_frozen_and_slotted(tmp_path: Path) -> Non
     repository_field = "repository"
     with pytest.raises(FrozenInstanceError):
         setattr(dependencies, repository_field, FakeRepository())
+
+
+def test_tool_service_readiness_maps_an_open_pdf_circuit_to_503(tmp_path: Path) -> None:
+    store = ContentAddressedStore(tmp_path)
+    tools = ToolService(
+        dependencies=ToolServiceDependencies(
+            repository=FakeRepository(),
+            downloader=FakeDownloader(store),
+            pdf=UnreadyPdfExecutor(
+                processor=FakePdfProcessor(store),
+                store=store,
+            ),
+            store=store,
+        ),
+        config=config(tmp_path),
+    )
+
+    with pytest.raises(AppError) as caught:
+        tools.ensure_ready()
+
+    assert caught.value.http_status == HTTPStatus.SERVICE_UNAVAILABLE
+    assert caught.value.code is ErrorCode.PDF_PROCESSING_FAILED
+
+
+def test_metadata_profile_readiness_does_not_consult_private_pdf_circuit(
+    tmp_path: Path,
+) -> None:
+    store = ContentAddressedStore(tmp_path)
+    tools = ToolService(
+        dependencies=ToolServiceDependencies(
+            repository=FakeRepository(),
+            downloader=FakeDownloader(store),
+            pdf=UnreadyPdfExecutor(
+                processor=FakePdfProcessor(store),
+                store=store,
+            ),
+            store=store,
+        ),
+        config=replace(config(tmp_path), deployment_profile="alpic-metadata"),
+    )
+
+    tools.ensure_ready()
 
 
 def observed_pdf_service(
@@ -554,7 +700,7 @@ def observed_pdf_service(
             dependencies=ToolServiceDependencies(
                 repository=FakeRepository(),
                 downloader=FakeDownloader(store),
-                pdf=processor,
+                pdf=InlinePdfExecutor(processor=processor, store=store),
                 store=store,
             ),
             config=config(tmp_path),
@@ -581,7 +727,10 @@ def service(tmp_path: Path) -> tuple[ToolService, FakeDownloader]:
             dependencies=ToolServiceDependencies(
                 repository=FakeRepository(),
                 downloader=downloader,
-                pdf=FakePdfProcessor(store),
+                pdf=InlinePdfExecutor(
+                    processor=FakePdfProcessor(store),
+                    store=store,
+                ),
                 store=store,
             ),
             config=config(tmp_path),
@@ -599,7 +748,10 @@ def test_tool_service_rejects_direct_parallel_pdf_config(tmp_path: Path) -> None
             dependencies=ToolServiceDependencies(
                 repository=FakeRepository(),
                 downloader=FakeDownloader(store),
-                pdf=FakePdfProcessor(store),
+                pdf=InlinePdfExecutor(
+                    processor=FakePdfProcessor(store),
+                    store=store,
+                ),
                 store=store,
             ),
             config=unsafe_config,
@@ -622,7 +774,10 @@ def test_tool_service_requires_exact_integer_pdf_capacity(
             dependencies=ToolServiceDependencies(
                 repository=FakeRepository(),
                 downloader=FakeDownloader(store),
-                pdf=FakePdfProcessor(store),
+                pdf=InlinePdfExecutor(
+                    processor=FakePdfProcessor(store),
+                    store=store,
+                ),
                 store=store,
             ),
             config=unsafe_config,
@@ -635,7 +790,7 @@ def test_tool_service_rejects_direct_nonserialized_pdf_config(
     store = ContentAddressedStore(tmp_path)
     unsafe_config = replace(
         config(tmp_path),
-        pdf_executor=cast("PdfExecutor", "threaded"),
+        pdf_executor=cast("PdfExecutorMode", "threaded"),
     )
 
     with pytest.raises(ValueError, match="PDF_EXECUTOR must be serialized"):
@@ -643,7 +798,10 @@ def test_tool_service_rejects_direct_nonserialized_pdf_config(
             dependencies=ToolServiceDependencies(
                 repository=FakeRepository(),
                 downloader=FakeDownloader(store),
-                pdf=FakePdfProcessor(store),
+                pdf=InlinePdfExecutor(
+                    processor=FakePdfProcessor(store),
+                    store=store,
+                ),
                 store=store,
             ),
             config=unsafe_config,
@@ -654,7 +812,7 @@ def test_tool_service_rejects_executor_with_forged_equality(tmp_path: Path) -> N
     store = ContentAddressedStore(tmp_path)
     unsafe_config = replace(
         config(tmp_path),
-        pdf_executor=cast("PdfExecutor", ForgedExecutor()),
+        pdf_executor=cast("PdfExecutorMode", ForgedExecutor()),
     )
 
     with pytest.raises(ValueError, match="PDF_EXECUTOR must be serialized"):
@@ -662,7 +820,35 @@ def test_tool_service_rejects_executor_with_forged_equality(tmp_path: Path) -> N
             dependencies=ToolServiceDependencies(
                 repository=FakeRepository(),
                 downloader=FakeDownloader(store),
-                pdf=FakePdfProcessor(store),
+                pdf=InlinePdfExecutor(
+                    processor=FakePdfProcessor(store),
+                    store=store,
+                ),
+                store=store,
+            ),
+            config=unsafe_config,
+        )
+
+
+def test_tool_service_rejects_a_forged_deployment_profile(tmp_path: Path) -> None:
+    store = ContentAddressedStore(tmp_path)
+    unsafe_config = replace(
+        config(tmp_path),
+        deployment_profile=cast(
+            "Literal['alpic-metadata', 'distributed-full', 'private-full']",
+            "private-full-suffix",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="DEPLOYMENT_PROFILE"):
+        _ = ToolService(
+            dependencies=ToolServiceDependencies(
+                repository=FakeRepository(),
+                downloader=FakeDownloader(store),
+                pdf=InlinePdfExecutor(
+                    processor=FakePdfProcessor(store),
+                    store=store,
+                ),
                 store=store,
             ),
             config=unsafe_config,
@@ -706,6 +892,63 @@ def test_tool_catalog_is_deterministic_and_strict(tmp_path: Path) -> None:
         assert annotations.get("destructiveHint") is False
         assert annotations.get("idempotentHint") is (name != "download_document_file")
         _ = json.dumps(tool, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_alpic_metadata_profile_closes_discovery_and_direct_dispatch(
+    tmp_path: Path,
+) -> None:
+    tools, _ = service(tmp_path)
+    tools = ToolService(
+        dependencies=ToolServiceDependencies(
+            repository=tools.repository,
+            downloader=tools.downloader,
+            pdf=tools.pdf,
+            store=tools.store,
+        ),
+        config=replace(tools.config, deployment_profile="alpic-metadata"),
+    )
+
+    names = {
+        _json_string(tool.get("name"), context="tool name")
+        for tool in tools.list_tools()
+    }
+    assert names == _METADATA_TOOL_NAMES
+
+    for forbidden in (
+        "download_document_file",
+        "get_render_manifest",
+        "inspect_pdf",
+        "render_pdf_page_tiles",
+        "render_pdf_pages",
+    ):
+        with pytest.raises(AppError) as caught:
+            _ = await tools.call(forbidden, {})
+        assert caught.value.code is ErrorCode.INVALID_INPUT
+
+    for forbidden_uri in (
+        "nplg://artifact/doc_" + ("1" * 64),
+        "nplg://render/rnd_" + ("1" * 32) + "/manifest",
+    ):
+        with pytest.raises(AppError) as caught:
+            _ = await tools.read_resource(forbidden_uri)
+        assert caught.value.code is ErrorCode.NOT_FOUND
+        assert caught.value.http_status == HTTPStatus.NOT_FOUND
+
+
+def test_distributed_profile_remains_fail_closed(tmp_path: Path) -> None:
+    tools, _ = service(tmp_path)
+
+    with pytest.raises(ValueError, match="distributed-full"):
+        _ = ToolService(
+            dependencies=ToolServiceDependencies(
+                repository=tools.repository,
+                downloader=tools.downloader,
+                pdf=tools.pdf,
+                store=tools.store,
+            ),
+            config=replace(tools.config, deployment_profile="distributed-full"),
+        )
 
 
 @pytest.mark.asyncio
@@ -887,44 +1130,45 @@ async def test_serialized_pdf_backend_never_enters_pdfium_concurrently(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_pdf_request_keeps_permit_until_native_worker_exits(
+async def test_cancelled_pdf_request_releases_permit_after_executor_cleanup(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    tools, processor, limiter, artifact_id = observed_pdf_service(
-        tmp_path,
-        monkeypatch,
+    store = ContentAddressedStore(tmp_path)
+    artifact = store.put_bytes(
+        b"%PDF-1.7\nfixture",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    executor = CancellationAwarePdfExecutor(
+        processor=FakePdfProcessor(store),
+        store=store,
+    )
+    tools = ToolService(
+        dependencies=ToolServiceDependencies(
+            repository=FakeRepository(),
+            downloader=FakeDownloader(store),
+            pdf=executor,
+            store=store,
+        ),
+        config=config(tmp_path),
     )
     first = asyncio.create_task(
-        tools.call("inspect_pdf", {"artifact_id": artifact_id}),
+        tools.call("inspect_pdf", {"artifact_id": artifact.object_id}),
     )
-    pending_tasks: list[asyncio.Task[JsonObject]] = []
-    first_cancelled = False
-    results: list[JsonObject] = []
-    try:
-        assert await asyncio.to_thread(processor.first_entered.wait, 2)
-        _ = first.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            _ = await first
-        first_cancelled = True
-        second = asyncio.create_task(
-            tools.call("inspect_pdf", {"artifact_id": artifact_id}),
-        )
-        pending_tasks.append(second)
-        await limiter.wait_for_attempt(2)
-        assert limiter.found_locked_on_attempt(2) is True
-        assert not processor.first_completed.is_set()
-        assert not processor.second_entered.is_set()
-        assert not second.done()
-    finally:
-        processor.release_first_call()
-        assert await asyncio.to_thread(processor.first_completed.wait, 2)
-        if not first_cancelled:
-            pending_tasks.insert(0, first)
-        results = await await_successful_pdf_tasks(pending_tasks)
+    async with asyncio.timeout(2):
+        _ = await executor.started.wait()
+    _ = first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await first
+
+    assert executor.cleaned_up.is_set()
+    recovered = await asyncio.wait_for(
+        tools.call("inspect_pdf", {"artifact_id": artifact.object_id}),
+        timeout=2,
+    )
     assert first.cancelled()
-    assert len(results) == 1
-    assert processor.maximum_simultaneous_calls == 1
+    assert recovered.get("artifact_id") == artifact.object_id
 
 
 @pytest.mark.asyncio
@@ -967,6 +1211,29 @@ async def test_cancelled_queued_pdf_waiter_does_not_release_or_leak_permit(
         results = await await_successful_pdf_tasks(pending_tasks)
     assert len(results) == _EXPECTED_SERIALIZED_CALL_COUNT
     assert processor.maximum_simultaneous_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_queued_pdf_call_uses_the_same_absolute_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools, processor, limiter, artifact_id = observed_pdf_service(
+        tmp_path,
+        monkeypatch,
+    )
+    monkeypatch.setattr(tools_module, "_PDF_JOB_TIMEOUT_SECONDS", 0.01)
+    await limiter.occupy()
+    try:
+        with pytest.raises(AppError) as captured:
+            async with asyncio.timeout(0.5):
+                _ = await tools.call("inspect_pdf", {"artifact_id": artifact_id})
+    finally:
+        limiter.release_occupied()
+
+    assert captured.value.code is ErrorCode.PDF_PROCESSING_FAILED
+    assert captured.value.http_status == HTTPStatus.SERVICE_UNAVAILABLE
+    assert processor.entered_operations == []
 
 
 @pytest.mark.asyncio
@@ -1150,7 +1417,7 @@ async def test_signed_asset_generation_requires_an_aware_utc_clock(
         dependencies=ToolServiceDependencies(
             repository=FakeRepository(),
             downloader=FakeDownloader(store),
-            pdf=FakePdfProcessor(store),
+            pdf=InlinePdfExecutor(processor=FakePdfProcessor(store), store=store),
             store=store,
         ),
         config=config(tmp_path),
@@ -1167,10 +1434,10 @@ async def test_signed_asset_generation_requires_an_aware_utc_clock(
 @pytest.mark.parametrize(
     ("fault", "message"),
     [
-        ("pages", "pages must be an array"),
-        ("relative_path", "relative_path must be a string"),
-        ("page_number", "page_number must be an integer"),
-        ("tiles", "tiles must be an array"),
+        ("pages", "pages"),
+        ("relative_path", "relative_path"),
+        ("page_number", "page_number"),
+        ("tiles", "tiles"),
     ],
 )
 @pytest.mark.asyncio
@@ -1190,7 +1457,10 @@ async def test_tool_service_rejects_malformed_pdf_collaborator_results(
         dependencies=ToolServiceDependencies(
             repository=FakeRepository(),
             downloader=FakeDownloader(store),
-            pdf=MalformedPdfProcessor(store, fault),
+            pdf=InlinePdfExecutor(
+                processor=MalformedPdfProcessor(store, fault),
+                store=store,
+            ),
             store=store,
         ),
         config=config(tmp_path),
@@ -1202,14 +1472,13 @@ async def test_tool_service_rejects_malformed_pdf_collaborator_results(
         if fault == "tiles"
         else {"artifact_id": artifact.object_id, "pages": [1]}
     )
-    with pytest.raises(TypeError, match=message):
+    with pytest.raises(ValidationError, match=message):
         _ = await tools.call(tool_name, arguments)
 
 
 @pytest.mark.asyncio
-async def test_pdf_job_releases_permit_when_task_creation_fails(
+async def test_pdf_job_releases_permit_when_executor_start_fails(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ContentAddressedStore(tmp_path)
     artifact = store.put_bytes(
@@ -1222,30 +1491,20 @@ async def test_pdf_job_releases_permit_when_task_creation_fails(
         dependencies=ToolServiceDependencies(
             repository=FakeRepository(),
             downloader=FakeDownloader(store),
-            pdf=FakePdfProcessor(store),
+            pdf=FailOncePdfExecutor(
+                processor=FakePdfProcessor(store),
+                store=store,
+            ),
             store=store,
         ),
         config=config(tmp_path),
     )
 
-    def fail_create_task(
-        coroutine: Coroutine[object, object, object],
-        *,
-        name: str | None = None,
-        context: object | None = None,
-    ) -> asyncio.Task[object]:
-        del name, context
-        coroutine.close()
-        message = "task creation failed"
-        raise RuntimeError(message)
-
-    with monkeypatch.context() as task_patch:
-        task_patch.setattr(asyncio, "create_task", fail_create_task)
-        with pytest.raises(RuntimeError, match="task creation failed"):
-            _ = await tools.call(
-                "inspect_pdf",
-                {"artifact_id": artifact.object_id},
-            )
+    with pytest.raises(RuntimeError, match="executor start failed"):
+        _ = await tools.call(
+            "inspect_pdf",
+            {"artifact_id": artifact.object_id},
+        )
 
     recovered = await asyncio.wait_for(
         tools.call("inspect_pdf", {"artifact_id": artifact.object_id}),
@@ -1269,7 +1528,10 @@ async def test_pdf_job_releases_permit_after_worker_cancellation(
         dependencies=ToolServiceDependencies(
             repository=FakeRepository(),
             downloader=FakeDownloader(store),
-            pdf=CancelOncePdfProcessor(store),
+            pdf=InlinePdfExecutor(
+                processor=CancelOncePdfProcessor(store),
+                store=store,
+            ),
             store=store,
         ),
         config=config(tmp_path),
@@ -1295,7 +1557,10 @@ async def test_render_tiles_exposes_signed_tile_and_resource_coordinates(
         dependencies=ToolServiceDependencies(
             repository=FakeRepository(),
             downloader=FakeDownloader(store),
-            pdf=PopulatedTilePdfProcessor(store),
+            pdf=InlinePdfExecutor(
+                processor=PopulatedTilePdfProcessor(store),
+                store=store,
+            ),
             store=store,
         ),
         config=config(tmp_path),
@@ -1314,3 +1579,151 @@ async def test_render_tiles_exposes_signed_tile_and_resource_coordinates(
     )
     asset_url = _json_string(tile.get("asset_url"), context="asset_url")
     assert asset_url.startswith("https://mcp.example.test/assets/")
+
+
+def test_private_full_requires_every_stateful_dependency(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires downloader, PDF, and store"):
+        _ = ToolService(
+            dependencies=ToolServiceDependencies(repository=FakeRepository()),
+            config=config(tmp_path),
+        )
+
+
+def test_document_resolution_rejects_an_invalid_internal_identifier(
+    tmp_path: Path,
+) -> None:
+    tools, _ = service(tmp_path)
+    attribute_name = "_resolve_document"
+    resolve_document = cast(
+        "Callable[[str], Path]",
+        getattr(tools, attribute_name),
+    )
+
+    with pytest.raises(AppError) as caught:
+        _ = resolve_document("../outside")
+
+    assert caught.value.code is ErrorCode.INVALID_INPUT
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "argument_kind", "expected_message"),
+    [
+        ("inspect_pdf", "artifact", "unexpected inspect payload"),
+        ("render_pdf_pages", "pages", "unexpected render payload"),
+        ("render_pdf_page_tiles", "tiles", "unexpected tile payload"),
+        ("get_render_manifest", "manifest", "unexpected manifest payload"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tool_service_rejects_operation_mismatched_worker_payloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    argument_kind: Literal["artifact", "pages", "tiles", "manifest"],
+    expected_message: str,
+) -> None:
+    tools, _ = service(tmp_path)
+    artifact = tools.store.put_bytes(
+        b"%PDF-1.7\nfixture",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+
+    async def mismatched_result(command: PdfCommand) -> PdfSuccess:
+        await asyncio.sleep(0)
+        del command
+        return cast("PdfSuccess", UnexpectedPdfSuccess())
+
+    monkeypatch.setattr(tools, "_run_pdf_job", mismatched_result)
+    render_id = "rnd_" + ("1" * 32)
+    arguments_by_kind: dict[str, JsonObject] = {
+        "artifact": {"artifact_id": artifact.object_id},
+        "pages": {"artifact_id": artifact.object_id, "pages": [1]},
+        "tiles": {"render_id": render_id, "page_number": 1},
+        "manifest": {"render_id": render_id},
+    }
+
+    with pytest.raises(PdfWorkerError, match=expected_message):
+        _ = await tools.call(tool_name, arguments_by_kind[argument_kind])
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected_message"),
+    [
+        ("pages", "pages must be an array"),
+        ("relative_path", "relative_path must be a string"),
+        ("page_number", "page_number must be an integer"),
+        ("manifest_relative_path", "manifest_relative_path must be a string"),
+        ("tiles", "tiles must be an array"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tool_service_rejects_corrupt_typed_serialization_at_trust_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: Literal[
+        "pages",
+        "relative_path",
+        "page_number",
+        "manifest_relative_path",
+        "tiles",
+    ],
+    expected_message: str,
+) -> None:
+    tools, _ = service(tmp_path)
+    artifact = tools.store.put_bytes(
+        b"%PDF-1.7\nfixture",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    render_id = "rnd_" + ("1" * 32)
+    valid_page: JsonObject = {
+        "relative_path": "renders/page-0001.jpg",
+        "media_type": "image/jpeg",
+        "page_number": 1,
+    }
+    forged_payloads: dict[str, JsonObject] = {
+        "pages": {
+            "render_id": render_id,
+            "pages": "not-an-array",
+            "manifest_relative_path": f"renders/{render_id}/manifest.json",
+        },
+        "relative_path": {
+            "render_id": render_id,
+            "pages": [{**valid_page, "relative_path": 7}],
+            "manifest_relative_path": f"renders/{render_id}/manifest.json",
+        },
+        "page_number": {
+            "render_id": render_id,
+            "pages": [{**valid_page, "page_number": True}],
+            "manifest_relative_path": f"renders/{render_id}/manifest.json",
+        },
+        "manifest_relative_path": {
+            "render_id": render_id,
+            "pages": [valid_page],
+        },
+        "tiles": {"tiles": "not-an-array"},
+    }
+
+    def forged_model_json(value: BaseModel, *, context: str) -> JsonObject:
+        del value, context
+        return forged_payloads[fault]
+
+    monkeypatch.setattr(tools_module, "_model_json", forged_model_json)
+    tool_name = "render_pdf_page_tiles" if fault == "tiles" else "render_pdf_pages"
+    arguments: JsonObject = (
+        {"render_id": render_id, "page_number": 1}
+        if fault == "tiles"
+        else {"artifact_id": artifact.object_id, "pages": [1]}
+    )
+
+    with pytest.raises(TypeError, match=expected_message):
+        _ = await tools.call(tool_name, arguments)
+
+
+class UnexpectedPdfSuccess:
+    """Deliberately violate the executor's typed result contract in one test."""
+
+    payload: object = object()

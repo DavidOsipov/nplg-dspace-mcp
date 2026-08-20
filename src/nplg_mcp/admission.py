@@ -11,6 +11,8 @@ from starlette.responses import JSONResponse
 from .errors import AppError, ErrorCode, to_public_error
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from starlette.types import ASGIApp, Receive, Scope, Send
 
 
@@ -48,6 +50,37 @@ class AdmissionGate:
                 msg = "admission gate release is unbalanced"
                 raise RuntimeError(msg)
             self._active -= 1
+
+
+class PrincipalAdmission:
+    """A fixed-cardinality set of per-principal zero-waiter gates."""
+
+    def __init__(self, principal_ids: Iterable[str], capacity: int) -> None:
+        """Create one bounded gate for each configured principal."""
+        super().__init__()
+        identifiers = tuple(principal_ids)
+        if not identifiers or len(set(identifiers)) != len(identifiers):
+            msg = "principal admission requires unique configured identifiers"
+            raise ValueError(msg)
+        self._gates = {
+            principal_id: AdmissionGate(capacity) for principal_id in identifiers
+        }
+
+    def try_acquire(self, principal_id: str) -> bool:
+        """Acquire the configured principal's permit without waiting."""
+        gate = self._gates.get(principal_id)
+        if gate is None:
+            msg = "principal admission identifier is not configured"
+            raise ValueError(msg)
+        return gate.try_acquire()
+
+    def release(self, principal_id: str) -> None:
+        """Release one permit held by the configured principal."""
+        gate = self._gates.get(principal_id)
+        if gate is None:
+            msg = "principal admission identifier is not configured"
+            raise ValueError(msg)
+        gate.release()
 
 
 class PathAdmissionMiddleware:

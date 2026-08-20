@@ -27,6 +27,7 @@ from .json_types import (
     load_json_value,
     require_json_object,
 )
+from .pdf_identity import render_identifier
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -1105,17 +1106,15 @@ class PdfProcessor:
             _ = document.close()
 
     def _render_id(self, source_sha256: str, pages: tuple[int, ...], mode: str) -> str:
-        key = {
-            "fallback_dpi": self.fallback_dpi,
-            "mode": mode,
-            "pages": list(pages),
-            "renderer_version": _RENDERER_VERSION,
-            "source_sha256": source_sha256,
-        }
-        digest = hashlib.sha256(
-            json.dumps(key, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-        return f"rnd_{digest[:32]}"
+        if mode != "native":
+            raise AppError(ErrorCode.INVALID_INPUT, "Render mode is invalid.")
+        return render_identifier(
+            source_sha256=source_sha256,
+            pages=pages,
+            mode="native",
+            renderer_version=_RENDERER_VERSION,
+            fallback_dpi=self.fallback_dpi,
+        )
 
     @staticmethod
     def _validate_render_id(render_id: str) -> str:

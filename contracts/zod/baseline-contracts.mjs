@@ -106,6 +106,26 @@ function issue(context, path, message) {
 }
 
 /**
+ * Build a string schema whose length bounds use Unicode code points, matching
+ * Python and Pydantic string-length semantics instead of UTF-16 code units.
+ * @param {number} minimum
+ * @param {number} maximum
+ * @returns {import("zod").ZodString}
+ */
+function codePointString(minimum, maximum) {
+  return z.string().superRefine((value, context) => {
+    const length = Array.from(value).length;
+    if (length < minimum || length > maximum) {
+      issue(
+        context,
+        [],
+        `string must contain between ${String(minimum)} and ${String(maximum)} Unicode code points`,
+      );
+    }
+  });
+}
+
+/**
  * @param {JsonValue} value
  * @param {number} [depth]
  * @returns {number}
@@ -181,9 +201,7 @@ const replayHeaderSchema = z.strictObject({
     .min(1)
     .max(128)
     .regex(/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/),
-  value: z.string()
-    .min(1)
-    .max(MAX_HEADER_VALUE_LENGTH)
+  value: codePointString(1, MAX_HEADER_VALUE_LENGTH)
     .regex(/^[^\r\n]+$/),
 });
 
@@ -1033,6 +1051,56 @@ export const baselineManifestSchema = z.strictObject({
       context,
       ["index_transition", "imported_index_tree"],
       "recovery and transition imported trees differ",
+    );
+  }
+});
+
+export const committedBaselineManifestSchema = z.strictObject({
+  attestation: z.strictObject({
+    allowed_paths: z.tuple([
+      z.literal("contracts/baseline/manifest.json"),
+      z.literal("contracts/baseline/historical-manifest-v3.json"),
+    ]),
+    scheme: z.literal("current-head-single-parent-manifest-delta-v1"),
+  }),
+  candidate: z.strictObject({
+    commit: gitObjectIdSchema,
+    src_tree: gitObjectIdSchema,
+    tree: gitObjectIdSchema,
+  }),
+  canonicalization: z.literal("nplg-json-sort-utf8-lf-v1"),
+  capture_mode: z.literal("committed-candidate-attestation"),
+  entries: z.tuple([
+    z.strictObject({ path: z.literal("tool-catalog.json"), sha256: sha256Schema }),
+    z.strictObject({ path: z.literal("resources.json"), sha256: sha256Schema }),
+    z.strictObject({ path: z.literal("result-cases.json"), sha256: sha256Schema }),
+    z.strictObject({ path: z.literal("error-cases.json"), sha256: sha256Schema }),
+  ]),
+  historical_provenance: z.strictObject({
+    path: z.literal("historical-manifest-v3.json"),
+    schema_version: z.literal(3),
+    sha256: sha256Schema,
+  }),
+  required_case_ids: z.array(caseIdSchema).min(1).max(512),
+  required_tool_names: z.tuple([
+    z.literal("download_document_file"),
+    z.literal("get_document_metadata"),
+    z.literal("get_render_manifest"),
+    z.literal("inspect_pdf"),
+    z.literal("list_document_files"),
+    z.literal("render_pdf_page_tiles"),
+    z.literal("render_pdf_pages"),
+    z.literal("search_documents"),
+  ]),
+  response_canonicalization: z.literal("nplg-response-semantic-numbers-v1"),
+  schema_version: z.literal(4),
+}).superRefine((manifest, context) => {
+  const normalizedCaseIds = [...new Set(manifest.required_case_ids)].sort();
+  if (!sameJson(manifest.required_case_ids, normalizedCaseIds)) {
+    issue(
+      context,
+      ["required_case_ids"],
+      "committed manifest case IDs must be unique and sorted",
     );
   }
 });

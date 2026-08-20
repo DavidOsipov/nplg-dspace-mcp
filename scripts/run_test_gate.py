@@ -398,6 +398,9 @@ _MEASURED_ROOTS = ("src/nplg_mcp", "scripts")
 _DECISION_MODULES = (
     "src/nplg_mcp/admission.py",
     "src/nplg_mcp/errors.py",
+    "src/nplg_mcp/network.py",
+    "src/nplg_mcp/pdf_executor.py",
+    "src/nplg_mcp/pdf_ipc.py",
     "src/nplg_mcp/rate_limit.py",
     "src/nplg_mcp/security.py",
     "src/nplg_mcp/tokens.py",
@@ -408,6 +411,7 @@ _DECISION_MODULES = (
     "scripts/run_mutation_gate.py",
     "scripts/verify_release.py",
     "scripts/bootstrap_external_tools.py",
+    "scripts/pyright_identity.py",
 )
 _POLICY_KEYS = frozenset(
     {
@@ -951,21 +955,21 @@ def parse_external_gate_registry(payload: bytes) -> ExternalGateRegistry:
             "kind": "live",
             "node_id": (
                 "tests/contracts/test_frozen_baseline.py::"
-                "test_capture_check_mode_exists_and_does_not_rewrite_outputs"
+                "test_capture_check_mode_fails_closed_until_attestation_without_rewriting"
             ),
         },
         {
             "kind": "live",
             "node_id": (
                 "tests/contracts/test_frozen_baseline.py::"
-                "test_capture_child_executes_from_the_exact_materialized_input_tree"
+                "test_historical_capture_rejects_a_non_recovery_head_without_writes"
             ),
         },
         {
             "kind": "live",
             "node_id": (
                 "tests/contracts/test_frozen_baseline.py::"
-                "test_check_capture_does_not_freshen_real_object_database_metadata"
+                "test_rejected_historical_capture_does_not_freshen_git_metadata"
             ),
         },
     ]
@@ -3408,6 +3412,7 @@ def _collect_deterministic_nodes(
 def _coverage_configuration(
     output: Path,
     *,
+    snapshot_root: Path,
     paths_configuration: bytes = b"",
 ) -> bytes:
     return (
@@ -3417,8 +3422,9 @@ def _coverage_configuration(
         "relative_files = false\n"
         "patch = subprocess\n"
         "source =\n"
-        "    nplg_mcp\n"
-        "    scripts\n"
+        f"    {snapshot_root.as_posix()}\n"
+        "omit =\n"
+        f"    {(snapshot_root / 'tests' / '*').as_posix()}\n"
         f"data_file = {(output / '.coverage').as_posix()}\n"
         "[report]\n"
         "fail_under = 95\n"
@@ -3775,11 +3781,12 @@ def _run_coverage_commands(
     coverage_json = output / "coverage.json"
     audit = output / "pytest-audit.json"
     import_roots = (materialized.root / "src", materialized.root)
+    application_package_root = materialized.root / "src" / "nplg_mcp"
     commands = (
         _trusted_python_command(
             "coverage-pytest",
             import_roots=import_roots,
-            application_package_root=materialized.root / "src" / "nplg_mcp",
+            application_package_root=application_package_root,
             arguments=(
                 rcfile.as_posix(),
                 audit.as_posix(),
@@ -3800,11 +3807,13 @@ def _run_coverage_commands(
         _trusted_python_command(
             "coverage",
             import_roots=import_roots,
+            application_package_root=application_package_root,
             arguments=("combine", f"--rcfile={rcfile.as_posix()}"),
         ),
         _trusted_python_command(
             "coverage",
             import_roots=import_roots,
+            application_package_root=application_package_root,
             arguments=(
                 "xml",
                 f"--rcfile={rcfile.as_posix()}",
@@ -3815,6 +3824,7 @@ def _run_coverage_commands(
         _trusted_python_command(
             "coverage",
             import_roots=import_roots,
+            application_package_root=application_package_root,
             arguments=(
                 "json",
                 f"--rcfile={rcfile.as_posix()}",
@@ -3988,6 +3998,7 @@ def _prepare_command_runtime(
         rcfile,
         _coverage_configuration(
             execution.output,
+            snapshot_root=snapshot_root,
             paths_configuration=paths_configuration,
         ),
     )

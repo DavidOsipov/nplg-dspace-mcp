@@ -382,6 +382,45 @@ class BaselineManifest(BaselineModel):
         return self
 
 
+class HistoricalManifestIdentity(BaselineModel):
+    """Digest identity for the preserved one-time recovery manifest."""
+
+    path: Literal["historical-manifest-v3.json"]
+    schema_version: Literal[3]
+    sha256: HexDigest
+
+
+class AttestationPolicy(BaselineModel):
+    """Closed policy for the commit that attests a clean candidate."""
+
+    scheme: Literal["current-head-single-parent-manifest-delta-v1"]
+    allowed_paths: tuple[
+        Literal["contracts/baseline/manifest.json"],
+        Literal["contracts/baseline/historical-manifest-v3.json"],
+    ]
+
+
+class CommittedBaselineManifest(BaselineModel):
+    """Independent closed schema for the post-recovery manifest v4."""
+
+    schema_version: Literal[4]
+    capture_mode: Literal["committed-candidate-attestation"]
+    candidate: GitSourceIdentity
+    historical_provenance: HistoricalManifestIdentity
+    attestation: AttestationPolicy
+    canonicalization: Literal["nplg-json-sort-utf8-lf-v1"]
+    response_canonicalization: Literal["nplg-response-semantic-numbers-v1"]
+    entries: Annotated[tuple[BaselineEntry, ...], Field(min_length=4, max_length=4)]
+    required_tool_names: Annotated[
+        tuple[CaseId, ...],
+        Field(min_length=8, max_length=8),
+    ]
+    required_case_ids: Annotated[
+        tuple[CaseId, ...],
+        Field(min_length=1, max_length=512),
+    ]
+
+
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -1067,6 +1106,33 @@ def make_capture_git_repository(root: Path) -> CapturePolicyValues:
     }
 
 
+def make_clean_committed_baseline_repository(root: Path) -> str:
+    """Create a clean committed candidate carrying the historical v3 baseline."""
+    _ = make_capture_git_repository(root)
+    baseline_root = root / "contracts" / "baseline"
+    for path in baseline_root.iterdir():
+        path.unlink()
+    baseline_root.rmdir()
+    _ = write_valid_infrastructure_fixture(baseline_root)
+    run_test_git_no_output(
+        root,
+        "add",
+        "--",
+        "contracts/baseline",
+        *INCLUDED_UNTRACKED_PATHS,
+    )
+    run_test_git_no_output(root, "commit", "--quiet", "-m", "candidate")
+    return run_test_git(root, "rev-parse", "HEAD")
+
+
+def make_unattested_committed_baseline_directory(root: Path) -> Path:
+    """Create a valid v4 directory without committing the attestation."""
+    repository = root / "repository"
+    _ = make_clean_committed_baseline_repository(repository)
+    capture_baseline.write_committed_candidate_manifest(repository)
+    return repository / "contracts" / "baseline"
+
+
 def test_temp_git_runner_uses_exact_closed_environment_argv_and_bounds(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1440,7 +1506,7 @@ async def test_replay_capture_rejects_unsafe_service_allocations(
         *,
         fault_mode: baseline_replay.CaseFaultMode,
     ) -> ToolService:
-        service = make_tool_service(root, fault_mode=fault_mode)
+        service = make_tool_service(root, fault_mode=fault_mode, frozen_origin=True)
         target = root / "fixture-source.pdf"
         outside = root.parent / f"outside-{root.name}"
         _ = outside.write_bytes(target.read_bytes())
@@ -1473,7 +1539,7 @@ async def test_replay_capture_rejects_invalid_or_unstable_tool_catalogs(
     ) -> ToolService:
         nonlocal service_count
         service_count += 1
-        service = make_tool_service(root, fault_mode=fault_mode)
+        service = make_tool_service(root, fault_mode=fault_mode, frozen_origin=True)
         catalog = service.list_tools()
         if fault == "invalid-name":
             catalog[0]["name"] = ""
@@ -1507,7 +1573,7 @@ async def test_replay_verifier_rejects_catalog_drift_from_the_supplied_fixture(
         *,
         fault_mode: baseline_replay.CaseFaultMode,
     ) -> ToolService:
-        service = make_tool_service(root, fault_mode=fault_mode)
+        service = make_tool_service(root, fault_mode=fault_mode, frozen_origin=True)
         catalog = service.list_tools()
         catalog[0]["description"] = "drifted"
         monkeypatch.setattr(service, "list_tools", lambda: catalog)
@@ -1534,7 +1600,7 @@ async def test_replay_capture_rejects_nonreproducible_setup_identifiers(
         *,
         fault_mode: baseline_replay.CaseFaultMode,
     ) -> ToolService:
-        service = make_tool_service(root, fault_mode=fault_mode)
+        service = make_tool_service(root, fault_mode=fault_mode, frozen_origin=True)
         call = service.call
 
         async def faulty_call(name: str, arguments: JsonObject) -> JsonObject:
@@ -1832,7 +1898,7 @@ async def test_frozen_case_replays_through_parse_and_handle_against_independent_
         fault_mode = "generic_error"
     else:
         fault_mode = "none"
-    service = make_tool_service(root, fault_mode=fault_mode)
+    service = make_tool_service(root, fault_mode=fault_mode, frozen_origin=True)
     await apply_normative_replay_setup(service, case.setup_kind)
     parsed = McpProtocol.parse_json(record.request.body_bytes())
     response = await McpProtocol(service).handle(
@@ -2216,7 +2282,7 @@ def test_every_frozen_case_contains_an_executable_replay_record() -> None:
 
 
 @pytest.mark.live
-def test_capture_check_mode_exists_and_does_not_rewrite_outputs() -> None:
+def test_capture_check_mode_fails_closed_until_attestation_without_rewriting() -> None:
     before = {
         path.name: (path.stat().st_mtime_ns, path.read_bytes())
         for path in sorted(BASELINE_DIR.glob("*.json"))
@@ -2232,7 +2298,11 @@ def test_capture_check_mode_exists_and_does_not_rewrite_outputs() -> None:
         path.name: (path.stat().st_mtime_ns, path.read_bytes())
         for path in sorted(BASELINE_DIR.glob("*.json"))
     }
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == capture_baseline.BASELINE_FAILURE_STATUS
+    assert result.stdout == ""
+    assert result.stderr == (
+        "baseline capture failed: committed baseline attestation required\n"
+    )
     assert after == before
 
 
@@ -3710,22 +3780,24 @@ def test_capture_main_returns_closed_status_for_success_or_capture_failure(
     capfd: pytest.CaptureFixture[str],
     result_kind: str,
 ) -> None:
-    def capture_mode(
+    def verify_attestation(
         repository: Path,
-        *,
-        policy: baseline_capture_io.CapturePolicy,
-        write: bool,
-        collector: baseline_capture_io.FixtureCollector | None = None,
-    ) -> None:
-        _ = (repository, policy, write, collector)
+    ) -> capture_baseline.CommittedBaselineManifest:
+        _ = repository
         if result_kind == "failure":
             msg = "closed-test-failure"
             raise capture_baseline.BaselineCaptureError(msg)
+        return cast("capture_baseline.CommittedBaselineManifest", object())
 
-    monkeypatch.setattr(capture_baseline, "run_capture_mode", capture_mode)
+    monkeypatch.setattr(
+        capture_baseline,
+        "verify_committed_candidate_attestation",
+        verify_attestation,
+    )
 
     failed = result_kind == "failure"
-    assert capture_baseline.main(["--check"]) == (2 if failed else 0)
+    expected_status = capture_baseline.BASELINE_FAILURE_STATUS if failed else 0
+    assert capture_baseline.main(["--check"]) == expected_status
     captured = capfd.readouterr()
     assert captured.out == ""
     assert captured.err == (
@@ -3733,33 +3805,60 @@ def test_capture_main_returns_closed_status_for_success_or_capture_failure(
     )
 
 
+def test_capture_main_dispatches_explicit_write_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[Path] = []
+
+    def write_manifest(repository: Path) -> None:
+        observed.append(repository)
+
+    monkeypatch.setattr(
+        capture_baseline,
+        "write_committed_candidate_manifest",
+        write_manifest,
+    )
+
+    assert capture_baseline.main(["--write"]) == 0
+    assert observed == [Path(capture_baseline.__file__).resolve().parents[1]]
+
+
 @pytest.mark.live
-def test_capture_child_executes_from_the_exact_materialized_input_tree() -> None:
+def test_historical_capture_rejects_a_non_recovery_head_without_writes() -> None:
     repository = Path(__file__).resolve().parents[2]
     before = baseline_bytes_from(repository / "contracts" / "baseline")
-    policy = current_recovery_policy()
 
-    with baseline_capture_io.materialize_synthetic_input(
-        repository,
-        policy=policy,
-        persist_objects=False,
-    ) as snapshot:
-        fixtures = capture_baseline.capture_from_materialized_root(snapshot.root)
+    with (
+        pytest.raises(
+            capture_baseline.BaselineCaptureError,
+            match="fixed recovery base",
+        ),
+        baseline_capture_io.materialize_synthetic_input(
+            repository,
+            policy=current_recovery_policy(),
+            persist_objects=False,
+        ),
+    ):
+        pass
 
-    assert set(fixtures) == set(BASELINE_FILE_NAMES)
-    assert set(fixtures["tool-catalog.json"]) == EXPECTED_TOOL_NAMES
     assert baseline_bytes_from(repository / "contracts" / "baseline") == before
 
 
 @pytest.mark.live
-def test_check_capture_does_not_freshen_real_object_database_metadata() -> None:
+def test_rejected_historical_capture_does_not_freshen_git_metadata() -> None:
     repository = Path(__file__).resolve().parents[2]
     before = git_object_metadata_inventory(repository)
 
-    with baseline_capture_io.materialize_synthetic_input(
-        repository,
-        policy=current_recovery_policy(),
-        persist_objects=False,
+    with (
+        pytest.raises(
+            capture_baseline.BaselineCaptureError,
+            match="fixed recovery base",
+        ),
+        baseline_capture_io.materialize_synthetic_input(
+            repository,
+            policy=current_recovery_policy(),
+            persist_objects=False,
+        ),
     ):
         pass
 
@@ -4245,6 +4344,247 @@ def test_capture_write_and_check_are_stable_and_check_is_side_effect_free(
     assert git_object_inventory(repository) == objects_after_write
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "committed-schema",
+        "historical-schema",
+        "historical-case-inventory",
+        "entry-order",
+        "tool-inventory",
+        "case-inventory",
+        "historical-digest",
+        "fixture-digest",
+    ],
+)
+def test_committed_baseline_rejects_adversarial_bundle_drift(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    baseline = make_unattested_committed_baseline_directory(tmp_path)
+    manifest_path = baseline / "manifest.json"
+    historical_path = baseline / "historical-manifest-v3.json"
+    manifest = require_test_object(
+        load_json_value(manifest_path.read_bytes()),
+        context="committed manifest",
+    )
+    historical = require_test_object(
+        load_json_value(historical_path.read_bytes()),
+        context="historical manifest",
+    )
+    target_path = manifest_path
+    target = manifest
+
+    if mutation == "committed-schema":
+        manifest["schema_version"] = 5
+    elif mutation == "historical-schema":
+        historical["schema_version"] = 2
+        target_path = historical_path
+        target = historical
+    elif mutation == "historical-case-inventory":
+        resources_path = baseline / "resources.json"
+        resources = require_test_object(
+            load_json_value(resources_path.read_bytes()),
+            context="resources fixture",
+        )
+        resources["unlisted.case"] = {}
+        resources_raw = canonical_test_bytes(resources)
+        _ = resources_path.write_bytes(resources_raw)
+        for raw_entry in require_test_array(
+            historical["entries"],
+            context="historical entries",
+        ):
+            entry = require_test_object(raw_entry, context="historical entry")
+            if entry.get("path") == "resources.json":
+                entry["sha256"] = hashlib.sha256(resources_raw).hexdigest()
+        target_path = historical_path
+        target = historical
+    elif mutation == "entry-order":
+        entries = require_test_array(manifest["entries"], context="committed entries")
+        manifest["entries"] = list(reversed(entries))
+    elif mutation == "tool-inventory":
+        tools = require_test_array(
+            manifest["required_tool_names"],
+            context="committed tool inventory",
+        )
+        tools[-1] = "unknown_tool"
+    elif mutation == "case-inventory":
+        manifest["required_case_ids"] = ["case.one", "error.one"]
+    elif mutation == "historical-digest":
+        provenance = require_test_object(
+            manifest["historical_provenance"],
+            context="historical provenance",
+        )
+        provenance["sha256"] = "0" * 64
+    else:
+        entries = require_test_array(manifest["entries"], context="committed entries")
+        entry = require_test_object(entries[0], context="committed entry")
+        entry["sha256"] = "0" * 64
+
+    _ = target_path.write_bytes(canonical_test_bytes(target))
+
+    with pytest.raises(capture_baseline.BaselineCaptureError):
+        _ = capture_baseline.validate_committed_baseline_directory(baseline)
+
+
+@pytest.mark.parametrize("mutation", ["non-directory", "unexpected-entry"])
+def test_committed_baseline_rejects_unclosed_root_boundary(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    if mutation == "non-directory":
+        baseline = tmp_path / "baseline"
+        _ = baseline.write_bytes(b"not-a-directory\n")
+    else:
+        baseline = make_unattested_committed_baseline_directory(tmp_path)
+        _ = (baseline / "unexpected.json").write_bytes(b"{}\n")
+
+    with pytest.raises(capture_baseline.BaselineCaptureError):
+        _ = capture_baseline.validate_committed_baseline_directory(baseline)
+
+
+def test_committed_baseline_writer_rejects_symlinked_repository(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "repository-target"
+    target.mkdir()
+    repository = tmp_path / "repository-link"
+    repository.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(
+        capture_baseline.BaselineCaptureError,
+        match="absolute non-symlink directory",
+    ):
+        capture_baseline.write_committed_candidate_manifest(repository)
+
+
+def test_committed_checker_requires_v4_before_git_attestation(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    _ = make_clean_committed_baseline_repository(repository)
+
+    with pytest.raises(
+        capture_baseline.BaselineCaptureError,
+        match="committed baseline attestation required",
+    ):
+        _ = capture_baseline.verify_committed_candidate_attestation(repository)
+
+
+def test_committed_manifest_writer_derives_candidate_and_preserves_fixtures(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    candidate_commit = make_clean_committed_baseline_repository(repository)
+    baseline = repository / "contracts" / "baseline"
+    historical_manifest = (baseline / "manifest.json").read_bytes()
+    fixture_bytes = {
+        name: (baseline / name).read_bytes() for name in BASELINE_FILE_NAMES
+    }
+
+    capture_baseline.write_committed_candidate_manifest(repository)
+
+    assert {
+        name: (baseline / name).read_bytes() for name in BASELINE_FILE_NAMES
+    } == fixture_bytes
+    assert (
+        baseline / "historical-manifest-v3.json"
+    ).read_bytes() == historical_manifest
+    manifest = CommittedBaselineManifest.model_validate_json(
+        (baseline / "manifest.json").read_bytes(),
+        strict=True,
+    )
+    assert manifest.candidate == GitSourceIdentity(
+        commit=candidate_commit,
+        tree=run_test_git(repository, "rev-parse", "HEAD^{tree}"),
+        src_tree=run_test_git(repository, "rev-parse", "HEAD:src"),
+    )
+    assert (
+        manifest.historical_provenance.sha256
+        == hashlib.sha256(
+            historical_manifest,
+        ).hexdigest()
+    )
+    assert run_test_git(repository, "status", "--short") == (
+        "M contracts/baseline/manifest.json\n"
+        "?? contracts/baseline/historical-manifest-v3.json"
+    )
+
+    run_test_git_no_output(
+        repository,
+        "add",
+        "--",
+        "contracts/baseline/manifest.json",
+        "contracts/baseline/historical-manifest-v3.json",
+    )
+    run_test_git_no_output(repository, "commit", "--quiet", "-m", "attest baseline")
+
+    verified = capture_baseline.verify_committed_candidate_attestation(repository)
+    assert verified.candidate.commit == candidate_commit
+
+
+def test_committed_manifest_writer_rejects_a_dirty_candidate_without_writes(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    _ = make_clean_committed_baseline_repository(repository)
+    baseline = repository / "contracts" / "baseline"
+    before = baseline_bytes_from(baseline)
+    _ = (repository / "src" / "module.py").write_text(
+        "VALUE = 2\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        capture_baseline.BaselineCaptureError,
+        match="candidate worktree must be clean",
+    ):
+        capture_baseline.write_committed_candidate_manifest(repository)
+
+    assert baseline_bytes_from(baseline) == before
+
+
+def test_committed_manifest_checker_rejects_uncommitted_provenance(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    _ = make_clean_committed_baseline_repository(repository)
+    capture_baseline.write_committed_candidate_manifest(repository)
+
+    with pytest.raises(
+        capture_baseline.BaselineCaptureError,
+        match="attestation worktree must be clean",
+    ):
+        _ = capture_baseline.verify_committed_candidate_attestation(repository)
+
+
+def test_committed_manifest_checker_rejects_an_unrelated_attestation_delta(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    _ = make_clean_committed_baseline_repository(repository)
+    capture_baseline.write_committed_candidate_manifest(repository)
+    _ = (repository / "src" / "module.py").write_text(
+        "VALUE = 2\n",
+        encoding="utf-8",
+    )
+    run_test_git_no_output(
+        repository,
+        "add",
+        "--",
+        "contracts/baseline/manifest.json",
+        "contracts/baseline/historical-manifest-v3.json",
+        "src/module.py",
+    )
+    run_test_git_no_output(repository, "commit", "--quiet", "-m", "forged attestation")
+
+    with pytest.raises(
+        capture_baseline.BaselineCaptureError,
+        match="attestation commit changes an unauthorized path",
+    ):
+        _ = capture_baseline.verify_committed_candidate_attestation(repository)
+
+
 @pytest.mark.parametrize("fault", ["tool-catalog", "duplicate-case"])
 def test_capture_mode_rejects_semantically_invalid_collector_output(
     tmp_path: Path,
@@ -4568,7 +4908,7 @@ def test_baseline_publication_rejects_destination_identity_races(
 
 @pytest.mark.asyncio
 async def test_fixture_factory_downloads_a_real_inspectable_pdf(tmp_path: Path) -> None:
-    service = make_tool_service(tmp_path)
+    service = make_tool_service(tmp_path, frozen_origin=True)
     downloaded = await service.call(
         "download_document_file",
         {"handle": "1234/560449", "bitstream_id": "bs_public"},
@@ -4639,7 +4979,9 @@ async def test_protocol_rejects_unknown_envelope_and_method_parameters(
     payload: JsonObject,
     headers: dict[str, str],
 ) -> None:
-    response = await McpProtocol(make_tool_service(tmp_path)).handle(payload, headers)
+    response = await McpProtocol(
+        make_tool_service(tmp_path, frozen_origin=True)
+    ).handle(payload, headers)
     assert response.status == BAD_REQUEST_STATUS
     assert response.payload is not None
     error = response.payload["error"]
@@ -5093,7 +5435,7 @@ EXPECTED_TASK1_SUPPRESSIONS = (
     ),
     SuppressionOccurrence(
         path="tests/contracts/test_frozen_baseline.py",
-        line=393,
+        line=432,
         rationale=(
             (
                 "# Security rationale: GIT_EXECUTABLE is absolute; fixed "
@@ -5109,7 +5451,7 @@ EXPECTED_TASK1_SUPPRESSIONS = (
     ),
     SuppressionOccurrence(
         path="tests/contracts/test_frozen_baseline.py",
-        line=3545,
+        line=3615,
         rationale=(
             (
                 "# Security rationale: sys.executable launches only the "
@@ -5128,7 +5470,7 @@ EXPECTED_TASK1_SUPPRESSIONS = (
     ),
     SuppressionOccurrence(
         path="src/nplg_mcp/protocol.py",
-        line=655,
+        line=750,
         rationale=(
             "# Security rationale: this is the final fail-closed JSON-RPC sanitizer.",
             (
@@ -5141,7 +5483,7 @@ EXPECTED_TASK1_SUPPRESSIONS = (
     ),
     SuppressionOccurrence(
         path="src/nplg_mcp/protocol.py",
-        line=659,
+        line=754,
         rationale=(
             "# Security rationale: tracebacks can contain untrusted or private data.",
             "# TRY400's logger.exception alternative would disclose that data.",

@@ -76,9 +76,11 @@ _MIN_MARKER_ARGUMENTS = 2
 _TRUSTED_PROOF_FIELDS = 4
 _PRIVATE_DIRECTORY_MODE = 0o700
 _EXPECTED_COMMAND_RECORDS = 9
+_EXPECTED_COVERAGE_REPORT_COMMANDS = 3
 _TRUSTED_DRIVER_MODE_INDEX = 5
 _TRUSTED_DRIVER_ROOTS_INDEX = 6
 _TRUSTED_DRIVER_PROOF_INDEX = 7
+_TRUSTED_DRIVER_PACKAGE_ROOT_INDEX = 8
 _TRUSTED_DRIVER_REJECTION = 97
 _CLI_FAILURE = 1
 _SECOND_CALL = 2
@@ -1141,6 +1143,9 @@ def _policy() -> CoveragePolicy:
         decision_modules=(
             "src/nplg_mcp/admission.py",
             "src/nplg_mcp/errors.py",
+            "src/nplg_mcp/network.py",
+            "src/nplg_mcp/pdf_executor.py",
+            "src/nplg_mcp/pdf_ipc.py",
             "src/nplg_mcp/rate_limit.py",
             "src/nplg_mcp/security.py",
             "src/nplg_mcp/tokens.py",
@@ -1151,6 +1156,7 @@ def _policy() -> CoveragePolicy:
             "scripts/run_mutation_gate.py",
             "scripts/verify_release.py",
             "scripts/bootstrap_external_tools.py",
+            "scripts/pyright_identity.py",
         ),
     )
 
@@ -1209,12 +1215,15 @@ def test_coverage_policy_parser_reaches_behavioral_red(tmp_path: Path) -> None:
                 b'"decision_module_branch_floor":100,',
                 b'"measured_roots":["src/nplg_mcp","scripts"],',
                 b'"decision_modules":["src/nplg_mcp/admission.py",',
-                b'"src/nplg_mcp/errors.py","src/nplg_mcp/rate_limit.py",',
+                b'"src/nplg_mcp/errors.py","src/nplg_mcp/network.py",',
+                b'"src/nplg_mcp/pdf_executor.py","src/nplg_mcp/pdf_ipc.py",',
+                b'"src/nplg_mcp/rate_limit.py",',
                 b'"src/nplg_mcp/security.py","src/nplg_mcp/tokens.py",',
                 b'"scripts/delete_render.py","scripts/smoke_live.py",',
                 b'"scripts/run_quality_gate.py","scripts/run_test_gate.py",',
                 b'"scripts/run_mutation_gate.py","scripts/verify_release.py",',
-                b'"scripts/bootstrap_external_tools.py"]}\n',
+                b'"scripts/bootstrap_external_tools.py",',
+                b'"scripts/pyright_identity.py"]}\n',
             )
         )
     )
@@ -1284,21 +1293,21 @@ def test_repository_policy_files_match_the_closed_task7_contract() -> None:
                 kind="live",
                 node_id=(
                     "tests/contracts/test_frozen_baseline.py::"
-                    "test_capture_check_mode_exists_and_does_not_rewrite_outputs"
+                    "test_capture_check_mode_fails_closed_until_attestation_without_rewriting"
                 ),
             ),
             ExternalGate(
                 kind="live",
                 node_id=(
                     "tests/contracts/test_frozen_baseline.py::"
-                    "test_capture_child_executes_from_the_exact_materialized_input_tree"
+                    "test_historical_capture_rejects_a_non_recovery_head_without_writes"
                 ),
             ),
             ExternalGate(
                 kind="live",
                 node_id=(
                     "tests/contracts/test_frozen_baseline.py::"
-                    "test_check_capture_does_not_freshen_real_object_database_metadata"
+                    "test_rejected_historical_capture_does_not_freshen_git_metadata"
                 ),
             ),
         ),
@@ -2784,6 +2793,9 @@ settings.register_profile(
     )
     false_modules = [
         "admission",
+        "network",
+        "pdf_executor",
+        "pdf_ipc",
         "rate_limit",
         "security",
         "tokens",
@@ -2794,6 +2806,7 @@ settings.register_profile(
         "run_mutation_gate",
         "verify_release",
         "bootstrap_external_tools",
+        "pyright_identity",
     ]
     if cover_every_branch:
         false_modules.insert(1, "errors")
@@ -2802,7 +2815,10 @@ settings.register_profile(
     ]
     test_source = "\n".join(
         (
-            "from nplg_mcp import admission, errors, rate_limit, security, tokens",
+            (
+                "from nplg_mcp import admission, errors, network, pdf_executor, "
+                "pdf_ipc, rate_limit, security, tokens"
+            ),
             "from scripts import (",
             "    bootstrap_external_tools,",
             "    delete_render,",
@@ -2810,14 +2826,16 @@ settings.register_profile(
             "    run_quality_gate,",
             "    run_test_gate,",
             "    smoke_live,",
+            "    pyright_identity,",
             "    verify_release,",
             ")",
             "",
             "MODULES = (",
-            "    admission, errors, rate_limit, security, tokens,",
+            "    admission, errors, network, pdf_executor, pdf_ipc,",
+            "    rate_limit, security, tokens,",
             "    delete_render, smoke_live, run_quality_gate,",
             "    run_test_gate, run_mutation_gate, verify_release,",
-            "    bootstrap_external_tools,",
+            "    bootstrap_external_tools, pyright_identity,",
             ")",
             "",
             "def test_all_decisions() -> None:",
@@ -2927,6 +2945,69 @@ def test_run_test_gate_reaches_behavioral_red(tmp_path: Path) -> None:
         == _EXPECTED_COMMAND_RECORDS
     )
     assert executor.requests
+
+
+def test_coverage_report_commands_prebind_materialized_package(
+    tmp_path: Path,
+) -> None:
+    repository, git_cache = _initialize_gate_repository(tmp_path)
+    output = (tmp_path / "external-output").resolve()
+    executor = _CoverageExecutor()
+
+    _ = run_test_gate(
+        GateRequest(
+            worktree=repository,
+            compare_branch="refs/heads/base",
+            output_dir=output,
+        ),
+        executor=executor,
+        clock=_Clock(),
+        filesystem=_Filesystem(),
+        git=_RealGit(git_cache),
+    )
+
+    expected_package_root = output / "snapshot" / "src" / "nplg_mcp"
+    coverage_reports = tuple(
+        request
+        for request in executor.requests
+        if len(request.argv) > _TRUSTED_DRIVER_PACKAGE_ROOT_INDEX
+        and request.argv[_TRUSTED_DRIVER_MODE_INDEX] == "coverage"
+    )
+    assert len(coverage_reports) == _EXPECTED_COVERAGE_REPORT_COMMANDS
+    assert all(
+        cast(
+            "object",
+            json.loads(request.argv[_TRUSTED_DRIVER_PACKAGE_ROOT_INDEX]),
+        )
+        == expected_package_root.as_posix()
+        for request in coverage_reports
+    )
+
+
+def test_coverage_configuration_binds_materialized_source_roots(
+    tmp_path: Path,
+) -> None:
+    repository, git_cache = _initialize_gate_repository(tmp_path)
+    output = (tmp_path / "external-output").resolve()
+
+    _ = run_test_gate(
+        GateRequest(
+            worktree=repository,
+            compare_branch="refs/heads/base",
+            output_dir=output,
+        ),
+        executor=_CoverageExecutor(),
+        clock=_Clock(),
+        filesystem=_Filesystem(),
+        git=_RealGit(git_cache),
+    )
+
+    snapshot = output / "snapshot"
+    configuration = (output / "coverage.rc").read_text(encoding="utf-8")
+    assert f"source =\n    {snapshot.as_posix()}\n" in configuration
+    assert f"omit =\n    {(snapshot / 'tests' / '*').as_posix()}\n" in configuration
+    assert "    nplg_mcp\n" not in configuration
+    assert "    scripts\n" not in configuration
 
 
 def test_run_test_gate_accepts_a_bounded_large_pytest_audit(tmp_path: Path) -> None:

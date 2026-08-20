@@ -22,6 +22,10 @@
     @private_metrics path /metrics
     respond @private_metrics 404
 
+    # Probes are for container/orchestrator checks, not the public Internet.
+    @private_probes path /healthz /readyz
+    respond @private_probes 404
+
     reverse_proxy app:8000 {
         health_uri /healthz
         health_interval 30s

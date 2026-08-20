@@ -30,9 +30,16 @@ from scripts.verify_release import (
 )
 
 SUBJECT_DIGEST = "sha256:" + "a" * 64
+PYRIGHT_EVIDENCE = (
+    "sha256:" + "c" * 64,
+    "sha256:" + "d" * 64,
+    "sha256:" + "e" * 64,
+    "sha256:" + "f" * 64,
+)
 PROJECT_ROOT = Path(__file__).parents[2]
 _CLI_FAILURE = 2
 _SECOND_CAPTURE = 2
+_EXPECTED_IDENTITY_VALIDATIONS = 3
 
 
 @dataclass(slots=True)
@@ -59,6 +66,11 @@ class _Clock:
 
 
 @dataclass(frozen=True, slots=True)
+class _RuntimeIdentityFixture:
+    offline_evidence: tuple[str, ...] = PYRIGHT_EVIDENCE
+
+
+@dataclass(frozen=True, slots=True)
 class _EmptyEvidenceRunner:
     stdout: bytes = b""
 
@@ -69,8 +81,25 @@ class _EmptyEvidenceRunner:
 
 class _PassingRunner:
     def __call__(self, command: GateCommand) -> ChildResult:
-        del command
+        if command.name == "mypy":
+            return ChildResult(0, b"", b"")
+        if command.name == "pyright":
+            return ChildResult(0, _pyright_stdout(), b"")
         return ChildResult(0, b"{}", b"")
+
+
+def _pyright_stderr_runner(command: GateCommand) -> ChildResult:
+    del command
+    return ChildResult(0, _pyright_stdout(), b"warning\n")
+
+
+def _stable_runtime_identity(
+    root: Path,
+    node_executable: Path,
+    cache_dir: Path,
+) -> _RuntimeIdentityFixture:
+    del root, node_executable, cache_dir
+    return _RuntimeIdentityFixture()
 
 
 class _JsonArrayRunner:
@@ -98,6 +127,33 @@ def _command(tmp_path: Path, name: str) -> GateCommand:
         result_schema="nplg.release.gate-result.v1",
         offline_evidence=("sha256:" + "b" * 64,),
     )
+
+
+def _pyright_stdout(
+    *,
+    version: str = "1.1.413",
+    diagnostics: list[JsonValue] | None = None,
+    summary_overrides: dict[str, JsonValue] | None = None,
+    extra: dict[str, JsonValue] | None = None,
+) -> bytes:
+    summary: dict[str, JsonValue] = {
+        "filesAnalyzed": 88,
+        "errorCount": 0,
+        "warningCount": 0,
+        "informationCount": 0,
+        "timeInSec": 10.102,
+    }
+    if summary_overrides is not None:
+        summary.update(summary_overrides)
+    payload: dict[str, JsonValue] = {
+        "version": version,
+        "time": "1787217300753",
+        "generalDiagnostics": [] if diagnostics is None else diagnostics,
+        "summary": summary,
+    }
+    if extra is not None:
+        payload.update(extra)
+    return json.dumps(payload, separators=(",", ":")).encode()
 
 
 def test_gate_battery_stops_after_first_nonpassing_result(tmp_path: Path) -> None:
@@ -175,6 +231,69 @@ def test_gate_battery_accepts_exact_mypy_empty_success(
     )
 
     assert result[0].verdict == "passed"
+
+
+def test_gate_battery_accepts_exact_clean_pyright_schema(tmp_path: Path) -> None:
+    command = replace(
+        _command(tmp_path, "pyright"),
+        version="1.1.413",
+    )
+
+    result = run_gate_battery(
+        (command,),
+        _EmptyEvidenceRunner(_pyright_stdout()),
+        monotonic=_Clock(),
+    )
+
+    assert result[0].verdict == "passed"
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        b"{}",
+        b"[]",
+        _pyright_stdout(version="1.1.414"),
+        _pyright_stdout(summary_overrides={"errorCount": 1}),
+        _pyright_stdout(summary_overrides={"warningCount": 1}),
+        _pyright_stdout(summary_overrides={"informationCount": 1}),
+        _pyright_stdout(diagnostics=[{"severity": "error"}]),
+        _pyright_stdout(extra={"unexpected": True}),
+        _pyright_stdout(extra={"time": 1787217300753}),
+        _pyright_stdout(summary_overrides={"filesAnalyzed": 0}),
+    ],
+)
+def test_gate_battery_rejects_malformed_or_unclean_pyright_success(
+    tmp_path: Path,
+    stdout: bytes,
+) -> None:
+    command = replace(
+        _command(tmp_path, "pyright"),
+        version="1.1.413",
+    )
+
+    result = run_gate_battery(
+        (command,),
+        _EmptyEvidenceRunner(stdout),
+        monotonic=_Clock(),
+    )
+
+    assert result[0].verdict == "tool_error"
+
+
+def test_gate_battery_rejects_pyright_stderr_on_zero_exit(tmp_path: Path) -> None:
+    command = replace(
+        _command(tmp_path, "pyright"),
+        version="1.1.413",
+    )
+
+    result = run_gate_battery(
+        (command,),
+        _pyright_stderr_runner,
+        monotonic=_Clock(),
+    )
+
+    assert result[0].verdict == "tool_error"
 
 
 def test_gate_command_rejects_finding_and_tool_error_conflation(
@@ -692,6 +811,7 @@ def test_source_snapshot_round_trip_includes_ignored_input_and_detects_change(
 
 def test_local_gates_records_external_requirements_as_not_passed(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
@@ -702,6 +822,22 @@ def test_local_gates_records_external_requirements_as_not_passed(
         output=output,
         node_executable=Path("/reviewed/node"),
         compare_branch="origin/main",
+    )
+    identity_calls: list[tuple[Path, Path, Path]] = []
+
+    def validate_identity(
+        root: Path,
+        node: Path,
+        cache: Path,
+    ) -> _RuntimeIdentityFixture:
+        identity_calls.append((root, node, cache))
+        return _RuntimeIdentityFixture()
+
+    monkeypatch.setattr(
+        release_module,
+        "_validate_pyright_runtime_identity",
+        validate_identity,
+        raising=False,
     )
 
     report = release_module.run_local_gates(
@@ -714,6 +850,9 @@ def test_local_gates_records_external_requirements_as_not_passed(
     assert report.terminal_verdict == "do_not_release"
     assert report.eligibility_reason == "external_authority_required"
     assert {item.status for item in report.external_requirements} == {"not_passed"}
+    pyright = next(result for result in report.results if result.name == "pyright")
+    assert pyright.offline_evidence == (pyright.subject_digest, *PYRIGHT_EVIDENCE)
+    assert len(identity_calls) == _EXPECTED_IDENTITY_VALIDATIONS
     assert (output / "release-gate-results.json").is_file()
 
 
@@ -725,7 +864,11 @@ def test_local_gate_commands_preserve_the_venv_python_executable() -> None:
         compare_branch="origin/main",
     )
 
-    commands = release_module.local_gate_commands(request, SUBJECT_DIGEST)
+    commands = release_module.local_gate_commands(
+        request,
+        SUBJECT_DIGEST,
+        pyright_evidence=PYRIGHT_EVIDENCE,
+    )
 
     assert commands[0].executable == Path(sys.executable)
     assert commands[0].argv[0] == sys.executable
@@ -744,6 +887,8 @@ def test_local_gate_commands_preserve_the_venv_python_executable() -> None:
     zizmor = next(command for command in commands if command.name == "zizmor")
     assert zizmor.executable == Path(sys.executable).parent / "zizmor"
     assert zizmor.argv[1:] == ("--offline", "--format=json", ".github/workflows")
+    pyright = next(command for command in commands if command.name == "pyright")
+    assert pyright.offline_evidence == (SUBJECT_DIGEST, *PYRIGHT_EVIDENCE)
 
 
 @pytest.mark.parametrize(
@@ -1278,7 +1423,10 @@ def test_materialize_source_rejects_dirty_git_evidence(
         )
 
 
-def test_local_gates_reject_source_drift(tmp_path: Path) -> None:
+def test_local_gates_reject_source_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     (worktree / ".git").mkdir()
@@ -1295,6 +1443,13 @@ def test_local_gates_reject_source_drift(tmp_path: Path) -> None:
                 self.mutated = True
             return ChildResult(0, b"{}", b"")
 
+    monkeypatch.setattr(
+        release_module,
+        "_validate_pyright_runtime_identity",
+        _stable_runtime_identity,
+        raising=False,
+    )
+
     with pytest.raises(ReleaseVerificationError, match="source changed"):
         _ = release_module.run_local_gates(
             release_module.LocalGatesRequest(
@@ -1304,6 +1459,105 @@ def test_local_gates_reject_source_drift(tmp_path: Path) -> None:
                 compare_branch="origin/main",
             ),
             runner=MutatingRunner(),
+            monotonic=_Clock(),
+        )
+
+
+def test_local_gates_rejects_pyright_identity_drift_while_tool_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    _ = (worktree / "source.txt").write_bytes(b"stable")
+    identities = iter(
+        (
+            _RuntimeIdentityFixture(),
+            _RuntimeIdentityFixture(),
+            _RuntimeIdentityFixture(
+                offline_evidence=(
+                    "sha256:" + "1" * 64,
+                    PYRIGHT_EVIDENCE[1],
+                    PYRIGHT_EVIDENCE[2],
+                    PYRIGHT_EVIDENCE[3],
+                )
+            ),
+        )
+    )
+
+    def drifting_runtime_identity(
+        root: Path,
+        node_executable: Path,
+        cache_dir: Path,
+    ) -> _RuntimeIdentityFixture:
+        del root, node_executable, cache_dir
+        return next(identities)
+
+    monkeypatch.setattr(
+        release_module,
+        "_validate_pyright_runtime_identity",
+        drifting_runtime_identity,
+        raising=False,
+    )
+
+    with pytest.raises(ReleaseVerificationError, match="Pyright identity changed"):
+        _ = release_module.run_local_gates(
+            release_module.LocalGatesRequest(
+                worktree=worktree,
+                output=(tmp_path / "external-output").resolve(),
+                node_executable=Path("/reviewed/node"),
+                compare_branch="origin/main",
+            ),
+            runner=_PassingRunner(),
+            monotonic=_Clock(),
+        )
+
+
+def test_local_gates_rejects_pyright_identity_drift_before_tool_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    _ = (worktree / "source.txt").write_bytes(b"stable")
+    identities = iter(
+        (
+            _RuntimeIdentityFixture(),
+            _RuntimeIdentityFixture(
+                offline_evidence=(
+                    "sha256:" + "1" * 64,
+                    PYRIGHT_EVIDENCE[1],
+                    PYRIGHT_EVIDENCE[2],
+                    PYRIGHT_EVIDENCE[3],
+                )
+            ),
+        )
+    )
+
+    def drifting_runtime_identity(
+        root: Path,
+        node_executable: Path,
+        cache_dir: Path,
+    ) -> _RuntimeIdentityFixture:
+        del root, node_executable, cache_dir
+        return next(identities)
+
+    monkeypatch.setattr(
+        release_module,
+        "_validate_pyright_runtime_identity",
+        drifting_runtime_identity,
+        raising=False,
+    )
+
+    with pytest.raises(ReleaseVerificationError, match="before execution"):
+        _ = release_module.run_local_gates(
+            release_module.LocalGatesRequest(
+                worktree=worktree,
+                output=(tmp_path / "external-output").resolve(),
+                node_executable=Path("/reviewed/node"),
+                compare_branch="origin/main",
+            ),
+            runner=_PassingRunner(),
             monotonic=_Clock(),
         )
 

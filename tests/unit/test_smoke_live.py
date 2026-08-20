@@ -663,7 +663,10 @@ def test_main_redacts_credentials_response_body_and_query() -> None:
     )
     dependencies, factory, _, stderr = _dependencies(
         client,
-        environ={"API_KEY": AMBIENT_MARKER},
+        environ={
+            "API_BEARER_TOKEN": AUTH_MARKER,
+            "API_KEY": AMBIENT_MARKER,
+        },
     )
 
     assert (
@@ -671,8 +674,6 @@ def test_main_redacts_credentials_response_body_and_query() -> None:
             [
                 "--base-url",
                 "https://mcp.example",
-                "--token",
-                AUTH_MARKER,
                 "--query",
                 QUERY_MARKER,
             ],
@@ -684,6 +685,37 @@ def test_main_redacts_credentials_response_body_and_query() -> None:
     assert stderr.getvalue() == "FAIL: live smoke request failed\n"
     for marker in (AUTH_MARKER, AMBIENT_MARKER, QUERY_MARKER, BODY_MARKER):
         assert marker not in stderr.getvalue()
+
+
+@pytest.mark.parametrize(
+    "credential_arguments",
+    [
+        ["--token", AUTH_MARKER],
+        [f"--token={AUTH_MARKER}"],
+        ["--api-key", AMBIENT_MARKER],
+        [f"--api-key={AMBIENT_MARKER}"],
+    ],
+)
+def test_main_rejects_credential_argv_without_echoing_values(
+    credential_arguments: list[str],
+) -> None:
+    client = ScriptedClient(_base_responses())
+    dependencies, factory, stdout, stderr = _dependencies(client)
+
+    assert (
+        main(
+            ["--base-url", "https://mcp.example", *credential_arguments],
+            dependencies=dependencies,
+        )
+        == ARGUMENT_ERROR_EXIT
+    )
+    assert factory.calls == []
+    assert stdout.getvalue() == ""
+    assert stderr.getvalue() == (
+        "FAIL: credentials must be supplied through environment variables\n"
+    )
+    assert AUTH_MARKER not in stderr.getvalue()
+    assert AMBIENT_MARKER not in stderr.getvalue()
 
 
 def test_main_rejects_oversized_canonical_output_without_partial_write() -> None:

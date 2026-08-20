@@ -84,6 +84,45 @@ def test_token_is_expired_at_its_exact_expiry_second() -> None:
         _ = verify_asset_token(SECRET, token, now=NOW)
 
 
+def test_asset_token_rejects_expiry_beyond_the_hard_lifetime_ceiling() -> None:
+    token = sign_asset_token(
+        SECRET,
+        path="documents/doc_abc/source.pdf",
+        media_type="application/pdf",
+        expires_at=NOW + timedelta(days=1, seconds=1),
+    )
+
+    with pytest.raises(AppError, match="lifetime"):
+        _ = verify_asset_token(SECRET, token, now=NOW)
+
+
+@pytest.mark.parametrize(
+    "max_ttl_seconds",
+    [
+        pytest.param(True, id="boolean"),
+        pytest.param(0, id="zero"),
+        pytest.param(86_401, id="above-hard-ceiling"),
+    ],
+)
+def test_asset_token_rejects_invalid_verifier_lifetime_ceiling(
+    max_ttl_seconds: int,
+) -> None:
+    token = sign_asset_token(
+        SECRET,
+        path="documents/doc_abc/source.pdf",
+        media_type="application/pdf",
+        expires_at=NOW + timedelta(minutes=10),
+    )
+
+    with pytest.raises(ValueError, match="max_ttl_seconds must be an integer"):
+        _ = verify_asset_token(
+            SECRET,
+            token,
+            now=NOW,
+            max_ttl_seconds=max_ttl_seconds,
+        )
+
+
 def test_wrong_secret_is_rejected() -> None:
     token = sign_asset_token(
         SECRET,

@@ -11,7 +11,7 @@ import re
 import stat
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, cast
@@ -25,7 +25,7 @@ if __name__ == "__main__" and not __package__:
     sys.path.insert(0, script_package_root.as_posix())
     __package__ = "scripts"
 
-from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from nplg_mcp.json_types import dataclass_to_json, load_json_value
 from scripts.baseline_capture_io import (
@@ -36,6 +36,19 @@ from scripts.baseline_capture_io import (
     read_regular_bytes,
     run_bounded_process,
     write_private_file,
+)
+from scripts.pyright_identity import (
+    PyrightIdentityError,
+    PyrightPackageIdentity,
+    stable_regular_file_sha256,
+    validate_pyright_package,
+)
+from scripts.run_quality_gate import (
+    GateError as QualityGateError,
+)
+from scripts.run_quality_gate import (
+    validate_managed_node,
+    verify_exact_version,
 )
 from scripts.run_test_gate import (
     SystemGit,
@@ -120,6 +133,32 @@ class _StrictModel(BaseModel):
     """Closed, immutable, non-coercing release-policy boundary."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+class _PyrightSummary(_StrictModel):
+    """Exact zero-diagnostic summary emitted by the reviewed Pyright build."""
+
+    files_analyzed: int = Field(alias="filesAnalyzed", ge=1)
+    error_count: Literal[0] = Field(alias="errorCount")
+    warning_count: Literal[0] = Field(alias="warningCount")
+    information_count: Literal[0] = Field(alias="informationCount")
+    time_in_seconds: float = Field(
+        alias="timeInSec",
+        ge=0.0,
+        allow_inf_nan=False,
+    )
+
+
+class _PyrightSuccess(_StrictModel):
+    """Closed success schema for Pyright 1.1.413 ``--outputjson`` output."""
+
+    version: Literal["1.1.413"]
+    time: str = Field(pattern=r"^[0-9]{13}$")
+    general_diagnostics: tuple[object, ...] = Field(
+        alias="generalDiagnostics",
+        max_length=0,
+    )
+    summary: _PyrightSummary
 
 
 class RiskWindow(_StrictModel):
@@ -862,6 +901,18 @@ class _GateCommandContext:
     subject_digest: str
 
 
+@dataclass(frozen=True, slots=True)
+class _PyrightRuntimeIdentity:
+    """Reviewed Node and package evidence used for one Pyright execution."""
+
+    node_sha256: str
+    package: PyrightPackageIdentity
+
+    @property
+    def offline_evidence(self) -> tuple[str, ...]:
+        return (self.node_sha256, *self.package.offline_evidence)
+
+
 def _gate_command(
     *,
     name: str,
@@ -890,7 +941,10 @@ def _gate_command(
 
 
 def local_gate_commands(
-    request: LocalGatesRequest, subject_digest: str
+    request: LocalGatesRequest,
+    subject_digest: str,
+    *,
+    pyright_evidence: tuple[str, ...],
 ) -> tuple[GateCommand, ...]:
     """Build the exact locally authoritative source/test command inventory."""
     python = Path(sys.executable)
@@ -921,16 +975,19 @@ def local_gate_commands(
             argv=(python.as_posix(), "-m", "mypy", "-O", "json", "src", "scripts"),
             context=context,
         ),
-        _gate_command(
-            name="pyright",
-            executable=node,
-            version="1.1.413",
-            argv=(
-                node.as_posix(),
-                (root / "node_modules/pyright/index.js").as_posix(),
-                "--outputjson",
+        replace(
+            _gate_command(
+                name="pyright",
+                executable=node,
+                version="1.1.413",
+                argv=(
+                    node.as_posix(),
+                    (root / "node_modules/pyright/index.js").as_posix(),
+                    "--outputjson",
+                ),
+                context=context,
             ),
-            context=context,
+            offline_evidence=(subject_digest, *pyright_evidence),
         ),
         _gate_command(
             name="test-gate",
@@ -1027,6 +1084,68 @@ def _external_requirements() -> tuple[ExternalRequirementResult, ...]:
     )
 
 
+def _validate_pyright_runtime_identity(
+    root: Path,
+    node_executable: Path,
+    cache_dir: Path,
+) -> _PyrightRuntimeIdentity:
+    """Prove the managed Node binary, Pyright package tree, and exact version."""
+    try:
+        reviewed_node = validate_managed_node(root, node_executable)
+        package = validate_pyright_package(root)
+        verify_exact_version(
+            (
+                reviewed_node.as_posix(),
+                (root / "node_modules" / "pyright" / "index.js").as_posix(),
+                "--version",
+            ),
+            expected_stdout=b"pyright 1.1.413\n",
+            root=root,
+            cache_dir=cache_dir,
+        )
+        node_sha256 = stable_regular_file_sha256(
+            reviewed_node,
+            max_bytes=256 * 1024 * 1024,
+        )
+    except (OSError, PyrightIdentityError, QualityGateError) as exc:
+        _fail_from("reviewed Pyright runtime identity is invalid", exc)
+    return _PyrightRuntimeIdentity(
+        node_sha256=node_sha256,
+        package=package,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PyrightIdentityBoundRunner:
+    """Recheck reviewed runtime bytes immediately around Pyright execution."""
+
+    delegate: CommandRunner
+    root: Path
+    node_executable: Path
+    cache_dir: Path
+    expected_evidence: tuple[str, ...]
+
+    def __call__(self, command: GateCommand) -> ChildResult:
+        if command.name != "pyright":
+            return self.delegate(command)
+        before = _validate_pyright_runtime_identity(
+            self.root,
+            self.node_executable,
+            self.cache_dir,
+        )
+        if before.offline_evidence != self.expected_evidence:
+            _fail("Pyright identity changed before execution")
+        completed = self.delegate(command)
+        after = _validate_pyright_runtime_identity(
+            self.root,
+            self.node_executable,
+            self.cache_dir,
+        )
+        if after.offline_evidence != self.expected_evidence:
+            _fail("Pyright identity changed while Pyright ran")
+        return completed
+
+
 def run_local_gates(
     request: LocalGatesRequest,
     *,
@@ -1039,8 +1158,27 @@ def run_local_gates(
         request.output,
         registered_worktrees=(request.worktree.resolve(strict=True),),
     )
-    commands = local_gate_commands(request, before.digest)
-    results = run_gate_battery(commands, runner, monotonic=monotonic)
+    identity_cache = output / "pyright-identity-cache"
+    identity_cache.mkdir(mode=0o700)
+    root = request.worktree.resolve(strict=True)
+    identity = _validate_pyright_runtime_identity(
+        root,
+        request.node_executable,
+        identity_cache,
+    )
+    commands = local_gate_commands(
+        request,
+        before.digest,
+        pyright_evidence=identity.offline_evidence,
+    )
+    bound_runner = _PyrightIdentityBoundRunner(
+        delegate=runner,
+        root=root,
+        node_executable=request.node_executable,
+        cache_dir=identity_cache,
+        expected_evidence=identity.offline_evidence,
+    )
+    results = run_gate_battery(commands, bound_runner, monotonic=monotonic)
     local_status: Literal["passed", "failed"] = (
         "passed"
         if len(results) == len(commands)
@@ -1263,6 +1401,7 @@ class GateResult:
     duration_seconds: float
     tool_version: str
     subject_digest: str
+    offline_evidence: tuple[str, ...]
     stdout_sha256: str
     stderr_sha256: str
     evidence_digest: str
@@ -1294,6 +1433,36 @@ class SystemCommandRunner:
         )
 
 
+def _valid_success_evidence(command: GateCommand, completed: ChildResult) -> bool:
+    """Validate a zero-exit tool result against its exact success contract."""
+    if command.name == "mypy":
+        valid = completed.stdout in (b"", b"\n") and completed.stderr == b""
+    elif command.name == "pyright":
+        valid = False
+        if completed.stderr != b"":
+            valid = False
+        else:
+            try:
+                _ = _PyrightSuccess.model_validate_json(
+                    completed.stdout,
+                    strict=True,
+                )
+            except ValidationError:
+                valid = False
+            else:
+                valid = True
+    elif not completed.stdout:
+        valid = False
+    else:
+        try:
+            parsed = load_json_value(completed.stdout)
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            valid = False
+        else:
+            valid = isinstance(parsed, (dict, list))
+    return valid
+
+
 def run_gate_battery(
     commands: Sequence[GateCommand],
     runner: CommandRunner,
@@ -1306,20 +1475,7 @@ def run_gate_battery(
         started = monotonic()
         completed = runner(command)
         duration = monotonic() - started
-        valid_json = False
-        if completed.stdout:
-            try:
-                parsed = load_json_value(completed.stdout)
-            except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
-                pass
-            else:
-                valid_json = isinstance(parsed, (dict, list))
-        valid_empty_mypy = (
-            command.name == "mypy"
-            and completed.stdout in (b"", b"\n")
-            and completed.stderr == b""
-        )
-        if completed.returncode == 0 and (valid_json or valid_empty_mypy):
+        if completed.returncode == 0 and _valid_success_evidence(command, completed):
             verdict: GateVerdict = "passed"
         elif completed.returncode in command.finding_exit_codes:
             verdict = "findings"
@@ -1332,6 +1488,7 @@ def run_gate_battery(
             "duration_seconds": duration,
             "exit_code": completed.returncode,
             "name": command.name,
+            "offline_evidence": list(command.offline_evidence),
             "stderr_sha256": stderr_digest,
             "stdout_sha256": stdout_digest,
             "subject_digest": command.subject_digest,
@@ -1349,6 +1506,7 @@ def run_gate_battery(
                 duration_seconds=duration,
                 tool_version=command.version,
                 subject_digest=command.subject_digest,
+                offline_evidence=command.offline_evidence,
                 stdout_sha256=stdout_digest,
                 stderr_sha256=stderr_digest,
                 evidence_digest=evidence_digest,

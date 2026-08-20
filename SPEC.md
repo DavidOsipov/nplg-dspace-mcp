@@ -28,6 +28,18 @@ not be generated from Python models or treated as evidence in this phase.
 - PDF work is serialized in the compatibility backend: `PDF_EXECUTOR=serialized`
   and `MAX_CONCURRENT_PDF_JOBS=1`. Cancellation cannot release the permit until
   the worker thread has completed.
+- Production is limited to `alpic-metadata` until PDF/native-code execution is
+  moved behind a separately deployed, least-privilege OS authority boundary.
+  A same-container child process is a development compatibility boundary, not
+  a production sandbox.
+- Production API credentials are a closed, strict Pydantic principal registry.
+  Every authenticated MCP request consumes both a principal-specific zero-waiter
+  permit and the process-global emergency permit. Legacy shared bearer/API-key
+  environment variables are development-only compatibility inputs.
+- DNS resolution, metadata parsing, and local storage publication use separate
+  bounded executors. Cancellation does not return a permit while underlying
+  blocking work remains live; parser structure budgets are enforced before a
+  complete HTML/XML tree is constructed.
 - Bootstrap artifacts require HTTPS, publisher SHA-256 evidence, safe archive
   members, exact embedded versions, and atomic publication. Detached
   signatures are verified when the publisher supplies them; checksum-only

@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from functools import partial
+from typing import TYPE_CHECKING
 from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from .bounded_work import DNS_WORK, STORAGE_WORK, BlockingWorkCapacityError
 from .errors import AppError, ErrorCode
 from .http_types import HttpClientProtocol, HttpResponseProtocol
 from .parsers import Bitstream
@@ -20,6 +23,9 @@ from .security import (
     validate_upstream_url,
 )
 from .storage import ContentAddressedStore, StoredArtifact
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _RUNTIME_ANNOTATION_TYPES = (
     HttpClientProtocol,
@@ -54,6 +60,30 @@ _STREAM_LIMIT_MESSAGE = (
 
 def _validate_nplg_dns() -> None:
     _ = resolve_approved_addresses(NPLG_HOST)
+
+
+async def _run_storage_write(operation: Callable[[], int]) -> int:
+    try:
+        return await STORAGE_WORK.run_to_completion(operation)
+    except BlockingWorkCapacityError as exc:
+        raise AppError(
+            ErrorCode.RATE_LIMITED,
+            "The artifact storage service is at capacity.",
+            http_status=503,
+        ) from exc
+
+
+async def _run_storage_commit(
+    operation: Callable[[], StoredArtifact],
+) -> StoredArtifact:
+    try:
+        return await STORAGE_WORK.run_to_completion(operation)
+    except BlockingWorkCapacityError as exc:
+        raise AppError(
+            ErrorCode.RATE_LIMITED,
+            "The artifact storage service is at capacity.",
+            http_status=503,
+        ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,7 +122,14 @@ class DocumentDownloader:
 
     async def _ensure_dns(self) -> None:
         if self.validate_dns:
-            await asyncio.to_thread(_validate_nplg_dns)
+            try:
+                await DNS_WORK.run(_validate_nplg_dns)
+            except BlockingWorkCapacityError as exc:
+                raise AppError(
+                    ErrorCode.RATE_LIMITED,
+                    "The DNS resolver is at capacity.",
+                    http_status=503,
+                ) from exc
 
     @staticmethod
     def _validate_bitstream(bitstream: Bitstream) -> str:
@@ -261,17 +298,21 @@ class DocumentDownloader:
                 if len(prefix) < _PDF_SIGNATURE_LENGTH:
                     remaining = _PDF_SIGNATURE_LENGTH - len(prefix)
                     prefix.extend(chunk[:remaining])
-                _ = destination.write(chunk)
+                write_chunk: Callable[[], int] = partial(destination.write, chunk)
+                _ = await _run_storage_write(write_chunk)
             if downloaded == 0 or not bytes(prefix).startswith(b"%PDF-"):
                 raise AppError(
                     ErrorCode.INVALID_DOCUMENT,
                     "The repository response did not contain a valid PDF signature.",
                     http_status=422,
                 )
-            artifact = destination.commit(
-                namespace="documents",
-                filename="source.pdf",
-                media_type="application/pdf",
+            artifact = await _run_storage_commit(
+                partial(
+                    destination.commit,
+                    namespace="documents",
+                    filename="source.pdf",
+                    media_type="application/pdf",
+                )
             )
             return DownloadResult(
                 artifact=artifact,

@@ -68,14 +68,14 @@ const taskOnePackageScriptsSchema = z.strictObject({
     "npm run contracts:zod && npm run contracts:baseline-zod && npm run contracts:asvs-zod",
   ),
   "contracts:baseline-static": z.literal(
-    "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs",
+    "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
   ),
   "test:contracts:asvs": z.literal(
     "node --test tests/contracts/zod_asvs_evidence_contracts.test.mjs",
   ),
   "typecheck:contracts": z.literal("tsc --project tsconfig.contracts.json"),
   "lint:contracts": z.literal(
-    "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs",
+    "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
   ),
 });
 const packageJsonSchema = z.looseObject({
@@ -103,12 +103,14 @@ const resolvedTsconfigSchema = z.looseObject({
 
 const root = new URL("../../", import.meta.url);
 const rootPath = fileURLToPath(root);
-/** @type {readonly ["contracts/zod/baseline-contracts.mjs", "contracts/zod/asvs-evidence-contracts.mjs", "tests/contracts/zod_baseline_contracts.test.mjs", "tests/contracts/zod_asvs_evidence_contracts.test.mjs"]} */
+/** @type {readonly ["contracts/zod/baseline-contracts.mjs", "contracts/zod/asvs-evidence-contracts.mjs", "contracts/zod/capability-contracts.mjs", "tests/contracts/zod_baseline_contracts.test.mjs", "tests/contracts/zod_asvs_evidence_contracts.test.mjs", "tests/contracts/zod_contracts.test.mjs"]} */
 const contractFilePaths = [
   "contracts/zod/baseline-contracts.mjs",
   "contracts/zod/asvs-evidence-contracts.mjs",
+  "contracts/zod/capability-contracts.mjs",
   "tests/contracts/zod_baseline_contracts.test.mjs",
   "tests/contracts/zod_asvs_evidence_contracts.test.mjs",
+  "tests/contracts/zod_contracts.test.mjs",
 ];
 /** @type {readonly ["resources.json", "result-cases.json", "error-cases.json"]} */
 const fixtureFileNames = [
@@ -376,6 +378,21 @@ void test("Zod binds exact request bytes, digest, headers, and profile", async (
   assert.throws(() => replayRecordSchema.parse(wrongProfile), { name: "ZodError" });
 });
 
+void test("Zod header length matches Pydantic Unicode code-point semantics", async () => {
+  const fixture = await load("result-cases.json");
+  const record = structuredClone(
+    requireRecord(fixture, "protocol.tools-list.modern.success"),
+  );
+  const header = { name: "X-Unicode-Test", value: "" };
+  record.request.headers.push(header);
+
+  header.value = "😀".repeat(4096);
+  replayRecordSchema.parse(record);
+
+  header.value = "😀".repeat(4097);
+  assert.throws(() => replayRecordSchema.parse(record), { name: "ZodError" });
+});
+
 void test("Zod fixture oracle rejects valid-shape profile, scenario, setup, header, and status drift", async () => {
   const source = await load("result-cases.json");
   /** @type {Array<(record: MutableReplayRecord) => void>} */
@@ -622,6 +639,52 @@ void test("strict Zod schemas accept the canonical manifest and tool catalog", a
   );
   assert.throws(
     () => baselineContracts.toolCatalogSchema.parse(catalog),
+    { name: "ZodError" },
+  );
+});
+
+void test("committed manifest Zod schema is strict and has no self-hash field", async () => {
+  const historical = await load("manifest.json");
+  const manifest = {
+    schema_version: 4,
+    capture_mode: "committed-candidate-attestation",
+    candidate: {
+      commit: "1".repeat(40),
+      tree: "2".repeat(40),
+      src_tree: "3".repeat(40),
+    },
+    historical_provenance: {
+      path: "historical-manifest-v3.json",
+      schema_version: 3,
+      sha256: "4".repeat(64),
+    },
+    attestation: {
+      scheme: "current-head-single-parent-manifest-delta-v1",
+      allowed_paths: [
+        "contracts/baseline/manifest.json",
+        "contracts/baseline/historical-manifest-v3.json",
+      ],
+    },
+    canonicalization: historical["canonicalization"],
+    response_canonicalization: historical["response_canonicalization"],
+    entries: historical.entries,
+    required_tool_names: historical["required_tool_names"],
+    required_case_ids: historical.required_case_ids,
+  };
+
+  baselineContracts.committedBaselineManifestSchema.parse(manifest);
+  assert.throws(
+    () => baselineContracts.committedBaselineManifestSchema.parse({
+      ...manifest,
+      attestation_commit: "5".repeat(40),
+    }),
+    { name: "ZodError" },
+  );
+  assert.throws(
+    () => baselineContracts.committedBaselineManifestSchema.parse({
+      ...manifest,
+      required_case_ids: [...manifest.required_case_ids].reverse(),
+    }),
     { name: "ZodError" },
   );
 });
@@ -875,7 +938,7 @@ void test("package scripts preserve capability and baseline Zod entrypoints", as
   );
   assert.equal(
     packageJson.scripts["contracts:baseline-static"],
-    "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs",
+    "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
   );
   assert.equal(
     packageJson.scripts["test:contracts:asvs"],
@@ -887,7 +950,7 @@ void test("package scripts preserve capability and baseline Zod entrypoints", as
   );
   assert.equal(
     packageJson.scripts["lint:contracts"],
-    "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs",
+    "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
   );
 });
 
@@ -902,19 +965,19 @@ void test("package policy model rejects missing or weakened static commands", ()
     "contracts:zod:all":
       "npm run contracts:zod && npm run contracts:baseline-zod && npm run contracts:asvs-zod",
     "contracts:baseline-static":
-      "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs",
+      "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
     "test:contracts:asvs":
       "node --test tests/contracts/zod_asvs_evidence_contracts.test.mjs",
     "typecheck:contracts": "tsc --project tsconfig.contracts.json",
     "lint:contracts":
-      "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs",
+      "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
   };
   const missingStatic = { ...exactScripts };
   delete missingStatic["contracts:baseline-static"];
   const weakenedStatic = {
     ...exactScripts,
     "contracts:baseline-static":
-      "tsc --project tsconfig.contracts.json && eslint contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs",
+      "tsc --project tsconfig.contracts.json && eslint contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
   };
   const incompleteAggregate = {
     ...exactScripts,

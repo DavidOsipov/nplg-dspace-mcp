@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -20,6 +21,7 @@ from nplg_mcp.tools import (
     ToolServiceDependencies,
     UtcClock,
 )
+from tests.helpers.inline_pdf_executor import InlinePdfExecutor
 from tests.helpers.pdf_factory import make_raster_pdf
 
 if TYPE_CHECKING:
@@ -40,7 +42,7 @@ def base_environment(**overrides: str) -> dict[str, str]:
     environment = {
         "NODE_ENV": "test",
         "ASSET_SIGNING_SECRET": "s" * 32,
-        "PUBLIC_BASE_URL": "http://testserver",
+        "PUBLIC_BASE_URL": "http://127.0.0.1:8000",
         "ALLOW_ANONYMOUS": "true",
         "CACHE_DIR": ".data/test-cache",
     }
@@ -128,8 +130,13 @@ class _FixtureDownloader:
         )
 
 
-def _config_for(tmp_path: Path) -> AppConfig:
-    return load_config(base_environment(CACHE_DIR=str(tmp_path)))
+def _config_for(tmp_path: Path, *, frozen_origin: bool = False) -> AppConfig:
+    config = load_config(base_environment(CACHE_DIR=str(tmp_path)))
+    return (
+        replace(config, public_base_url="http://testserver")
+        if frozen_origin
+        else config
+    )
 
 
 def _pdf_for(config: AppConfig, store: ContentAddressedStore) -> PdfProcessor:
@@ -150,9 +157,10 @@ def make_tool_service(
     pdf_processor: PdfProcessor | None = None,
     fault_mode: FixtureFaultMode = "none",
     utc_now: UtcClock = fixture_utc_now,
+    frozen_origin: bool = False,
 ) -> ToolService:
     """Construct a production ToolService with offline deterministic collaborators."""
-    config = _config_for(tmp_path)
+    config = _config_for(tmp_path, frozen_origin=frozen_origin)
     store = ContentAddressedStore(tmp_path, max_bytes=config.cache_max_bytes)
     fixture = make_raster_pdf(
         tmp_path / "fixture-source.pdf",
@@ -168,7 +176,7 @@ def make_tool_service(
                 "DownloaderProtocol",
                 _FixtureDownloader(store, fixture.path.read_bytes()),
             ),
-            pdf=pdf,
+            pdf=InlinePdfExecutor(processor=pdf, store=store),
             store=store,
         ),
         config=config,
