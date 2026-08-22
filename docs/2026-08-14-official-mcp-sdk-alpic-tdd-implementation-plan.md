@@ -8,7 +8,6 @@
 > configured uv index also does not provide CPython `3.13.15`, so local
 > verification uses `3.13.13` without claiming the exact patch. These are
 > release blockers, not silently substituted pins.
-
 > **Phase 0-1 execution reconciliation (2026-08-16):** Work advanced beyond
 > the requested audit boundary before the user stopped execution. The review
 > below retains only changes with independently reproduced security,
@@ -39,7 +38,6 @@
 > remote controls, and later external gates were not performed. Durable task
 > reports hold volatile hashes, counts, temporary paths, and review-round
 > evidence; those values must not be copied into this normative plan.
-
 > **For agentic workers:** REQUIRED SUB-SKILLS: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` task-by-task, use `superpowers:test-driven-development` for every behavioral/security change, and use `superpowers:verification-before-completion` at every phase gate. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Migrate the existing NPLG DSpace server to the official MCP Python SDK, make every public boundary strictly typed and independently contract-tested, isolate untrusted PDF processing, and produce an evidence-backed Alpic metadata staging candidate plus a falsifiable release decision aligned with OWASP ASVS 5.0.0 Level 2. A public release is conditional on the separately governed issuer, provider, protected release-controller, and operational evidence named below; this plan may correctly end with `do not release` and must not relabel a staging result as production eligibility.
@@ -672,7 +670,7 @@ records: five `S603`, one `S310`, one `PLR0913`, one `BLE001`, and one `TRY400`;
 no other suppression is accepted. Against the pinned analyzers it must detect file-level and inline
 Pyright modes, ignores, severity toggles over the exact pinned diagnostic-rule
 tuple, and the exact accepted boolean-rule tuple; mypy controls only at the
-literal, case-sensitive, column-zero `# mypy: ` prefix; Ruff/Flake8 lint,
+literal, case-sensitive, column-zero # mypy:  prefix; Ruff/Flake8 lint,
 file-ignore, block disable/enable, file-noqa, and formatter controls;
 import-sorter, security-scanner, Coverage.py exclusion/partial-branch, and coded
 or blanket type-ignore forms.
@@ -2627,6 +2625,19 @@ After explicit authorization, stage only the Task 8 workflow/policy files, `depl
 ---
 
 ## Phase 2 — Strict Runtime and Cross-language Contracts
+
+> **Phase 2 audit reconciliation (2026-08-21):** The Task 9–10 implementation,
+> including the TDD repairs identified during its review rounds, was independently
+> reassessed against the current staged sources. Focused contract and schema-oracle
+> suites, the repository test/coverage gate, documentation lint, and both targeted
+> mutation gates passed without changing the staged index. The required exact full
+> quality gate and full installed-wheel PEP 561 consumer gate remain unverified in
+> this environment because the locked Node v24.19.0 executable is absent; the
+> available v24.18.0 executable is correctly rejected by the digest check. Treat
+> Phase 2 as implemented but not fully verification-closed, do not mark its exit
+> gate satisfied, and do not use it as a Phase 3 predecessor until the locked
+> toolchain gates are rerun. Historical RED command output also remains a
+> provenance limitation; current mutation/fault evidence does not replace it.
 
 ### Task 9: Add strict input/output models and a typed tool catalog
 

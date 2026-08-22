@@ -108,7 +108,7 @@ def _invoke_worker(
         encode_frame(command, maximum=MAX_COMMAND_FRAME_BYTES),
     )
 
-    assert worker_main.main() == 0
+    assert worker_main.main([]) == 0
 
     frame = output.getvalue()
     assert len(frame) >= _FRAME_PREFIX_BYTES
@@ -283,7 +283,7 @@ def test_worker_main_rejects_invalid_resource_limit_environment(
     _disable_process_only_mutations(monkeypatch)
 
     with pytest.raises(RuntimeError, match="NPLG_PDF_CPU_SECONDS"):
-        _ = worker_main.main()
+        _ = worker_main.main([])
 
 
 @pytest.mark.parametrize("defect", ["relative", "symlink", "permissions"])
@@ -307,7 +307,7 @@ def test_worker_main_rejects_an_unsafe_work_root(
     _disable_process_only_mutations(monkeypatch)
 
     with pytest.raises(RuntimeError, match="worker root"):
-        _ = worker_main.main()
+        _ = worker_main.main([])
 
 
 @pytest.mark.parametrize(
@@ -331,4 +331,4 @@ def test_worker_main_rejects_truncated_oversized_or_trailing_commands(
     _ = _bind_standard_streams(monkeypatch, payload)
 
     with pytest.raises(RuntimeError, match="command"):
-        _ = worker_main.main()
+        _ = worker_main.main([])

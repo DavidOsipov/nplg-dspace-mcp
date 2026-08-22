@@ -37,6 +37,22 @@ jobs:
         with:
           node-version: 24.19.0
 
+      - name: Bootstrap the locked JavaScript toolchain
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/nplg-js-toolchain"
+          python scripts/bootstrap_toolchain.py --lock security/bootstrap-toolchain-lock.json --tool node --target x86_64-unknown-linux-gnu --destination "$RUNNER_TEMP/nplg-js-toolchain/node"
+          python scripts/bootstrap_toolchain.py --lock security/bootstrap-toolchain-lock.json --tool npm --target x86_64-unknown-linux-gnu --destination "$RUNNER_TEMP/nplg-js-toolchain/npm" --dependency "node=$RUNNER_TEMP/nplg-js-toolchain/node"
+          "$RUNNER_TEMP/nplg-js-toolchain/npm/bin/npm" --version | grep -Fx '11.18.0'
+          echo "$RUNNER_TEMP/nplg-js-toolchain/node/node-v24.19.0-linux-x64/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/nplg-js-toolchain/npm/bin" >> "$GITHUB_PATH"
+
+      - name: Verify locked npm command resolution
+        run: |
+          set -euo pipefail
+          test "$(command -v npm)" = "$RUNNER_TEMP/nplg-js-toolchain/npm/bin/npm"
+          test "$(npm --version)" = "11.18.0"
+
       - name: Install hash-locked tools
         run: |
           python -m pip install --require-hashes -r requirements-dev.lock
@@ -84,6 +100,22 @@ jobs:
         with:
           node-version: 24.19.0
 
+      - name: Bootstrap the locked JavaScript toolchain
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/nplg-js-toolchain"
+          python scripts/bootstrap_toolchain.py --lock security/bootstrap-toolchain-lock.json --tool node --target x86_64-unknown-linux-gnu --destination "$RUNNER_TEMP/nplg-js-toolchain/node"
+          python scripts/bootstrap_toolchain.py --lock security/bootstrap-toolchain-lock.json --tool npm --target x86_64-unknown-linux-gnu --destination "$RUNNER_TEMP/nplg-js-toolchain/npm" --dependency "node=$RUNNER_TEMP/nplg-js-toolchain/node"
+          "$RUNNER_TEMP/nplg-js-toolchain/npm/bin/npm" --version | grep -Fx '11.18.0'
+          echo "$RUNNER_TEMP/nplg-js-toolchain/node/node-v24.19.0-linux-x64/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/nplg-js-toolchain/npm/bin" >> "$GITHUB_PATH"
+
+      - name: Verify locked npm command resolution
+        run: |
+          set -euo pipefail
+          test "$(command -v npm)" = "$RUNNER_TEMP/nplg-js-toolchain/npm/bin/npm"
+          test "$(npm --version)" = "11.18.0"
+
       - name: Install hash-locked tools
         run: |
           python -m pip install --require-hashes -r requirements-dev.lock
@@ -91,6 +123,9 @@ jobs:
 
       - name: Run the strict type gate
         run: python scripts/run_quality_gate.py --node-executable "$(command -v node)" --worktree "$GITHUB_WORKSPACE" --cache-dir "$RUNNER_TEMP/nplg-quality-types" --require-clean --candidate "$GITHUB_SHA" src tests scripts typings
+
+      - name: Verify the full PEP 561 authority
+        run: python -I -B scripts/verify_pep561.py --worktree "$GITHUB_WORKSPACE" --output-dir "$RUNNER_TEMP/nplg-pep561" --node-executable "$(command -v node)" --candidate "$GITHUB_SHA"
 
       - name: Bind type evidence to its bytes
         run: |
@@ -103,7 +138,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: types-${{ github.sha }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/nplg-types
+          path: |
+            ${{ runner.temp }}/nplg-types
+            ${{ runner.temp }}/nplg-pep561
           if-no-files-found: error
           retention-days: 30
           overwrite: false
@@ -128,21 +165,51 @@ jobs:
         with:
           node-version: 24.19.0
 
+      - name: Bootstrap the locked JavaScript toolchain
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/nplg-js-toolchain"
+          python scripts/bootstrap_toolchain.py --lock security/bootstrap-toolchain-lock.json --tool node --target x86_64-unknown-linux-gnu --destination "$RUNNER_TEMP/nplg-js-toolchain/node"
+          python scripts/bootstrap_toolchain.py --lock security/bootstrap-toolchain-lock.json --tool npm --target x86_64-unknown-linux-gnu --destination "$RUNNER_TEMP/nplg-js-toolchain/npm" --dependency "node=$RUNNER_TEMP/nplg-js-toolchain/node"
+          "$RUNNER_TEMP/nplg-js-toolchain/npm/bin/npm" --version | grep -Fx '11.18.0'
+          echo "$RUNNER_TEMP/nplg-js-toolchain/node/node-v24.19.0-linux-x64/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/nplg-js-toolchain/npm/bin" >> "$GITHUB_PATH"
+
+      - name: Verify locked npm command resolution
+        run: |
+          set -euo pipefail
+          test "$(command -v npm)" = "$RUNNER_TEMP/nplg-js-toolchain/npm/bin/npm"
+          test "$(npm --version)" = "11.18.0"
+
       - name: Install hash-locked tools
         run: |
           python -m pip install --require-hashes -r requirements-dev.lock
           npm ci --ignore-scripts
 
-      - name: Type-check and lint the independent Zod oracle
-        run: npm run contracts:baseline-static
+      - name: Lint the complete contract project
+        run: npm run contracts:lint
 
-      - name: Run every independent Zod oracle
-        run: npm run contracts:zod:all
+      - name: Type-check the complete contract project
+        run: npm run contracts:typecheck
+
+      - name: Run every independent contract oracle
+        run: npm run contracts:test
+
+      - name: Lint all repository-owned Markdown
+        run: npm run docs:lint
+
+      - name: Verify deterministic generated contracts
+        run: |
+          python scripts/export_contracts.py --check
+          check-jsonschema --check-metaschema contracts/generated/tool-contracts.schema.json
+          python -m pytest tests/contracts/test_zod_contracts.py -q
+          git diff --exit-code -- contracts/generated > "$RUNNER_TEMP/generated-contracts.diff"
 
       - name: Bind contract evidence to its bytes
         run: |
           mkdir -p "$RUNNER_TEMP/nplg-contracts"
-          sha256sum contracts/zod/*.mjs tests/contracts/*.mjs > "$RUNNER_TEMP/nplg-contracts/SHA256SUMS"
+          cp "$RUNNER_TEMP/generated-contracts.diff" "$RUNNER_TEMP/nplg-contracts/generated-contracts.diff"
+          sha256sum contracts/generated/*.json contracts/zod/*.mjs contracts/zod/*.ts contracts/tool-contracts.corpus.json tests/contracts/*.mjs tests/contracts/test_zod_contracts.py "$RUNNER_TEMP/nplg-contracts/generated-contracts.diff" > "$RUNNER_TEMP/nplg-contracts/SHA256SUMS"
 
       - name: Upload contract evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

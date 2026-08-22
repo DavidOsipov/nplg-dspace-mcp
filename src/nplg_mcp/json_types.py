@@ -71,6 +71,7 @@ def dump_json(value: JsonValue, *, sort_keys: bool = False) -> str:
     """Serialize a validated JSON value with the project defaults."""
     return json.dumps(
         value,
+        allow_nan=False,
         ensure_ascii=False,
         sort_keys=sort_keys,
         separators=(",", ":"),

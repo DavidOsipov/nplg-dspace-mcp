@@ -13,6 +13,7 @@ import uvicorn
 
 import nplg_mcp.__main__ as entrypoint
 import nplg_mcp.app as app_module
+from nplg_mcp.private_tls import PrivateTlsMaterialError, PrivateTlsPaths
 
 if TYPE_CHECKING:
     from typing import Unpack
@@ -25,6 +26,74 @@ class _RunKwargs(TypedDict):
     forwarded_allow_ips: str
     access_log: bool
     limit_concurrency: int
+
+
+def test_main_requires_mutual_tls_for_the_private_edge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The internal origin must not silently downgrade to plaintext."""
+    sentinel = SimpleNamespace(
+        state=SimpleNamespace(
+            config=SimpleNamespace(
+                max_concurrent_http_requests=16,
+                private_edge_tls=True,
+            )
+        )
+    )
+    captured: dict[str, object] = {}
+    validated: list[PrivateTlsPaths] = []
+    monkeypatch.setattr(entrypoint, "build_default_app", lambda: sentinel)
+
+    def record_material(paths: PrivateTlsPaths, *, now: object) -> None:
+        del now
+        validated.append(paths)
+
+    monkeypatch.setattr(entrypoint, "validate_private_tls_material", record_material)
+
+    def fake_run(app: object, **kwargs: object) -> None:
+        captured["app"] = app
+        captured.update(kwargs)
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+
+    assert entrypoint.main() == 0
+    assert captured["ssl_certfile"] == "/run/secrets/app_server_cert"
+    assert captured["ssl_keyfile"] == "/run/secrets/app_server_key"
+    assert captured["ssl_ca_certs"] == "/run/secrets/caddy_client_ca"
+    assert captured["ssl_cert_reqs"] != 0
+    assert len(validated) == 1
+    validated_paths = validated[0]
+    assert validated_paths.server_name == "app.internal"
+
+
+def test_main_rejects_private_tls_material_before_server_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = SimpleNamespace(
+        state=SimpleNamespace(
+            config=SimpleNamespace(
+                max_concurrent_http_requests=16,
+                private_edge_tls=True,
+            )
+        )
+    )
+    monkeypatch.setattr(entrypoint, "build_default_app", lambda: sentinel)
+
+    def reject_material(paths: object, *, now: object) -> None:
+        del paths, now
+        error = PrivateTlsMaterialError.for_reason("test fixture")
+        raise error
+
+    def forbidden_run(app: object, **kwargs: object) -> None:
+        del app, kwargs
+        msg = "uvicorn must not start with invalid private TLS material"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(entrypoint, "validate_private_tls_material", reject_material)
+    monkeypatch.setattr(uvicorn, "run", forbidden_run)
+
+    with pytest.raises(PrivateTlsMaterialError, match="test fixture"):
+        _ = entrypoint.main()
 
 
 def test_main_disables_access_logs_that_would_disclose_signed_asset_tokens(

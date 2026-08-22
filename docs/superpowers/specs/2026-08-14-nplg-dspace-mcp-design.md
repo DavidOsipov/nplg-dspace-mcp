@@ -911,13 +911,13 @@ The MVP is accepted only when all of the following are demonstrated from a fresh
 
 ## 22. Source references
 
-- Iverieli repository: https://dspace.nplg.gov.ge/
-- Iverieli help/search behavior: https://dspace.nplg.gov.ge/help/index.html
-- Example public item: https://dspace.nplg.gov.ge/handle/1234/499564
-- Repository registry record and reported DSpace/OAI characteristics: https://ird.coar-repositories.org/systems/65ead5c9-a630-444b-b77e-ced5b9b0fd9c?lang=en
-- MCP Streamable HTTP specification: https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http
-- MCP TypeScript SDK: https://github.com/modelcontextprotocol/typescript-sdk
-- pypdfium2/PDFium: https://github.com/pypdfium2-team/pypdfium2
-- Poppler `pdfimages`: https://manpages.debian.org/unstable/poppler-utils/pdfimages.1.en.html
-- Sharp JPEG options: https://sharp.pixelplumbing.com/api-output/
-- Zod releases: https://github.com/colinhacks/zod/releases
+- Iverieli repository: <https://dspace.nplg.gov.ge/>
+- Iverieli help/search behavior: <https://dspace.nplg.gov.ge/help/index.html>
+- Example public item: <https://dspace.nplg.gov.ge/handle/1234/499564>
+- Repository registry record and reported DSpace/OAI characteristics: <https://ird.coar-repositories.org/systems/65ead5c9-a630-444b-b77e-ced5b9b0fd9c?lang=en>
+- MCP Streamable HTTP specification: <https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http>
+- MCP TypeScript SDK: <https://github.com/modelcontextprotocol/typescript-sdk>
+- pypdfium2/PDFium: <https://github.com/pypdfium2-team/pypdfium2>
+- Poppler `pdfimages`: <https://manpages.debian.org/unstable/poppler-utils/pdfimages.1.en.html>
+- Sharp JPEG options: <https://sharp.pixelplumbing.com/api-output/>
+- Zod releases: <https://github.com/colinhacks/zod/releases>

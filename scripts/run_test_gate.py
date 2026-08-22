@@ -367,6 +367,7 @@ _ALLOWED_UNTRACKED_PREFIXES = (
 _ALLOWED_UNTRACKED_ROOTS = frozenset(
     {
         ".gitignore",
+        ".markdownlint-cli2.mjs",
         ".env.example",
         "SECURITY.md",
         "SPEC.md",
@@ -398,10 +399,13 @@ _MEASURED_ROOTS = ("src/nplg_mcp", "scripts")
 _DECISION_MODULES = (
     "src/nplg_mcp/admission.py",
     "src/nplg_mcp/errors.py",
+    "src/nplg_mcp/http_security.py",
+    "src/nplg_mcp/json_preflight.py",
     "src/nplg_mcp/network.py",
     "src/nplg_mcp/pdf_executor.py",
     "src/nplg_mcp/pdf_ipc.py",
     "src/nplg_mcp/rate_limit.py",
+    "src/nplg_mcp/sdk_boundary.py",
     "src/nplg_mcp/security.py",
     "src/nplg_mcp/tokens.py",
     "scripts/delete_render.py",
@@ -3184,6 +3188,7 @@ def _command_environment(
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "NO_COLOR": "1",
+        "NPLG_PYTHON_ONLY_CONTRACT_GATE": "1",
         "PATH": os.pathsep.join(
             (Path(sys.executable).parent.as_posix(), "/usr/bin", "/bin")
         ),

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { ESLint } from "eslint";
@@ -67,6 +69,16 @@ const taskOnePackageScriptsSchema = z.strictObject({
   "contracts:zod:all": z.literal(
     "npm run contracts:zod && npm run contracts:baseline-zod && npm run contracts:asvs-zod",
   ),
+  "contracts:lint": z.literal(
+    "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/models.ts contracts/zod/contract.test.ts tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+  ),
+  "contracts:typecheck": z.literal("tsc --project tsconfig.contracts.json"),
+  "contracts:test": z.literal(
+    "node --test contracts/zod/contract.test.ts && npm run contracts:zod:all",
+  ),
+  "docs:lint": z.literal(
+    "markdownlint-cli2 \"*.md\" \"docs/**/*.md\" \"deploy/**/*.md\" \"skills/**/*.md\"",
+  ),
   "contracts:baseline-static": z.literal(
     "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
   ),
@@ -90,9 +102,35 @@ const resolvedEslintConfigSchema = z.looseObject({
 });
 const resolvedTsconfigSchema = z.looseObject({
   compilerOptions: z.looseObject({
-    noUncheckedSideEffectImports: z.boolean().optional(),
+    exactOptionalPropertyTypes: z.literal(true),
+    forceConsistentCasingInFileNames: z.literal(true),
+    module: z.literal("nodenext"),
+    moduleResolution: z.literal("nodenext"),
+    noEmit: z.literal(true),
+    noFallthroughCasesInSwitch: z.literal(true),
+    noImplicitOverride: z.literal(true),
+    noImplicitReturns: z.literal(true),
+    noPropertyAccessFromIndexSignature: z.literal(true),
+    noUncheckedIndexedAccess: z.literal(true),
+    noUncheckedSideEffectImports: z.literal(true),
+    strict: z.literal(true),
+    types: z.tuple([z.literal("node")]),
+    useUnknownInCatchVariables: z.literal(true),
+    verbatimModuleSyntax: z.literal(true),
   }),
   files: z.array(z.string()),
+}).superRefine((value, context) => {
+  const expected = contractFilePaths.map((path) => `./${path}`);
+  if (
+    value.files.length !== expected.length
+    || value.files.some((path, index) => path !== expected[index])
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "TypeScript source inventory must be exact and ordered",
+      path: ["files"],
+    });
+  }
 });
 
 /** @typedef {z.infer<typeof mutableJsonObjectSchema>} MutableJsonObject */
@@ -103,14 +141,21 @@ const resolvedTsconfigSchema = z.looseObject({
 
 const root = new URL("../../", import.meta.url);
 const rootPath = fileURLToPath(root);
-/** @type {readonly ["contracts/zod/baseline-contracts.mjs", "contracts/zod/asvs-evidence-contracts.mjs", "contracts/zod/capability-contracts.mjs", "tests/contracts/zod_baseline_contracts.test.mjs", "tests/contracts/zod_asvs_evidence_contracts.test.mjs", "tests/contracts/zod_contracts.test.mjs"]} */
+/** @type {readonly ["contracts/zod/baseline-contracts.mjs", "contracts/zod/asvs-evidence-contracts.mjs", "contracts/zod/capability-contracts.mjs", "contracts/zod/models.ts", "contracts/zod/contract.test.ts", "tests/contracts/zod_baseline_contracts.test.mjs", "tests/contracts/zod_asvs_evidence_contracts.test.mjs", "tests/contracts/zod_contracts.test.mjs"]} */
 const contractFilePaths = [
   "contracts/zod/baseline-contracts.mjs",
   "contracts/zod/asvs-evidence-contracts.mjs",
   "contracts/zod/capability-contracts.mjs",
+  "contracts/zod/models.ts",
+  "contracts/zod/contract.test.ts",
   "tests/contracts/zod_baseline_contracts.test.mjs",
   "tests/contracts/zod_asvs_evidence_contracts.test.mjs",
   "tests/contracts/zod_contracts.test.mjs",
+];
+/** @type {readonly ["contracts/zod/contract.test.ts", "contracts/zod/models.ts"]} */
+const contractTypeScriptFilePaths = [
+  "contracts/zod/contract.test.ts",
+  "contracts/zod/models.ts",
 ];
 /** @type {readonly ["resources.json", "result-cases.json", "error-cases.json"]} */
 const fixtureFileNames = [
@@ -937,6 +982,22 @@ void test("package scripts preserve capability and baseline Zod entrypoints", as
     "npm run contracts:zod && npm run contracts:baseline-zod && npm run contracts:asvs-zod",
   );
   assert.equal(
+    packageJson.scripts["contracts:lint"],
+    "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/models.ts contracts/zod/contract.test.ts tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+  );
+  assert.equal(
+    packageJson.scripts["contracts:typecheck"],
+    "tsc --project tsconfig.contracts.json",
+  );
+  assert.equal(
+    packageJson.scripts["contracts:test"],
+    "node --test contracts/zod/contract.test.ts && npm run contracts:zod:all",
+  );
+  assert.equal(
+    packageJson.scripts["docs:lint"],
+    "markdownlint-cli2 \"*.md\" \"docs/**/*.md\" \"deploy/**/*.md\" \"skills/**/*.md\"",
+  );
+  assert.equal(
     packageJson.scripts["contracts:baseline-static"],
     "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
   );
@@ -964,6 +1025,13 @@ void test("package policy model rejects missing or weakened static commands", ()
       "node --test tests/contracts/zod_asvs_evidence_contracts.test.mjs",
     "contracts:zod:all":
       "npm run contracts:zod && npm run contracts:baseline-zod && npm run contracts:asvs-zod",
+    "contracts:lint":
+      "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/models.ts contracts/zod/contract.test.ts tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+    "contracts:typecheck": "tsc --project tsconfig.contracts.json",
+    "contracts:test":
+      "node --test contracts/zod/contract.test.ts && npm run contracts:zod:all",
+    "docs:lint":
+      "markdownlint-cli2 \"*.md\" \"docs/**/*.md\" \"deploy/**/*.md\" \"skills/**/*.md\"",
     "contracts:baseline-static":
       "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
     "test:contracts:asvs":
@@ -989,6 +1057,10 @@ void test("package policy model rejects missing or weakened static commands", ()
   }
   for (
     const scriptName of [
+      "contracts:lint",
+      "contracts:typecheck",
+      "contracts:test",
+      "docs:lint",
       "test:contracts:asvs",
       "typecheck:contracts",
       "lint:contracts",
@@ -1037,6 +1109,77 @@ void test("configured ESLint rejects forbidden type escapes in every contract fi
         assert.deepEqual(
           result.messages.map(({ ruleId }) => ruleId),
           [expectedRule],
+        );
+      });
+    }
+  }
+});
+
+void test("configured TypeScript ESLint rejects adversarial type escapes", async (t) => {
+  const lintEngine = new ESLint({ cwd: rootPath });
+  const filePath = "contracts/zod/models.ts";
+  /** @type {ReadonlyArray<readonly [string, string, string]>} */
+  const mutants = [
+    [
+      "explicit any",
+      "export const escaped: any = 1;\n",
+      "@typescript-eslint/no-explicit-any",
+    ],
+    [
+      "unsafe assertion",
+      "const value: unknown = {};\nexport const asserted = value as { readonly text: string };\n",
+      "@typescript-eslint/no-unsafe-type-assertion",
+    ],
+    [
+      "double unknown assertion",
+      "export const asserted = 1 as unknown as string;\n",
+      "@typescript-eslint/no-unsafe-type-assertion",
+    ],
+    [
+      "unchecked JSON parse",
+      "export const parsed: string = JSON.parse(\"{}\");\n",
+      "@typescript-eslint/no-unsafe-assignment",
+    ],
+    [
+      "non-exhaustive discriminated union",
+      "type Value = { readonly kind: \"left\" } | { readonly kind: \"right\" };\nexport function select(value: Value): number {\n  switch (value.kind) {\n    case \"left\": return 1;\n  }\n}\n",
+      "@typescript-eslint/switch-exhaustiveness-check",
+    ],
+  ];
+  for (const [name, source, expectedRule] of mutants) {
+    await t.test(name, async () => {
+      const results = await lintEngine.lintText(source, { filePath });
+      const result = results[0];
+      assert.ok(result !== undefined);
+      assert.ok(
+        result.messages.some(({ ruleId }) => ruleId === expectedRule),
+        `${name} did not trigger ${expectedRule}: ${JSON.stringify(result.messages)}`,
+      );
+    });
+  }
+});
+
+void test("configured ESLint forbids native Zod string length semantics", async (t) => {
+  const lintEngine = new ESLint({ cwd: rootPath });
+  const discoveredTypeScriptSources = (await readdir(join(rootPath, "contracts/zod")))
+    .filter((name) => name.endsWith(".ts"))
+    .map((name) => `contracts/zod/${name}`)
+    .sort();
+  assert.deepEqual(discoveredTypeScriptSources, contractTypeScriptFilePaths);
+  for (const filePath of contractTypeScriptFilePaths) {
+    for (const method of ["min", "max", "length"]) {
+      await t.test(`${filePath} ${method}`, async () => {
+        const results = await lintEngine.lintText(
+          `import { z } from "zod";\nexport const invalid = z.string().${method}(1);\n`,
+          { filePath },
+        );
+        const result = results[0];
+        assert.ok(result !== undefined);
+        assert.ok(
+          result.messages.some(
+            ({ ruleId }) => ruleId === "task1/no-native-zod-string-length",
+          ),
+          `${filePath} ${method} did not trigger the native Zod length policy: ${JSON.stringify(result.messages)}`,
         );
       });
     }
@@ -1186,4 +1329,116 @@ void test("resolved static configuration closes directive and side-effect escape
     true,
   );
   assert.deepEqual(resolvedTsconfig.files, contractFilePaths.map((path) => `./${path}`));
+});
+
+void test("resolved TypeScript policy rejects emit and source-inventory mutants", () => {
+  const compilerOptions = {
+    module: "nodenext",
+    moduleResolution: "nodenext",
+    noEmit: true,
+    verbatimModuleSyntax: true,
+    noUncheckedSideEffectImports: true,
+    forceConsistentCasingInFileNames: true,
+    types: ["node"],
+    strict: true,
+    noUncheckedIndexedAccess: true,
+    exactOptionalPropertyTypes: true,
+    noImplicitOverride: true,
+    noImplicitReturns: true,
+    noFallthroughCasesInSwitch: true,
+    noPropertyAccessFromIndexSignature: true,
+    useUnknownInCatchVariables: true,
+  };
+  const files = contractFilePaths.map((path) => `./${path}`);
+
+  assert.throws(() => resolvedTsconfigSchema.parse({
+    compilerOptions: { ...compilerOptions, noEmit: false },
+    files,
+  }));
+  assert.throws(() => resolvedTsconfigSchema.parse({
+    compilerOptions,
+    files: [...files, "./contracts/zod/unlisted.ts"],
+  }));
+});
+
+void test("TypeScript negative fixtures fail at the configured compile boundary", async (t) => {
+  const tscEntrypoint = fileURLToPath(
+    new URL("../../node_modules/typescript/bin/tsc", import.meta.url),
+  );
+  /** @type {ReadonlyArray<readonly [string, Readonly<Record<string, string>>, RegExp]>} */
+  const fixtures = [
+    [
+      "unresolved side-effect import",
+      { "fixture.ts": "import \"./missing.js\";\nexport {};\n" },
+      /Cannot find module/u,
+    ],
+    [
+      "wrong-case path",
+      {
+        "fixture.ts": "import { value } from \"./Helper.js\";\nexport { value };\n",
+        "helper.ts": "export const value = 1;\n",
+      },
+      /Cannot find module/u,
+    ],
+    [
+      "ambient browser type",
+      { "fixture.ts": "export const body = document.body;\n" },
+      /Cannot find name 'document'/u,
+    ],
+  ];
+
+  for (const [name, sources, expected] of fixtures) {
+    await t.test(name, async (fixtureTest) => {
+      const directory = await mkdtemp(join(tmpdir(), "nplg-task10-tsc-"));
+      fixtureTest.after(async () => {
+        await rm(directory, { force: true, recursive: true });
+      });
+      await writeFile(
+        join(directory, "package.json"),
+        '{"type":"module"}\n',
+        "utf8",
+      );
+      for (const [path, source] of Object.entries(sources)) {
+        await writeFile(join(directory, path), source, "utf8");
+      }
+      await writeFile(
+        join(directory, "tsconfig.json"),
+        `${JSON.stringify({
+          compilerOptions: {
+            forceConsistentCasingInFileNames: true,
+            lib: ["ES2024"],
+            module: "NodeNext",
+            moduleResolution: "NodeNext",
+            noEmit: true,
+            noUncheckedSideEffectImports: true,
+            strict: true,
+            typeRoots: [join(rootPath, "node_modules/@types")],
+            types: ["node"],
+          },
+          files: Object.keys(sources),
+        }, null, 2)}\n`,
+        "utf8",
+      );
+      const result = spawnSync(
+        process.execPath,
+        [tscEntrypoint, "--project", "tsconfig.json", "--pretty", "false"],
+        {
+          cwd: directory,
+          encoding: "utf8",
+          env: {
+            LANG: "C.UTF-8",
+            LC_ALL: "C.UTF-8",
+            NO_COLOR: "1",
+          },
+          shell: false,
+          timeout: 5_000,
+          maxBuffer: 1_048_576,
+        },
+      );
+      assert.notEqual(result.status, 0, `${name} unexpectedly compiled`);
+      assert.equal(result.signal, null);
+      assert.equal(result.error, undefined);
+      assert.match(`${result.stdout}\n${result.stderr}`, expected);
+    });
+  }
 });

@@ -24,6 +24,9 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Protocol, cast, override
 
 import pytest
+from coverage.config import DEFAULT_EXCLUDE
+from coverage.misc import join_regex
+from coverage.parser import PythonParser
 from hypothesis import settings
 
 import scripts.run_test_gate as test_gate_module
@@ -1143,10 +1146,13 @@ def _policy() -> CoveragePolicy:
         decision_modules=(
             "src/nplg_mcp/admission.py",
             "src/nplg_mcp/errors.py",
+            "src/nplg_mcp/http_security.py",
+            "src/nplg_mcp/json_preflight.py",
             "src/nplg_mcp/network.py",
             "src/nplg_mcp/pdf_executor.py",
             "src/nplg_mcp/pdf_ipc.py",
             "src/nplg_mcp/rate_limit.py",
+            "src/nplg_mcp/sdk_boundary.py",
             "src/nplg_mcp/security.py",
             "src/nplg_mcp/tokens.py",
             "scripts/delete_render.py",
@@ -1159,6 +1165,19 @@ def _policy() -> CoveragePolicy:
             "scripts/pyright_identity.py",
         ),
     )
+
+
+def test_branchless_mcp_server_is_not_registered_as_a_decision_module() -> None:
+    """Decision inventory contains only modules with measurable branch exits."""
+    relative = "src/nplg_mcp/mcp_server.py"
+    parser = PythonParser(filename=relative, exclude=join_regex(DEFAULT_EXCLUDE))
+    parser.parse_source()
+    branch_exits = sum(
+        exits - 1 for exits in parser.exit_counts().values() if exits > 1
+    )
+
+    assert branch_exits == 0
+    assert relative not in _policy().decision_modules
 
 
 def _policy_document() -> dict[str, object]:
@@ -1215,9 +1234,11 @@ def test_coverage_policy_parser_reaches_behavioral_red(tmp_path: Path) -> None:
                 b'"decision_module_branch_floor":100,',
                 b'"measured_roots":["src/nplg_mcp","scripts"],',
                 b'"decision_modules":["src/nplg_mcp/admission.py",',
-                b'"src/nplg_mcp/errors.py","src/nplg_mcp/network.py",',
+                b'"src/nplg_mcp/errors.py","src/nplg_mcp/http_security.py",',
+                b'"src/nplg_mcp/json_preflight.py","src/nplg_mcp/network.py",',
                 b'"src/nplg_mcp/pdf_executor.py","src/nplg_mcp/pdf_ipc.py",',
                 b'"src/nplg_mcp/rate_limit.py",',
+                b'"src/nplg_mcp/sdk_boundary.py",',
                 b'"src/nplg_mcp/security.py","src/nplg_mcp/tokens.py",',
                 b'"scripts/delete_render.py","scripts/smoke_live.py",',
                 b'"scripts/run_quality_gate.py","scripts/run_test_gate.py",',
@@ -1274,7 +1295,7 @@ def test_empty_external_registry_parser_reaches_behavioral_red() -> None:
     assert registry == ExternalGateRegistry(version=1, gates=())
 
 
-def test_repository_policy_files_match_the_closed_task7_contract() -> None:
+def test_repository_policy_files_match_the_closed_phase3_contract() -> None:
     root = Path(__file__).resolve().parents[2]
 
     assert (
@@ -2793,10 +2814,13 @@ settings.register_profile(
     )
     false_modules = [
         "admission",
+        "http_security",
+        "json_preflight",
         "network",
         "pdf_executor",
         "pdf_ipc",
         "rate_limit",
+        "sdk_boundary",
         "security",
         "tokens",
         "delete_render",
@@ -2816,8 +2840,9 @@ settings.register_profile(
     test_source = "\n".join(
         (
             (
-                "from nplg_mcp import admission, errors, network, pdf_executor, "
-                "pdf_ipc, rate_limit, security, tokens"
+                "from nplg_mcp import (admission, errors, http_security, "
+                "json_preflight, network, pdf_executor, pdf_ipc, "
+                "rate_limit, sdk_boundary, security, tokens)"
             ),
             "from scripts import (",
             "    bootstrap_external_tools,",
@@ -2831,8 +2856,9 @@ settings.register_profile(
             ")",
             "",
             "MODULES = (",
-            "    admission, errors, network, pdf_executor, pdf_ipc,",
-            "    rate_limit, security, tokens,",
+            "    admission, errors, http_security, json_preflight, network,",
+            "    pdf_executor, pdf_ipc, rate_limit, sdk_boundary,",
+            "    security, tokens,",
             "    delete_render, smoke_live, run_quality_gate,",
             "    run_test_gate, run_mutation_gate, verify_release,",
             "    bootstrap_external_tools, pyright_identity,",

@@ -94,7 +94,7 @@ The verified source was restored locally and the obsolete recovery payload/workf
 ## Verification evidence
 
 | Check | Result |
-|---|---|
+| --- | --- |
 | Python 3.13.13 full suite | `254 passed in 7.76s` |
 | Python 3.14.5 full suite | `254 passed in 8.05s` |
 | Independent storage/PDF affected suite | `68 passed in 5.68s` |

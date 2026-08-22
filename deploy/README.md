@@ -1,6 +1,13 @@
-# Production deployment: Docker Compose + Caddy
+# Private-full candidate deployment: Docker Compose + Caddy
 
-This is the supported first deployment for the metadata-only NPLG DSpace MCP. It assumes a dedicated Linux VPS, a public DNS name, Docker Engine, and Docker Compose v2. Caddy terminates TLS and forwards only to the private application container.
+> This Compose definition is a **private-full candidate**, not release authority. Its
+> required no-network, mTLS, scanner, quota, and recovery claims require the
+> controller-authoritative external gates in the implementation plan. Do not treat a
+> successful local Compose start as ASVS L2 or release evidence.
+
+The Compose candidate assumes a dedicated Linux VPS, a public DNS name, Docker Engine,
+and Docker Compose v2. Caddy terminates public TLS and forwards only to the mutually
+authenticated encrypted private application listener.
 
 ## 1. Capacity and prerequisites
 
@@ -14,7 +21,16 @@ Recommended starting point for the default limits:
 - inbound TCP 80 and 443;
 - outbound DNS and TCP 443 to `dspace.nplg.gov.ge`.
 
-The application container is capped at 4 GiB. Production accepts only `DEPLOYMENT_PROFILE=alpic-metadata`; `private-full` remains disabled until PDF/native-code work is moved behind a separately deployed least-privilege OS authority. `MAX_CONCURRENT_MCP_REQUESTS` is a fail-fast global emergency ceiling (default 16), while `MAX_CONCURRENT_MCP_REQUESTS_PER_PRINCIPAL` (default 4) prevents one configured credential from consuming every MCP permit. `MAX_CONCURRENT_HTTP_REQUESTS` supplies a larger Uvicorn-wide ceiling (default 128). Saturated gates return HTTP 503 instead of queueing unbounded work, and `REQUEST_BODY_TIMEOUT_SECONDS` (default 10) releases permits when a client stalls while uploading JSON.
+The application container is capped at 4 GiB. This Compose file overrides the generic
+environment example with `DEPLOYMENT_PROFILE=private-full`,
+`PDF_EXECUTOR=unix-worker`, and `PRIVATE_EDGE_TLS=true`. The generic metadata-only
+profile remains separately supported but is not what this Compose file starts.
+`MAX_CONCURRENT_MCP_REQUESTS` is a fail-fast global emergency ceiling (default 16),
+while `MAX_CONCURRENT_MCP_REQUESTS_PER_PRINCIPAL` (default 4) prevents one configured
+credential from consuming every MCP permit. `MAX_CONCURRENT_HTTP_REQUESTS` supplies a
+larger Uvicorn-wide ceiling (default 128). Saturated gates return HTTP 503 instead of
+queueing unbounded work, and `REQUEST_BODY_TIMEOUT_SECONDS` (default 10) releases
+permits when a client stalls while uploading JSON.
 
 Create an A and/or AAAA record for the MCP hostname and point it at the VPS before starting Caddy.
 
@@ -49,7 +65,43 @@ path.write_text(text)
 PY
 ```
 
-Review `.env`. `MCP_DOMAIN` must contain only the host name. `PUBLIC_BASE_URL` must be the matching HTTPS origin. Keep `DEPLOYMENT_PROFILE=alpic-metadata` and `ALLOW_ANONYMOUS=false` for this Internet deployment. Give each client or operator a distinct registry entry and credential. `private-full` and `distributed-full` fail production startup until their separate worker/storage authority boundaries are implemented.
+Before starting Compose, provision `nplg_pdf_worker_slot` as an external Docker
+volume backed by a dedicated ext4 mount. It must have exactly the capacity,
+inode count, and `rw,nodev,nosuid,noexec` options in
+`deploy/pdf-worker-slot-policy.json`; it must not be a directory inside the
+cache volume. The application validates that mount before it accepts a
+private-full production worker. For example, after an operator has created and
+mounted the reviewed filesystem at `/srv/nplg/pdf-worker-slot`:
+
+```bash
+docker volume create \
+  --driver local \
+  --opt type=none \
+  --opt device=/srv/nplg/pdf-worker-slot \
+  --opt o=bind \
+  nplg_pdf_worker_slot
+```
+
+Do not let Compose create this volume implicitly, and do not substitute a
+Docker-managed cache volume. The parent application and the PDF worker share
+only this one serialized, bounded slot plus their AF_UNIX socket; the worker
+has no mount of `/data/cache`.
+
+Review `.env`. `MCP_DOMAIN` must contain only the host name and `PUBLIC_BASE_URL` must
+be the matching HTTPS origin. Give each client or operator a distinct registry entry
+and credential. The Compose service overrides the profile and internal port values;
+do not try to enable private TLS by placing certificate material in `.env`.
+
+Before any candidate start, the deployment-specific private CA must provision six
+**external Docker secrets** outside the repository and outside normal environment
+variables: `app_server_cert`, `app_server_key`, `app_server_ca`,
+`caddy_client_ca`, `caddy_client_cert`, and `caddy_client_key`. The application checks
+its server certificate/key pairing, server SAN (`app.internal`), server EKU, validity,
+modern key/signature policy, distinct CAs, and owner-only files before binding port
+8443. Caddy has the corresponding client certificate/key and app-server CA. The
+candidate does not issue, rotate, export, or log any of this material. Actual issuance,
+rotation overlap, client-certificate identity, and old-peer rejection remain
+controller-authoritative operational checks.
 
 Load the values into the current shell when running verification commands:
 
@@ -142,20 +194,26 @@ Apply an infrastructure egress policy that permits the application container onl
 
 Reconcile the permitted addresses when NPLG DNS changes. A provider-level firewall, host `DOCKER-USER` rules, or a dedicated network-policy layer is preferable. **Docker may bypass UFW** rules that only cover the host input/output paths; verify effective rules from inside the running container.
 
-PDF/native-code execution is not reachable in the production metadata profile. Production `private-full` deliberately fails startup until a separately deployed, no-network, least-privilege worker and its recovery evidence exist.
+The PDF worker and scanner containers are deliberately on no network. The
+`scanner-updater` is the only scanner service that requires egress; Docker network
+membership is not an egress firewall. The operator must enforce a brokered allowlist
+for its reviewed signature-source endpoints and deny every other scanner-updater
+destination. The application egress policy above remains independently required.
+
+The candidate's local fixtures do not prove filesystem block/inode quotas, backup
+restoration, or runtime network isolation. Those properties are release-blocking until
+their controller-authoritative operational evidence is recorded.
 
 ## 7. Operations
 
-Health, readiness, and metrics are deliberately blocked at the public Caddy edge. Query them only on the private application network:
-
-```bash
-docker compose exec -T app python -c \
-  'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8000/healthz", timeout=3).read().decode())'
-docker compose exec -T app python -c \
-  'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8000/readyz", timeout=3).read().decode())'
-docker compose exec -T app python -c \
-  'import json, os, urllib.parse, urllib.request; p=json.loads(os.environ["API_PRINCIPALS_JSON"])[0]; v=p.get("bearer_token"); h=urllib.parse.urlsplit(os.environ["PUBLIC_BASE_URL"]).netloc; headers={"Host":h, "Authorization":"Bearer "+v} if v else {"Host":h, "x-api-key":p["api_key"]}; r=urllib.request.Request("http://127.0.0.1:8000/metrics",headers=headers); print(urllib.request.urlopen(r,timeout=3).read().decode()[:2000])'
-```
+Health, readiness, and metrics are deliberately blocked at the public Caddy edge. The
+private app listener on 8443 requires Caddy's client certificate, and the application
+container deliberately does not receive Caddy's private key. There is **no plaintext
+application health check** for this profile; the inherited image health check is
+disabled in Compose rather than probing a non-existent `http://127.0.0.1:8000`
+listener. `docker compose ps` is only a liveness observation, not readiness evidence.
+The protected controller's private-edge gate is the only authorized readiness and mTLS
+verification path.
 
 Metrics are not exposed through Caddy; probes are also private, and the raw metrics route returns 404 without a configured API credential. Caddy request access logs and Uvicorn access logs are disabled deliberately; this also prevents future signed asset tokens from entering routine log streams. Application and proxy process/error logs remain available. Use MCP counters plus infrastructure telemetry for monitoring; add a redacting log pipeline before enabling request logs.
 
@@ -167,7 +225,15 @@ docker stats
 sudo du -sh /var/lib/docker/volumes/nplg-dspace-mcp_nplg_cache/_data
 ```
 
-The cache does not automatically prune downloaded source PDFs. Instead, a process-local logical-byte budget rejects all new download/render bytes before `CACHE_MAX_BYTES` is crossed (20 GiB by default). The quota includes existing regular files and active staging reservations and is concurrency-safe within the single application process. It is not a filesystem-block or inode quota, and external writers are unsupported, so retain volume limits and disk alerts. Render deletion is operator-only. The cleanup helper opens the cache as a separate process and performs startup recovery, so stop the app first and guarantee its restart:
+The content-addressed cache remains protected by a process-local logical-byte
+budget. It is not the PDF parser's filesystem quota. The separately mounted
+worker slot is checked against the fixed ext4 block/inode policy at private-full
+production startup and again before each serialized dispatch; inode or byte
+headroom loss rejects the request before staging. This candidate check does not
+replace the controller-authoritative block/inode and concurrency probe. Render
+deletion is operator-only. The cleanup helper opens the cache as a separate
+process and performs startup recovery, so stop the app first and guarantee its
+restart:
 
 ```bash
 (
@@ -182,7 +248,10 @@ Source artifacts are content-addressed and retained. Use an operator-approved re
 
 ## 8. Backup and restore
 
-The cache is reproducible from NPLG, but backing it up avoids re-downloading and re-rendering. Stop the app for a consistent backup:
+The cache is reproducible from NPLG, but backing it up avoids re-downloading and
+re-rendering. Stop the app for a consistent backup. This procedure does not establish
+the required private-full recovery proof; use the protected recovery gate for the
+authoritative restore, clock, lease, reservation, and RTO evidence:
 
 ```bash
 (

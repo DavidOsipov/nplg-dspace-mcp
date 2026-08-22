@@ -1,12 +1,15 @@
 # Copyright (c) 2026 David Osipov
 """Unit tests for the typed tool service."""
+# ruff: noqa: SLF001
 
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import threading
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, dataclass, replace
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
@@ -17,6 +20,7 @@ from pydantic import BaseModel, ValidationError
 
 import nplg_mcp.tools as tools_module
 from nplg_mcp.config import AppConfig
+from nplg_mcp.contracts import RenderTilesInput, SearchDocumentsInput
 from nplg_mcp.downloader import DownloadResult
 from nplg_mcp.errors import AppError, ErrorCode
 from nplg_mcp.json_types import load_json_value, require_json_object
@@ -32,7 +36,6 @@ from nplg_mcp.pdf_executor import PdfWorkerError, PdfWorkerUnavailableError
 from nplg_mcp.storage import ContentAddressedStore
 from nplg_mcp.tokens import verify_asset_token
 from nplg_mcp.tools import (
-    SearchDocumentsInput,
     ToolService,
     ToolServiceDependencies,
 )
@@ -42,12 +45,13 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from nplg_mcp.config import PdfExecutor as PdfExecutorMode
+    from nplg_mcp.contracts import MonotonicDeadline, StrictOutput
     from nplg_mcp.json_types import JsonObject, JsonValue
-    from nplg_mcp.pdf_executor import MonotonicDeadline
     from nplg_mcp.pdf_ipc import PdfCommand, PdfResult, PdfSuccess
 ControlledResultT = TypeVar("ControlledResultT")
 _EXPECTED_SERIALIZED_CALL_COUNT = 2
 _EXPECTED_DEFAULT_TILE_OVERLAP = 128
+_EXPLICIT_TILE_DIMENSION_BOUNDARY = 256
 _METADATA_TOOL_NAMES = {
     "get_document_metadata",
     "list_document_files",
@@ -76,10 +80,125 @@ def _json_array(value: JsonValue | None, *, context: str) -> list[JsonValue]:
     return value
 
 
+def _output_json(value: StrictOutput) -> JsonObject:
+    return cast(
+        "JsonObject",
+        value.model_dump(mode="json", by_alias=True),
+    )
+
+
 def test_search_page_size_is_capped_at_fifty() -> None:
     invalid: JsonObject = {"query": "ივერია", "page_size": 51}
     with pytest.raises(ValidationError):
         _ = SearchDocumentsInput.model_validate(invalid)
+
+
+def test_frozen_protocol_schema_leaves_non_search_tools_unchanged() -> None:
+    schema: JsonObject = {"type": "object"}
+
+    projected = tools_module._frozen_protocol_input_schema(  # pyright: ignore[reportPrivateUsage]
+        "get_document_metadata",
+        schema,
+    )
+
+    assert projected is schema
+
+
+@pytest.mark.parametrize(
+    ("schema", "expected"),
+    cast(
+        "list[tuple[JsonObject, str]]",
+        [
+            ({}, "properties"),
+            ({"properties": {}}, "query schema"),
+            ({"properties": {"query": {}}}, "query schema lacks"),
+            (
+                {"properties": {"query": {"pattern": "^x$"}}},
+                "cursor schema",
+            ),
+            (
+                {
+                    "properties": {
+                        "query": {"pattern": "^x$"},
+                        "cursor": {},
+                    }
+                },
+                "alternatives",
+            ),
+            (
+                {
+                    "properties": {
+                        "query": {"pattern": "^x$"},
+                        "cursor": {"anyOf": []},
+                    }
+                },
+                "alternatives",
+            ),
+            (
+                {
+                    "properties": {
+                        "query": {"pattern": "^x$"},
+                        "cursor": {"anyOf": [None]},
+                    }
+                },
+                "alternatives",
+            ),
+            (
+                {
+                    "properties": {
+                        "query": {"pattern": "^x$"},
+                        "cursor": {"anyOf": [{}]},
+                    }
+                },
+                "minimum length",
+            ),
+            (
+                {
+                    "properties": {
+                        "query": {"pattern": "^x$"},
+                        "cursor": {"anyOf": [{"minLength": 0}]},
+                    }
+                },
+                "cursor schema lacks the strict text pattern",
+            ),
+        ],
+    ),
+)
+def test_frozen_search_schema_projection_fails_closed_on_shape_drift(
+    schema: JsonObject,
+    expected: str,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match=expected):
+        _ = tools_module._frozen_protocol_input_schema(  # pyright: ignore[reportPrivateUsage]
+            "search_documents",
+            copy.deepcopy(schema),
+        )
+
+
+def test_frozen_search_schema_projection_removes_only_new_refinements() -> None:
+    schema: JsonObject = {
+        "properties": {
+            "query": {"pattern": "^x$", "type": "string"},
+            "cursor": {
+                "anyOf": [
+                    {"minLength": 0, "pattern": "^x*$", "type": "string"},
+                    {"type": "null"},
+                ]
+            },
+        }
+    }
+
+    projected = tools_module._frozen_protocol_input_schema(  # pyright: ignore[reportPrivateUsage]
+        "search_documents",
+        schema,
+    )
+
+    assert projected == {
+        "properties": {
+            "query": {"type": "string"},
+            "cursor": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        }
+    }
 
 
 class FakeRepository:
@@ -163,20 +282,31 @@ class FakeDownloader:
 class FakePdfProcessor:
     """Deterministic PDF collaborator for tool tests."""
 
-    def __init__(self, store: ContentAddressedStore) -> None:
+    def __init__(
+        self,
+        store: ContentAddressedStore,
+        *,
+        page_content: bytes = b"jpeg-page",
+    ) -> None:
         """Bind the test store and publish one stable rendered page."""
         super().__init__()
         self.store = store
         self.deleted: list[str] = []
-        page = self.store.put_bytes(
-            b"jpeg-page",
-            namespace="renders",
-            filename="page-0001.jpg",
-            media_type="image/jpeg",
+        self.render_id = "rnd_" + "1" * 32
+        self.page_path, self.page_sha256 = self.store.put_render_bytes(
+            f"renders/{self.render_id}/page-0001.jpg",
+            page_content,
         )
-        # Tool tests do not rely on the content-addressed render directory shape;
-        # they only exercise signed delivery of a validated stored relative path.
-        self.page_path = page.relative_path
+        self.manifest_path = f"renders/{self.render_id}/manifest.json"
+        manifest_document: JsonObject = {"render_id": self.render_id}
+        _ = self.store.put_render_bytes(
+            self.manifest_path,
+            json.dumps(
+                manifest_document,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode(),
+        )
 
     def inspect(self, pdf_path: Path) -> PdfInspection:
         assert pdf_path.name == "source.pdf"
@@ -191,7 +321,7 @@ class FakePdfProcessor:
         assert pages == (1,)
         assert mode == "native"
         return RenderManifest(
-            render_id="rnd_" + "1" * 32,
+            render_id=self.render_id,
             source_sha256="a" * 64,
             renderer_version="test",
             mode="native",
@@ -207,7 +337,7 @@ class FakePdfProcessor:
                     resolution_source="embedded_scan",
                     conversion_path="direct_extract",
                     relative_path=self.page_path,
-                    sha256="b" * 64,
+                    sha256=self.page_sha256,
                     media_type="image/jpeg",
                     resize_applied=False,
                     pixel_dimensions_preserved=True,
@@ -216,7 +346,7 @@ class FakePdfProcessor:
                     lossy_conversion=False,
                 ),
             ),
-            manifest_relative_path="renders/rnd_" + "1" * 32 + "/manifest.json",
+            manifest_relative_path=self.manifest_path,
         )
 
     def render_tiles(
@@ -228,10 +358,25 @@ class FakePdfProcessor:
         tile_height: int | None = None,
         overlap: int | None = None,
     ) -> TileManifest:
+        manifest_path = (
+            f"renders/{render_id}/tiles/page-{page_number:04d}/manifest.json"
+        )
+        manifest_document: JsonObject = {
+            "page_number": page_number,
+            "render_id": render_id,
+        }
+        _ = self.store.put_render_bytes(
+            manifest_path,
+            json.dumps(
+                manifest_document,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode(),
+        )
         return TileManifest(
             render_id=render_id,
             page_number=page_number,
-            page_sha256="b" * 64,
+            page_sha256=self.page_sha256,
             tile_width=tile_width or 2048,
             tile_height=tile_height or 2048,
             overlap=128 if overlap is None else overlap,
@@ -247,11 +392,11 @@ class FakePdfProcessor:
                     full_page_height=2048,
                     overlap=128 if overlap is None else overlap,
                     relative_path=self.page_path,
-                    sha256="b" * 64,
+                    sha256=self.page_sha256,
                     media_type="image/jpeg",
                 ),
             ),
-            manifest_relative_path=f"renders/{render_id}/tiles/page-{page_number:04d}/manifest.json",
+            manifest_relative_path=manifest_path,
         )
 
     def get_manifest(self, render_id: str) -> RenderManifest:
@@ -261,6 +406,121 @@ class FakePdfProcessor:
     def delete_render(self, render_id: str) -> bool:
         self.deleted.append(render_id)
         return True
+
+
+class SharedPagePdfProcessor(FakePdfProcessor):
+    """Publish one identical page from two legitimate render requests."""
+
+    def __init__(self, store: ContentAddressedStore) -> None:
+        """Persist stable render artifacts for the one- and two-page requests."""
+        super().__init__(store, page_content=b"shared-jpeg-page-one")
+        self.render_ids: dict[tuple[int, ...], str] = {
+            (1,): "rnd_" + "1" * 32,
+            (1, 2): "rnd_" + "2" * 32,
+        }
+        self.page_paths: dict[tuple[int, ...], tuple[str, str]] = {}
+        for pages, render_id in self.render_ids.items():
+            if pages == (1,):
+                page_path, page_digest = self.page_path, self.page_sha256
+            else:
+                page_path, page_digest = store.put_render_bytes(
+                    f"renders/{render_id}/page-0001.jpg",
+                    b"shared-jpeg-page-one",
+                )
+            self.page_paths[pages] = (page_path, page_digest)
+            if pages != (1,):
+                manifest_document: JsonObject = {"render_id": render_id}
+                _ = store.put_render_bytes(
+                    f"renders/{render_id}/manifest.json",
+                    json.dumps(manifest_document).encode(),
+                )
+        self.second_page_path, self.second_page_digest = store.put_render_bytes(
+            f"renders/{self.render_ids[(1, 2)]}/page-0002.jpg",
+            b"jpeg-page-two",
+        )
+
+    @staticmethod
+    def _page(
+        page_number: int,
+        relative_path: str,
+        sha256: str,
+    ) -> RenderedPage:
+        return RenderedPage(
+            page_number=page_number,
+            width=100,
+            height=200,
+            rotation=0,
+            classification="single_raster_jpeg",
+            effective_dpi_x=300.0,
+            effective_dpi_y=300.0,
+            resolution_source="embedded_scan",
+            conversion_path="direct_extract",
+            relative_path=relative_path,
+            sha256=sha256,
+            media_type="image/jpeg",
+            resize_applied=False,
+            pixel_dimensions_preserved=True,
+            renderer_resampling="none",
+            reencoded=False,
+            lossy_conversion=False,
+        )
+
+    @override
+    def render_pages(
+        self,
+        pdf_path: Path,
+        *,
+        pages: tuple[int, ...],
+        mode: str,
+    ) -> RenderManifest:
+        assert pdf_path.name == "source.pdf"
+        assert pages in self.render_ids
+        assert mode == "native"
+        render_id = self.render_ids[pages]
+        first_path, first_digest = self.page_paths[pages]
+        rendered_pages = [self._page(1, first_path, first_digest)]
+        if pages == (1, 2):
+            rendered_pages.append(
+                self._page(2, self.second_page_path, self.second_page_digest)
+            )
+        return RenderManifest(
+            render_id=render_id,
+            source_sha256="a" * 64,
+            renderer_version="test",
+            mode="native",
+            pages=tuple(rendered_pages),
+            manifest_relative_path=f"renders/{render_id}/manifest.json",
+        )
+
+
+class DuplicatePagePdfProcessor(FakePdfProcessor):
+    """Publish identical page bytes at two paths in one render."""
+
+    def __init__(self, store: ContentAddressedStore) -> None:
+        """Create two same-render paths containing identical JPEG bytes."""
+        super().__init__(store, page_content=b"duplicate-blank-page")
+        self.second_path, self.second_sha256 = store.put_render_bytes(
+            f"renders/{self.render_id}/page-0002.jpg",
+            b"duplicate-blank-page",
+        )
+
+    @override
+    def render_pages(
+        self,
+        pdf_path: Path,
+        *,
+        pages: tuple[int, ...],
+        mode: str,
+    ) -> RenderManifest:
+        assert pages == (1, 2)
+        first = super().render_pages(pdf_path, pages=(1,), mode=mode)
+        second_page = replace(
+            first.pages[0],
+            page_number=2,
+            relative_path=self.second_path,
+            sha256=self.second_sha256,
+        )
+        return replace(first, pages=(first.pages[0], second_page))
 
 
 class MalformedPdfProcessor(FakePdfProcessor):
@@ -394,6 +654,29 @@ class CancellationAwarePdfExecutor(InlinePdfExecutor):
         return await super().execute(command, deadline=deadline)
 
 
+class ExpiredDeadlineProbePdfExecutor:
+    """Record executor ingress without performing a PDF operation."""
+
+    def __init__(self) -> None:
+        """Initialize the zero-side-effect call ledger."""
+        super().__init__()
+        self.execute_calls = 0
+
+    def ensure_ready(self) -> None:
+        """Return successfully because the probe has no circuit."""
+
+    async def execute(
+        self,
+        command: PdfCommand,
+        *,
+        deadline: MonotonicDeadline,
+    ) -> PdfResult:
+        del command, deadline
+        self.execute_calls += 1
+        message = "expired deadline crossed the executor boundary"
+        raise PdfWorkerError(message)
+
+
 class UnreadyPdfExecutor(InlinePdfExecutor):
     """Expose one open worker circuit to the ToolService readiness hook."""
 
@@ -423,11 +706,9 @@ class PopulatedTilePdfProcessor(FakePdfProcessor):
             tile_height=tile_height,
             overlap=overlap,
         )
-        tile = self.store.put_bytes(
+        tile_path, tile_sha256 = self.store.put_render_bytes(
+            f"renders/{render_id}/tile-x0000-y0000.jpg",
             b"jpeg-tile",
-            namespace="renders",
-            filename="tile-x0000-y0000.jpg",
-            media_type="image/jpeg",
         )
         return replace(
             manifest,
@@ -442,8 +723,8 @@ class PopulatedTilePdfProcessor(FakePdfProcessor):
                     full_page_width=2048,
                     full_page_height=2048,
                     overlap=manifest.overlap,
-                    relative_path=tile.relative_path,
-                    sha256=tile.sha256,
+                    relative_path=tile_path,
+                    sha256=tile_sha256,
                     media_type="image/jpeg",
                 ),
             ),
@@ -494,6 +775,11 @@ class ObservedPdfJobLimiter:
 
     def found_locked_on_attempt(self, attempt_number: int) -> bool:
         return self._found_locked[attempt_number - 1]
+
+    @property
+    def acquire_attempts(self) -> int:
+        """Return the number of capacity-boundary crossings."""
+        return len(self._found_locked)
 
 
 class ForgedExecutor:
@@ -710,20 +996,20 @@ def observed_pdf_service(
 
 
 async def await_successful_pdf_tasks(
-    tasks: list[asyncio.Task[JsonObject]],
+    tasks: list[asyncio.Task[StrictOutput]],
 ) -> list[JsonObject]:
     results: list[JsonObject] = []
     for task in tasks:
         result = await asyncio.wait_for(task, timeout=2)
-        results.append(result)
+        results.append(_output_json(result))
     return results
 
 
-def service(tmp_path: Path) -> tuple[ToolService, FakeDownloader]:
+def service(tmp_path: Path) -> tuple[TestableToolService, FakeDownloader]:
     store = ContentAddressedStore(tmp_path)
     downloader = FakeDownloader(store)
     return (
-        ToolService(
+        TestableToolService(
             dependencies=ToolServiceDependencies(
                 repository=FakeRepository(),
                 downloader=downloader,
@@ -898,15 +1184,15 @@ def test_tool_catalog_is_deterministic_and_strict(tmp_path: Path) -> None:
 async def test_alpic_metadata_profile_closes_discovery_and_direct_dispatch(
     tmp_path: Path,
 ) -> None:
-    tools, _ = service(tmp_path)
+    full_tools, _ = service(tmp_path)
     tools = ToolService(
         dependencies=ToolServiceDependencies(
-            repository=tools.repository,
-            downloader=tools.downloader,
-            pdf=tools.pdf,
-            store=tools.store,
+            repository=full_tools.repository,
+            downloader=full_tools.downloader,
+            pdf=full_tools.pdf,
+            store=full_tools.store,
         ),
-        config=replace(tools.config, deployment_profile="alpic-metadata"),
+        config=replace(full_tools.config, deployment_profile="alpic-metadata"),
     )
 
     names = {
@@ -956,7 +1242,9 @@ async def test_search_preserves_georgian_unicode_and_structured_fields(
     tmp_path: Path,
 ) -> None:
     tools, _ = service(tmp_path)
-    result = await tools.call("search_documents", {"query": "ივერია", "page_size": 10})
+    result = _output_json(
+        await tools.call("search_documents", {"query": "ივერია", "page_size": 10})
+    )
 
     items = _json_array(result.get("items"), context="search items")
     first_item = require_json_object(items[0], context="search item")
@@ -970,9 +1258,11 @@ async def test_download_uses_only_discovered_bitstream_and_returns_bound_signed_
     tmp_path: Path,
 ) -> None:
     tools, downloader = service(tmp_path)
-    result = await tools.call(
-        "download_document_file",
-        {"handle": "1234/560449", "bitstream_id": "bs_public"},
+    result = _output_json(
+        await tools.call(
+            "download_document_file",
+            {"handle": "1234/560449", "bitstream_id": "bs_public"},
+        )
     )
 
     assert downloader.calls == ["bs_public"]
@@ -1013,20 +1303,27 @@ async def test_artifact_chain_inspect_render_tile_manifest_and_delete(
     tmp_path: Path,
 ) -> None:
     tools, _ = service(tmp_path)
-    downloaded = await tools.call(
-        "download_document_file",
-        {"handle": "1234/560449", "bitstream_id": "bs_public"},
+    downloaded = _output_json(
+        await tools.call(
+            "download_document_file",
+            {"handle": "1234/560449", "bitstream_id": "bs_public"},
+        )
     )
     artifact_id = _json_string(
         downloaded.get("artifact_id"),
         context="artifact ID",
     )
 
-    inspected = await tools.call("inspect_pdf", {"artifact_id": artifact_id})
+    inspected = _output_json(
+        await tools.call("inspect_pdf", {"artifact_id": artifact_id})
+    )
     assert inspected["page_count"] == 1
 
-    rendered = await tools.call(
-        "render_pdf_pages", {"artifact_id": artifact_id, "pages": [1]}
+    rendered = _output_json(
+        await tools.call(
+            "render_pdf_pages",
+            {"artifact_id": artifact_id, "pages": [1]},
+        )
     )
     render_id = _json_string(rendered.get("render_id"), context="render ID")
     pages = _json_array(rendered.get("pages"), context="rendered pages")
@@ -1037,15 +1334,19 @@ async def test_artifact_chain_inspect_render_tile_manifest_and_delete(
         "https://mcp.example.test/assets/",
     )
 
-    tiled = await tools.call(
-        "render_pdf_page_tiles",
-        {"render_id": render_id, "page_number": 1},
+    tiled = _output_json(
+        await tools.call(
+            "render_pdf_page_tiles",
+            {"render_id": render_id, "page_number": 1},
+        )
     )
     assert _json_integer(tiled.get("page_number"), context="tile page number") == 1
 
-    manifest = await tools.call(
-        "get_render_manifest",
-        {"render_id": render_id},
+    manifest = _output_json(
+        await tools.call(
+            "get_render_manifest",
+            {"render_id": render_id},
+        )
     )
     assert _json_string(manifest.get("render_id"), context="manifest render ID") == (
         render_id
@@ -1163,9 +1464,11 @@ async def test_cancelled_pdf_request_releases_permit_after_executor_cleanup(
         _ = await first
 
     assert executor.cleaned_up.is_set()
-    recovered = await asyncio.wait_for(
-        tools.call("inspect_pdf", {"artifact_id": artifact.object_id}),
-        timeout=2,
+    recovered = _output_json(
+        await asyncio.wait_for(
+            tools.call("inspect_pdf", {"artifact_id": artifact.object_id}),
+            timeout=2,
+        )
     )
     assert first.cancelled()
     assert recovered.get("artifact_id") == artifact.object_id
@@ -1237,6 +1540,58 @@ async def test_queued_pdf_call_uses_the_same_absolute_deadline(
 
 
 @pytest.mark.asyncio
+async def test_expired_tool_deadline_has_no_pdf_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ContentAddressedStore(tmp_path)
+    artifact = store.put_bytes(
+        b"%PDF-1.7\nfixture",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    executor = ExpiredDeadlineProbePdfExecutor()
+    real_semaphore = asyncio.Semaphore
+    configured_limiters: list[ObservedPdfJobLimiter] = []
+
+    def observed_semaphore(capacity: int = 1) -> ObservedPdfJobLimiter:
+        limiter = ObservedPdfJobLimiter(real_semaphore(capacity))
+        configured_limiters.append(limiter)
+        return limiter
+
+    with monkeypatch.context() as constructor_patch:
+        constructor_patch.setattr(asyncio, "Semaphore", observed_semaphore)
+        tools = ToolService(
+            dependencies=ToolServiceDependencies(
+                repository=FakeRepository(),
+                downloader=FakeDownloader(store),
+                pdf=executor,
+                store=store,
+            ),
+            config=config(tmp_path),
+            monotonic_clock=lambda: 100.0,
+        )
+    assert len(configured_limiters) == 1
+    limiter = configured_limiters[0]
+    before = tuple(
+        sorted(path.relative_to(store.root) for path in store.root.rglob("*"))
+    )
+    monkeypatch.setattr(tools_module, "_PDF_JOB_TIMEOUT_SECONDS", 0.0)
+
+    with pytest.raises(AppError) as captured:
+        _ = await tools.call("inspect_pdf", {"artifact_id": artifact.object_id})
+
+    after = tuple(
+        sorted(path.relative_to(store.root) for path in store.root.rglob("*"))
+    )
+    assert captured.value.code is ErrorCode.PDF_PROCESSING_FAILED
+    assert limiter.acquire_attempts == 0
+    assert executor.execute_calls == 0
+    assert after == before
+
+
+@pytest.mark.asyncio
 async def test_pdf_worker_exception_releases_the_next_queued_call(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1249,7 +1604,7 @@ async def test_pdf_worker_exception_releases_the_next_queued_call(
     first = asyncio.create_task(
         tools.call("inspect_pdf", {"artifact_id": artifact_id}),
     )
-    successors: list[asyncio.Task[JsonObject]] = []
+    successors: list[asyncio.Task[StrictOutput]] = []
     try:
         assert await asyncio.to_thread(processor.first_entered.wait, 2)
         second = asyncio.create_task(
@@ -1308,21 +1663,25 @@ async def test_tile_overlap_must_fit_each_explicit_dimension(tmp_path: Path) -> 
     tools, _ = service(tmp_path)
     render_id = "rnd_" + "1" * 32
 
-    explicit_none = await tools.call(
-        "render_pdf_page_tiles",
-        {"render_id": render_id, "page_number": 1, "overlap": None},
+    explicit_none = _output_json(
+        await tools.call(
+            "render_pdf_page_tiles",
+            {"render_id": render_id, "page_number": 1, "overlap": None},
+        )
     )
     assert explicit_none.get("overlap") == _EXPECTED_DEFAULT_TILE_OVERLAP
 
-    valid = await tools.call(
-        "render_pdf_page_tiles",
-        {
-            "render_id": render_id,
-            "page_number": 1,
-            "tile_width": 512,
-            "tile_height": 512,
-            "overlap": 128,
-        },
+    valid = _output_json(
+        await tools.call(
+            "render_pdf_page_tiles",
+            {
+                "render_id": render_id,
+                "page_number": 1,
+                "tile_width": 512,
+                "tile_height": 512,
+                "overlap": 128,
+            },
+        )
     )
     assert valid.get("overlap") == _EXPECTED_DEFAULT_TILE_OVERLAP
 
@@ -1348,13 +1707,165 @@ async def test_tile_overlap_must_fit_each_explicit_dimension(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_tile_operational_boundary_rejects_unsafe_geometry_before_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    render_id = "rnd_" + "1" * 32
+    unsafe_geometry: JsonObject = {
+        "render_id": render_id,
+        "page_number": 1,
+        "tile_width": _EXPLICIT_TILE_DIMENSION_BOUNDARY,
+        "tile_height": 512,
+        "overlap": _EXPLICIT_TILE_DIMENSION_BOUNDARY,
+    }
+    accepted = RenderTilesInput.model_validate(unsafe_geometry, strict=True)
+    assert accepted.overlap == _EXPLICIT_TILE_DIMENSION_BOUNDARY
+
+    store = ContentAddressedStore(tmp_path)
+    executor = ExpiredDeadlineProbePdfExecutor()
+    real_semaphore = asyncio.Semaphore
+    configured_limiters: list[ObservedPdfJobLimiter] = []
+
+    def observed_semaphore(capacity: int = 1) -> ObservedPdfJobLimiter:
+        limiter = ObservedPdfJobLimiter(real_semaphore(capacity))
+        configured_limiters.append(limiter)
+        return limiter
+
+    with monkeypatch.context() as constructor_patch:
+        constructor_patch.setattr(asyncio, "Semaphore", observed_semaphore)
+        tools = ToolService(
+            dependencies=ToolServiceDependencies(
+                repository=FakeRepository(),
+                downloader=FakeDownloader(store),
+                pdf=executor,
+                store=store,
+            ),
+            config=config(tmp_path),
+        )
+    assert len(configured_limiters) == 1
+    limiter = configured_limiters[0]
+    before = tuple(
+        sorted(path.relative_to(store.root) for path in store.root.rglob("*"))
+    )
+
+    with pytest.raises(AppError, match="declared schema"):
+        _ = await tools.call("render_pdf_page_tiles", unsafe_geometry)
+
+    after = tuple(
+        sorted(path.relative_to(store.root) for path in store.root.rglob("*"))
+    )
+    assert limiter.acquire_attempts == 0
+    assert executor.execute_calls == 0
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_identical_page_content_across_render_requests_remains_readable(
+    tmp_path: Path,
+) -> None:
+    store = ContentAddressedStore(tmp_path)
+    processor = SharedPagePdfProcessor(store)
+    dependencies = ToolServiceDependencies(
+        repository=FakeRepository(),
+        downloader=FakeDownloader(store),
+        pdf=InlinePdfExecutor(processor=processor, store=store),
+        store=store,
+    )
+    tools = ToolService(dependencies=dependencies, config=config(tmp_path))
+    downloaded = _output_json(
+        await tools.call(
+            "download_document_file",
+            {"handle": "1234/560449", "bitstream_id": "bs_public"},
+        )
+    )
+    artifact_id = _json_string(downloaded.get("artifact_id"), context="artifact ID")
+
+    first = _output_json(
+        await tools.call(
+            "render_pdf_pages",
+            {"artifact_id": artifact_id, "pages": [1]},
+        )
+    )
+    second = _output_json(
+        await tools.call(
+            "render_pdf_pages",
+            {"artifact_id": artifact_id, "pages": [1, 2]},
+        )
+    )
+    first_page = require_json_object(
+        _json_array(first.get("pages"), context="first render pages")[0],
+        context="first rendered page",
+    )
+    second_page = require_json_object(
+        _json_array(second.get("pages"), context="second render pages")[0],
+        context="second rendered page",
+    )
+    resource_uri = _json_string(
+        first_page.get("resource_uri"),
+        context="first page resource URI",
+    )
+    assert second_page.get("resource_uri") == resource_uri
+
+    live = await tools.read_resource(resource_uri)
+    restarted = ToolService(dependencies=dependencies, config=config(tmp_path))
+    rediscovered = await restarted.read_resource(resource_uri)
+
+    assert live["blob"] == rediscovered["blob"]
+    assert live["sha256"] == resource_uri.removeprefix("nplg://artifact/doc_")
+    assert live["render_id"] == ""
+    assert rediscovered["render_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_identical_page_content_at_two_paths_in_one_render_survives_restart(
+    tmp_path: Path,
+) -> None:
+    store = ContentAddressedStore(tmp_path)
+    processor = DuplicatePagePdfProcessor(store)
+    dependencies = ToolServiceDependencies(
+        repository=FakeRepository(),
+        downloader=FakeDownloader(store),
+        pdf=InlinePdfExecutor(processor=processor, store=store),
+        store=store,
+    )
+    tools = ToolService(dependencies=dependencies, config=config(tmp_path))
+    downloaded = _output_json(
+        await tools.call(
+            "download_document_file",
+            {"handle": "1234/560449", "bitstream_id": "bs_public"},
+        )
+    )
+    artifact_id = _json_string(downloaded.get("artifact_id"), context="artifact ID")
+    rendered = _output_json(
+        await tools.call(
+            "render_pdf_pages",
+            {"artifact_id": artifact_id, "pages": [1, 2]},
+        )
+    )
+    pages = _json_array(rendered.get("pages"), context="rendered pages")
+    first = require_json_object(pages[0], context="first page")
+    second = require_json_object(pages[1], context="second page")
+    resource_uri = _json_string(first.get("resource_uri"), context="resource URI")
+    assert second.get("resource_uri") == resource_uri
+
+    restarted = ToolService(dependencies=dependencies, config=config(tmp_path))
+    resource = await restarted.read_resource(resource_uri)
+
+    assert resource["sha256"] == resource_uri.removeprefix("nplg://artifact/doc_")
+    assert resource["render_id"] == processor.render_id
+
+
+@pytest.mark.asyncio
 async def test_tool_resources_cover_about_document_render_and_not_found(
     tmp_path: Path,
 ) -> None:
     tools, _ = service(tmp_path)
-    downloaded = await tools.call(
-        "download_document_file",
-        {"handle": "1234/560449", "bitstream_id": "bs_public"},
+    downloaded = _output_json(
+        await tools.call(
+            "download_document_file",
+            {"handle": "1234/560449", "bitstream_id": "bs_public"},
+        )
     )
     artifact_id = _json_string(downloaded.get("artifact_id"), context="artifact ID")
     render_id = "rnd_" + "1" * 32
@@ -1390,11 +1901,15 @@ async def test_metadata_and_file_tools_expose_repository_results(
 ) -> None:
     tools, _ = service(tmp_path)
 
-    metadata = await tools.call(
-        "get_document_metadata",
-        {"handle": "1234/560449"},
+    metadata = _output_json(
+        await tools.call(
+            "get_document_metadata",
+            {"handle": "1234/560449"},
+        )
     )
-    files = await tools.call("list_document_files", {"handle": "1234/560449"})
+    files = _output_json(
+        await tools.call("list_document_files", {"handle": "1234/560449"})
+    )
 
     assert metadata.get("title") == "ბორჯომი N34"
     listed = _json_array(files.get("files"), context="listed files")
@@ -1506,9 +2021,11 @@ async def test_pdf_job_releases_permit_when_executor_start_fails(
             {"artifact_id": artifact.object_id},
         )
 
-    recovered = await asyncio.wait_for(
-        tools.call("inspect_pdf", {"artifact_id": artifact.object_id}),
-        timeout=2,
+    recovered = _output_json(
+        await asyncio.wait_for(
+            tools.call("inspect_pdf", {"artifact_id": artifact.object_id}),
+            timeout=2,
+        )
     )
     assert recovered.get("artifact_id") == artifact.object_id
 
@@ -1541,9 +2058,11 @@ async def test_pdf_job_releases_permit_after_worker_cancellation(
         _ = await tools.call("inspect_pdf", {"artifact_id": artifact.object_id})
     await asyncio.sleep(0)
 
-    recovered = await asyncio.wait_for(
-        tools.call("inspect_pdf", {"artifact_id": artifact.object_id}),
-        timeout=2,
+    recovered = _output_json(
+        await asyncio.wait_for(
+            tools.call("inspect_pdf", {"artifact_id": artifact.object_id}),
+            timeout=2,
+        )
     )
     assert recovered.get("artifact_id") == artifact.object_id
 
@@ -1566,16 +2085,18 @@ async def test_render_tiles_exposes_signed_tile_and_resource_coordinates(
         config=config(tmp_path),
     )
 
-    result = await tools.call(
-        "render_pdf_page_tiles",
-        {"render_id": "rnd_" + "1" * 32, "page_number": 1},
+    result = _output_json(
+        await tools.call(
+            "render_pdf_page_tiles",
+            {"render_id": "rnd_" + "1" * 32, "page_number": 1},
+        )
     )
 
     tiles = _json_array(result.get("tiles"), context="tiles")
     tile = require_json_object(tiles[0], context="tiles[0]")
     assert tile["resource_uri"] == (
-        "nplg://render/rnd_11111111111111111111111111111111/page/1/"
-        "tile/x0000-y0000-w2048-h2048"
+        "nplg://artifact/"
+        "doc_99917095357c700e296f8ce53aa2aaa3b83479ef0f3c16ce7a8992278f9fc023"
     )
     asset_url = _json_string(tile.get("asset_url"), context="asset_url")
     assert asset_url.startswith("https://mcp.example.test/assets/")
@@ -1649,13 +2170,17 @@ async def test_tool_service_rejects_operation_mismatched_worker_payloads(
 
 
 @pytest.mark.parametrize(
-    ("fault", "expected_message"),
+    ("fault", "expected_error", "expected_message"),
     [
-        ("pages", "pages must be an array"),
-        ("relative_path", "relative_path must be a string"),
-        ("page_number", "page_number must be an integer"),
-        ("manifest_relative_path", "manifest_relative_path must be a string"),
-        ("tiles", "tiles must be an array"),
+        ("pages", TypeError, "pages must be an array"),
+        ("relative_path", TypeError, "relative_path must be a string"),
+        ("page_number", ValidationError, "pages.0.page_number"),
+        (
+            "manifest_relative_path",
+            TypeError,
+            "manifest_relative_path must be a string",
+        ),
+        ("tiles", TypeError, "tiles must be an array"),
     ],
 )
 @pytest.mark.asyncio
@@ -1669,6 +2194,7 @@ async def test_tool_service_rejects_corrupt_typed_serialization_at_trust_boundar
         "manifest_relative_path",
         "tiles",
     ],
+    expected_error: type[Exception],
     expected_message: str,
 ) -> None:
     tools, _ = service(tmp_path)
@@ -1680,9 +2206,10 @@ async def test_tool_service_rejects_corrupt_typed_serialization_at_trust_boundar
     )
     render_id = "rnd_" + ("1" * 32)
     valid_page: JsonObject = {
-        "relative_path": "renders/page-0001.jpg",
+        "relative_path": f"renders/{render_id}/page-0001.jpg",
         "media_type": "image/jpeg",
         "page_number": 1,
+        "sha256": "bc9cf615b74a3779185e9bd9ce5b988453aada714f8ee6e6238afc5416d11459",
     }
     forged_payloads: dict[str, JsonObject] = {
         "pages": {
@@ -1719,7 +2246,7 @@ async def test_tool_service_rejects_corrupt_typed_serialization_at_trust_boundar
         else {"artifact_id": artifact.object_id, "pages": [1]}
     )
 
-    with pytest.raises(TypeError, match=expected_message):
+    with pytest.raises(expected_error, match=expected_message):
         _ = await tools.call(tool_name, arguments)
 
 
@@ -1727,3 +2254,985 @@ class UnexpectedPdfSuccess:
     """Deliberately violate the executor's typed result contract in one test."""
 
     payload: object = object()
+
+
+class TestableToolService(ToolService):
+    """Typed public test facade for internal fail-closed resource invariants."""
+
+    _forced_document_path: Path | None = None
+
+    def ensure_profile_catalog_for_test(self) -> None:
+        self._ensure_profile_catalog()
+
+    def resource_index_path_for_test(self, render_id: str, artifact_id: str) -> str:
+        return self._resource_index_relative_path(render_id, artifact_id)
+
+    def prune_resource_for_test(self, render_id: str, artifact_id: str) -> None:
+        self._prune_resource_index(render_id, artifact_id)
+
+    def resource_is_cached_for_test(self, artifact_id: str) -> bool:
+        return artifact_id in self._resource_artifacts
+
+    def load_resource_index_for_test(
+        self,
+        render_directory: Path,
+        artifact_id: str,
+    ) -> bool:
+        return (
+            self._load_render_resource_index(render_directory, artifact_id) is not None
+        )
+
+    def load_and_cache_resource_for_test(
+        self,
+        render_directory: Path,
+        artifact_id: str,
+    ) -> bool:
+        resource = self._load_render_resource_index(render_directory, artifact_id)
+        if resource is None:
+            return False
+        self._resource_artifacts[artifact_id] = resource.owners
+        return True
+
+    def discover_resource_for_test(
+        self,
+        artifact_id: str,
+    ) -> bool:
+        return self._discover_render_artifact(artifact_id) is not None
+
+    def read_artifact_for_test(self, uri: str, artifact_id: str) -> dict[str, str]:
+        return self._read_artifact_resource(uri, artifact_id)
+
+    def register_render_for_test(
+        self,
+        *,
+        relative_path: str,
+        sha256: str | None,
+        media_type: str,
+        render_id: str,
+    ) -> str:
+        return self._register_render_artifact(
+            relative_path=relative_path,
+            sha256=sha256,
+            media_type=media_type,
+            render_id=render_id,
+        )
+
+    def force_missing_document_for_test(self, path: Path) -> None:
+        self._forced_document_path = path
+
+    @override
+    def _resolve_document(self, artifact_id: str) -> Path:
+        if self._forced_document_path is not None:
+            return self._forced_document_path
+        return super()._resolve_document(artifact_id)
+
+    @property
+    def pdf_limiter_for_test(self) -> asyncio.Semaphore:
+        return self._pdf_jobs
+
+
+_FUTURE_TIMESTAMP = 4_102_444_800
+
+
+@dataclass(frozen=True, slots=True)
+class _PersistRenderIndexOptions:
+    expires_at: int = _FUTURE_TIMESTAMP
+    media_type: str = "image/jpeg"
+
+
+_DEFAULT_PERSIST_RENDER_INDEX_OPTIONS = _PersistRenderIndexOptions()
+
+
+def _persist_render_index(
+    tools: TestableToolService,
+    *,
+    render_id: str,
+    identity: tuple[str, str, str, int],
+    options: _PersistRenderIndexOptions = _DEFAULT_PERSIST_RENDER_INDEX_OPTIONS,
+) -> Path:
+    """Persist one controlled strict render-resource sidecar."""
+    artifact_id, relative_path, sha256, size = identity
+    payload_document: JsonObject = {
+        "artifact_id": artifact_id,
+        "expires_at": options.expires_at,
+        "media_type": options.media_type,
+        "relative_path": relative_path,
+        "render_id": render_id,
+        "sha256": sha256,
+        "size": size,
+        "version": 1,
+    }
+    payload = json.dumps(
+        payload_document,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    index_relative_path = tools.resource_index_path_for_test(render_id, artifact_id)
+    written, _ = tools.store.put_render_bytes(index_relative_path, payload)
+    return tools.store.root / written
+
+
+def test_profile_catalog_rejects_exact_name_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools, _ = service(tmp_path)
+
+    def wrong_names(_profile: object) -> tuple[()]:
+        return ()
+
+    monkeypatch.setattr(tools_module, "tool_names_for_profile", wrong_names)
+
+    with pytest.raises(ValueError, match="deployment profile"):
+        tools.ensure_profile_catalog_for_test()
+
+
+def test_pruning_absent_resource_still_removes_persisted_subtree(
+    tmp_path: Path,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    artifact_id = "doc_" + "2" * 64
+
+    tools.prune_resource_for_test(render_id, artifact_id)
+
+    assert not tools.resource_is_cached_for_test(artifact_id)
+
+
+def test_render_index_rejects_invalid_render_directory(tmp_path: Path) -> None:
+    tools, _ = service(tmp_path)
+    render_directory = tools.store.root / "renders" / "not-a-render"
+    render_directory.mkdir(parents=True)
+
+    with pytest.raises(AppError, match="Render storage is corrupted"):
+        _ = tools.load_resource_index_for_test(
+            render_directory,
+            "doc_" + "2" * 64,
+        )
+
+
+def test_render_index_rejects_non_file_index(tmp_path: Path) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    artifact_id = "doc_" + "2" * 64
+    index = (
+        tools.store.root
+        / "renders"
+        / render_id
+        / "resources"
+        / artifact_id
+        / "index.json"
+    )
+    index.mkdir(parents=True)
+
+    with pytest.raises(AppError, match="index is invalid"):
+        _ = tools.load_resource_index_for_test(index.parents[2], artifact_id)
+
+
+def test_render_index_rejects_requested_artifact_rebinding(tmp_path: Path) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    data = b"jpeg"
+    digest = hashlib.sha256(data).hexdigest()
+    actual_artifact_id = f"doc_{digest}"
+    requested_artifact_id = "doc_" + "2" * 64
+    relative_path = f"renders/{render_id}/page.jpg"
+    _ = tools.store.put_render_bytes(relative_path, data)
+    source_index = _persist_render_index(
+        tools,
+        render_id=render_id,
+        identity=(actual_artifact_id, relative_path, digest, len(data)),
+    )
+    payload = source_index.read_bytes()
+    requested_index = tools.resource_index_path_for_test(
+        render_id,
+        requested_artifact_id,
+    )
+    _ = tools.store.put_render_bytes(requested_index, payload)
+
+    with pytest.raises(AppError, match="provenance is invalid"):
+        _ = tools.load_resource_index_for_test(
+            tools.store.root / "renders" / render_id,
+            requested_artifact_id,
+        )
+
+
+def test_render_index_expiry_prunes_authorization(tmp_path: Path) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    data = b"jpeg"
+    digest = hashlib.sha256(data).hexdigest()
+    artifact_id = f"doc_{digest}"
+    relative_path = f"renders/{render_id}/page.jpg"
+    _ = tools.store.put_render_bytes(relative_path, data)
+    index = _persist_render_index(
+        tools,
+        render_id=render_id,
+        identity=(artifact_id, relative_path, digest, len(data)),
+        options=_PersistRenderIndexOptions(expires_at=0),
+    )
+
+    assert not tools.load_resource_index_for_test(index.parents[2], artifact_id)
+    assert not index.exists()
+
+
+def test_render_discovery_returns_none_without_render_root(tmp_path: Path) -> None:
+    tools, _ = service(tmp_path)
+    renders_root = tools.store.root / "renders"
+    for render_directory in tuple(renders_root.iterdir()):
+        assert tools.store.delete_render_subtree(f"renders/{render_directory.name}")
+    renders_root.rmdir()
+
+    assert not tools.discover_resource_for_test("doc_" + "2" * 64)
+
+
+def test_render_discovery_rejects_non_directory_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools, _ = service(tmp_path)
+    renders_root = tools.store.root / "renders"
+    original_is_dir = Path.is_dir
+
+    def false_for_render(path: Path) -> bool:
+        return False if path == renders_root else original_is_dir(path)
+
+    monkeypatch.setattr(
+        Path,
+        "is_dir",
+        false_for_render,
+    )
+
+    with pytest.raises(AppError, match="Render storage is corrupted"):
+        _ = tools.discover_resource_for_test("doc_" + "2" * 64)
+
+
+def test_render_discovery_enforces_scan_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools, _ = service(tmp_path)
+    (tools.store.root / "renders" / ("rnd_" + "1" * 32)).mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    monkeypatch.setattr(tools_module, "_MAX_RENDER_RESOURCE_SCAN_DIRECTORIES", 0)
+
+    with pytest.raises(AppError, match="exceeds its scan bound"):
+        _ = tools.discover_resource_for_test("doc_" + "2" * 64)
+
+
+def test_render_discovery_accepts_identical_content_with_multiple_owners(
+    tmp_path: Path,
+) -> None:
+    tools, _ = service(tmp_path)
+    data = b"same-jpeg"
+    digest = hashlib.sha256(data).hexdigest()
+    artifact_id = f"doc_{digest}"
+    for digit in ("1", "2"):
+        render_id = "rnd_" + digit * 32
+        relative_path = f"renders/{render_id}/page.jpg"
+        _ = tools.store.put_render_bytes(relative_path, data)
+        _ = _persist_render_index(
+            tools,
+            render_id=render_id,
+            identity=(artifact_id, relative_path, digest, len(data)),
+        )
+
+    assert tools.discover_resource_for_test(artifact_id) is True
+    resource = tools.read_artifact_for_test(
+        f"nplg://artifact/{artifact_id}",
+        artifact_id,
+    )
+    assert resource["sha256"] == digest
+    assert resource["render_id"] == ""
+
+
+def test_multi_owner_pruning_retains_a_valid_authorized_owner(tmp_path: Path) -> None:
+    tools, _ = service(tmp_path)
+    data = b"same-jpeg"
+    digest = hashlib.sha256(data).hexdigest()
+    artifact_id = f"doc_{digest}"
+    render_ids = tuple("rnd_" + digit * 32 for digit in ("1", "2"))
+    for render_id in render_ids:
+        relative_path = f"renders/{render_id}/page.jpg"
+        _ = tools.store.put_render_bytes(relative_path, data)
+        _ = _persist_render_index(
+            tools,
+            render_id=render_id,
+            identity=(artifact_id, relative_path, digest, len(data)),
+        )
+    assert tools.discover_resource_for_test(artifact_id) is True
+
+    tools.prune_resource_for_test(render_ids[0], artifact_id)
+    resource = tools.read_artifact_for_test(
+        f"nplg://artifact/{artifact_id}",
+        artifact_id,
+    )
+
+    assert tools.resource_is_cached_for_test(artifact_id) is True
+    assert resource["render_id"] == render_ids[1]
+
+
+def test_multi_owner_discovery_rejects_conflicting_media_identity(
+    tmp_path: Path,
+) -> None:
+    tools, _ = service(tmp_path)
+    data = b"same-content"
+    digest = hashlib.sha256(data).hexdigest()
+    artifact_id = f"doc_{digest}"
+    first_render = "rnd_" + "1" * 32
+    first_path = f"renders/{first_render}/page.jpg"
+    _ = tools.store.put_render_bytes(first_path, data)
+    _ = _persist_render_index(
+        tools,
+        render_id=first_render,
+        identity=(artifact_id, first_path, digest, len(data)),
+    )
+    second_render = "rnd_" + "2" * 32
+    second_path = f"renders/{second_render}/manifest.json"
+    _ = tools.store.put_render_bytes(second_path, data)
+    _ = _persist_render_index(
+        tools,
+        render_id=second_render,
+        identity=(artifact_id, second_path, digest, len(data)),
+        options=_PersistRenderIndexOptions(media_type="application/json"),
+    )
+
+    with pytest.raises(AppError, match="provenance is ambiguous"):
+        _ = tools.discover_resource_for_test(artifact_id)
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "code"),
+    [
+        (
+            "renders/rnd_11111111111111111111111111111111/missing.jpg",
+            ErrorCode.NOT_FOUND,
+        ),
+        (
+            "renders/rnd_11111111111111111111111111111111/../bad.jpg",
+            ErrorCode.INVALID_INPUT,
+        ),
+    ],
+)
+def test_registered_resource_maps_only_storage_not_found(
+    tmp_path: Path,
+    relative_path: str,
+    code: ErrorCode,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    digest = "2" * 64
+    artifact_id = f"doc_{digest}"
+    index = _persist_render_index(
+        tools,
+        render_id=render_id,
+        identity=(artifact_id, relative_path, digest, 1),
+    )
+    assert tools.load_and_cache_resource_for_test(index.parents[2], artifact_id)
+
+    with pytest.raises(AppError) as captured:
+        _ = tools.read_artifact_for_test(f"nplg://artifact/{artifact_id}", artifact_id)
+
+    expected = ErrorCode.NOT_FOUND if code is ErrorCode.NOT_FOUND else code
+    assert captured.value.code is expected
+
+
+def test_registered_resource_prunes_after_read_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    data = b"jpeg"
+    digest = hashlib.sha256(data).hexdigest()
+    artifact_id = f"doc_{digest}"
+    relative_path = f"renders/{render_id}/page.jpg"
+    path = tools.store.root / relative_path
+    _ = tools.store.put_render_bytes(relative_path, data)
+    index = _persist_render_index(
+        tools,
+        render_id=render_id,
+        identity=(artifact_id, relative_path, digest, len(data)),
+    )
+    assert tools.load_and_cache_resource_for_test(index.parents[2], artifact_id)
+
+    def resolved_deleted_path(_relative: str) -> Path:
+        return path
+
+    monkeypatch.setattr(tools.store, "resolve_asset", resolved_deleted_path)
+    path.unlink()
+
+    with pytest.raises(AppError) as captured:
+        _ = tools.read_artifact_for_test(f"nplg://artifact/{artifact_id}", artifact_id)
+
+    assert captured.value.code is ErrorCode.NOT_FOUND
+    assert not tools.resource_is_cached_for_test(artifact_id)
+
+
+def test_unregistered_document_deletion_skips_render_pruning(
+    tmp_path: Path,
+) -> None:
+    tools, _ = service(tmp_path)
+    artifact_id = "doc_" + "2" * 64
+    missing = tools.store.root / "documents" / artifact_id / "source.pdf"
+
+    tools.force_missing_document_for_test(missing)
+
+    with pytest.raises(AppError) as captured:
+        _ = tools.read_artifact_for_test(f"nplg://artifact/{artifact_id}", artifact_id)
+
+    assert captured.value.code is ErrorCode.NOT_FOUND
+
+
+def test_unregistered_document_rejects_content_digest_mismatch(
+    tmp_path: Path,
+) -> None:
+    tools, _ = service(tmp_path)
+    artifact_id = "doc_" + "2" * 64
+    mismatched = tmp_path / "mismatched.pdf"
+    _ = mismatched.write_bytes(b"not-the-addressed-content")
+    tools.force_missing_document_for_test(mismatched)
+
+    with pytest.raises(AppError, match="integrity verification failed"):
+        _ = tools.read_artifact_for_test(f"nplg://artifact/{artifact_id}", artifact_id)
+
+
+def test_registered_resource_rejects_size_mismatch_with_valid_digest(
+    tmp_path: Path,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    data = b"jpeg"
+    digest = hashlib.sha256(data).hexdigest()
+    artifact_id = f"doc_{digest}"
+    relative_path = f"renders/{render_id}/page.jpg"
+    _ = tools.store.put_render_bytes(relative_path, data)
+    index = _persist_render_index(
+        tools,
+        render_id=render_id,
+        identity=(artifact_id, relative_path, digest, len(data) + 1),
+    )
+    assert tools.load_and_cache_resource_for_test(index.parents[2], artifact_id)
+
+    with pytest.raises(AppError, match="integrity verification failed"):
+        _ = tools.read_artifact_for_test(f"nplg://artifact/{artifact_id}", artifact_id)
+
+
+def test_render_registration_rejects_unapproved_media_type(tmp_path: Path) -> None:
+    tools, _ = service(tmp_path)
+
+    with pytest.raises(AppError, match="media type is invalid"):
+        _ = tools.register_render_for_test(
+            relative_path="renders/rnd_" + "1" * 32 + "/page.jpg",
+            sha256=None,
+            media_type="text/plain",
+            render_id="rnd_" + "1" * 32,
+        )
+
+
+def test_render_registration_rejects_cross_render_path(tmp_path: Path) -> None:
+    tools, _ = service(tmp_path)
+
+    with pytest.raises(AppError, match="provenance is invalid"):
+        _ = tools.register_render_for_test(
+            relative_path="renders/rnd_" + "2" * 32 + "/page.jpg",
+            sha256=None,
+            media_type="image/jpeg",
+            render_id="rnd_" + "1" * 32,
+        )
+
+
+def test_render_registration_rejects_empty_artifact(tmp_path: Path) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    relative_path = f"renders/{render_id}/page.jpg"
+    _ = tools.store.put_render_bytes(relative_path, b"")
+
+    with pytest.raises(AppError, match="size is invalid"):
+        _ = tools.register_render_for_test(
+            relative_path=relative_path,
+            sha256=None,
+            media_type="image/jpeg",
+            render_id=render_id,
+        )
+
+
+def test_render_registration_rejects_supplied_digest_mismatch(tmp_path: Path) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    relative_path = f"renders/{render_id}/page.jpg"
+    _ = tools.store.put_render_bytes(relative_path, b"jpeg")
+
+    with pytest.raises(AppError, match="integrity verification failed"):
+        _ = tools.register_render_for_test(
+            relative_path=relative_path,
+            sha256="2" * 64,
+            media_type="image/jpeg",
+            render_id=render_id,
+        )
+
+
+def test_render_registration_accepts_same_content_at_two_paths_in_one_render(
+    tmp_path: Path,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    first_path = f"renders/{render_id}/first.jpg"
+    second_path = f"renders/{render_id}/second.jpg"
+    _ = tools.store.put_render_bytes(first_path, b"jpeg")
+    _ = tools.store.put_render_bytes(second_path, b"jpeg")
+    first_id = tools.register_render_for_test(
+        relative_path=first_path,
+        sha256=None,
+        media_type="image/jpeg",
+        render_id=render_id,
+    )
+
+    second_id = tools.register_render_for_test(
+        relative_path=second_path,
+        sha256=None,
+        media_type="image/jpeg",
+        render_id=render_id,
+    )
+    restarted, _ = service(tmp_path)
+    resource = restarted.read_artifact_for_test(
+        f"nplg://artifact/{first_id}",
+        first_id,
+    )
+
+    assert second_id == first_id
+    assert resource["sha256"] == first_id.removeprefix("doc_")
+    assert resource["render_id"] == render_id
+
+
+@pytest.mark.parametrize("path_count", [33, 100])
+def test_same_render_duplicate_content_scales_to_allowed_tile_count_after_restart(
+    tmp_path: Path,
+    path_count: int,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    artifact_ids: set[str] = set()
+    for index in range(path_count):
+        relative_path = f"renders/{render_id}/tile-{index:04}.jpg"
+        _ = tools.store.put_render_bytes(relative_path, b"identical-tile")
+        artifact_ids.add(
+            tools.register_render_for_test(
+                relative_path=relative_path,
+                sha256=None,
+                media_type="image/jpeg",
+                render_id=render_id,
+            )
+        )
+
+    [artifact_id] = artifact_ids
+    restarted, _ = service(tmp_path)
+    resource = restarted.read_artifact_for_test(
+        f"nplg://artifact/{artifact_id}",
+        artifact_id,
+    )
+
+    assert resource["sha256"] == artifact_id.removeprefix("doc_")
+    assert resource["render_id"] == render_id
+
+
+@pytest.mark.parametrize("reader_mode", ["in-process", "restart"])
+def test_missing_representative_is_replaced_by_verified_same_render_duplicate(
+    tmp_path: Path,
+    reader_mode: str,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    first_path = f"renders/{render_id}/tile-0000.jpg"
+    second_path = f"renders/{render_id}/tile-0001.jpg"
+    data = b"identical-tile"
+    _ = tools.store.put_render_bytes(first_path, data)
+    artifact_id = tools.register_render_for_test(
+        relative_path=first_path,
+        sha256=None,
+        media_type="image/jpeg",
+        render_id=render_id,
+    )
+    (tools.store.root / first_path).unlink()
+    _ = tools.store.put_render_bytes(second_path, data)
+
+    duplicate_id = tools.register_render_for_test(
+        relative_path=second_path,
+        sha256=None,
+        media_type="image/jpeg",
+        render_id=render_id,
+    )
+    reader = service(tmp_path)[0] if reader_mode == "restart" else tools
+    resource = reader.read_artifact_for_test(
+        f"nplg://artifact/{artifact_id}",
+        artifact_id,
+    )
+
+    assert duplicate_id == artifact_id
+    assert resource["sha256"] == artifact_id.removeprefix("doc_")
+    assert resource["render_id"] == render_id
+
+
+def test_representative_deleted_after_resolution_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    first_path = f"renders/{render_id}/tile-0000.jpg"
+    second_path = f"renders/{render_id}/tile-0001.jpg"
+    data = b"identical-tile"
+    _ = tools.store.put_render_bytes(first_path, data)
+    artifact_id = tools.register_render_for_test(
+        relative_path=first_path,
+        sha256=None,
+        media_type="image/jpeg",
+        render_id=render_id,
+    )
+    _ = tools.store.put_render_bytes(second_path, data)
+    real_resolve = tools.store.resolve_asset
+
+    def resolve_then_delete(relative_path: str) -> Path:
+        resolved = real_resolve(relative_path)
+        if relative_path == first_path:
+            resolved.unlink()
+        return resolved
+
+    monkeypatch.setattr(tools.store, "resolve_asset", resolve_then_delete)
+
+    duplicate_id = tools.register_render_for_test(
+        relative_path=second_path,
+        sha256=None,
+        media_type="image/jpeg",
+        render_id=render_id,
+    )
+    resource = tools.read_artifact_for_test(
+        f"nplg://artifact/{artifact_id}",
+        artifact_id,
+    )
+
+    assert duplicate_id == artifact_id
+    assert resource["sha256"] == artifact_id.removeprefix("doc_")
+
+
+def test_missing_representative_index_is_not_silently_recreated(
+    tmp_path: Path,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    first_path = f"renders/{render_id}/tile-0000.jpg"
+    second_path = f"renders/{render_id}/tile-0001.jpg"
+    data = b"identical-tile"
+    _ = tools.store.put_render_bytes(first_path, data)
+    artifact_id = tools.register_render_for_test(
+        relative_path=first_path,
+        sha256=None,
+        media_type="image/jpeg",
+        render_id=render_id,
+    )
+    index_path = tools.store.root / tools.resource_index_path_for_test(
+        render_id,
+        artifact_id,
+    )
+    index_path.unlink()
+    _ = tools.store.put_render_bytes(second_path, data)
+
+    with pytest.raises(AppError, match="index is invalid"):
+        _ = tools.register_render_for_test(
+            relative_path=second_path,
+            sha256=None,
+            media_type="image/jpeg",
+            render_id=render_id,
+        )
+
+
+def test_symlink_representative_is_not_replaced_by_duplicate(tmp_path: Path) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    first_path = f"renders/{render_id}/tile-0000.jpg"
+    second_path = f"renders/{render_id}/tile-0001.jpg"
+    data = b"identical-tile"
+    _ = tools.store.put_render_bytes(first_path, data)
+    _ = tools.register_render_for_test(
+        relative_path=first_path,
+        sha256=None,
+        media_type="image/jpeg",
+        render_id=render_id,
+    )
+    (tools.store.root / first_path).unlink()
+    _ = tools.store.put_render_bytes(second_path, data)
+    (tools.store.root / first_path).symlink_to(tools.store.root / second_path)
+
+    with pytest.raises(AppError, match="provenance is invalid"):
+        _ = tools.register_render_for_test(
+            relative_path=second_path,
+            sha256=None,
+            media_type="image/jpeg",
+            render_id=render_id,
+        )
+
+
+def test_empty_representative_is_not_replaced_by_duplicate(tmp_path: Path) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    first_path = f"renders/{render_id}/tile-0000.jpg"
+    second_path = f"renders/{render_id}/tile-0001.jpg"
+    data = b"identical-tile"
+    _ = tools.store.put_render_bytes(first_path, data)
+    _ = tools.register_render_for_test(
+        relative_path=first_path,
+        sha256=None,
+        media_type="image/jpeg",
+        render_id=render_id,
+    )
+    _ = (tools.store.root / first_path).write_bytes(b"")
+    _ = tools.store.put_render_bytes(second_path, data)
+
+    with pytest.raises(AppError, match="integrity verification failed"):
+        _ = tools.register_render_for_test(
+            relative_path=second_path,
+            sha256=None,
+            media_type="image/jpeg",
+            render_id=render_id,
+        )
+
+
+@pytest.mark.parametrize("fault", ["invalid", "unavailable", "read"])
+def test_representative_lookup_fault_is_not_silently_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    first_path = f"renders/{render_id}/tile-0000.jpg"
+    second_path = f"renders/{render_id}/tile-0001.jpg"
+    data = b"identical-tile"
+    _ = tools.store.put_render_bytes(first_path, data)
+    _ = tools.register_render_for_test(
+        relative_path=first_path,
+        sha256=None,
+        media_type="image/jpeg",
+        render_id=render_id,
+    )
+    _ = tools.store.put_render_bytes(second_path, data)
+    real_resolve = tools.store.resolve_asset
+    real_read_bytes = Path.read_bytes
+
+    def faulty_resolve(relative_path: str) -> Path:
+        if relative_path == first_path:
+            code = (
+                ErrorCode.INVALID_INPUT if fault == "invalid" else ErrorCode.NOT_FOUND
+            )
+            raise AppError(code, "injected lookup fault")
+        return real_resolve(relative_path)
+
+    def faulty_read_bytes(path: Path) -> bytes:
+        if path == tools.store.root / first_path:
+            message = "injected read fault"
+            raise OSError(message)
+        return real_read_bytes(path)
+
+    if fault == "read":
+        monkeypatch.setattr(Path, "read_bytes", faulty_read_bytes)
+    else:
+        monkeypatch.setattr(tools.store, "resolve_asset", faulty_resolve)
+
+    with pytest.raises(AppError) as captured:
+        _ = tools.register_render_for_test(
+            relative_path=second_path,
+            sha256=None,
+            media_type="image/jpeg",
+            render_id=render_id,
+        )
+
+    assert captured.value.code in {ErrorCode.INVALID_INPUT, ErrorCode.INTERNAL_ERROR}
+
+
+def test_same_render_duplicate_with_conflicting_media_type_is_rejected(
+    tmp_path: Path,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    data = b"same-content"
+    image_path = f"renders/{render_id}/tile.jpg"
+    manifest_path = f"renders/{render_id}/other/manifest.json"
+    _ = tools.store.put_render_bytes(image_path, data)
+    _ = tools.register_render_for_test(
+        relative_path=image_path,
+        sha256=None,
+        media_type="image/jpeg",
+        render_id=render_id,
+    )
+    _ = tools.store.put_render_bytes(manifest_path, data)
+
+    with pytest.raises(AppError, match="provenance is ambiguous"):
+        _ = tools.register_render_for_test(
+            relative_path=manifest_path,
+            sha256=None,
+            media_type="application/json",
+            render_id=render_id,
+        )
+
+
+def test_corrupt_representative_is_not_replaced_by_duplicate(tmp_path: Path) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    first_path = f"renders/{render_id}/tile-0000.jpg"
+    second_path = f"renders/{render_id}/tile-0001.jpg"
+    data = b"identical-tile"
+    _ = tools.store.put_render_bytes(first_path, data)
+    _ = tools.register_render_for_test(
+        relative_path=first_path,
+        sha256=None,
+        media_type="image/jpeg",
+        render_id=render_id,
+    )
+    _ = (tools.store.root / first_path).write_bytes(b"corrupted-tile")
+    _ = tools.store.put_render_bytes(second_path, data)
+
+    with pytest.raises(AppError, match="integrity verification failed"):
+        _ = tools.register_render_for_test(
+            relative_path=second_path,
+            sha256=None,
+            media_type="image/jpeg",
+            render_id=render_id,
+        )
+
+
+def test_corrupt_index_is_not_overwritten_when_representative_is_missing(
+    tmp_path: Path,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    first_path = f"renders/{render_id}/tile-0000.jpg"
+    second_path = f"renders/{render_id}/tile-0001.jpg"
+    data = b"identical-tile"
+    _ = tools.store.put_render_bytes(first_path, data)
+    artifact_id = tools.register_render_for_test(
+        relative_path=first_path,
+        sha256=None,
+        media_type="image/jpeg",
+        render_id=render_id,
+    )
+    (tools.store.root / first_path).unlink()
+    index_path = tools.store.root / tools.resource_index_path_for_test(
+        render_id,
+        artifact_id,
+    )
+    _ = index_path.write_bytes(b"{")
+    _ = tools.store.put_render_bytes(second_path, data)
+
+    with pytest.raises(AppError, match="index is invalid"):
+        _ = tools.register_render_for_test(
+            relative_path=second_path,
+            sha256=None,
+            media_type="image/jpeg",
+            render_id=render_id,
+        )
+
+
+def test_restart_rejects_representative_path_with_mismatched_content(
+    tmp_path: Path,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    expected = b"expected-jpeg"
+    digest = hashlib.sha256(expected).hexdigest()
+    artifact_id = f"doc_{digest}"
+    forged_path = f"renders/{render_id}/representative.jpg"
+    _ = tools.store.put_render_bytes(forged_path, b"forged-jpeg")
+    _ = _persist_render_index(
+        tools,
+        render_id=render_id,
+        identity=(artifact_id, forged_path, digest, len(expected)),
+    )
+    restarted, _ = service(tmp_path)
+
+    with pytest.raises(AppError, match="integrity verification failed"):
+        _ = restarted.read_artifact_for_test(
+            f"nplg://artifact/{artifact_id}",
+            artifact_id,
+        )
+
+
+@pytest.mark.parametrize("forgery", ["cross-render", "wrong-media"])
+def test_restart_rejects_forged_representative_path_binding(
+    tmp_path: Path,
+    forgery: str,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    data = b"expected-jpeg"
+    digest = hashlib.sha256(data).hexdigest()
+    artifact_id = f"doc_{digest}"
+    primary_path = f"renders/{render_id}/first.jpg"
+    _ = tools.store.put_render_bytes(primary_path, data)
+    forged_paths: dict[str, str] = {
+        "cross-render": f"renders/rnd_{'2' * 32}/second.jpg",
+        "wrong-media": f"renders/{render_id}/second.json",
+    }
+    index = _persist_render_index(
+        tools,
+        render_id=render_id,
+        identity=(artifact_id, forged_paths[forgery], digest, len(data)),
+    )
+    restarted, _ = service(tmp_path)
+
+    with pytest.raises(AppError, match="provenance is invalid"):
+        _ = restarted.load_resource_index_for_test(
+            index.parents[2],
+            artifact_id,
+        )
+
+
+def test_render_registration_rejects_index_write_path_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    relative_path = f"renders/{render_id}/page.jpg"
+    _ = tools.store.put_render_bytes(relative_path, b"jpeg")
+    original_put = tools.store.put_render_bytes
+
+    def wrong_index_path(path: str, data: bytes) -> tuple[str, str]:
+        written, digest = original_put(path, data)
+        return f"{written}.wrong", digest
+
+    monkeypatch.setattr(tools.store, "put_render_bytes", wrong_index_path)
+
+    with pytest.raises(AppError, match="index path mismatch"):
+        _ = tools.register_render_for_test(
+            relative_path=relative_path,
+            sha256=None,
+            media_type="image/jpeg",
+            render_id=render_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_pdf_job_does_not_release_unacquired_permit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools, _ = service(tmp_path)
+    artifact = tools.store.put_bytes(
+        b"%PDF-1.7\nfixture",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+
+    async def timeout_acquire() -> bool:
+        raise TimeoutError
+
+    monkeypatch.setattr(tools.pdf_limiter_for_test, "acquire", timeout_acquire)
+
+    with pytest.raises(AppError) as captured:
+        _ = await tools.call("inspect_pdf", {"artifact_id": artifact.object_id})
+
+    assert captured.value.code is ErrorCode.PDF_PROCESSING_FAILED

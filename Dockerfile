@@ -15,6 +15,7 @@ RUN python -m pip install --require-hashes --no-deps --only-binary=:all: -r requ
 
 COPY src ./src
 COPY scripts/delete_render.py ./scripts/delete_render.py
+COPY deploy/pdf-worker-slot-policy.json /etc/nplg/pdf-worker-slot-policy.json
 COPY pyproject.toml README.md LICENSE THIRD_PARTY_NOTICES.md ./
 
 RUN chmod -R a=rX /app/src /app/scripts \
@@ -22,7 +23,7 @@ RUN chmod -R a=rX /app/src /app/scripts \
     && chown -R 10001:10001 /data /home/nplg
 
 USER 10001:10001
-EXPOSE 8000
+EXPOSE 8443
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).read()"]

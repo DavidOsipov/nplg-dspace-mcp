@@ -9,10 +9,13 @@ from pydantic import SecretStr
 
 from nplg_mcp.config import (
     HARD_MAX_DOWNLOAD_BYTES,
+    PDF_WORKER_SLOT_POLICY_PATH,
+    PDF_WORKER_SLOT_ROOT,
     ApiPrincipalCredential,
     AppConfig,
     load_config,
 )
+from nplg_mcp.http_security import build_transport_security_settings
 from tests.helpers.app_factory import base_environment
 
 _TEST_CACHE_DIR = Path("/", "tmp", "nplg-test-cache")
@@ -70,6 +73,92 @@ def test_defaults_are_bounded_and_point_only_to_nplg() -> None:
         == _EXPECTED_ASSET_STREAM_TOTAL_TIMEOUT_SECONDS
     )
     assert config.deployment_profile == "private-full"
+
+
+def test_unix_pdf_worker_is_private_full_only_and_required_in_production() -> None:
+    """Reject a local executor where the selected profile needs OS isolation."""
+    private_test_config = load_config(
+        base_env(
+            DEPLOYMENT_PROFILE="private-full",
+            PDF_EXECUTOR="unix-worker",
+        )
+    )
+
+    assert private_test_config.pdf_executor == "unix-worker"
+
+    with pytest.raises(ValueError, match="PDF_EXECUTOR"):
+        _ = load_config(
+            base_env(
+                DEPLOYMENT_PROFILE="alpic-metadata",
+                PDF_EXECUTOR="unix-worker",
+            )
+        )
+
+    with pytest.raises(ValueError, match="PDF_EXECUTOR"):
+        _ = load_config(
+            {
+                "NODE_ENV": "production",
+                "DEPLOYMENT_PROFILE": "private-full",
+                "ASSET_SIGNING_SECRET": "s" * 32,
+                "PUBLIC_BASE_URL": "https://mcp.example.net",
+                "API_PRINCIPALS_JSON": (
+                    '[{"principal_id":"operator","bearer_token":"' + ("t" * 32) + '"}]'
+                ),
+                "ALLOW_ANONYMOUS": "false",
+                "PDF_EXECUTOR": "serialized",
+            }
+        )
+
+
+def test_pdf_worker_slot_paths_are_fixed_for_the_private_profile() -> None:
+    """Catch an environment override that redirects the isolated worker slot."""
+    config = load_config(base_env(PDF_EXECUTOR="unix-worker"))
+
+    assert config.pdf_worker_slot_root == PDF_WORKER_SLOT_ROOT
+    assert config.pdf_worker_slot_policy_path == PDF_WORKER_SLOT_POLICY_PATH
+
+    with pytest.raises(ValueError, match="PDF_WORKER_SLOT_ROOT"):
+        _ = load_config(
+            base_env(
+                PDF_EXECUTOR="unix-worker",
+                PDF_WORKER_SLOT_ROOT="/var/lib/nplg/attacker-slot",
+            )
+        )
+
+
+def test_private_edge_tls_is_explicit_and_limited_to_private_full() -> None:
+    """Do not permit an accidental plaintext origin in the private profile."""
+    config = load_config(
+        base_env(
+            DEPLOYMENT_PROFILE="private-full",
+            PRIVATE_EDGE_TLS="true",
+        )
+    )
+
+    assert config.private_edge_tls is True
+
+    with pytest.raises(ValueError, match="PRIVATE_EDGE_TLS"):
+        _ = load_config(
+            base_env(
+                DEPLOYMENT_PROFILE="alpic-metadata",
+                PRIVATE_EDGE_TLS="true",
+            )
+        )
+
+    with pytest.raises(ValueError, match="PRIVATE_EDGE_TLS"):
+        _ = load_config(
+            {
+                "NODE_ENV": "production",
+                "DEPLOYMENT_PROFILE": "private-full",
+                "PDF_EXECUTOR": "unix-worker",
+                "ASSET_SIGNING_SECRET": "s" * 32,
+                "PUBLIC_BASE_URL": "https://mcp.example.net",
+                "API_PRINCIPALS_JSON": (
+                    '[{"principal_id":"operator","bearer_token":"' + ("t" * 32) + '"}]'
+                ),
+                "ALLOW_ANONYMOUS": "false",
+            }
+        )
 
 
 def test_foreign_repository_base_url_is_rejected() -> None:
@@ -346,6 +435,8 @@ def test_alpic_host_does_not_select_a_deployment_profile() -> None:
             ),
             "ALLOW_ANONYMOUS": "false",
             "DEPLOYMENT_PROFILE": "private-full",
+            "PDF_EXECUTOR": "unix-worker",
+            "PRIVATE_EDGE_TLS": "true",
         }
     )
 
@@ -679,3 +770,91 @@ def test_configured_bearer_token_must_be_strong() -> None:
                 API_BEARER_TOKEN=str(0),
             )
         )
+
+
+def test_mcp_allowed_hosts_are_strict_canonical_values() -> None:
+    """The transport receives only the exact canonical host authorities."""
+    configured = load_config(
+        base_env(NPLG_MCP_ALLOWED_HOSTS_JSON='["127.0.0.1:9000","mcp.example.test"]')
+    )
+
+    assert configured.mcp_allowed_hosts == (
+        "127.0.0.1:9000",
+        "mcp.example.test",
+    )
+
+    for value in (
+        "*.example.test",
+        "MCP.example.test",
+        "mcp.example.test/",
+        "mcp.example.test:08000",
+        "user@mcp.example.test",
+        "[fe80::1%25eth0]",
+    ):
+        with pytest.raises(ValueError, match="MCP allowed host"):
+            _ = load_config(base_env(NPLG_MCP_ALLOWED_HOSTS_JSON=f'["{value}"]'))
+
+
+def test_mcp_allowed_hosts_reject_duplicates_and_empty_lists() -> None:
+    """The Host allowlist is nonempty and duplicate aliases are never collapsed."""
+    with pytest.raises(ValueError, match="must not be empty"):
+        _ = load_config(base_env(NPLG_MCP_ALLOWED_HOSTS_JSON="[]"))
+    with pytest.raises(ValueError, match="duplicates"):
+        _ = load_config(
+            base_env(
+                NPLG_MCP_ALLOWED_HOSTS_JSON=('["mcp.example.test","mcp.example.test"]')
+            )
+        )
+
+
+def test_mcp_allowed_origins_are_strict_canonical_values() -> None:
+    """Only exact HTTPS origins or explicit development loopback HTTP are admitted."""
+    configured = load_config(
+        base_env(
+            NPLG_MCP_ALLOWED_ORIGINS_JSON=(
+                '["https://mcp.example.test","http://127.0.0.1:9000"]'
+            )
+        )
+    )
+    assert configured.mcp_allowed_origins == (
+        "https://mcp.example.test",
+        "http://127.0.0.1:9000",
+    )
+
+    for value in (
+        "https://user@mcp.example.test",
+        "https://mcp.example.test/",
+        "https://mcp.example.test?x=1",
+        "https://MCP.example.test",
+        "http://mcp.example.test",
+    ):
+        with pytest.raises(ValueError, match="MCP allowed origin"):
+            _ = load_config(base_env(NPLG_MCP_ALLOWED_ORIGINS_JSON=f'["{value}"]'))
+
+
+def test_mcp_allowed_origins_reject_duplicates() -> None:
+    """Duplicate exact origins are rejected rather than silently deduplicated."""
+    with pytest.raises(ValueError, match="duplicates"):
+        _ = load_config(
+            base_env(
+                NPLG_MCP_ALLOWED_ORIGINS_JSON=(
+                    '["https://mcp.example.test","https://mcp.example.test"]'
+                )
+            )
+        )
+
+
+def test_transport_security_settings_exactly_match_config() -> None:
+    """SDK DNS-rebinding policy is built from the same immutable allowlists."""
+    configured = load_config(
+        base_env(
+            NPLG_MCP_ALLOWED_HOSTS_JSON='["mcp.example.test"]',
+            NPLG_MCP_ALLOWED_ORIGINS_JSON='["https://mcp.example.test"]',
+        )
+    )
+
+    settings = build_transport_security_settings(configured)
+
+    assert settings.enable_dns_rebinding_protection is True
+    assert settings.allowed_hosts == ["mcp.example.test"]
+    assert settings.allowed_origins == ["https://mcp.example.test"]

@@ -100,7 +100,10 @@ jobs:
           npm ci --ignore-scripts
 
       - name: Run the typed local SCA battery
-        run: python scripts/verify_release.py local-gates --worktree "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/nplg-security-sca" --node-executable "$(command -v node)" --compare-branch origin/main
+        run: |
+          python scripts/verify_release.py local-gates --worktree "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/nplg-security-sca" --node-executable "$(command -v node)" --compare-branch origin/main
+          npm audit --audit-level=low --package-lock-only --ignore-scripts --json > "$RUNNER_TEMP/nplg-security-sca/npm-audit.json"
+          sha256sum package-lock.json > "$RUNNER_TEMP/nplg-security-sca/package-lock.SHA256SUMS"
 
       - name: Bind SCA evidence to its bytes
         if: always()
@@ -146,7 +149,10 @@ jobs:
           npm ci --ignore-scripts
 
       - name: Run the typed local SBOM battery
-        run: python scripts/verify_release.py local-gates --worktree "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/nplg-security-sbom" --node-executable "$(command -v node)" --compare-branch origin/main
+        run: |
+          python scripts/verify_release.py local-gates --worktree "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/nplg-security-sbom" --node-executable "$(command -v node)" --compare-branch origin/main
+          npm sbom --package-lock-only --sbom-format cyclonedx > "$RUNNER_TEMP/nplg-security-sbom/npm.cdx.json"
+          sha256sum package-lock.json > "$RUNNER_TEMP/nplg-security-sbom/package-lock.SHA256SUMS"
 
       - name: Bind SBOM evidence to its bytes
         if: always()

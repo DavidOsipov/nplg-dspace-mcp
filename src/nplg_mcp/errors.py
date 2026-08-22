@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import math
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, cast
@@ -17,6 +19,11 @@ _MAX_PUBLIC_DETAIL_DEPTH = 32
 _MAX_PUBLIC_DETAIL_VALUES = 4_096
 _MAX_PUBLIC_DETAIL_STRING_CODE_POINTS = 65_536
 _MAX_PUBLIC_DETAIL_INTEGER_BITS = 256
+_MAX_RESOURCE_URI_CODE_POINTS = 512
+_CANONICAL_ARTIFACT_URI = re.compile(r"^nplg://artifact/doc_[0-9a-f]{64}$")
+_CANONICAL_RENDER_MANIFEST_URI = re.compile(
+    r"^nplg://render/rnd_[0-9a-f]{32}/manifest$"
+)
 
 
 class ErrorCode(StrEnum):
@@ -53,6 +60,25 @@ class AppError(Exception):
 
 class _InvalidPublicDetailsError(ValueError):
     pass
+
+
+class InvalidResourceUriError(ValueError):
+    """A resource URI is not one of the bounded canonical project forms."""
+
+
+def validate_resource_uri(uri: str) -> str:
+    """Return one syntactically valid bounded canonical project resource URI."""
+    if not 0 < len(uri) <= _MAX_RESOURCE_URI_CODE_POINTS:
+        raise InvalidResourceUriError
+    if any(unicodedata.category(character) in {"Cc", "Cf"} for character in uri):
+        raise InvalidResourceUriError
+    if (
+        uri == "nplg://about"
+        or _CANONICAL_ARTIFACT_URI.fullmatch(uri) is not None
+        or _CANONICAL_RENDER_MANIFEST_URI.fullmatch(uri) is not None
+    ):
+        return uri
+    raise InvalidResourceUriError
 
 
 @dataclass(slots=True)

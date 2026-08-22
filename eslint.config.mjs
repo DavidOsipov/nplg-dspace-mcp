@@ -6,10 +6,16 @@ const contractFiles = [
   "contracts/zod/baseline-contracts.mjs",
   "contracts/zod/asvs-evidence-contracts.mjs",
   "contracts/zod/capability-contracts.mjs",
+  "contracts/zod/models.ts",
+  "contracts/zod/contract.test.ts",
   "tests/contracts/zod_baseline_contracts.test.mjs",
   "tests/contracts/zod_asvs_evidence_contracts.test.mjs",
   "tests/contracts/zod_contracts.test.mjs",
 ];
+const zodContractTypeScriptSources = new Set([
+  "/contracts/zod/contract.test.ts",
+  "/contracts/zod/models.ts",
+]);
 const forbiddenJSDocAnyKinds = new Set([
   typescript.SyntaxKind.AnyKeyword,
   typescript.SyntaxKind.JSDocAllType,
@@ -22,6 +28,69 @@ const taskOnePolicyPlugin = {
     version: "1.0.0",
   },
   rules: {
+    "no-native-zod-string-length": {
+      create(context) {
+        return {
+          Program(program) {
+            const parserServices = context.sourceCode.parserServices;
+            const sourceFile = parserServices.esTreeNodeToTSNodeMap?.get(program);
+            const typeChecker = parserServices.program?.getTypeChecker();
+            if (sourceFile === undefined || typeChecker === undefined) {
+              throw new Error(
+                "task1/no-native-zod-string-length requires TypeScript parser services",
+              );
+            }
+            if (
+              ![...zodContractTypeScriptSources].some((suffix) =>
+                sourceFile.fileName.endsWith(suffix)
+              )
+            ) {
+              return;
+            }
+            const forbiddenMethods = new Set(["length", "max", "min"]);
+            const inspectTypeScriptNode = (node) => {
+              if (
+                typescript.isCallExpression(node)
+                && typescript.isPropertyAccessExpression(node.expression)
+                && forbiddenMethods.has(node.expression.name.text)
+              ) {
+                const receiverType = typeChecker.getTypeAtLocation(
+                  node.expression.expression,
+                );
+                if (receiverType.getSymbol()?.getName() === "ZodString") {
+                  context.report({
+                    loc: {
+                      start: context.sourceCode.getLocFromIndex(
+                        node.expression.name.getStart(sourceFile),
+                      ),
+                      end: context.sourceCode.getLocFromIndex(
+                        node.expression.name.end,
+                      ),
+                    },
+                    messageId: "native",
+                  });
+                }
+              }
+              typescript.forEachChild(node, inspectTypeScriptNode);
+            };
+
+            inspectTypeScriptNode(sourceFile);
+          },
+        };
+      },
+      meta: {
+        docs: {
+          description:
+            "Require codePointString instead of UTF-16 Zod string length methods",
+        },
+        messages: {
+          native:
+            "Zod string min/max/length uses UTF-16 units; use codePointString.",
+        },
+        schema: [],
+        type: "problem",
+      },
+    },
     "no-jsdoc-any": {
       create(context) {
         return {
@@ -83,6 +152,11 @@ const withContractFiles = (configuration) => ({
   ...configuration,
   files: contractFiles,
 });
+const noUnsafeRules = Object.fromEntries(
+  Object.keys(typescriptEslint.plugin.rules)
+    .filter((name) => name.startsWith("no-unsafe-"))
+    .map((name) => [`@typescript-eslint/${name}`, "error"]),
+);
 
 export default typescriptEslint.config(
   withContractFiles(eslint.configs.recommended),
@@ -104,6 +178,7 @@ export default typescriptEslint.config(
       task1: taskOnePolicyPlugin,
     },
     rules: {
+      ...noUnsafeRules,
       "@typescript-eslint/ban-ts-comment": [
         "error",
         {
@@ -114,11 +189,26 @@ export default typescriptEslint.config(
         },
       ],
       "@typescript-eslint/no-explicit-any": "error",
+      "@typescript-eslint/no-floating-promises": "error",
+      "@typescript-eslint/no-misused-promises": "error",
+      "@typescript-eslint/no-unnecessary-condition": "error",
       "@typescript-eslint/no-unnecessary-type-assertion": "error",
       "@typescript-eslint/no-unsafe-type-assertion": "error",
+      "@typescript-eslint/consistent-indexed-object-style": [
+        "error",
+        "record",
+      ],
+      "@typescript-eslint/consistent-type-definitions": ["error", "interface"],
+      "@typescript-eslint/no-empty-object-type": [
+        "error",
+        { allowInterfaces: "with-single-extends" },
+      ],
+      "@typescript-eslint/promise-function-async": "error",
+      "@typescript-eslint/switch-exhaustiveness-check": "error",
       "no-eval": "error",
       "no-implied-eval": "error",
       "no-new-func": "error",
+      "task1/no-native-zod-string-length": "error",
       "task1/no-jsdoc-any": "error",
     },
   },

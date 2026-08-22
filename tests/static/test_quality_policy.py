@@ -10,10 +10,12 @@ from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
+import pytest
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from nplg_mcp.json_types import JsonObject, require_json_object
+from nplg_mcp.json_types import JsonObject, load_json_value, require_json_object
+from scripts.run_quality_gate import run_bounded_command
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -211,6 +213,26 @@ ACTION_INVENTORY = {
     "github/codeql-action@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd": "v4.37.7",
 }
 EXPECTED_PYTHON_PATCHES = ("3.12.14", "3.13.15", "3.14.7")
+CONTRACT_SOURCE_INVENTORY = (
+    "contracts/zod/baseline-contracts.mjs",
+    "contracts/zod/asvs-evidence-contracts.mjs",
+    "contracts/zod/capability-contracts.mjs",
+    "contracts/zod/models.ts",
+    "contracts/zod/contract.test.ts",
+    "tests/contracts/zod_baseline_contracts.test.mjs",
+    "tests/contracts/zod_asvs_evidence_contracts.test.mjs",
+    "tests/contracts/zod_contracts.test.mjs",
+)
+PHASE_TWO_NODE_PINS = {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.13.3",
+    "eslint": "10.8.1",
+    "markdownlint-cli2": "0.23.2",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.67.0",
+    "zod": "4.4.3",
+}
+PACKAGE_LOCK_EVIDENCE_JOBS = 2
 EXPECTED_SEMGREP_RULE_IDS = frozenset(
     {
         "nplg.no-subprocess-shell",
@@ -336,8 +358,19 @@ def test_quality_lock_keeps_security_linter_separate() -> None:
 
 def test_ci_runs_the_strict_quality_contract_with_release_identity() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    assert "run: npm run contracts:baseline-static" in workflow
-    assert "run: npm run contracts:zod:all" in workflow
+    for command in (
+        "run: npm run contracts:lint",
+        "run: npm run contracts:typecheck",
+        "run: npm run contracts:test",
+        "run: npm run docs:lint",
+    ):
+        assert command in workflow
+    assert "python scripts/export_contracts.py --check" in workflow
+    assert (
+        "check-jsonschema --check-metaschema "
+        "contracts/generated/tool-contracts.schema.json"
+    ) in workflow
+    assert "git diff --exit-code -- contracts/generated" in workflow
     assert QUALITY_RUNNER + MANAGED_NODE_ARGUMENT + "--self-test" in workflow
     assert (
         QUALITY_RUNNER
@@ -347,6 +380,118 @@ def test_ci_runs_the_strict_quality_contract_with_release_identity() -> None:
         + '--require-clean --candidate "$GITHUB_SHA" '
         + "src tests scripts typings"
     ) in workflow
+
+
+def test_phase_two_node_and_typescript_policy_is_exact() -> None:
+    package = require_json_object(
+        load_json_value((ROOT / "package.json").read_bytes()),
+        context="package.json",
+    )
+    dependencies = require_json_object(
+        package["devDependencies"],
+        context="package.json devDependencies",
+    )
+    assert {
+        name: dependencies[name] for name in PHASE_TWO_NODE_PINS
+    } == PHASE_TWO_NODE_PINS
+    assert package["type"] == "module"
+    assert package["packageManager"] == "npm@11.18.0"
+
+    tsconfig = require_json_object(
+        load_json_value((ROOT / "tsconfig.contracts.json").read_bytes()),
+        context="tsconfig.contracts.json",
+    )
+    assert tsconfig["include"] == list(CONTRACT_SOURCE_INVENTORY)
+    options = require_json_object(
+        tsconfig["compilerOptions"],
+        context="tsconfig compilerOptions",
+    )
+    assert options == {
+        "allowImportingTsExtensions": True,
+        "allowJs": True,
+        "checkJs": True,
+        "erasableSyntaxOnly": True,
+        "exactOptionalPropertyTypes": True,
+        "forceConsistentCasingInFileNames": True,
+        "lib": ["ES2024"],
+        "module": "NodeNext",
+        "moduleDetection": "force",
+        "moduleResolution": "NodeNext",
+        "noEmit": True,
+        "noFallthroughCasesInSwitch": True,
+        "noImplicitOverride": True,
+        "noImplicitReturns": True,
+        "noPropertyAccessFromIndexSignature": True,
+        "noUncheckedIndexedAccess": True,
+        "noUncheckedSideEffectImports": True,
+        "noUnusedLocals": True,
+        "noUnusedParameters": True,
+        "strict": True,
+        "target": "ES2024",
+        "types": ["node"],
+        "useUnknownInCatchVariables": True,
+        "verbatimModuleSyntax": True,
+    }
+
+
+def test_markdown_policy_is_closed_and_covers_owned_markdown() -> None:
+    expected_config = """// Copyright (c) 2026 David Osipov
+
+export default {
+  config: {
+    default: true,
+    MD013: false,
+    MD024: { siblings_only: true },
+    MD040: true,
+    MD046: { style: \"fenced\" },
+    MD048: { style: \"backtick\" },
+  },
+  ignores: [\"THIRD_PARTY_NOTICES.md\"],
+};
+"""
+    assert (ROOT / ".markdownlint-cli2.mjs").read_text(
+        encoding="utf-8"
+    ) == expected_config
+    package = require_json_object(
+        load_json_value((ROOT / "package.json").read_bytes()),
+        context="package.json",
+    )
+    scripts = require_json_object(package["scripts"], context="package scripts")
+    assert scripts["docs:lint"] == (
+        'markdownlint-cli2 "*.md" "docs/**/*.md" "deploy/**/*.md" "skills/**/*.md"'
+    )
+    result = run_bounded_command(
+        (
+            "/usr/bin/git",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "*.md",
+        ),
+        root=ROOT,
+        cache_dir=Path("/dev/null"),
+    )
+    paths = tuple(
+        field.decode("utf-8") for field in result.stdout.split(b"\0") if field
+    )
+    assert paths
+    assert all(
+        "/" not in path or path.startswith(("docs/", "deploy/", "skills/"))
+        for path in paths
+    )
+
+
+def test_security_workflow_binds_node_sca_and_sbom_to_package_lock() -> None:
+    workflow = _workflow_text(".github/workflows/security.yml")
+    assert (
+        "npm audit --audit-level=low --package-lock-only --ignore-scripts --json"
+        in workflow
+    )
+    assert "npm sbom --package-lock-only --sbom-format cyclonedx" in workflow
+    assert workflow.count("sha256sum package-lock.json") == PACKAGE_LOCK_EVIDENCE_JOBS
 
 
 def test_ci_checkout_is_credentialless_and_fetches_full_history() -> None:
@@ -474,6 +619,221 @@ def test_ci_runs_exact_python_node_quality_test_and_package_gates() -> None:
     assert "--override-ini=pythonpath=" in workflow
 
 
+def _assert_full_pep561_ci_command(command: str) -> None:
+    required = (
+        "python -I -B scripts/verify_pep561.py",
+        '--worktree "$GITHUB_WORKSPACE"',
+        '--output-dir "$RUNNER_TEMP/nplg-pep561"',
+        '--node-executable "$(command -v node)"',
+        '--candidate "$GITHUB_SHA"',
+    )
+    for fragment in required:
+        assert fragment in command, fragment
+    assert "--artifact-only" not in command
+
+
+def test_ci_requires_full_pep561_authority_and_uploads_bound_evidence() -> None:
+    jobs = _workflow_jobs(".github/workflows/ci.yml")
+    types_job = require_json_object(jobs["types"], context="ci.types")
+    raw_steps = types_job["steps"]
+    assert isinstance(raw_steps, list)
+    steps = tuple(
+        require_json_object(step, context="ci.types.steps")
+        for step in cast("list[object]", raw_steps)
+    )
+    authority = next(
+        step
+        for step in steps
+        if step.get("name") == "Verify the full PEP 561 authority"
+    )
+    command = authority["run"]
+    assert isinstance(command, str)
+    _assert_full_pep561_ci_command(command)
+    upload = next(
+        step
+        for step in steps
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+    )
+    inputs = require_json_object(upload["with"], context="PEP 561 upload inputs")
+    assert "${{ runner.temp }}/nplg-pep561" in str(inputs["path"])
+
+
+def _add_artifact_only(command: str) -> str:
+    return command + " --artifact-only"
+
+
+def _remove_candidate(command: str) -> str:
+    return command.replace('--candidate "$GITHUB_SHA"', "")
+
+
+def _remove_output(command: str) -> str:
+    return command.replace('--output-dir "$RUNNER_TEMP/nplg-pep561"', "")
+
+
+def _remove_node(command: str) -> str:
+    return command.replace('--node-executable "$(command -v node)"', "")
+
+
+_PEP561_CI_MUTATIONS: tuple[Callable[[str], str], ...] = (
+    _add_artifact_only,
+    _remove_candidate,
+    _remove_output,
+    _remove_node,
+)
+
+
+@pytest.mark.parametrize("mutation", list(_PEP561_CI_MUTATIONS))
+def test_full_pep561_ci_command_mutants_are_rejected(
+    mutation: Callable[[str], str],
+) -> None:
+    canonical = (
+        "python -I -B scripts/verify_pep561.py "
+        '--worktree "$GITHUB_WORKSPACE" '
+        '--output-dir "$RUNNER_TEMP/nplg-pep561" '
+        '--node-executable "$(command -v node)" '
+        '--candidate "$GITHUB_SHA"'
+    )
+    with pytest.raises(AssertionError):
+        _assert_full_pep561_ci_command(mutation(canonical))
+
+
+def test_every_node_ci_job_bootstraps_and_invokes_locked_npm_11_18() -> None:
+    jobs = _workflow_jobs(".github/workflows/ci.yml")
+    node_jobs = {"contracts", "lint", "types"}
+    for job_name in node_jobs:
+        job = require_json_object(jobs[job_name], context=f"ci.{job_name}")
+        raw_steps = job["steps"]
+        assert isinstance(raw_steps, list)
+        steps = tuple(
+            require_json_object(step, context=f"ci.{job_name}.steps")
+            for step in cast("list[object]", raw_steps)
+        )
+        bootstrap = next(
+            step
+            for step in steps
+            if step.get("name") == "Bootstrap the locked JavaScript toolchain"
+        )
+        command = bootstrap["run"]
+        assert isinstance(command, str)
+        for fragment in (
+            "--tool node",
+            "--tool npm",
+            '--dependency "node=$RUNNER_TEMP/nplg-js-toolchain/node"',
+            '"$RUNNER_TEMP/nplg-js-toolchain/npm/bin/npm" --version',
+            "grep -Fx '11.18.0'",
+            '"$RUNNER_TEMP/nplg-js-toolchain/npm/bin" >> "$GITHUB_PATH"',
+        ):
+            assert fragment in command, f"{job_name}: {fragment}"
+
+
+_NODE_BIN_PATH = "$RUNNER_TEMP/nplg-js-toolchain/node/node-v24.19.0-linux-x64/bin"
+_NPM_BIN_PATH = "$RUNNER_TEMP/nplg-js-toolchain/npm/bin"
+_NODE_GITHUB_PATH = f'echo "{_NODE_BIN_PATH}" >> "$GITHUB_PATH"'
+_NPM_GITHUB_PATH = f'echo "{_NPM_BIN_PATH}" >> "$GITHUB_PATH"'
+_NPM_IDENTITY = f'test "$(command -v npm)" = "{_NPM_BIN_PATH}/npm"'
+_NPM_VERSION = 'test "$(npm --version)" = "11.18.0"'
+_BARE_NPM_COMMAND = re.compile(r"(?m)(?:^|[;&|]\s*)npm(?:\s|$)")
+
+
+def _assert_locked_npm_precedes_bare_use(
+    steps: tuple[JsonObject, ...],
+    *,
+    context: str,
+) -> None:
+    bootstrap_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("name") == "Bootstrap the locked JavaScript toolchain"
+    )
+    bootstrap = steps[bootstrap_index]
+    bootstrap_command = bootstrap["run"]
+    assert isinstance(bootstrap_command, str)
+    assert bootstrap_command.index(_NODE_GITHUB_PATH) < bootstrap_command.index(
+        _NPM_GITHUB_PATH
+    ), context
+
+    proof_index = bootstrap_index + 1
+    proof = steps[proof_index]
+    assert proof.get("name") == "Verify locked npm command resolution", context
+    proof_command = proof["run"]
+    assert isinstance(proof_command, str)
+    assert proof_command.index(_NPM_IDENTITY) < proof_command.index(_NPM_VERSION), (
+        context
+    )
+
+    for step in steps[:proof_index]:
+        command = step.get("run")
+        if isinstance(command, str):
+            assert _BARE_NPM_COMMAND.search(command) is None, context
+
+
+def test_every_node_ci_job_resolves_locked_npm_before_bare_use() -> None:
+    jobs = _workflow_jobs(".github/workflows/ci.yml")
+    for job_name in ("contracts", "lint", "types"):
+        job = require_json_object(jobs[job_name], context=f"ci.{job_name}")
+        raw_steps = job["steps"]
+        assert isinstance(raw_steps, list)
+        steps = tuple(
+            require_json_object(step, context=f"ci.{job_name}.steps")
+            for step in cast("list[object]", raw_steps)
+        )
+        _assert_locked_npm_precedes_bare_use(steps, context=job_name)
+
+        bootstrap_index = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("name") == "Bootstrap the locked JavaScript toolchain"
+        )
+        reversed_bootstrap = dict(steps[bootstrap_index])
+        command = reversed_bootstrap["run"]
+        assert isinstance(command, str)
+        reversed_bootstrap["run"] = command.replace(
+            f"{_NODE_GITHUB_PATH}\n{_NPM_GITHUB_PATH}",
+            f"{_NPM_GITHUB_PATH}\n{_NODE_GITHUB_PATH}",
+        )
+        reversed_steps = (
+            *steps[:bootstrap_index],
+            reversed_bootstrap,
+            *steps[bootstrap_index + 1 :],
+        )
+        with pytest.raises(AssertionError):
+            _assert_locked_npm_precedes_bare_use(
+                reversed_steps,
+                context=f"{job_name}.reversed",
+            )
+
+        proof_index = bootstrap_index + 1
+        missing_identity = dict(steps[proof_index])
+        proof_command = missing_identity["run"]
+        assert isinstance(proof_command, str)
+        missing_identity["run"] = proof_command.replace(_NPM_IDENTITY, "")
+        missing_identity_steps = (
+            *steps[:proof_index],
+            missing_identity,
+            *steps[proof_index + 1 :],
+        )
+        with pytest.raises((AssertionError, ValueError)):
+            _assert_locked_npm_precedes_bare_use(
+                missing_identity_steps,
+                context=f"{job_name}.missing-identity",
+            )
+
+        early_npm: JsonObject = {
+            "name": "Unverified bare npm",
+            "run": "npm --version",
+        }
+        early_npm_steps = (
+            *steps[:proof_index],
+            early_npm,
+            *steps[proof_index:],
+        )
+        with pytest.raises(AssertionError):
+            _assert_locked_npm_precedes_bare_use(
+                early_npm_steps,
+                context=f"{job_name}.early-npm",
+            )
+
+
 def test_semgrep_rules_are_closed_and_digest_verified() -> None:
     rules_path = ROOT / "security" / "semgrep" / "rules.yml"
     sums_path = ROOT / "security" / "semgrep" / "SHA256SUMS"
@@ -502,3 +862,11 @@ def test_temporary_quality_ratchet_and_all_direct_references_are_removed() -> No
         text = (ROOT / relative_path).read_text(encoding="utf-8")
         for token in REMOVED_QUALITY_RATCHET_TOKENS:
             assert token not in text, f"{relative_path}: {token}"
+
+
+def test_pep_561_marker_is_empty_and_not_declared_as_package_data() -> None:
+    """Leave PEP 561's automatic marker inclusion outside package-data records."""
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert (ROOT / "src/nplg_mcp/py.typed").read_bytes() == b""
+    assert "[tool.setuptools.package-data]" not in pyproject

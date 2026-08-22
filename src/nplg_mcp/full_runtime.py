@@ -6,8 +6,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .downloader import DocumentDownloader
-from .pdf_executor import PdfProcessorSettings, PdfWorkerPolicy
-from .pdf_worker_client import SubprocessPdfExecutor
+from .malware import ClamAvUnixSocketScanner
+from .pdf_executor import PdfExecutor, PdfProcessorSettings, PdfWorkerPolicy
+from .pdf_worker_client import (
+    SubprocessPdfExecutor,
+    UnixSocketPdfExecutor,
+    WorkerStagingBinding,
+)
+from .pdf_worker_slot import WorkerStagingQuota, load_pdf_worker_slot_policy
+from .services import FullServiceComposition
 from .storage import ContentAddressedStore
 from .tools import ToolService, ToolServiceDependencies
 
@@ -24,7 +31,7 @@ def build_full_services(
     repository: NplgRepository,
     client: HttpClientProtocol,
     limiter: AsyncRateLimiter,
-) -> tuple[ToolService, ContentAddressedStore]:
+) -> FullServiceComposition:
     """Construct the private-full downloader, store, PDF, and tool services."""
     store = ContentAddressedStore(
         config.cache_dir,
@@ -37,21 +44,42 @@ def build_full_services(
         max_redirects=config.max_redirects,
         limiter=limiter,
         total_timeout_seconds=config.upstream_timeout_seconds,
+        scanner=ClamAvUnixSocketScanner(
+            socket_path=config.scanner_socket_path,
+            max_bytes=config.max_download_bytes,
+        ),
+        require_scanner=True,
     )
-    pdf = SubprocessPdfExecutor(
-        store=store,
-        policy=PdfWorkerPolicy(
-            capacity=config.max_concurrent_pdf_jobs,
-            processor=PdfProcessorSettings(
-                max_pages_per_render=config.max_render_pages,
-                max_page_pixels=config.max_page_pixels,
-                max_render_pixels=config.max_render_pixels,
-                tile_width=config.tile_width,
-                tile_height=config.tile_height,
-                tile_overlap=config.tile_overlap,
-            ),
+    policy = PdfWorkerPolicy(
+        capacity=config.max_concurrent_pdf_jobs,
+        processor=PdfProcessorSettings(
+            max_pages_per_render=config.max_render_pages,
+            max_page_pixels=config.max_page_pixels,
+            max_render_pixels=config.max_render_pixels,
+            tile_width=config.tile_width,
+            tile_height=config.tile_height,
+            tile_overlap=config.tile_overlap,
         ),
     )
+    pdf: PdfExecutor
+    if config.pdf_executor == "unix-worker":
+        staging_quota: WorkerStagingQuota | None = None
+        if config.environment == "production":
+            slot_policy = load_pdf_worker_slot_policy(
+                config.pdf_worker_slot_policy_path
+            )
+            staging_quota = WorkerStagingQuota(policy=slot_policy)
+        pdf = UnixSocketPdfExecutor(
+            store=store,
+            socket_path=config.pdf_worker_socket_path,
+            staging=WorkerStagingBinding(
+                root=config.pdf_worker_slot_root,
+                quota=staging_quota,
+            ),
+            policy=policy,
+        )
+    else:
+        pdf = SubprocessPdfExecutor(store=store, policy=policy)
     tools = ToolService(
         dependencies=ToolServiceDependencies(
             repository=repository,
@@ -61,4 +89,4 @@ def build_full_services(
         ),
         config=config,
     )
-    return tools, store
+    return FullServiceComposition(tools=tools, store=store, http_client=client)

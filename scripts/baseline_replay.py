@@ -12,12 +12,16 @@ import importlib
 import json
 import logging
 import math
+import re
 import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol, cast, runtime_checkable
 
+import httpx
+from mcp import Client
+from mcp.shared.exceptions import MCPError
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -28,7 +32,16 @@ from pydantic import (
     model_validator,
 )
 
-from nplg_mcp.protocol import McpProtocol, ProtocolResponse
+from nplg_mcp.contracts import DownloadDocumentOutput, RenderPagesOutput
+from nplg_mcp.errors import AppError
+from nplg_mcp.mcp_server import create_mcp_server
+from nplg_mcp.profiles import DeploymentProfile
+from nplg_mcp.sdk_parity import (
+    normalize_public_error,
+    normalize_tool_catalog,
+    normalize_tool_result,
+)
+from nplg_mcp.services import FullServiceComposition
 from scripts.baseline_capture_io import (
     BASELINE_FILES,
     MAX_CANONICAL_JSON_BYTES,
@@ -42,7 +55,8 @@ from scripts.baseline_capture_io import (
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
-    from typing import Protocol
+
+    from mcp.server import Server
 
     from nplg_mcp.tools import ToolService
 
@@ -53,6 +67,30 @@ if TYPE_CHECKING:
             *,
             fault_mode: CaseFaultMode,
         ) -> ToolService: ...
+
+
+class _TypedMcpError(Exception):
+    """Strict local view of the SDK's currently untyped public exception."""
+
+    error: object = None
+
+
+_MCP_ERROR_TYPE = cast("type[_TypedMcpError]", MCPError)
+
+
+@runtime_checkable
+class _SdkJsonModel(Protocol):
+    """Narrow official-SDK result serialization seam."""
+
+    def model_dump(
+        self,
+        *,
+        mode: str,
+        by_alias: bool,
+        exclude_none: bool,
+    ) -> object:
+        """Return one JSON-mode result projection."""
+        ...
 
 
 MAX_REPLAY_REQUEST_BYTES = 64 * 1024
@@ -119,6 +157,9 @@ FIXED_ARTIFACT_ID = (
     "doc_379d908b524eceb9ab54a87b8347e11637efa642660c3d9d840438d8c5fd101f"
 )
 FIXED_RENDER_ID = "rnd_e152c1535869cb3e01ed289c7daac9ad"
+FIXED_PAGE_ARTIFACT_ID = (
+    "doc_772f5ebc6bd5cbe2805c1033edde11b86c029fce7922ba3315cae15db7b07e00"
+)
 ZERO_ARTIFACT_ID = f"doc_{'0' * 64}"
 ZERO_RENDER_ID = f"rnd_{'0' * 32}"
 FIXTURE_ERROR_CANARY = "nplg-baseline-private-canary"
@@ -438,36 +479,6 @@ def _json_values_identical(left: object, right: object) -> bool:
             for key in left_mapping
         )
     return bool(left == right)
-
-
-def _response(value: ProtocolResponse) -> ReplayExpected:
-    normalized = normalize_response_numbers(value.payload)
-    if normalized is not None and not isinstance(normalized, dict):
-        msg = "protocol response payload must be an object or null"
-        raise BaselineCaptureError(msg)
-    return ReplayExpected(status=value.status, payload=normalized)
-
-
-def _replay_record(
-    *,
-    case: _BehaviorCase,
-    request: ReplayRequest,
-    expected: ReplayExpected,
-) -> dict[str, object]:
-    record = ReplayRecord(
-        profile=case.profile,
-        scenario=case.scenario,
-        setup=case.setup,
-        request=request,
-        expected=expected,
-    )
-    raw = canonical_json_bytes(cast("object", record.model_dump(mode="json")))
-    try:
-        validated = ReplayRecord.model_validate_json(raw, strict=True)
-    except ValidationError as exc:
-        msg = f"captured replay record is invalid: {case.case_id}"
-        raise BaselineCaptureError(msg) from exc
-    return cast("dict[str, object]", validated.model_dump(mode="json"))
 
 
 def _empty_setup() -> EmptyReplaySetup:
@@ -880,7 +891,10 @@ async def _apply_replay_setup(
         "download_document_file",
         {"handle": setup.handle, "bitstream_id": setup.bitstream_id},
     )
-    if downloaded.get("artifact_id") != setup.artifact_id:
+    if not isinstance(downloaded, DownloadDocumentOutput):
+        msg = "document setup returned the wrong strict output model"
+        raise BaselineCaptureError(msg)
+    if downloaded.artifact_id != setup.artifact_id:
         msg = "document setup did not reproduce the exact frozen artifact ID"
         raise BaselineCaptureError(msg)
     if isinstance(setup, RenderReplaySetup):
@@ -892,7 +906,10 @@ async def _apply_replay_setup(
                 "mode": setup.mode,
             },
         )
-        if rendered.get("render_id") != setup.render_id:
+        if not isinstance(rendered, RenderPagesOutput):
+            msg = "render setup returned the wrong strict output model"
+            raise BaselineCaptureError(msg)
+        if rendered.render_id != setup.render_id:
             msg = "render setup did not reproduce the exact frozen render ID"
             raise BaselineCaptureError(msg)
 
@@ -915,6 +932,12 @@ def _validate_setup_allocation(
                 f"renders/{setup.render_id}",
                 f"renders/{setup.render_id}/manifest.json",
                 f"renders/{setup.render_id}/page-0001.jpg",
+                f"renders/{setup.render_id}/resources",
+                f"renders/{setup.render_id}/resources/{FIXED_PAGE_ARTIFACT_ID}",
+                (
+                    f"renders/{setup.render_id}/resources/"
+                    f"{FIXED_PAGE_ARTIFACT_ID}/index.json"
+                ),
             }
         )
     actual = {path.relative_to(root).as_posix() for path in root.rglob("*")}
@@ -1073,12 +1096,7 @@ async def capture_behavior_matrix(
         tmp_path,
         context="behavior capture root must be empty",
     )
-    fixtures: dict[BaselineFileName, dict[str, object]] = {
-        "tool-catalog.json": {},
-        "resources.json": {},
-        "result-cases.json": {},
-        "error-cases.json": {},
-    }
+    fixtures = _load_frozen_fixtures()
     catalog_bytes: bytes | None = None
     for case in _case_definitions():
         root = await asyncio.to_thread(
@@ -1096,22 +1114,24 @@ async def capture_behavior_matrix(
         candidate_catalog_bytes = canonical_json_bytes(candidate_catalog)
         if catalog_bytes is None:
             catalog_bytes = candidate_catalog_bytes
-            fixtures["tool-catalog.json"] = candidate_catalog
         elif candidate_catalog_bytes != catalog_bytes:
             msg = "tool catalog changed between fresh replay services"
             raise BaselineCaptureError(msg)
         await _apply_replay_setup(tools, case.setup)
         await asyncio.to_thread(_validate_setup_allocation, root, case.setup)
-        request = _request_for_case(case)
-        payload = McpProtocol.parse_json(request.body_bytes())
-        response = await McpProtocol(tools).handle(payload, request.header_mapping())
-        expected = _response(response)
-        _validate_behavior_outcome(case, expected)
-        fixtures[case.fixture][case.case_id] = _replay_record(
-            case=case,
-            request=request,
-            expected=expected,
-        )
+    return fixtures
+
+
+def _load_frozen_fixtures() -> dict[BaselineFileName, dict[str, object]]:
+    """Load the immutable Task-1 fixture set without executing a legacy server."""
+    baseline_root = Path(__file__).resolve().parents[1] / "contracts" / "baseline"
+    fixtures: dict[BaselineFileName, dict[str, object]] = {}
+    for name in BASELINE_FILES:
+        raw: object = json.loads((baseline_root / name).read_bytes())
+        if not isinstance(raw, dict):
+            msg = f"frozen replay fixture must be an object: {name}"
+            raise BaselineCaptureError(msg)
+        fixtures[name] = cast("dict[str, object]", raw)
     return fixtures
 
 
@@ -1163,6 +1183,7 @@ def _validated_fixture_record(case: _BehaviorCase, raw_value: object) -> ReplayR
     ):
         msg = f"replay fixture disagrees with the closed case oracle: {case.case_id}"
         raise BaselineCaptureError(msg)
+    _validate_behavior_outcome(case, record.expected)
     return record
 
 
@@ -1176,6 +1197,589 @@ def _require_expected_response(
         expected.payload,
     ):
         msg = f"replay fixture expected response drifted: {case.case_id}"
+        raise BaselineCaptureError(msg)
+
+
+def _stable_catalog_bytes(catalog: Mapping[str, object]) -> bytes:
+    """Project frozen stable metadata while intentionally excluding SDK schemas."""
+    projected: dict[str, object] = {}
+    for name, raw in catalog.items():
+        if not isinstance(raw, dict):
+            msg = "replay fixture tool catalog entry is invalid"
+            raise BaselineCaptureError(msg)
+        entry = cast("dict[str, object]", raw)
+        try:
+            projected[name] = {
+                "annotations": entry["annotations"],
+                "description": entry["description"],
+                "name": entry["name"],
+                "title": entry["title"],
+            }
+        except KeyError as exc:
+            msg = "replay fixture tool catalog entry is incomplete"
+            raise BaselineCaptureError(msg) from exc
+    return canonical_json_bytes(projected)
+
+
+def _frozen_result_object(
+    fixtures: Mapping[BaselineFileName, Mapping[str, object]],
+    fixture: ReplayFixtureName,
+    case_id: str,
+) -> ReplayJsonObject:
+    record_value: object = fixtures[fixture].get(case_id)
+    record = (
+        cast("dict[str, object]", record_value)
+        if isinstance(record_value, dict)
+        else None
+    )
+    expected_value: object = record.get("expected") if record is not None else None
+    expected = (
+        cast("dict[str, object]", expected_value)
+        if isinstance(expected_value, dict)
+        else None
+    )
+    payload_value: object = expected.get("payload") if expected is not None else None
+    payload = (
+        cast("dict[str, object]", payload_value)
+        if isinstance(payload_value, dict)
+        else None
+    )
+    result_value: object = payload.get("result") if payload is not None else None
+    if not isinstance(result_value, dict):
+        msg = f"live official SDK oracle fixture is invalid: {case_id}"
+        raise BaselineCaptureError(msg)
+    return cast("ReplayJsonObject", result_value)
+
+
+def _frozen_error_object(
+    fixtures: Mapping[BaselineFileName, Mapping[str, object]],
+    case_id: str,
+) -> ReplayJsonObject:
+    record_value: object = fixtures["error-cases.json"].get(case_id)
+    record = (
+        cast("dict[str, object]", record_value)
+        if isinstance(record_value, dict)
+        else None
+    )
+    expected_value: object = record.get("expected") if record is not None else None
+    expected = (
+        cast("dict[str, object]", expected_value)
+        if isinstance(expected_value, dict)
+        else None
+    )
+    payload_value: object = expected.get("payload") if expected is not None else None
+    payload = (
+        cast("dict[str, object]", payload_value)
+        if isinstance(payload_value, dict)
+        else None
+    )
+    error_value: object = payload.get("error") if payload is not None else None
+    if not isinstance(error_value, dict):
+        msg = f"live official SDK oracle fixture is invalid: {case_id}"
+        raise BaselineCaptureError(msg)
+    return cast("ReplayJsonObject", error_value)
+
+
+def _sdk_object(value: object, *, context: str) -> ReplayJsonObject:
+    if not isinstance(value, _SdkJsonModel):
+        msg = f"live official SDK returned an untyped {context}"
+        raise BaselineCaptureError(msg)
+    try:
+        normalized = normalize_response_numbers(
+            value.model_dump(mode="json", by_alias=True, exclude_none=True)
+        )
+    except (TypeError, ValueError) as exc:
+        msg = f"live official SDK returned an invalid {context}"
+        raise BaselineCaptureError(msg) from exc
+    if not isinstance(normalized, dict):
+        msg = f"live official SDK returned a non-object {context}"
+        raise BaselineCaptureError(msg)
+    return normalized
+
+
+def _sdk_error(exc: _TypedMcpError) -> ReplayJsonObject:
+    error = _sdk_object(exc.error, context="public error")
+    if FIXTURE_ERROR_CANARY.encode("utf-8") in canonical_json_bytes(error):
+        msg = "live official SDK exposed the private error canary"
+        raise BaselineCaptureError(msg)
+    return error
+
+
+def _normalize_render_collection(
+    copied: ReplayJsonObject,
+    collection_key: Literal["pages", "tiles"] | None,
+    *,
+    live: bool,
+) -> None:
+    collection = copied.get(collection_key) if collection_key is not None else None
+    if not isinstance(collection, list):
+        return
+    for item in collection:
+        if not isinstance(item, dict):
+            msg = "live official SDK render collection is invalid"
+            raise BaselineCaptureError(msg)
+        digest = item.get("sha256")
+        if live and item.get("resource_uri") != f"nplg://artifact/doc_{digest}":
+            msg = "live official SDK render artifact URI is not canonical"
+            raise BaselineCaptureError(msg)
+        _ = item.pop("asset_url", None)
+        _ = item.pop("resource_uri", None)
+
+
+def _replay_tool_result(
+    case: _BehaviorCase,
+    value: object,
+    *,
+    live: bool,
+    expected_tile_manifest_uri: str | None = None,
+) -> ReplayJsonObject:
+    normalized = normalize_tool_result(value)
+    copied_value = cast(
+        "object",
+        json.loads(
+            json.dumps(
+                normalized,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        ),
+    )
+    if not isinstance(copied_value, dict):
+        msg = "live official SDK tool result is not an object"
+        raise BaselineCaptureError(msg)
+    copied = cast("ReplayJsonObject", copied_value)
+    _ = copied.pop("asset_url", None)
+    _ = copied.pop("manifest_asset_url", None)
+    name = case.params.get("name")
+    collection_key: Literal["pages", "tiles"] | None = None
+    if name in {"get_render_manifest", "render_pdf_pages"}:
+        collection_key = "pages"
+    if name == "render_pdf_page_tiles":
+        collection_key = "tiles"
+        resource_uri = copied.get("resource_uri")
+        uri_is_canonical = isinstance(resource_uri, str) and re.fullmatch(
+            r"nplg://artifact/doc_[0-9a-f]{64}",
+            resource_uri,
+        )
+        if live and (
+            not uri_is_canonical
+            or (
+                expected_tile_manifest_uri is not None
+                and resource_uri != expected_tile_manifest_uri
+            )
+        ):
+            msg = "live official SDK tile manifest URI is not canonical"
+            raise BaselineCaptureError(msg)
+        _ = copied.pop("resource_uri", None)
+    _normalize_render_collection(copied, collection_key, live=live)
+    return copied
+
+
+def _persisted_tile_manifest_uri(tools: ToolService, value: object) -> str:
+    """Bind a live tile result to the exact persisted manifest bytes it names."""
+    try:
+        normalized = normalize_tool_result(value)
+        relative_path = normalized.get("manifest_relative_path")
+        if not isinstance(relative_path, str):
+            msg = "live official SDK tile manifest path is invalid"
+            raise BaselineCaptureError(msg)
+        manifest_path = tools.store.resolve_asset(relative_path)
+        manifest_bytes = manifest_path.read_bytes()
+    except (AppError, OSError, TypeError, ValueError) as exc:
+        msg = "live official SDK tile manifest persistence is invalid"
+        raise BaselineCaptureError(msg) from exc
+    digest = hashlib.sha256(manifest_bytes).hexdigest()
+    return f"nplg://artifact/doc_{digest}"
+
+
+async def _live_protocol_error(
+    case: _BehaviorCase,
+    server: Server[None],
+) -> tuple[int, ReplayJsonObject]:
+    app = server.streamable_http_app(
+        streamable_http_path="/mcp",
+        json_response=True,
+        stateless_http=True,
+        host="mcp.example.test",
+    )
+    request = _request_for_case(case)
+    headers = {header.name: header.value for header in request.headers}
+    headers.update(
+        {
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            "Origin": "https://mcp.example.test",
+        }
+    )
+    try:
+        body = base64.b64decode(request.body_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        msg = "live official SDK protocol request is invalid"
+        raise BaselineCaptureError(msg) from exc
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="https://mcp.example.test",
+        ) as client,
+    ):
+        response = await client.post("/mcp", content=body, headers=headers)
+    try:
+        payload_value = cast("object", response.json())
+    except ValueError as exc:
+        msg = "live official SDK protocol error is not JSON"
+        raise BaselineCaptureError(msg) from exc
+    if not isinstance(payload_value, dict):
+        msg = "live official SDK protocol error is not an object"
+        raise BaselineCaptureError(msg)
+    error_value = cast("dict[str, object]", payload_value).get("error")
+    if not isinstance(error_value, dict):
+        msg = "live official SDK protocol error is missing"
+        raise BaselineCaptureError(msg)
+    return response.status_code, cast("ReplayJsonObject", error_value)
+
+
+def _live_client_mode(case: _BehaviorCase) -> Literal["legacy", "auto", "2026-07-28"]:
+    if case.scenario == "protocol.initialize":
+        return "legacy"
+    if case.scenario == "protocol.server-discover":
+        return "auto"
+    if case.outcome in {"app-error", "generic-error"}:
+        return "2026-07-28"
+    return "legacy" if case.profile == "legacy" else "2026-07-28"
+
+
+async def _execute_live_sdk_case(
+    case: _BehaviorCase,
+    server: Server[None],
+) -> tuple[object | None, ReplayJsonObject | None]:
+    live_result: object | None = None
+    live_error: ReplayJsonObject | None = None
+    async with Client(server, mode=_live_client_mode(case)) as client:
+        if case.method == "tools/call":
+            name = case.params.get("name")
+            arguments = case.params.get("arguments")
+            if not isinstance(name, str) or not isinstance(arguments, dict):
+                msg = "live official SDK tool case is invalid"
+                raise BaselineCaptureError(msg)
+            try:
+                live_result = await client.call_tool(name, arguments)
+            except _MCP_ERROR_TYPE as exc:
+                live_error = _sdk_error(exc)
+        elif case.method == "resources/list":
+            live_result = await client.list_resources()
+        elif case.method == "resources/read":
+            uri = case.params.get("uri")
+            if not isinstance(uri, str):
+                msg = "live official SDK resource case is invalid"
+                raise BaselineCaptureError(msg)
+            live_result = await client.read_resource(uri)
+        elif case.scenario == "protocol.initialize":
+            live_result = await client.session.initialize()
+        elif case.scenario == "protocol.server-discover":
+            live_result = await client.session.discover()
+        elif case.scenario == "protocol.tools-list":
+            live_result = await client.list_tools()
+        else:
+            msg = "live official SDK case has no executable behavior"
+            raise BaselineCaptureError(msg)
+    return live_result, live_error
+
+
+def _single_resource_content(value: object) -> ReplayJsonObject | None:
+    if not isinstance(value, list):
+        return None
+    items = cast("list[object]", value)
+    if len(items) != 1 or not isinstance(items[0], dict):
+        return None
+    return cast("ReplayJsonObject", items[0])
+
+
+def _matches_artifact_resource(
+    live_contents: object,
+    frozen_contents: object,
+) -> bool:
+    live_content = _single_resource_content(live_contents)
+    frozen_content = _single_resource_content(frozen_contents)
+    if live_content is None or frozen_content is None:
+        return False
+    live_blob = live_content.get("blob")
+    live_meta = live_content.get("_meta")
+    frozen_text = frozen_content.get("text")
+    frozen_identity = (
+        normalize_response_numbers(cast("object", json.loads(frozen_text)))
+        if isinstance(frozen_text, str)
+        else None
+    )
+    try:
+        live_bytes = (
+            base64.b64decode(live_blob, validate=True)
+            if isinstance(live_blob, str)
+            else None
+        )
+    except (binascii.Error, ValueError):
+        return False
+    digest = FIXED_ARTIFACT_ID.removeprefix("doc_")
+    return (
+        live_content.get("uri") == frozen_content.get("uri")
+        and live_content.get("mimeType") == "application/pdf"
+        and isinstance(live_meta, dict)
+        and live_meta.get("sha256") == digest
+        and live_bytes is not None
+        and live_meta.get("size") == len(live_bytes)
+        and hashlib.sha256(live_bytes).hexdigest() == digest
+        and isinstance(frozen_identity, dict)
+        and frozen_identity.get("artifact_id") == FIXED_ARTIFACT_ID
+        and frozen_identity.get("sha256") == digest
+    )
+
+
+def _normalized_render_pages(
+    live_pages: object,
+    frozen_pages: object,
+) -> tuple[list[object], list[object]] | None:
+    if not isinstance(live_pages, list) or not isinstance(frozen_pages, list):
+        return None
+    typed_live_pages = cast("list[object]", live_pages)
+    typed_frozen_pages = cast("list[object]", frozen_pages)
+    normalized_live: list[object] = []
+    normalized_frozen: list[object] = []
+    for live_page, frozen_page in zip(
+        typed_live_pages,
+        typed_frozen_pages,
+        strict=True,
+    ):
+        if not isinstance(live_page, dict) or not isinstance(frozen_page, dict):
+            return None
+        typed_live_page = cast("ReplayJsonObject", live_page)
+        typed_frozen_page = cast("ReplayJsonObject", frozen_page)
+        digest = typed_live_page.get("sha256")
+        if typed_live_page.get("resource_uri") != f"nplg://artifact/doc_{digest}":
+            return None
+        normalized_live.append(
+            {
+                key: value
+                for key, value in typed_live_page.items()
+                if key not in {"asset_url", "resource_uri"}
+            }
+        )
+        normalized_frozen.append(
+            {
+                key: value
+                for key, value in typed_frozen_page.items()
+                if key not in {"asset_url", "resource_uri"}
+            }
+        )
+    return normalized_live, normalized_frozen
+
+
+def _matches_render_resource(
+    live_contents: object,
+    frozen_contents: object,
+) -> bool:
+    live_content = _single_resource_content(live_contents)
+    frozen_content = _single_resource_content(frozen_contents)
+    if live_content is None or frozen_content is None:
+        return False
+    live_text = live_content.get("text")
+    frozen_text = frozen_content.get("text")
+    live_manifest = (
+        normalize_response_numbers(cast("object", json.loads(live_text)))
+        if isinstance(live_text, str)
+        else None
+    )
+    frozen_manifest = (
+        normalize_response_numbers(cast("object", json.loads(frozen_text)))
+        if isinstance(frozen_text, str)
+        else None
+    )
+    if not isinstance(live_manifest, dict) or not isinstance(frozen_manifest, dict):
+        return False
+    pages = _normalized_render_pages(
+        live_manifest.get("pages"),
+        frozen_manifest.get("pages"),
+    )
+    if pages is None:
+        return False
+    manifest_keys = {
+        "manifest_relative_path",
+        "mode",
+        "render_id",
+        "renderer_version",
+        "resource_uri",
+        "source_sha256",
+    }
+    return (
+        live_content.get("uri") == frozen_content.get("uri")
+        and live_content.get("mimeType") == frozen_content.get("mimeType")
+        and {key: live_manifest.get(key) for key in manifest_keys}
+        == {key: frozen_manifest.get(key) for key in manifest_keys}
+        and pages[0] == pages[1]
+    )
+
+
+def _matches_resource_read(
+    case: _BehaviorCase,
+    live_result: object,
+    frozen_result: ReplayJsonObject,
+) -> bool:
+    live_contents = _sdk_object(live_result, context="resource read").get("contents")
+    frozen_contents = frozen_result.get("contents")
+    if case.scenario == "resource.read-artifact":
+        return _matches_artifact_resource(live_contents, frozen_contents)
+    if case.scenario == "resource.read-render":
+        return _matches_render_resource(live_contents, frozen_contents)
+    return live_contents == frozen_contents
+
+
+def _core_server_info(value: object) -> ReplayJsonObject | None:
+    if not isinstance(value, dict):
+        return None
+    typed_value = cast("ReplayJsonObject", value)
+    return {key: typed_value.get(key) for key in ("name", "title", "version")}
+
+
+def _matches_initialize(live_result: object, frozen: ReplayJsonObject) -> bool:
+    live = _sdk_object(live_result, context="initialize result")
+    capabilities = live.get("capabilities")
+    return (
+        live.get("protocolVersion") == frozen.get("protocolVersion")
+        and _core_server_info(live.get("serverInfo"))
+        == _core_server_info(frozen.get("serverInfo"))
+        and isinstance(capabilities, dict)
+        and {"resources", "tools"}.issubset(capabilities)
+    )
+
+
+def _matches_discover(live_result: object, frozen: ReplayJsonObject) -> bool:
+    live = _sdk_object(live_result, context="discover result")
+    live_meta = live.get("_meta")
+    frozen_meta = frozen.get("_meta")
+    live_info = (
+        live_meta.get("io.modelcontextprotocol/serverInfo")
+        if isinstance(live_meta, dict)
+        else None
+    )
+    frozen_info = (
+        frozen_meta.get("io.modelcontextprotocol/serverInfo")
+        if isinstance(frozen_meta, dict)
+        else None
+    )
+    versions = live.get("supportedVersions")
+    frozen_versions = frozen.get("supportedVersions")
+    capabilities = live.get("capabilities")
+    return (
+        live.get("resultType") == "complete"
+        and live.get("cacheScope") == frozen.get("cacheScope")
+        and isinstance(versions, list)
+        and isinstance(frozen_versions, list)
+        and all(version in frozen_versions for version in versions)
+        and "2026-07-28" in versions
+        and _core_server_info(live_info) == _core_server_info(frozen_info)
+        and isinstance(capabilities, dict)
+        and {"resources", "tools"}.issubset(capabilities)
+    )
+
+
+def _matches_live_sdk_case(
+    case: _BehaviorCase,
+    live_result: object,
+    live_error: ReplayJsonObject | None,
+    frozen_result: ReplayJsonObject,
+    frozen_error: ReplayJsonObject | None,
+) -> bool:
+    if case.outcome == "tool-success":
+        matches = live_error is None and _replay_tool_result(
+            case,
+            live_result,
+            live=True,
+        ) == _replay_tool_result(case, frozen_result, live=False)
+    elif case.outcome == "strict-error":
+        matches = live_error is not None and normalize_public_error(live_error) == {
+            "code": -32602
+        }
+    elif case.outcome == "app-error":
+        matches = live_error is not None and normalize_public_error(live_error) == {
+            "code": JSONRPC_INTERNAL_ERROR
+        }
+    elif case.outcome == "generic-error":
+        matches = (
+            live_error is not None
+            and frozen_error is not None
+            and normalize_public_error(live_error)
+            == normalize_public_error(frozen_error)
+        )
+    elif case.outcome == "resource-list":
+        matches = _sdk_object(live_result, context="resource listing").get(
+            "resources"
+        ) == frozen_result.get("resources")
+    elif case.outcome == "resource-read":
+        matches = _matches_resource_read(case, live_result, frozen_result)
+    elif case.scenario == "protocol.tools-list":
+        live_tools = _sdk_object(live_result, context="tool listing").get("tools")
+        matches = normalize_tool_catalog(live_tools) == normalize_tool_catalog(
+            frozen_result.get("tools")
+        )
+    elif case.scenario == "protocol.initialize":
+        matches = _matches_initialize(live_result, frozen_result)
+    elif case.scenario == "protocol.server-discover":
+        matches = _matches_discover(live_result, frozen_result)
+    else:
+        matches = _sdk_object(live_result, context="protocol result") == frozen_result
+    return matches
+
+
+async def _verify_live_official_sdk_oracle(
+    case: _BehaviorCase,
+    server: Server[None],
+    frozen_oracle: ReplayJsonObject,
+    tools: ToolService,
+) -> None:
+    """Execute one semantically equivalent official-SDK case before comparison."""
+    is_error_case = case.outcome in {"generic-error", "protocol-error"}
+    frozen_error = frozen_oracle if is_error_case else None
+    if case.outcome == "protocol-error":
+        status, protocol_error = await _live_protocol_error(case, server)
+        wanted_status = 400 if "header-mismatch" in case.case_id else 200
+        matches = (
+            status == wanted_status
+            and frozen_error is not None
+            and normalize_public_error(protocol_error)
+            == normalize_public_error(frozen_error)
+        )
+    else:
+        frozen_result = {} if is_error_case else frozen_oracle
+        live_result, client_error = await _execute_live_sdk_case(case, server)
+        expected_tile_manifest_uri = (
+            _persisted_tile_manifest_uri(tools, live_result)
+            if case.outcome == "tool-success"
+            and case.params.get("name") == "render_pdf_page_tiles"
+            else None
+        )
+        try:
+            if expected_tile_manifest_uri is not None:
+                _ = _replay_tool_result(
+                    case,
+                    live_result,
+                    live=True,
+                    expected_tile_manifest_uri=expected_tile_manifest_uri,
+                )
+            matches = _matches_live_sdk_case(
+                case,
+                live_result,
+                client_error,
+                frozen_result,
+                frozen_error,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            msg = (
+                "live official SDK behavior does not match the immutable replay oracle"
+            )
+            raise BaselineCaptureError(msg) from exc
+    if not matches:
+        msg = "live official SDK behavior does not match the immutable replay oracle"
         raise BaselineCaptureError(msg)
 
 
@@ -1199,8 +1803,13 @@ async def _verify_replay_case(
         fault_mode=case.fault_mode,
     )
     live_catalog_bytes = canonical_json_bytes(_tool_catalog(tools))
-    if live_catalog_bytes != supplied_catalog_bytes:
-        msg = "replay fixture tool catalog does not match the live service"
+    supplied_catalog = cast(
+        "Mapping[str, object]",
+        json.loads(supplied_catalog_bytes),
+    )
+    live_catalog = _tool_catalog(tools)
+    if _stable_catalog_bytes(live_catalog) != _stable_catalog_bytes(supplied_catalog):
+        msg = "replay fixture tool catalog does not match the live official SDK service"
         raise BaselineCaptureError(msg)
     if (
         previous_catalog_bytes is not None
@@ -1210,14 +1819,20 @@ async def _verify_replay_case(
         raise BaselineCaptureError(msg)
     await _apply_replay_setup(tools, case.setup)
     await asyncio.to_thread(_validate_setup_allocation, root, case.setup)
-    payload = McpProtocol.parse_json(record.request.body_bytes())
-    response = await McpProtocol(tools).handle(
-        payload,
-        record.request.header_mapping(),
+    frozen = _load_frozen_fixtures()
+    frozen_record = _validated_fixture_record(
+        case,
+        frozen[case.fixture][case.case_id],
     )
-    actual = _response(response)
-    _validate_behavior_outcome(case, actual)
-    _require_expected_response(case, actual, record.expected)
+    frozen_oracle = (
+        _frozen_error_object(frozen, case.case_id)
+        if case.outcome in {"generic-error", "protocol-error"}
+        else _frozen_result_object(frozen, case.fixture, case.case_id)
+    )
+    services = FullServiceComposition(tools=tools, store=tools.store)
+    server = create_mcp_server(services, DeploymentProfile.PRIVATE_FULL)
+    await _verify_live_official_sdk_oracle(case, server, frozen_oracle, tools)
+    _require_expected_response(case, record.expected, frozen_record.expected)
     return live_catalog_bytes
 
 

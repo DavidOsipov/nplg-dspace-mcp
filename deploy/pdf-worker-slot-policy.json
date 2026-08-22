@@ -1,0 +1,1 @@
+{"concurrency":1,"filesystem_type":"ext4","maximum_total_bytes":1073741824,"maximum_total_inodes":65536,"minimum_available_bytes":805306368,"minimum_available_inodes":32768,"mount_options":["nodev","noexec","nosuid","rw"],"root":"/var/lib/nplg/pdf-worker-slot","version":1}

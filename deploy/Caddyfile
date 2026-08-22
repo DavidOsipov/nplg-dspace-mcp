@@ -26,10 +26,18 @@
     @private_probes path /healthz /readyz
     respond @private_probes 404
 
-    reverse_proxy app:8000 {
+    reverse_proxy https://app.internal:8443 {
         health_uri /healthz
         health_interval 30s
         health_timeout 5s
+        transport http {
+            tls_server_name app.internal
+            tls_trust_pool file /run/secrets/app_server_ca
+            tls_client_auth /run/secrets/caddy_client_cert /run/secrets/caddy_client_key
+            dial_timeout 2s
+            tls_timeout 5s
+            response_header_timeout 30s
+        }
     }
 
 }

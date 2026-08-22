@@ -15,6 +15,7 @@ from nplg_mcp.storage import ContentAddressedStore, StoredArtifact
 
 _SMALL_PAYLOAD_SIZE = 4
 _QUOTA_BYTES = 8
+_RECOVERY_PAYLOAD_SIZE = 10
 
 
 class _StagedWriterProtocol(Protocol):
@@ -797,6 +798,153 @@ def test_direct_put_detects_corrupted_content_address(tmp_path: Path) -> None:
         )
 
     assert raised.value.code is ErrorCode.INTERNAL_ERROR
+
+
+def test_render_replacement_atomically_compares_existing_digest(tmp_path: Path) -> None:
+    store = ContentAddressedStore(tmp_path)
+    relative_path = f"renders/rnd_{'a' * 32}/resources/index.json"
+    written_path, old_digest = store.put_render_bytes(relative_path, b"old-index")
+
+    replaced_path, new_digest = store.replace_render_bytes_if_matches(
+        relative_path,
+        b"new-index",
+        expected_sha256=old_digest,
+    )
+
+    assert written_path == replaced_path == relative_path
+    assert new_digest == sha256(b"new-index").hexdigest()
+    assert (store.root / relative_path).read_bytes() == b"new-index"
+    assert not tuple(store.staging_dir.iterdir())
+
+
+def test_render_replacement_rejects_stale_digest_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    store = ContentAddressedStore(tmp_path)
+    relative_path = f"renders/rnd_{'a' * 32}/resources/index.json"
+    _ = store.put_render_bytes(relative_path, b"old-index")
+
+    with pytest.raises(AppError) as raised:
+        _ = store.replace_render_bytes_if_matches(
+            relative_path,
+            b"new-index",
+            expected_sha256="0" * 64,
+        )
+
+    assert raised.value.code is ErrorCode.INTERNAL_ERROR
+    assert (store.root / relative_path).read_bytes() == b"old-index"
+    assert not tuple(store.staging_dir.iterdir())
+
+
+@pytest.mark.parametrize("expected_sha256", ["short", "g" * 64])
+def test_render_replacement_rejects_invalid_expected_digest(
+    tmp_path: Path,
+    expected_sha256: str,
+) -> None:
+    store = ContentAddressedStore(tmp_path)
+    relative_path = f"renders/rnd_{'a' * 32}/resources/index.json"
+    _ = store.put_render_bytes(relative_path, b"old-index")
+
+    with pytest.raises(AppError) as raised:
+        _ = store.replace_render_bytes_if_matches(
+            relative_path,
+            b"new-index",
+            expected_sha256=expected_sha256,
+        )
+
+    assert raised.value.code is ErrorCode.INVALID_INPUT
+    assert (store.root / relative_path).read_bytes() == b"old-index"
+
+
+@pytest.mark.parametrize("destination_state", ["missing", "symlink"])
+def test_render_replacement_requires_regular_existing_destination(
+    tmp_path: Path,
+    destination_state: str,
+) -> None:
+    store = ContentAddressedStore(tmp_path)
+    relative_path = f"renders/rnd_{'a' * 32}/resources/index.json"
+    _, old_digest = store.put_render_bytes(relative_path, b"old-index")
+    destination = store.root / relative_path
+    destination.unlink()
+    if destination_state == "symlink":
+        target = store.root / "renders" / f"rnd_{'a' * 32}" / "target.json"
+        _ = target.write_bytes(b"old-index")
+        destination.symlink_to(target)
+
+    with pytest.raises(AppError) as raised:
+        _ = store.replace_render_bytes_if_matches(
+            relative_path,
+            b"new-index",
+            expected_sha256=old_digest,
+        )
+
+    assert raised.value.code is ErrorCode.INTERNAL_ERROR
+    assert not tuple(store.staging_dir.iterdir())
+
+
+def test_render_replacement_rejects_staged_identity_change_during_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ContentAddressedStore(tmp_path)
+    relative_path = f"renders/rnd_{'a' * 32}/resources/index.json"
+    _, old_digest = store.put_render_bytes(relative_path, b"old-index")
+    real_replace = Path.replace
+
+    def replace_then_mutate(source: Path, target: Path | str) -> Path:
+        published = real_replace(source, target)
+        _ = Path(target).write_bytes(b"tampered")
+        return published
+
+    monkeypatch.setattr(Path, "replace", replace_then_mutate)
+
+    with pytest.raises(AppError) as raised:
+        _ = store.replace_render_bytes_if_matches(
+            relative_path,
+            b"new-index",
+            expected_sha256=old_digest,
+        )
+
+    assert raised.value.code is ErrorCode.INVALID_INPUT
+    assert not (store.root / relative_path).exists()
+    assert not tuple(store.staging_dir.iterdir())
+
+
+def test_render_replacement_identity_failure_reconciles_quota_after_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ContentAddressedStore(tmp_path, max_bytes=18)
+    relative_path = f"renders/rnd_{'a' * 32}/resources/index.json"
+    _, old_digest = store.put_render_bytes(relative_path, b"old-index")
+    real_replace = Path.replace
+
+    def replace_then_mutate(source: Path, target: Path | str) -> Path:
+        published = real_replace(source, target)
+        _ = Path(target).write_bytes(b"tampered")
+        return published
+
+    monkeypatch.setattr(Path, "replace", replace_then_mutate)
+
+    with pytest.raises(AppError) as raised:
+        _ = store.replace_render_bytes_if_matches(
+            relative_path,
+            b"new-index",
+            expected_sha256=old_digest,
+        )
+
+    assert raised.value.code is ErrorCode.INVALID_INPUT
+    assert store.used_bytes == 0
+    assert store.reserved_bytes == 0
+    assert not tuple(store.staging_dir.iterdir())
+    monkeypatch.setattr(Path, "replace", real_replace)
+
+    next_path = f"renders/rnd_{'b' * 32}/next.bin"
+    written_path, _ = store.put_render_bytes(next_path, b"0123456789")
+
+    assert written_path == next_path
+    assert store.used_bytes == _RECOVERY_PAYLOAD_SIZE
+    assert (store.root / next_path).read_bytes() == b"0123456789"
 
 
 def test_two_open_writers_deduplicate_at_commit(tmp_path: Path) -> None:

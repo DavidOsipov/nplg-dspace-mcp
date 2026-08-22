@@ -7,11 +7,45 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env
+    environment:
+      DEPLOYMENT_PROFILE: private-full
+      PDF_EXECUTOR: unix-worker
+      PORT: "8443"
+      PRIVATE_EDGE_TLS: "true"
     user: "10001:10001"
     expose:
-      - "8000"
+      - "8443"
     volumes:
       - nplg_cache:/data/cache
+      - nplg_pdf_worker_slot:/var/lib/nplg/pdf-worker-slot
+      - nplg_pdf_socket:/run/nplg-pdf-worker
+      - nplg_scanner_socket:/run/nplg-scanner:ro
+    secrets:
+      - source: app_server_cert
+        target: app_server_cert
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: app_server_key
+        target: app_server_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: app_server_ca
+        target: app_server_ca
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: caddy_client_ca
+        target: caddy_client_ca
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    depends_on:
+      scanner:
+        condition: service_started
+      pdf-worker:
+        condition: service_started
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
@@ -25,13 +59,144 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).read()"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+      disable: true
     networks:
-      - backend
+      backend:
+        aliases:
+          - app.internal
+
+  pdf-worker-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: "0:0"
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        install -d -o 10001 -g 10001 -m 0700 /var/lib/nplg/pdf-worker-slot
+        /run/nplg-pdf-worker
+    volumes:
+      - nplg_pdf_worker_slot:/var/lib/nplg/pdf-worker-slot
+      - nplg_pdf_socket:/run/nplg-pdf-worker
+    restart: "no"
+
+  pdf-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: "10001:10001"
+    command:
+      - python
+      - -m
+      - nplg_mcp.pdf_worker_main
+      - --unix-socket
+      - /run/nplg-pdf-worker/worker.sock
+    environment:
+      NPLG_PDF_WORK_ROOT: /var/lib/nplg/pdf-worker-slot
+      NPLG_PDF_CPU_SECONDS: "30"
+      NPLG_PDF_ADDRESS_SPACE_BYTES: "1073741824"
+      NPLG_PDF_FILE_SIZE_BYTES: "536870912"
+      NPLG_PDF_OPEN_FILES: "64"
+      NPLG_PDF_PROCESSES: "8"
+      NPLG_PDF_MAX_PAGES_PER_RENDER: "8"
+      NPLG_PDF_MAX_PAGE_PIXELS: "120000000"
+      NPLG_PDF_MAX_RENDER_PIXELS: "480000000"
+      NPLG_PDF_FALLBACK_DPI: "400"
+      NPLG_PDF_TILE_WIDTH: "2048"
+      NPLG_PDF_TILE_HEIGHT: "2048"
+      NPLG_PDF_TILE_OVERLAP: "128"
+      NPLG_PDF_MAX_TILES_PER_PAGE: "100"
+    depends_on:
+      pdf-worker-init:
+        condition: service_completed_successfully
+    volumes:
+      - nplg_pdf_worker_slot:/var/lib/nplg/pdf-worker-slot
+      - nplg_pdf_socket:/run/nplg-pdf-worker
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./deploy/pdf-worker-seccomp.json
+    pids_limit: 8
+    mem_limit: 1g
+    cpus: 1.0
+    restart: unless-stopped
+
+  scanner-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    user: "0:0"
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        install -d -o 10001 -g 10001 -m 0700 /var/lib/clamav
+        /run/nplg-scanner
+    volumes:
+      - nplg_scanner_db:/var/lib/clamav
+      - nplg_scanner_socket:/run/nplg-scanner
+    restart: "no"
+
+  scanner-updater:
+    image: clamav/clamav:1.4.6@sha256:c3bfbf2a2c9abc1fc179e63832a9e8bfac901ede83853e3fa10acf6f1fb5c803
+    user: "10001:10001"
+    command:
+      - freshclam
+      - --config-file=/etc/clamav/freshclam.conf
+    depends_on:
+      scanner-init:
+        condition: service_completed_successfully
+    volumes:
+      - nplg_scanner_db:/var/lib/clamav
+      - ./deploy/freshclam.conf:/etc/clamav/freshclam.conf:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 16
+    mem_limit: 512m
+    cpus: 0.5
+    restart: "no"
+    networks:
+      - scanner-updates
+
+  scanner:
+    image: clamav/clamav:1.4.6@sha256:c3bfbf2a2c9abc1fc179e63832a9e8bfac901ede83853e3fa10acf6f1fb5c803
+    user: "10001:10001"
+    command:
+      - clamd
+      - --foreground=true
+      - --config-file=/etc/clamav/clamd.conf
+    depends_on:
+      scanner-init:
+        condition: service_completed_successfully
+      scanner-updater:
+        condition: service_completed_successfully
+    volumes:
+      - nplg_scanner_db:/var/lib/clamav:ro
+      - nplg_scanner_socket:/run/nplg-scanner
+      - ./deploy/clamd.conf:/etc/clamav/clamd.conf:ro
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 16
+    mem_limit: 1g
+    cpus: 1.0
+    restart: unless-stopped
 
   caddy:
     image: caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
@@ -39,7 +204,7 @@ services:
       MCP_DOMAIN: "${MCP_DOMAIN:?Set MCP_DOMAIN in .env}"
     depends_on:
       app:
-        condition: service_healthy
+        condition: service_started
     ports:
       - "80:80"
       - "443:443"
@@ -47,6 +212,22 @@ services:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    secrets:
+      - source: caddy_client_cert
+        target: caddy_client_cert
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: caddy_client_key
+        target: caddy_client_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: app_server_ca
+        target: app_server_ca
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
@@ -66,8 +247,29 @@ services:
 networks:
   backend:
     driver: bridge
+  scanner-updates:
+    driver: bridge
 
 volumes:
   nplg_cache:
+  nplg_pdf_worker_slot:
+    external: true
+  nplg_pdf_socket:
+  nplg_scanner_db:
+  nplg_scanner_socket:
   caddy_data:
   caddy_config:
+
+secrets:
+  app_server_cert:
+    external: true
+  app_server_key:
+    external: true
+  caddy_client_ca:
+    external: true
+  caddy_client_cert:
+    external: true
+  caddy_client_key:
+    external: true
+  app_server_ca:
+    external: true

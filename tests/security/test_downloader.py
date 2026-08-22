@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast, get_type_hints, override
 
 import httpx
@@ -14,6 +16,7 @@ import pytest
 from nplg_mcp.downloader import DocumentDownloader
 from nplg_mcp.errors import AppError, ErrorCode
 from nplg_mcp.http_types import HttpClientProtocol
+from nplg_mcp.malware import ScanResult, ScanVerdict
 from nplg_mcp.parsers import Bitstream
 from nplg_mcp.storage import ContentAddressedStore
 
@@ -52,6 +55,57 @@ def test_downloader_protocol_annotation_is_runtime_resolvable() -> None:
 
     assert isinstance(hints, dict)
     assert hints["client"] is HttpClientProtocol
+
+
+@pytest.mark.asyncio
+async def test_scanner_verdict_is_required_before_a_download_is_published(
+    tmp_path: Path,
+) -> None:
+    """A scanner failure must not leave an unscanned document in the cache."""
+
+    class InfectedScanner:
+        async def scan(
+            self,
+            path: Path,
+            *,
+            expected_sha256: str,
+            deadline: object,
+        ) -> ScanResult:
+            del deadline
+            assert await asyncio.to_thread(path.is_file)
+            scanned_bytes = await asyncio.to_thread(path.read_bytes)
+            assert hashlib.sha256(scanned_bytes).hexdigest() == expected_sha256
+            return ScanResult(
+                verdict=ScanVerdict.INFECTED,
+                scanned_sha256=expected_sha256,
+                engine_version="clamav-1.4.3",
+                signature_version="daily-28123",
+                signatures_updated_at=datetime(2026, 8, 22, tzinfo=UTC),
+            )
+
+    body = b"%PDF-1.7\nmalware-fixture"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=body, headers={"content-type": "application/pdf"}
+        )
+
+    store = ContentAddressedStore(tmp_path)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        downloader = DocumentDownloader(
+            client=client,
+            store=store,
+            max_bytes=1024,
+            validate_dns=False,
+            scanner=InfectedScanner(),
+            scan_now=lambda: datetime(2026, 8, 22, 1, tzinfo=UTC),
+        )
+        with pytest.raises(AppError) as captured:
+            _ = await downloader.download(bitstream())
+
+    assert captured.value.code is ErrorCode.INVALID_DOCUMENT
+    assert list((tmp_path / "documents").rglob("*")) == []
+    assert list((tmp_path / ".staging").iterdir()) == []
 
 
 @pytest.mark.asyncio

@@ -7,19 +7,24 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal, cast
 
-from nplg_mcp.app import AppServices
-from nplg_mcp.config import AppConfig, load_config
+from nplg_mcp.config import (
+    AppConfig,
+    load_config,
+)
+from nplg_mcp.config import (
+    DeploymentProfile as DeploymentProfileName,
+)
 from nplg_mcp.downloader import DownloadResult
 from nplg_mcp.errors import AppError, ErrorCode
 from nplg_mcp.parsers import Bitstream, DocumentRecord, SearchItem, SearchPage
 from nplg_mcp.pdf import PdfProcessor
+from nplg_mcp.services import MetadataServiceComposition
 from nplg_mcp.storage import ContentAddressedStore
 from nplg_mcp.tools import (
     DownloaderProtocol,
     RepositoryProtocol,
     ToolService,
     ToolServiceDependencies,
-    UtcClock,
 )
 from tests.helpers.inline_pdf_executor import InlinePdfExecutor
 from tests.helpers.pdf_factory import make_raster_pdf
@@ -130,12 +135,19 @@ class _FixtureDownloader:
         )
 
 
-def _config_for(tmp_path: Path, *, frozen_origin: bool = False) -> AppConfig:
+def _config_for(
+    tmp_path: Path,
+    *,
+    deployment_profile: DeploymentProfileName = "private-full",
+    frozen_origin: bool = False,
+) -> AppConfig:
     config = load_config(base_environment(CACHE_DIR=str(tmp_path)))
-    return (
-        replace(config, public_base_url="http://testserver")
-        if frozen_origin
-        else config
+    return replace(
+        config,
+        deployment_profile=deployment_profile,
+        public_base_url=(
+            "http://testserver" if frozen_origin else config.public_base_url
+        ),
     )
 
 
@@ -156,11 +168,15 @@ def make_tool_service(
     *,
     pdf_processor: PdfProcessor | None = None,
     fault_mode: FixtureFaultMode = "none",
-    utc_now: UtcClock = fixture_utc_now,
+    deployment_profile: DeploymentProfileName = "private-full",
     frozen_origin: bool = False,
 ) -> ToolService:
     """Construct a production ToolService with offline deterministic collaborators."""
-    config = _config_for(tmp_path, frozen_origin=frozen_origin)
+    config = _config_for(
+        tmp_path,
+        deployment_profile=deployment_profile,
+        frozen_origin=frozen_origin,
+    )
     store = ContentAddressedStore(tmp_path, max_bytes=config.cache_max_bytes)
     fixture = make_raster_pdf(
         tmp_path / "fixture-source.pdf",
@@ -180,11 +196,11 @@ def make_tool_service(
             store=store,
         ),
         config=config,
-        utc_now=utc_now,
+        utc_now=fixture_utc_now,
     )
 
 
-def make_app_services(tmp_path: Path) -> AppServices:
-    """Construct the app service bundle without network clients or ambient state."""
-    tools = make_tool_service(tmp_path)
-    return AppServices(tools=tools, store=tools.store, http_client=None)
+def make_app_services(tmp_path: Path) -> MetadataServiceComposition:
+    """Construct the concrete metadata composition used by SDK contract tests."""
+    tools = make_tool_service(tmp_path, deployment_profile="alpic-metadata")
+    return MetadataServiceComposition(tools=tools, http_client=None)

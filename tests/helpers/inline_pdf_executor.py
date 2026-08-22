@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from functools import partial
 from typing import TYPE_CHECKING, Protocol
 
@@ -25,10 +26,11 @@ from nplg_mcp.pdf_ipc import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
+    from nplg_mcp.contracts import MonotonicDeadline
     from nplg_mcp.pdf import PdfInspection, RenderManifest, TileManifest
-    from nplg_mcp.pdf_executor import MonotonicDeadline
     from nplg_mcp.pdf_ipc import PdfCommand, PdfResult
     from nplg_mcp.storage import ContentAddressedStore
 
@@ -75,11 +77,13 @@ class InlinePdfExecutor:
         *,
         processor: SyncPdfProcessor,
         store: ContentAddressedStore,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Bind one trusted processor and its authoritative fixture store."""
         super().__init__()
         self._processor = processor
         self._store = store
+        self._monotonic_clock = monotonic_clock
 
     def ensure_ready(self) -> None:
         """Return successfully because this test adapter has no circuit."""
@@ -91,7 +95,7 @@ class InlinePdfExecutor:
         deadline: MonotonicDeadline,
     ) -> PdfResult:
         """Dispatch one strict command and validate the fake's output model."""
-        if deadline.remaining() <= 0:
+        if deadline.remaining(now=self._monotonic_clock()) <= 0:
             message = "test PDF operation exceeded its deadline"
             raise PdfWorkerError(message)
         if isinstance(command, InspectCommand):

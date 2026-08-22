@@ -25,6 +25,11 @@ def render_identifier(
         "source_sha256": source_sha256,
     }
     digest = hashlib.sha256(
-        json.dumps(key, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        json.dumps(
+            key,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
     ).hexdigest()
     return f"rnd_{digest[:32]}"

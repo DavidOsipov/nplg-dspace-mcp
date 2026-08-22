@@ -14,16 +14,23 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-    from nplg_mcp.app import AppServices
+    from nplg_mcp.services import MetadataServiceComposition
     from nplg_mcp.tools import ToolService
+
+    type ToolServiceFactory = Callable[[Path], ToolService]
+    type ToolServiceFixture = Callable[[ToolServiceFactory], ToolServiceFactory]
+    type MetadataServiceFactory = Callable[[Path], MetadataServiceComposition]
+    type MetadataServiceFixture = Callable[
+        [MetadataServiceFactory], MetadataServiceFactory
+    ]
 
 
 tool_service_fixture = cast(
-    "Callable[[Callable[[Path], ToolService]], Callable[[Path], ToolService]]",
+    "ToolServiceFixture",
     pytest.fixture,
 )
 app_services_fixture = cast(
-    "Callable[[Callable[[Path], AppServices]], Callable[[Path], AppServices]]",
+    "MetadataServiceFixture",
     pytest.fixture,
 )
 
@@ -43,5 +50,5 @@ def tool_service(tmp_path: Path) -> ToolService:
 
 
 @app_services_fixture
-def app_services(tmp_path: Path) -> AppServices:
+def app_services(tmp_path: Path) -> MetadataServiceComposition:
     return make_app_services(tmp_path)

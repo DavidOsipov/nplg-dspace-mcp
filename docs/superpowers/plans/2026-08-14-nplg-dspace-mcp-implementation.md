@@ -1,7 +1,6 @@
 # NPLG DSpace MCP Implementation Plan
 
 > **Historical plan:** this document records the original implementation sequence and dependency choices. Security repairs made after that sequence supersede its version list and some operational details; use `pyproject.toml`, `requirements.in`, `requirements.lock`, and the current security-repair verification report as the release sources of truth.
-
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build and verify a deployable, read-only Streamable HTTP MCP server for NPLG Iverieli that searches records, returns metadata, downloads validated public PDFs, and renders full-page JPEGs plus crop-only tiles without post-render resizing.

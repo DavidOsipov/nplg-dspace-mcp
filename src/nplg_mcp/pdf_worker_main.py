@@ -3,12 +3,18 @@
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import json
 import os
 import resource
+import socket
+import stat
 import sys
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, cast
+from typing import TYPE_CHECKING, BinaryIO, Protocol, cast, runtime_checkable
 
 from .config import (
     HARD_MAX_PAGE_PIXELS,
@@ -59,6 +65,40 @@ _LIMIT_ENVIRON = {
     "NPLG_PDF_MAX_TILES_PER_PAGE": (1, HARD_MAX_TILES_PER_PAGE),
 }
 _FRAME_PREFIX_BYTES = 4
+_PEER_CREDENTIAL_BYTES = 12
+
+if TYPE_CHECKING:
+    from asyncio import StreamReader, StreamWriter
+
+
+@runtime_checkable
+class _UnixSocketPeer(Protocol):
+    """The narrow socket capability required for local peer verification."""
+
+    family: socket.AddressFamily
+
+    def getsockopt(self, level: int, option: int, buffer_size: int) -> bytes:
+        """Return the fixed-width peer-credential record."""
+        ...
+
+
+def _peer_credentials(value: bytes) -> tuple[int, int, int]:
+    """Decode exactly one native Linux ``ucred`` record without dynamic types."""
+    if len(value) != _PEER_CREDENTIAL_BYTES:
+        message = "PDF worker peer credentials are malformed"
+        raise RuntimeError(message)
+    return (
+        int.from_bytes(value[0:4], byteorder=sys.byteorder, signed=True),
+        int.from_bytes(value[4:8], byteorder=sys.byteorder, signed=True),
+        int.from_bytes(value[8:12], byteorder=sys.byteorder, signed=True),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkerOptions:
+    """Typed projection of the worker's intentionally tiny CLI namespace."""
+
+    unix_socket: Path | None
 
 
 def _configured_integer(name: str) -> int:
@@ -133,6 +173,38 @@ def _read_command() -> PdfCommand:
         message = "PDF worker command is truncated or has trailing data"
         raise RuntimeError(message)
     return parse_command_frame(body)
+
+
+async def _read_socket_command(reader: StreamReader) -> PdfCommand:
+    """Read exactly one bounded request frame from an AF_UNIX peer."""
+    prefix = await reader.readexactly(_FRAME_PREFIX_BYTES)
+    size = int.from_bytes(prefix, "big")
+    if size < 1 or size > MAX_COMMAND_FRAME_BYTES:
+        message = "PDF worker command length is outside the allowed range"
+        raise RuntimeError(message)
+    body = await reader.readexactly(size)
+    if await reader.read(1):
+        message = "PDF worker command has trailing data"
+        raise RuntimeError(message)
+    return parse_command_frame(body)
+
+
+def _request_root(root: Path, command: PdfCommand) -> Path:
+    """Confine a socket request to its UUID-derived, parent-created job directory."""
+    path = root / command.request_id.hex
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        message = "PDF worker request staging directory is unavailable"
+        raise RuntimeError(message) from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_mode & 0o077
+    ):
+        message = "PDF worker request staging directory is invalid"
+        raise RuntimeError(message)
+    return path
 
 
 def _execute(
@@ -253,12 +325,124 @@ def _failure(command: PdfCommand, error: Exception) -> PdfFailure:
     )
 
 
-def main() -> int:
+def _verified_unix_peer(writer: StreamWriter) -> None:
+    """Accept only a same-identity AF_UNIX client on the private socket."""
+    stream_socket = cast("object", writer.get_extra_info("socket"))
+    if (
+        not isinstance(stream_socket, _UnixSocketPeer)
+        or stream_socket.family != socket.AF_UNIX
+    ):
+        message = "PDF worker transport is not AF_UNIX"
+        raise RuntimeError(message)
+    credentials = stream_socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    _process_id, peer_uid, _peer_group = _peer_credentials(credentials)
+    if peer_uid != os.geteuid():
+        message = "PDF worker peer identity is invalid"
+        raise RuntimeError(message)
+
+
+def _validate_server_socket_path(path: Path) -> None:
+    """Reject unsafe replacement or traversal targets before binding a socket."""
+    if not path.is_absolute() or path.exists() or path.is_symlink():
+        message = "PDF worker socket path is invalid"
+        raise RuntimeError(message)
+    parent = path.parent
+    parent_metadata = parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or stat.S_ISLNK(parent_metadata.st_mode)
+        or parent_metadata.st_mode & 0o077
+    ):
+        message = "PDF worker socket directory is invalid"
+        raise RuntimeError(message)
+
+
+def _set_private_socket_mode(path: Path) -> None:
+    """Constrain the newly created endpoint to its owner before accepting peers."""
+    path.chmod(0o600)
+
+
+def _remove_socket(path: Path) -> None:
+    """Remove only the server-created socket during ordinary worker shutdown."""
+    with suppress(FileNotFoundError):
+        path.unlink()
+
+
+async def _serve_one_unix_request(
+    reader: StreamReader,
+    writer: StreamWriter,
+    *,
+    root: Path,
+    max_bytes: int,
+    settings: PdfProcessorSettings,
+) -> None:
+    """Process one EOF-delimited request and never leave a framing ambiguity."""
+    try:
+        _verified_unix_peer(writer)
+        command = await _read_socket_command(reader)
+        try:
+            result: PdfResult = _execute(
+                command,
+                _request_root(root, command),
+                max_bytes=max_bytes,
+                settings=settings,
+            )
+        except Exception as exc:  # noqa: BLE001 - sanitize all parser failures.
+            result = _failure(command, exc)
+        writer.write(encode_frame(result, maximum=MAX_RESULT_FRAME_BYTES))
+        await writer.drain()
+    finally:
+        writer.close()
+        with suppress(OSError):
+            await writer.wait_closed()
+
+
+async def _serve_unix_socket(
+    path: Path,
+    *,
+    root: Path,
+    max_bytes: int,
+    settings: PdfProcessorSettings,
+) -> None:
+    """Serve a new authenticated connection for every parent request."""
+    _validate_server_socket_path(path)
+    server = await asyncio.start_unix_server(
+        lambda reader, writer: _serve_one_unix_request(
+            reader,
+            writer,
+            root=root,
+            max_bytes=max_bytes,
+            settings=settings,
+        ),
+        path=str(path),
+    )
+    _set_private_socket_mode(path)
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        _remove_socket(path)
+
+
+def main(argv: list[str] | None = None) -> int:
     """Execute exactly one command and emit exactly one result frame."""
+    parser = argparse.ArgumentParser(add_help=False)
+    _ = parser.add_argument("--unix-socket", type=Path)
+    options = cast("_WorkerOptions", parser.parse_args(argv))
     _ = os.umask(0o077)
     max_bytes = _apply_resource_limits()
     settings = _processor_settings()
     root = _work_root()
+    if options.unix_socket is not None:
+        _ = asyncio.run(
+            _serve_unix_socket(
+                options.unix_socket,
+                root=root,
+                max_bytes=max_bytes,
+                settings=settings,
+            )
+        )
+        return 0
     command = _read_command()
     result: PdfResult
     try:

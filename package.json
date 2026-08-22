@@ -2,11 +2,16 @@
   "name": "nplg-dspace-mcp-quality-tools",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "packageManager": "npm@11.18.0",
   "engines": {
     "node": ">=24.0.0 <25.0.0"
   },
   "scripts": {
+    "contracts:lint": "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/models.ts contracts/zod/contract.test.ts tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+    "contracts:typecheck": "tsc --project tsconfig.contracts.json",
+    "contracts:test": "node --test contracts/zod/contract.test.ts && npm run contracts:zod:all",
+    "docs:lint": "markdownlint-cli2 \"*.md\" \"docs/**/*.md\" \"deploy/**/*.md\" \"skills/**/*.md\"",
     "contracts:zod": "node --test tests/contracts/zod_contracts.test.mjs",
     "contracts:baseline-zod": "node --test tests/contracts/zod_baseline_contracts.test.mjs",
     "contracts:asvs-zod": "node --test tests/contracts/zod_asvs_evidence_contracts.test.mjs",
@@ -18,8 +23,10 @@
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
+    "@modelcontextprotocol/conformance": "0.2.0-alpha.11",
     "@types/node": "24.13.3",
     "eslint": "10.8.1",
+    "markdownlint-cli2": "0.23.2",
     "pyright": "1.1.413",
     "typescript": "6.0.3",
     "typescript-eslint": "8.67.0",

@@ -1,0 +1,18 @@
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "architectures": ["SCMP_ARCH_X86_64", "SCMP_ARCH_AARCH64"],
+  "syscalls": [
+    {
+      "names": ["socket", "socketpair"],
+      "action": "SCMP_ACT_ERRNO",
+      "args": [
+        {
+          "index": 0,
+          "value": 1,
+          "valueTwo": 0,
+          "op": "SCMP_CMP_NE"
+        }
+      ]
+    }
+  ]
+}

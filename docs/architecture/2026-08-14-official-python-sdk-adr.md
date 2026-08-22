@@ -40,6 +40,15 @@ error is permitted to close that gap.
 - Alpic and OAuth records remain negative evidence until vendor/provider
   fixtures and end-to-end observations exist.
 
+### Phase 3 local parity disposition
+
+The digest-bound `metadata-tool-catalog-schema-projection` difference is
+limited to the frozen custom-protocol advertisement. The official SDK projects
+the complete current Pydantic input/output schemas; retained custom behavior
+continues to enforce the same Pydantic models at runtime. The ledger is local
+implementation evidence, not release approval, and the custom adapter is
+removed in Task 14.
+
 ## Rejected alternatives
 
 - Continuing the custom protocol as the long-term transport implementation.

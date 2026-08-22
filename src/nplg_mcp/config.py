@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 from dataclasses import dataclass
 from ipaddress import ip_address
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Literal, NewType, cast
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -35,12 +36,18 @@ HARD_MAX_CACHE_BYTES = 1024 * 1024 * 1024 * 1024
 HARD_MAX_TILE_DIMENSION = 4096
 HARD_MAX_TILE_OVERLAP = 512
 HARD_MAX_TILES_PER_PAGE = 100
+PDF_WORKER_SOCKET_PATH = Path("/run/nplg-pdf-worker/worker.sock")
+SCANNER_SOCKET_PATH = Path("/run/nplg-scanner/clamd.sock")
+PDF_WORKER_SLOT_ROOT = Path("/var/lib/nplg/pdf-worker-slot")
+PDF_WORKER_SLOT_POLICY_PATH = Path("/etc/nplg/pdf-worker-slot-policy.json")
 _DOCUMENTED_PLACEHOLDER = "replace-with-at-least-32-random-characters"
 _MIN_CREDENTIAL_BYTES = 32
 _MAX_CREDENTIAL_BYTES = 512
 _MAX_API_PRINCIPALS = 64
-PdfExecutor = Literal["serialized"]
+PdfExecutor = Literal["serialized", "unix-worker"]
 DeploymentProfile = Literal["alpic-metadata", "distributed-full", "private-full"]
+CanonicalHost = NewType("CanonicalHost", str)
+CanonicalOrigin = NewType("CanonicalOrigin", str)
 PrincipalId = Annotated[
     str,
     StringConstraints(
@@ -133,6 +140,11 @@ class AppConfig:
     upstream_rate_per_second: float
     max_redirects: int
     pdf_executor: PdfExecutor = "serialized"
+    pdf_worker_socket_path: Path = PDF_WORKER_SOCKET_PATH
+    pdf_worker_slot_root: Path = PDF_WORKER_SLOT_ROOT
+    pdf_worker_slot_policy_path: Path = PDF_WORKER_SLOT_POLICY_PATH
+    scanner_socket_path: Path = SCANNER_SOCKET_PATH
+    private_edge_tls: bool = False
     max_concurrent_pdf_jobs: int = 1
     max_concurrent_mcp_requests: int = 16
     max_concurrent_asset_streams: int = 8
@@ -144,6 +156,199 @@ class AppConfig:
     deployment_profile: DeploymentProfile = "private-full"
     api_principals: tuple[ApiPrincipalCredential, ...] = ()
     max_concurrent_mcp_requests_per_principal: int = 4
+    mcp_allowed_hosts: tuple[CanonicalHost, ...] = (CanonicalHost("127.0.0.1:8000"),)
+    mcp_allowed_origins: tuple[CanonicalOrigin, ...] = ()
+    mcp_application_deadline_seconds: float = 20.0
+
+    @property
+    def mcp_max_body_bytes(self) -> int:
+        """Expose the single project body ceiling at the SDK transport seam."""
+        return self.max_request_body_bytes
+
+
+_DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_MAX_CANONICAL_HOST_BYTES = 253
+_ASCII_SPACE = 0x20
+_ASCII_DELETE = 0x7F
+_IPV4_VERSION = 4
+_IPV6_VERSION = 6
+_MAX_PORT = 65_535
+
+
+def _canonical_host(  # noqa: C901, PLR0912, PLR0915
+    value: object, *, default_port: int | None
+) -> CanonicalHost:
+    """Validate one exact lower-case ASCII host authority without aliases."""
+    if type(value) is not str or not value or len(value) > _MAX_CANONICAL_HOST_BYTES:
+        msg = "MCP allowed host must be a nonempty canonical string"
+        raise ValueError(msg)
+    try:
+        _ = value.encode("ascii")
+    except UnicodeEncodeError as exc:
+        msg = "MCP allowed host must be ASCII"
+        raise ValueError(msg) from exc
+    if (
+        value != value.lower()
+        or any(
+            ord(character) <= _ASCII_SPACE or ord(character) == _ASCII_DELETE
+            for character in value
+        )
+        or any(marker in value for marker in ("*", "%", "\\", "@", "/", "?", "#"))
+    ):
+        msg = "MCP allowed host is not canonical"
+        raise ValueError(msg)
+
+    host = value
+    port_text: str | None = None
+    if value.startswith("["):
+        closing = value.find("]")
+        if closing < 0:
+            msg = "MCP allowed host has an invalid IP literal"
+            raise ValueError(msg)
+        host = value[1:closing]
+        suffix = value[closing + 1 :]
+        if suffix:
+            if not suffix.startswith(":"):
+                msg = "MCP allowed host has an invalid authority"
+                raise ValueError(msg)
+            port_text = suffix[1:]
+        try:
+            parsed_ip = ip_address(host)
+        except ValueError as exc:
+            msg = "MCP allowed host has an invalid IP literal"
+            raise ValueError(msg) from exc
+        if parsed_ip.version != _IPV6_VERSION or parsed_ip.compressed != host:
+            msg = "MCP allowed host IP literal is not canonical"
+            raise ValueError(msg)
+    else:
+        if value.count(":") > 1:
+            msg = "MCP allowed IPv6 hosts must be bracketed"
+            raise ValueError(msg)
+        if ":" in value:
+            host, port_text = value.rsplit(":", 1)
+        try:
+            parsed_ip = ip_address(host)
+        except ValueError:
+            labels = host.split(".")
+            if any(_DNS_LABEL.fullmatch(label) is None for label in labels):
+                msg = "MCP allowed DNS host is not canonical"
+                raise ValueError(msg) from None
+        else:
+            if parsed_ip.version != _IPV4_VERSION or str(parsed_ip) != host:
+                msg = "MCP allowed host IP literal is not canonical"
+                raise ValueError(msg)
+
+    if port_text is not None:
+        if (
+            not port_text
+            or not port_text.isascii()
+            or not port_text.isdecimal()
+            or (len(port_text) > 1 and port_text.startswith("0"))
+        ):
+            msg = "MCP allowed host port is not canonical"
+            raise ValueError(msg)
+        port = int(port_text)
+        if not 1 <= port <= _MAX_PORT or port == default_port:
+            msg = "MCP allowed host port is not canonical"
+            raise ValueError(msg)
+    return CanonicalHost(value)
+
+
+def _canonical_origin(value: object, *, production: bool) -> CanonicalOrigin:
+    """Validate one exact canonical HTTPS origin or development loopback HTTP."""
+    if type(value) is not str or not value:
+        msg = "MCP allowed origin must be a nonempty canonical string"
+        raise ValueError(msg)
+    try:
+        _ = value.encode("ascii")
+    except UnicodeEncodeError as exc:
+        msg = "MCP allowed origin must be ASCII"
+        raise ValueError(msg) from exc
+    if any(
+        ord(character) <= _ASCII_SPACE or ord(character) == _ASCII_DELETE
+        for character in value
+    ):
+        msg = "MCP allowed origin contains unsafe bytes"
+        raise ValueError(msg)
+    parsed = urlsplit(value)
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.scheme not in {"http", "https"}
+        or parsed.hostname is None
+    ):
+        msg = "MCP allowed origin is not an exact origin"
+        raise ValueError(msg)
+    if production and parsed.scheme != "https":
+        msg = "MCP allowed origins must use HTTPS in production"
+        raise ValueError(msg)
+    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+        msg = "MCP allowed origin HTTP values are restricted to loopback development"
+        raise ValueError(msg)
+    default_port = 443 if parsed.scheme == "https" else 80
+    try:
+        host = _canonical_host(parsed.netloc, default_port=default_port)
+    except ValueError as exc:
+        msg = "MCP allowed origin is not canonical"
+        raise ValueError(msg) from exc
+    rendered = f"{parsed.scheme}://{host}"
+    if value != rendered:
+        msg = "MCP allowed origin is not canonical"
+        raise ValueError(msg)
+    return CanonicalOrigin(value)
+
+
+def _strict_json_string_list(env: Mapping[str, str], name: str) -> list[object] | None:
+    raw = env.get(name)
+    if raw is None:
+        return None
+    try:
+        value = cast("object", json.loads(raw))
+    except (TypeError, ValueError) as exc:
+        msg = f"{name} must be a strict JSON string array"
+        raise ValueError(msg) from exc
+    if not isinstance(value, list):
+        msg = f"{name} must be a strict JSON string array"
+        raise ValueError(msg)  # noqa: TRY004 - config errors are ValueError.
+    items = cast("list[object]", value)
+    if any(type(item) is not str for item in items):
+        msg = f"{name} must be a strict JSON string array"
+        raise ValueError(msg)
+    return items
+
+
+def _mcp_transport_allowlists(
+    env: Mapping[str, str],
+    *,
+    public_base_url: str,
+    production: bool,
+) -> tuple[tuple[CanonicalHost, ...], tuple[CanonicalOrigin, ...]]:
+    parsed_public = urlsplit(public_base_url)
+    default_port = 443 if parsed_public.scheme == "https" else 80
+    default_host = parsed_public.netloc
+    raw_hosts = _strict_json_string_list(env, "NPLG_MCP_ALLOWED_HOSTS_JSON")
+    raw_origins = _strict_json_string_list(env, "NPLG_MCP_ALLOWED_ORIGINS_JSON")
+    host_values = [default_host] if raw_hosts is None else raw_hosts
+    origin_values = [public_base_url] if raw_origins is None else raw_origins
+    hosts = tuple(
+        _canonical_host(value, default_port=default_port) for value in host_values
+    )
+    origins = tuple(
+        _canonical_origin(value, production=production) for value in origin_values
+    )
+    if not hosts:
+        msg = "NPLG_MCP_ALLOWED_HOSTS_JSON must not be empty"
+        raise ValueError(msg)
+    if len(set(hosts)) != len(hosts):
+        msg = "NPLG_MCP_ALLOWED_HOSTS_JSON contains duplicates"
+        raise ValueError(msg)
+    if len(set(origins)) != len(origins):
+        msg = "NPLG_MCP_ALLOWED_ORIGINS_JSON contains duplicates"
+        raise ValueError(msg)
+    return hosts, origins
 
 
 def _bool(env: Mapping[str, str], name: str, *, default: bool) -> bool:
@@ -201,10 +406,10 @@ def _float(
 
 def _pdf_executor(env: Mapping[str, str]) -> PdfExecutor:
     value = env.get("PDF_EXECUTOR", "serialized").strip().lower()
-    if value != "serialized":
-        msg = "PDF_EXECUTOR must be serialized"
+    if value not in {"serialized", "unix-worker"}:
+        msg = "PDF_EXECUTOR must be serialized or unix-worker"
         raise ValueError(msg)
-    return "serialized"
+    return cast("PdfExecutor", value)
 
 
 def _normalize_public_base_url(value: str, *, production: bool) -> str:
@@ -449,7 +654,12 @@ def _tile_geometry(env: Mapping[str, str]) -> tuple[int, int, int]:
     return tile_width, tile_height, tile_overlap
 
 
-def _pdf_settings(env: Mapping[str, str]) -> tuple[PdfExecutor, int]:
+def _pdf_settings(
+    env: Mapping[str, str],
+    *,
+    deployment_profile: DeploymentProfile,
+    production: bool,
+) -> tuple[PdfExecutor, int]:
     pdf_executor = _pdf_executor(env)
     max_concurrent_pdf_jobs = _int(
         env,
@@ -459,9 +669,50 @@ def _pdf_settings(env: Mapping[str, str]) -> tuple[PdfExecutor, int]:
         maximum=4,
     )
     if max_concurrent_pdf_jobs != 1:
-        msg = "MAX_CONCURRENT_PDF_JOBS must equal 1 for serialized PDF_EXECUTOR"
+        msg = "MAX_CONCURRENT_PDF_JOBS must equal 1 for PDF_EXECUTOR"
+        raise ValueError(msg)
+    if pdf_executor == "unix-worker" and deployment_profile != "private-full":
+        msg = "PDF_EXECUTOR=unix-worker requires DEPLOYMENT_PROFILE=private-full"
+        raise ValueError(msg)
+    if (
+        production
+        and deployment_profile == "private-full"
+        and pdf_executor != "unix-worker"
+    ):
+        msg = "PDF_EXECUTOR=unix-worker is required for private-full production"
         raise ValueError(msg)
     return pdf_executor, max_concurrent_pdf_jobs
+
+
+def _pdf_worker_socket_path(env: Mapping[str, str]) -> Path:
+    """Accept only the reviewed private AF_UNIX endpoint path."""
+    value = env.get("PDF_WORKER_SOCKET", str(PDF_WORKER_SOCKET_PATH))
+    if value != str(PDF_WORKER_SOCKET_PATH):
+        msg = "PDF_WORKER_SOCKET must use the reviewed private socket path"
+        raise ValueError(msg)
+    return PDF_WORKER_SOCKET_PATH
+
+
+def _scanner_socket_path(env: Mapping[str, str]) -> Path:
+    """Accept only the reviewed private ClamAV AF_UNIX endpoint path."""
+    value = env.get("SCANNER_SOCKET", str(SCANNER_SOCKET_PATH))
+    if value != str(SCANNER_SOCKET_PATH):
+        msg = "SCANNER_SOCKET must use the reviewed private socket path"
+        raise ValueError(msg)
+    return SCANNER_SOCKET_PATH
+
+
+def _pdf_worker_slot_paths(env: Mapping[str, str]) -> tuple[Path, Path]:
+    """Reject environment-selected writable roots or policy documents."""
+    root = env.get("PDF_WORKER_SLOT_ROOT", str(PDF_WORKER_SLOT_ROOT))
+    if root != str(PDF_WORKER_SLOT_ROOT):
+        msg = "PDF_WORKER_SLOT_ROOT must use the reviewed dedicated slot root"
+        raise ValueError(msg)
+    policy = env.get("PDF_WORKER_SLOT_POLICY", str(PDF_WORKER_SLOT_POLICY_PATH))
+    if policy != str(PDF_WORKER_SLOT_POLICY_PATH):
+        msg = "PDF_WORKER_SLOT_POLICY must use the reviewed slot policy path"
+        raise ValueError(msg)
+    return PDF_WORKER_SLOT_ROOT, PDF_WORKER_SLOT_POLICY_PATH
 
 
 def load_config(env: Mapping[str, str]) -> AppConfig:
@@ -493,6 +744,11 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
         env,
         production=production,
     )
+    mcp_allowed_hosts, mcp_allowed_origins = _mcp_transport_allowlists(
+        env,
+        public_base_url=public_base_url,
+        production=production,
+    )
     _validate_anonymous_scope(
         env,
         public_base_url=public_base_url,
@@ -505,7 +761,21 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
         api_principals=api_principals,
     )
     tile_width, tile_height, tile_overlap = _tile_geometry(env)
-    pdf_executor, max_concurrent_pdf_jobs = _pdf_settings(env)
+    pdf_executor, max_concurrent_pdf_jobs = _pdf_settings(
+        env,
+        deployment_profile=deployment_profile,
+        production=production,
+    )
+    pdf_worker_socket_path = _pdf_worker_socket_path(env)
+    _ = _pdf_worker_slot_paths(env)
+    scanner_socket_path = _scanner_socket_path(env)
+    private_edge_tls = _bool(env, "PRIVATE_EDGE_TLS", default=False)
+    if private_edge_tls and deployment_profile != "private-full":
+        msg = "PRIVATE_EDGE_TLS requires DEPLOYMENT_PROFILE=private-full"
+        raise ValueError(msg)
+    if production and deployment_profile == "private-full" and not private_edge_tls:
+        msg = "PRIVATE_EDGE_TLS=true is required for private-full production"
+        raise ValueError(msg)
     asset_stream_idle_timeout_seconds = _float(
         env,
         "ASSET_STREAM_IDLE_TIMEOUT_SECONDS",
@@ -624,6 +894,9 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
         ),
         max_redirects=_int(env, "MAX_REDIRECTS", 3, minimum=0, maximum=5),
         pdf_executor=pdf_executor,
+        pdf_worker_socket_path=pdf_worker_socket_path,
+        scanner_socket_path=scanner_socket_path,
+        private_edge_tls=private_edge_tls,
         max_concurrent_pdf_jobs=max_concurrent_pdf_jobs,
         max_concurrent_mcp_requests=max_concurrent_mcp_requests,
         max_concurrent_mcp_requests_per_principal=(
@@ -660,4 +933,6 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
         asset_stream_idle_timeout_seconds=asset_stream_idle_timeout_seconds,
         asset_stream_total_timeout_seconds=asset_stream_total_timeout_seconds,
         deployment_profile=deployment_profile,
+        mcp_allowed_hosts=mcp_allowed_hosts,
+        mcp_allowed_origins=mcp_allowed_origins,
     )

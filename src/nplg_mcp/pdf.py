@@ -1476,6 +1476,7 @@ class PdfProcessor:
         )
         payload = json.dumps(
             dataclass_to_json(manifest, context="render manifest"),
+            allow_nan=False,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -1557,6 +1558,7 @@ class PdfProcessor:
         )
         payload = json.dumps(
             dataclass_to_json(result, context="tile manifest"),
+            allow_nan=False,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),

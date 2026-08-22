@@ -12,7 +12,13 @@ from typing import TYPE_CHECKING, cast, override
 import pytest
 
 from nplg_mcp import errors as errors_module
-from nplg_mcp.errors import AppError, ErrorCode, to_public_error
+from nplg_mcp.errors import (
+    AppError,
+    ErrorCode,
+    InvalidResourceUriError,
+    to_public_error,
+    validate_resource_uri,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -57,6 +63,13 @@ _MAX_PUBLIC_DETAIL_VALUES = 4_096
 _MAX_PUBLIC_DETAIL_STRING_CODE_POINTS = 65_536
 _MAX_PUBLIC_DETAIL_INTEGER_BITS = 256
 _MAX_MONITORING_TOOL_ID = 5
+
+
+@pytest.mark.parametrize("uri", ["", "x" * 513])
+def test_resource_uri_rejects_values_outside_the_bounded_length(uri: str) -> None:
+    """Empty and overlong resource URIs fail before grammar evaluation."""
+    with pytest.raises(InvalidResourceUriError):
+        _ = validate_resource_uri(uri)
 
 
 class _HostileMapping(Mapping[str, object]):
@@ -485,7 +498,7 @@ def test_detail_mapping_growth_during_copy_fails_closed() -> None:
 
     public = _serialize_with_interleaved_mutation(
         error,
-        trigger_line=85,
+        trigger_line=111,
         mutate=lambda: details.__setitem__("late", None),
     )
 
@@ -505,7 +518,7 @@ def test_detail_list_growth_during_copy_fails_closed() -> None:
 
     public = _serialize_with_interleaved_mutation(
         error,
-        trigger_line=94,
+        trigger_line=120,
         mutate=lambda: items.append(0),
     )
 

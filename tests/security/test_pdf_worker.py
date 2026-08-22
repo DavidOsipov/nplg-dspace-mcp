@@ -20,8 +20,8 @@ import pytest
 from PIL import Image
 
 from nplg_mcp.bounded_work import STORAGE_WORK
+from nplg_mcp.contracts import MonotonicDeadline
 from nplg_mcp.pdf_executor import (
-    MonotonicDeadline,
     PdfCircuitBreaker,
     PdfCircuitPolicy,
     PdfProcessorSettings,
@@ -48,18 +48,155 @@ from nplg_mcp.pdf_ipc import (
     RenderTilesPayload,
     parse_command_frame,
 )
-from nplg_mcp.pdf_worker_client import SubprocessPdfExecutor
+from nplg_mcp.pdf_worker_client import SubprocessPdfExecutor, UnixSocketPdfExecutor
 from nplg_mcp.storage import ContentAddressedStore
 from tests.helpers.pdf_factory import make_raster_pdf
 
 if TYPE_CHECKING:
     from asyncio.subprocess import Process
+    from typing import Literal
 
     from nplg_mcp.pdf_ipc import PdfResult
 
 _INSPECTED_WIDTH = 120
 _INSPECTED_HEIGHT = 80
 _EXPECTED_TERMINATION_WAITS = 2
+
+
+class _ProbePermit(asyncio.Semaphore):
+    """Record whether an expired call crosses the capacity boundary."""
+
+    def __init__(self) -> None:
+        super().__init__(1)
+        self.acquire_calls = 0
+
+    @override
+    async def acquire(self) -> Literal[True]:
+        self.acquire_calls += 1
+        return True
+
+    @override
+    def release(self) -> None:
+        return None
+
+
+def _deadline(seconds: float) -> MonotonicDeadline:
+    return MonotonicDeadline.after(seconds, clock=time.monotonic)
+
+
+@pytest.mark.asyncio
+async def test_unix_socket_executor_uses_the_confined_worker_protocol(
+    tmp_path: Path,
+) -> None:
+    """A private worker processes only the parent's request-scoped staging tree."""
+    store = ContentAddressedStore(tmp_path / "cache")
+    fixture = make_raster_pdf(
+        tmp_path / "source.pdf",
+        width=_INSPECTED_WIDTH,
+        height=_INSPECTED_HEIGHT,
+        dpi=200,
+    )
+    artifact = store.put_bytes(
+        fixture.path.read_bytes(),
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    worker_root = store.root / ".pdf-worker-jobs"
+    worker_root.mkdir(mode=0o700)
+    socket_path = tmp_path / "worker.sock"
+    environment = {
+        **os.environ,
+        "NPLG_PDF_WORK_ROOT": str(worker_root),
+        "NPLG_PDF_CPU_SECONDS": "30",
+        "NPLG_PDF_ADDRESS_SPACE_BYTES": str(1_073_741_824),
+        "NPLG_PDF_FILE_SIZE_BYTES": str(536_870_912),
+        "NPLG_PDF_OPEN_FILES": "64",
+        "NPLG_PDF_PROCESSES": "8",
+        "NPLG_PDF_MAX_PAGES_PER_RENDER": "8",
+        "NPLG_PDF_MAX_PAGE_PIXELS": "120000000",
+        "NPLG_PDF_MAX_RENDER_PIXELS": "480000000",
+        "NPLG_PDF_FALLBACK_DPI": "400",
+        "NPLG_PDF_TILE_WIDTH": "2048",
+        "NPLG_PDF_TILE_HEIGHT": "2048",
+        "NPLG_PDF_TILE_OVERLAP": "128",
+        "NPLG_PDF_MAX_TILES_PER_PAGE": "100",
+    }
+    worker = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "nplg_mcp.pdf_worker_main",
+        "--unix-socket",
+        str(socket_path),
+        cwd="/",
+        env=environment,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        for _ in range(40):
+            if socket_path.exists() or worker.returncode is not None:
+                break
+            await asyncio.sleep(0.025)
+        if not socket_path.exists():
+            error_stream = worker.stderr
+            if worker.returncode is None:
+                worker.terminate()
+            _ = await worker.wait()
+            stderr = await error_stream.read() if error_stream is not None else b""
+            pytest.fail(stderr.decode("utf-8"))
+        executor = UnixSocketPdfExecutor(store=store, socket_path=socket_path)
+        result = await executor.execute(
+            InspectCommand(
+                request_id=UUID("00000000-0000-4000-8000-000000000071"),
+                operation="inspect",
+                source_relative_path=artifact.relative_path,
+                parameters=InspectParams(),
+            ),
+            deadline=_deadline(10.0),
+        )
+    finally:
+        if worker.returncode is None:
+            worker.terminate()
+        _ = await worker.wait()
+
+    assert isinstance(result, PdfSuccess)
+    assert isinstance(result.payload, InspectPayload)
+    assert result.payload.value.page_count == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_executor_deadline_does_not_acquire_capacity_or_create_jobs(
+    tmp_path: Path,
+) -> None:
+    clock = _MonotonicClock()
+    store = ContentAddressedStore(tmp_path / "expired-deadline-cache")
+    artifact = store.put_bytes(
+        b"%PDF-1.7\nexpired-deadline-fixture",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    executor = SubprocessPdfExecutor(store=store, monotonic_clock=clock)
+    permit = _ProbePermit()
+    executor._permit = permit  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    command = InspectCommand(
+        request_id=UUID(int=1),
+        operation="inspect",
+        source_relative_path=artifact.relative_path,
+        parameters=InspectParams(),
+    )
+
+    with pytest.raises(PdfWorkerOperationalError, match="deadline"):
+        _ = await executor.execute(
+            command,
+            deadline=MonotonicDeadline.after(0.0, clock=clock),
+        )
+
+    assert permit.acquire_calls == 0
+    assert not (store.root / ".pdf-worker-jobs").exists()
 
 
 class _MonotonicClock:
@@ -109,12 +246,12 @@ class _DelayedTerminationExecutor(SubprocessPdfExecutor):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("seconds", [0.0, -1.0, float("nan"), float("inf")])
+@pytest.mark.parametrize("seconds", [-1.0, float("nan"), float("inf")])
 async def test_pdf_deadline_rejects_every_nonpositive_or_nonfinite_duration(
     seconds: float,
 ) -> None:
-    with pytest.raises(ValueError, match="deadline duration"):
-        _ = MonotonicDeadline.after(seconds)
+    with pytest.raises(ValueError, match="budget_seconds"):
+        _ = _deadline(seconds)
 
 
 def test_pdf_resource_limits_reject_nonpositive_exact_integer_limits() -> None:
@@ -299,7 +436,7 @@ async def test_cancellation_kills_and_reaps_the_worker_process_group(
     )
 
     task: asyncio.Task[PdfResult] = asyncio.create_task(
-        executor.execute(command, deadline=MonotonicDeadline.after(10.0))
+        executor.execute(command, deadline=_deadline(10.0))
     )
     worker_pid, descendant_pid = await _read_process_ids(pid_file, expected=2)
 
@@ -337,7 +474,7 @@ async def test_repeated_cancellation_cannot_interrupt_worker_cleanup(
                 source_relative_path=artifact.relative_path,
                 parameters=InspectParams(),
             ),
-            deadline=MonotonicDeadline.after(10.0),
+            deadline=_deadline(10.0),
         )
     )
     worker_pid, descendant_pid = await _read_process_ids(pid_file, expected=2)
@@ -388,7 +525,7 @@ async def test_worker_job_tree_is_removed_when_termination_reports_failure(
                 source_relative_path=artifact.relative_path,
                 parameters=InspectParams(),
             ),
-            deadline=MonotonicDeadline.after(5.0),
+            deadline=_deadline(5.0),
         )
 
     assert list((store.root / ".pdf-worker-jobs").iterdir()) == []
@@ -422,7 +559,7 @@ async def test_process_start_failure_removes_unstarted_worker_job_tree(
                 source_relative_path=artifact.relative_path,
                 parameters=InspectParams(),
             ),
-            deadline=MonotonicDeadline.after(5.0),
+            deadline=_deadline(5.0),
         )
 
     assert list((store.root / ".pdf-worker-jobs").iterdir()) == []
@@ -458,7 +595,8 @@ async def test_cleanup_has_reserved_capacity_when_storage_workers_are_saturated(
     ]
     try:
         async with asyncio.timeout(2.0):
-            _ = await asyncio.gather(*(event.wait() for event in started))
+            _ = await started[0].wait()
+            _ = await started[1].wait()
 
         with pytest.raises(PdfWorkerOperationalError, match="capacity is exhausted"):
             _ = await executor.execute(
@@ -468,7 +606,7 @@ async def test_cleanup_has_reserved_capacity_when_storage_workers_are_saturated(
                     source_relative_path=artifact.relative_path,
                     parameters=InspectParams(),
                 ),
-                deadline=MonotonicDeadline.after(5.0),
+                deadline=_deadline(5.0),
             )
 
         assert list((store.root / ".pdf-worker-jobs").iterdir()) == []
@@ -503,7 +641,7 @@ async def test_cleanup_recovers_permissions_before_removing_hostile_worker_tree(
                 source_relative_path=artifact.relative_path,
                 parameters=InspectParams(),
             ),
-            deadline=MonotonicDeadline.after(5.0),
+            deadline=_deadline(5.0),
         )
 
     assert list((store.root / ".pdf-worker-jobs").iterdir()) == []
@@ -546,7 +684,7 @@ async def test_cleanup_reports_operational_failure_when_bounded_retry_fails(
                 source_relative_path=artifact.relative_path,
                 parameters=InspectParams(),
             ),
-            deadline=MonotonicDeadline.after(5.0),
+            deadline=_deadline(5.0),
         )
 
     assert attempts == expected_attempts
@@ -580,7 +718,7 @@ async def test_deadline_kills_and_reaps_the_worker_process_group(
     with pytest.raises(PdfWorkerError, match="deadline"):
         _ = await executor.execute(
             command,
-            deadline=MonotonicDeadline.after(0.2),
+            deadline=_deadline(0.2),
         )
 
     worker_pid, descendant_pid = await _read_process_ids(pid_file, expected=2)
@@ -614,7 +752,7 @@ async def test_executor_capacity_wait_uses_the_caller_absolute_deadline(
                 source_relative_path=artifact.relative_path,
                 parameters=InspectParams(),
             ),
-            deadline=MonotonicDeadline.after(10.0),
+            deadline=_deadline(10.0),
         )
     )
     worker_pid, descendant_pid = await _read_process_ids(pid_file, expected=2)
@@ -628,7 +766,7 @@ async def test_executor_capacity_wait_uses_the_caller_absolute_deadline(
                         source_relative_path=artifact.relative_path,
                         parameters=InspectParams(),
                     ),
-                    deadline=MonotonicDeadline.after(0.05),
+                    deadline=_deadline(0.05),
                 )
     finally:
         _ = first.cancel()
@@ -664,7 +802,7 @@ async def test_success_reaps_a_same_group_descendant(
             source_relative_path=artifact.relative_path,
             parameters=InspectParams(),
         ),
-        deadline=MonotonicDeadline.after(5.0),
+        deadline=_deadline(5.0),
     )
     (descendant_pid,) = await _read_process_ids(pid_file, expected=1)
 
@@ -699,7 +837,7 @@ async def test_worker_job_directory_stays_inside_the_writable_cache_mount(
                 source_relative_path=artifact.relative_path,
                 parameters=InspectParams(),
             ),
-            deadline=MonotonicDeadline.after(5.0),
+            deadline=_deadline(5.0),
         )
     finally:
         parent.chmod(original_mode)
@@ -742,7 +880,7 @@ async def test_parent_rejects_malformed_or_unbounded_worker_frames(
     with pytest.raises(PdfWorkerError, match="PDF worker"):
         _ = await executor.execute(
             command,
-            deadline=MonotonicDeadline.after(2.0),
+            deadline=_deadline(2.0),
         )
 
     assert list(store.root.parent.glob(".nplg-pdf-worker-*")) == []
@@ -778,7 +916,7 @@ async def test_repeated_worker_transport_failures_open_the_executor_circuit(
         with pytest.raises(PdfWorkerError, match="transport"):
             _ = await executor.execute(
                 command,
-                deadline=MonotonicDeadline.after(2.0),
+                deadline=_deadline(2.0),
             )
 
     with pytest.raises(PdfWorkerUnavailableError, match="temporarily unavailable"):
@@ -786,7 +924,7 @@ async def test_repeated_worker_transport_failures_open_the_executor_circuit(
     with pytest.raises(PdfWorkerUnavailableError, match="temporarily unavailable"):
         _ = await executor.execute(
             command,
-            deadline=MonotonicDeadline.after(2.0),
+            deadline=_deadline(2.0),
         )
 
 
@@ -816,7 +954,7 @@ async def test_disposable_worker_inspects_a_staged_pdf_without_child_cache_acces
         parameters=InspectParams(),
     )
 
-    result = await executor.execute(command, deadline=MonotonicDeadline.after(15.0))
+    result = await executor.execute(command, deadline=_deadline(15.0))
 
     assert isinstance(result, PdfSuccess)
     assert isinstance(result.payload, InspectPayload)
@@ -854,7 +992,7 @@ async def test_parent_rejects_a_worker_result_bound_to_another_source(
     with pytest.raises(PdfWorkerError, match="source digest mismatch"):
         _ = await executor.execute(
             command,
-            deadline=MonotonicDeadline.after(5.0),
+            deadline=_deadline(5.0),
         )
 
 
@@ -884,7 +1022,7 @@ async def test_parent_rejects_a_nonzero_worker_exit_after_a_valid_frame(
     with pytest.raises(PdfWorkerError, match="exited unsuccessfully"):
         _ = await executor.execute(
             command,
-            deadline=MonotonicDeadline.after(5.0),
+            deadline=_deadline(5.0),
         )
 
 
@@ -907,7 +1045,7 @@ async def test_parent_returns_a_typed_failure_for_invalid_pdf_bytes(
             source_relative_path=artifact.relative_path,
             parameters=InspectParams(),
         ),
-        deadline=MonotonicDeadline.after(5.0),
+        deadline=_deadline(5.0),
     )
 
     assert isinstance(result, PdfFailure)
@@ -954,7 +1092,7 @@ async def test_parent_fails_closed_when_spawned_process_pipes_are_absent(
     with pytest.raises(PdfWorkerError, match="pipes are unavailable"):
         _ = await executor.execute(
             command,
-            deadline=MonotonicDeadline.after(5.0),
+            deadline=_deadline(5.0),
         )
 
     assert process.wait_count == _EXPECTED_TERMINATION_WAITS
@@ -997,7 +1135,7 @@ async def test_parent_rejects_an_input_swapped_between_stat_and_open(
                     source_relative_path=artifact.relative_path,
                     parameters=InspectParams(),
                 ),
-                deadline=MonotonicDeadline.after(5.0),
+                deadline=_deadline(5.0),
             )
 
 
@@ -1035,7 +1173,7 @@ async def test_parent_rejects_input_metadata_drift_during_copy(
                     source_relative_path=artifact.relative_path,
                     parameters=InspectParams(),
                 ),
-                deadline=MonotonicDeadline.after(5.0),
+                deadline=_deadline(5.0),
             )
 
 
@@ -1063,7 +1201,7 @@ async def test_parent_uses_safe_no_follow_fallback_when_flag_is_unavailable(
         patch.delattr(os, "O_NOFOLLOW")
         result = await SubprocessPdfExecutor(store=store).execute(
             command,
-            deadline=MonotonicDeadline.after(15.0),
+            deadline=_deadline(15.0),
         )
 
     assert isinstance(result, PdfSuccess)
@@ -1108,7 +1246,7 @@ async def test_parent_rejects_unsafe_authoritative_render_trees_before_spawn(
     with pytest.raises(PdfWorkerError, match=message):
         _ = await executor.execute(
             command,
-            deadline=MonotonicDeadline.after(5.0),
+            deadline=_deadline(5.0),
         )
 
 
@@ -1145,7 +1283,7 @@ async def test_parent_rejects_cross_wired_worker_envelopes(
     with pytest.raises(PdfWorkerError, match=message):
         _ = await executor.execute(
             command,
-            deadline=MonotonicDeadline.after(5.0),
+            deadline=_deadline(5.0),
         )
 
 
@@ -1202,7 +1340,7 @@ async def test_parent_rejects_malicious_child_output_before_publication(
     with pytest.raises(PdfWorkerError, match=message):
         _ = await executor.execute(
             command,
-            deadline=MonotonicDeadline.after(5.0),
+            deadline=_deadline(5.0),
         )
 
     assert list((store.root / "renders").iterdir()) == []
@@ -1289,7 +1427,7 @@ async def test_parent_rejects_consistent_oversized_images_before_decode(
                 source_relative_path=artifact.relative_path,
                 parameters=RenderPagesParams(pages=pages, mode="native"),
             ),
-            deadline=MonotonicDeadline.after(5.0),
+            deadline=_deadline(5.0),
         )
 
     assert list((store.root / "renders").iterdir()) == []
@@ -1314,7 +1452,7 @@ async def test_parent_caps_tile_grid_before_constructing_expected_tiles(
             source_relative_path=artifact.relative_path,
             parameters=RenderPagesParams(pages=(1,), mode="native"),
         ),
-        deadline=MonotonicDeadline.after(15.0),
+        deadline=_deadline(15.0),
     )
     assert isinstance(render, PdfSuccess)
     assert isinstance(render.payload, RenderPagesPayload)
@@ -1340,7 +1478,7 @@ async def test_parent_caps_tile_grid_before_constructing_expected_tiles(
                     overlap=0,
                 ),
             ),
-            deadline=MonotonicDeadline.after(5.0),
+            deadline=_deadline(5.0),
         )
 
 
@@ -1363,7 +1501,7 @@ async def test_parent_rejects_oversized_staged_tile_source_before_grid_allocatio
             source_relative_path=artifact.relative_path,
             parameters=RenderPagesParams(pages=(1,), mode="native"),
         ),
-        deadline=MonotonicDeadline.after(15.0),
+        deadline=_deadline(15.0),
     )
     assert isinstance(render, PdfSuccess)
     assert isinstance(render.payload, RenderPagesPayload)
@@ -1392,7 +1530,7 @@ async def test_parent_rejects_oversized_staged_tile_source_before_grid_allocatio
                     overlap=0,
                 ),
             ),
-            deadline=MonotonicDeadline.after(5.0),
+            deadline=_deadline(5.0),
         )
 
 
@@ -1438,7 +1576,7 @@ async def test_parent_rehashes_worker_output_during_publication(
                 source_relative_path=artifact.relative_path,
                 parameters=RenderPagesParams(pages=(1,), mode="native"),
             ),
-            deadline=MonotonicDeadline.after(15.0),
+            deadline=_deadline(15.0),
         )
 
     assert mutated is True
@@ -1482,7 +1620,7 @@ async def test_parent_deadline_covers_output_publication(
                 source_relative_path=artifact.relative_path,
                 parameters=RenderPagesParams(pages=(1,), mode="native"),
             ),
-            deadline=MonotonicDeadline.after(0.75),
+            deadline=_deadline(0.75),
         )
 
     assert delayed is True
@@ -1530,7 +1668,7 @@ async def test_pdf_output_publication_does_not_block_the_event_loop(
             source_relative_path=artifact.relative_path,
             parameters=RenderPagesParams(pages=(1,), mode="native"),
         ),
-        deadline=MonotonicDeadline.after(5.0),
+        deadline=_deadline(5.0),
     )
 
     assert isinstance(result, PdfSuccess)
@@ -1572,7 +1710,7 @@ async def test_parent_rejects_malicious_tile_claims_and_allows_empty_directories
             source_relative_path=artifact.relative_path,
             parameters=RenderPagesParams(pages=(1,), mode="native"),
         ),
-        deadline=MonotonicDeadline.after(15.0),
+        deadline=_deadline(15.0),
     )
     assert isinstance(render, PdfSuccess)
     assert isinstance(render.payload, RenderPagesPayload)
@@ -1596,7 +1734,7 @@ async def test_parent_rejects_malicious_tile_claims_and_allows_empty_directories
     if message is None:
         result = await executor.execute(
             command,
-            deadline=MonotonicDeadline.after(5.0),
+            deadline=_deadline(5.0),
         )
         assert isinstance(result, PdfSuccess)
         assert isinstance(result.payload, RenderTilesPayload)
@@ -1607,7 +1745,7 @@ async def test_parent_rejects_malicious_tile_claims_and_allows_empty_directories
         with pytest.raises(PdfWorkerError, match=message):
             _ = await executor.execute(
                 command,
-                deadline=MonotonicDeadline.after(5.0),
+                deadline=_deadline(5.0),
             )
 
 
@@ -1632,7 +1770,7 @@ async def test_parent_validates_and_publishes_render_outputs_manifest_last(
         parameters=RenderPagesParams(pages=(1,), mode="native"),
     )
 
-    result = await executor.execute(command, deadline=MonotonicDeadline.after(15.0))
+    result = await executor.execute(command, deadline=_deadline(15.0))
 
     assert isinstance(result, PdfSuccess)
     assert isinstance(result.payload, RenderPagesPayload)
@@ -1645,13 +1783,13 @@ async def test_parent_validates_and_publishes_render_outputs_manifest_last(
 
     repeated = await executor.execute(
         command,
-        deadline=MonotonicDeadline.after(15.0),
+        deadline=_deadline(15.0),
     )
     assert repeated == result
     _ = page_path.write_bytes(b"tampered-authoritative-page")
     repaired = await executor.execute(
         command,
-        deadline=MonotonicDeadline.after(15.0),
+        deadline=_deadline(15.0),
     )
     assert repaired == result
     assert store.resolve_asset(page.relative_path).read_bytes() != (
@@ -1681,7 +1819,7 @@ async def test_disposable_worker_reads_manifest_and_publishes_validated_tiles(
             source_relative_path=artifact.relative_path,
             parameters=RenderPagesParams(pages=(1,), mode="native"),
         ),
-        deadline=MonotonicDeadline.after(15.0),
+        deadline=_deadline(15.0),
     )
     assert isinstance(render, PdfSuccess)
     assert isinstance(render.payload, RenderPagesPayload)
@@ -1693,7 +1831,7 @@ async def test_disposable_worker_reads_manifest_and_publishes_validated_tiles(
             operation="manifest",
             parameters=ManifestParams(render_id=render_id),
         ),
-        deadline=MonotonicDeadline.after(15.0),
+        deadline=_deadline(15.0),
     )
     tile_command = RenderTilesCommand(
         request_id=UUID("00000000-0000-4000-8000-000000000007"),
@@ -1708,7 +1846,7 @@ async def test_disposable_worker_reads_manifest_and_publishes_validated_tiles(
     )
     tiled = await executor.execute(
         tile_command,
-        deadline=MonotonicDeadline.after(15.0),
+        deadline=_deadline(15.0),
     )
 
     assert isinstance(manifest, PdfSuccess)
@@ -1723,14 +1861,14 @@ async def test_disposable_worker_reads_manifest_and_publishes_validated_tiles(
 
     repeated_tiles = await executor.execute(
         tile_command,
-        deadline=MonotonicDeadline.after(15.0),
+        deadline=_deadline(15.0),
     )
     assert repeated_tiles == tiled
     first_tile_path = store.resolve_asset(tiled.payload.value.tiles[0].relative_path)
     _ = first_tile_path.write_bytes(b"tampered-authoritative-tile")
     repaired_tiles = await executor.execute(
         tile_command,
-        deadline=MonotonicDeadline.after(15.0),
+        deadline=_deadline(15.0),
     )
     assert repaired_tiles == tiled
     assert store.resolve_asset(
@@ -1766,5 +1904,5 @@ async def test_stderr_overflow_is_detected_without_waiting_for_the_deadline(
     with pytest.raises(PdfWorkerError, match="stderr exceeded"):
         _ = await executor.execute(
             command,
-            deadline=MonotonicDeadline.after(0.5),
+            deadline=_deadline(0.5),
         )

@@ -62,6 +62,7 @@ __all__ = (
     "cli",
     "initial_mutation_policy",
     "main",
+    "mutation_policy_for_targets",
     "parse_arguments",
     "parse_mutation_results",
     "run_mutation_gate",
@@ -108,6 +109,31 @@ _INITIAL_TARGETS = (
     "scripts/smoke_live.py",
     "scripts/run_quality_gate.py",
 )
+_TASK_NINE_TARGETS = (
+    "src/nplg_mcp/contracts/base.py",
+    "src/nplg_mcp/contracts/inputs.py",
+    "src/nplg_mcp/contracts/outputs.py",
+    "src/nplg_mcp/contracts/catalog.py",
+    "src/nplg_mcp/tools.py",
+)
+_TASK_TEN_TARGETS = (
+    "src/nplg_mcp/contracts/schema.py",
+    "scripts/export_contracts.py",
+)
+_TASK_ELEVEN_AND_FOURTEEN_TARGETS = (
+    "src/nplg_mcp/mcp_server.py",
+    "src/nplg_mcp/sdk_boundary.py",
+    "src/nplg_mcp/errors.py",
+)
+_TASK_TWELVE_TARGETS = ("src/nplg_mcp/errors.py",)
+_TASK_THIRTEEN_TARGETS = (
+    "src/nplg_mcp/sdk_boundary.py",
+    "src/nplg_mcp/http_security.py",
+    "src/nplg_mcp/json_preflight.py",
+    "src/nplg_mcp/config.py",
+    "src/nplg_mcp/app.py",
+    "src/nplg_mcp/__main__.py",
+)
 _TARGET_MODULES = {
     "src/nplg_mcp/security.py": "nplg_mcp.security",
     "src/nplg_mcp/tokens.py": "nplg_mcp.tokens",
@@ -117,6 +143,20 @@ _TARGET_MODULES = {
     "scripts/delete_render.py": "scripts.delete_render",
     "scripts/smoke_live.py": "scripts.smoke_live",
     "scripts/run_quality_gate.py": "scripts.run_quality_gate",
+    "src/nplg_mcp/contracts/base.py": "nplg_mcp.contracts.base",
+    "src/nplg_mcp/contracts/inputs.py": "nplg_mcp.contracts.inputs",
+    "src/nplg_mcp/contracts/outputs.py": "nplg_mcp.contracts.outputs",
+    "src/nplg_mcp/contracts/catalog.py": "nplg_mcp.contracts.catalog",
+    "src/nplg_mcp/tools.py": "nplg_mcp.tools",
+    "src/nplg_mcp/contracts/schema.py": "nplg_mcp.contracts.schema",
+    "scripts/export_contracts.py": "scripts.export_contracts",
+    "src/nplg_mcp/mcp_server.py": "nplg_mcp.mcp_server",
+    "src/nplg_mcp/sdk_boundary.py": "nplg_mcp.sdk_boundary",
+    "src/nplg_mcp/http_security.py": "nplg_mcp.http_security",
+    "src/nplg_mcp/json_preflight.py": "nplg_mcp.json_preflight",
+    "src/nplg_mcp/config.py": "nplg_mcp.config",
+    "src/nplg_mcp/app.py": "nplg_mcp.app",
+    "src/nplg_mcp/__main__.py": "nplg_mcp.__main__",
 }
 _REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
     "src/nplg_mcp/security.py": (
@@ -191,6 +231,7 @@ _REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
         "x__snapshot_scalar",
         "x__store_snapshot",
         "x_to_public_error",
+        "x_validate_resource_uri",
     ),
     "scripts/delete_render.py": (
         "x__confirm",
@@ -271,6 +312,181 @@ _REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
         "x_verify_exact_version",
         "x_version_probes",
     ),
+    "src/nplg_mcp/contracts/base.py": (
+        "x__own_sequence",
+        "x__validate_safe_integer",
+        "x_reject_unsafe_text",
+    ),
+    "src/nplg_mcp/contracts/inputs.py": ("x__validate_page_selection_length",),
+    "src/nplg_mcp/contracts/outputs.py": (),
+    "src/nplg_mcp/contracts/catalog.py": (
+        "xǁToolCatalogǁ__init__",
+        "xǁToolCatalogǁcall",
+        "xǁ_ContractValidationErrorǁ__init__",
+    ),
+    "src/nplg_mcp/tools.py": (
+        "x__frozen_protocol_input_schema",
+        "x__joined_text",
+        "x__json_integer",
+        "x__json_string",
+        "x__model_json",
+        "x__public_model_schema",
+        "x__system_utc_now",
+        "x__tool_annotations",
+        "x__validated_serialized_pdf_capacity",
+        "xǁRepositoryProtocolǁsearch",
+        "xǁToolServiceǁ__init__",
+        "xǁToolServiceǁ_download_document",
+        "xǁToolServiceǁ_ensure_profile_catalog",
+        "xǁToolServiceǁ_get_metadata",
+        "xǁToolServiceǁ_get_render_manifest",
+        "xǁToolServiceǁ_inspect_pdf",
+        "xǁToolServiceǁ_list_files",
+        "xǁToolServiceǁ_manifest_dict",
+        "xǁToolServiceǁ_render_pages",
+        "xǁToolServiceǁ_render_tiles",
+        "xǁToolServiceǁ_resolve_document",
+        "xǁToolServiceǁ_run_pdf_job",
+        "xǁToolServiceǁ_search",
+        "xǁToolServiceǁ_signed_asset_url",
+        "xǁToolServiceǁcall",
+        "xǁToolServiceǁensure_ready",
+        "xǁToolServiceǁlist_resources",
+        "xǁToolServiceǁlist_tools",
+        "xǁToolServiceǁread_resource",
+    ),
+    "src/nplg_mcp/contracts/schema.py": (
+        "x__child_schemas",
+        "x__contract_model_key",
+        "x__model_schema",
+        "x__rewrite_references",
+        "x__utf8_key",
+        "x__validate_node_identity",
+        "x__validate_node_values",
+        "x__validate_numeric_bounds",
+        "x__validate_pattern",
+        "x__validate_required",
+        "x__validate_schema",
+        "x_aggregate_contract_schema",
+        "x_canonical_json_bytes",
+        "x_contract_models",
+        "x_export_contract_schemas",
+        "x_normalized_schema",
+        "x_schema_manifest",
+    ),
+    "scripts/export_contracts.py": (
+        "x__artifacts",
+        "x__fail",
+        "x__inventory",
+        "x__read_artifact",
+        "x__validated_output_directory",
+        "x__write_artifact",
+        "x_cli",
+        "x_export_contracts",
+        "x_main",
+        "x_parse_arguments",
+    ),
+    "src/nplg_mcp/mcp_server.py": ("x_create_mcp_server",),
+    "src/nplg_mcp/sdk_boundary.py": (
+        "x__adapt_resource",
+        "x__binding_for_tool",
+        "x__serialized_output",
+    ),
+    "src/nplg_mcp/http_security.py": (
+        "x_build_transport_security_settings",
+        "xǁMcpSecurityMiddlewareǁ__call__",
+        "xǁMcpSecurityMiddlewareǁ__init__",
+        "xǁMcpSecurityMiddlewareǁ_admitted_call",
+        "xǁMcpSecurityMiddlewareǁ_authenticated_principal",
+        "xǁMcpSecurityMiddlewareǁ_bounded_body",
+        "xǁMcpSecurityMiddlewareǁ_security_call",
+        "xǁMcpSecurityMiddlewareǁ_send_response",
+        "xǁMcpSecurityMiddlewareǁ_send_with_policy",
+        "xǁMcpSecurityMiddlewareǁshutdown",
+        "xǁMcpSecurityMiddlewareǁstart",
+        "xǁ_JSONResponseǁ__init__",
+    ),
+    "src/nplg_mcp/json_preflight.py": (
+        "x_preflight_json",
+        "xǁJsonPreflightErrorǁ__init__",
+        "xǁ_JsonPreflightParserǁ__init__",
+        "xǁ_JsonPreflightParserǁ_begin_value",
+        "xǁ_JsonPreflightParserǁ_consume_array_separator",
+        "xǁ_JsonPreflightParserǁ_consume_byte",
+        "xǁ_JsonPreflightParserǁ_consume_escape",
+        "xǁ_JsonPreflightParserǁ_consume_exponent",
+        "xǁ_JsonPreflightParserǁ_consume_fraction",
+        "xǁ_JsonPreflightParserǁ_consume_integer",
+        "xǁ_JsonPreflightParserǁ_consume_number",
+        "xǁ_JsonPreflightParserǁ_consume_object_key",
+        "xǁ_JsonPreflightParserǁ_consume_object_separator",
+        "xǁ_JsonPreflightParserǁ_consume_one_or_more_digits",
+        "xǁ_JsonPreflightParserǁ_consume_sign",
+        "xǁ_JsonPreflightParserǁ_consume_string",
+        "xǁ_JsonPreflightParserǁ_consume_unicode_code_unit",
+        "xǁ_JsonPreflightParserǁ_count_token",
+        "xǁ_JsonPreflightParserǁ_finish_container",
+        "xǁ_JsonPreflightParserǁ_finish_scalar",
+        "xǁ_JsonPreflightParserǁ_increment_array_item",
+        "xǁ_JsonPreflightParserǁ_increment_object_member",
+        "xǁ_JsonPreflightParserǁ_is_digit",
+        "xǁ_JsonPreflightParserǁ_is_nonzero_digit",
+        "xǁ_JsonPreflightParserǁ_peek_byte",
+        "xǁ_JsonPreflightParserǁ_push_container",
+        "xǁ_JsonPreflightParserǁ_skip_whitespace",
+        "xǁ_JsonPreflightParserǁvalidate",
+    ),
+    "src/nplg_mcp/config.py": (
+        "x__api_principal_registry",
+        "x__authorization",
+        "x__bool",
+        "x__canonical_host",
+        "x__canonical_origin",
+        "x__deployment_profile",
+        "x__environment",
+        "x__float",
+        "x__int",
+        "x__is_loopback_host",
+        "x__mcp_transport_allowlists",
+        "x__normalize_public_base_url",
+        "x__pdf_executor",
+        "x__pdf_settings",
+        "x__reject_duplicate_json_keys",
+        "x__signing_secret",
+        "x__strict_json_string_list",
+        "x__tile_geometry",
+        "x__validate_anonymous_scope",
+        "x__validate_credential_separation",
+        "x_load_config",
+        "x_validate_deployment_profile",
+        "xǁApiPrincipalCredentialǁapi_key_value",
+        "xǁApiPrincipalCredentialǁbearer_value",
+        "xǁApiPrincipalCredentialǁcredential_value",
+    ),
+    "src/nplg_mcp/app.py": (
+        "x__api_principal",
+        "x__app_error_response",
+        "x__asset_response",
+        "x__ensure_runtime_ready",
+        "x__enter_owned_context",
+        "x__full_runtime_module",
+        "x__has_valid_api_credential",
+        "x__header_values",
+        "x__json_response",
+        "x__metrics_response",
+        "x__origin",
+        "x__request_authority",
+        "x__require_public_host",
+        "x__runtime_services",
+        "x__validate_startup_config",
+        "x_create_app",
+        "xǁ_DisconnectAwareFileResponseǁ__init__",
+        "xǁ_DisconnectAwareFileResponseǁ_wait_for_disconnect",
+    ),
+    "src/nplg_mcp/__main__.py": (
+        "x__http_concurrency_limit",
+        "x_main",
+    ),
 }
 
 
@@ -342,6 +558,8 @@ class MutationPolicy:
     accepted_exit_codes: frozenset[int]
     minimum_killed_percent: int
     required_functions: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    test_paths: tuple[str, ...] = ()
+    deselected_tests: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,8 +591,13 @@ class MutationGateResult:
     output_dir: Path
 
 
-def initial_mutation_policy() -> MutationPolicy:
-    """Return Task 7's exact reviewed pinned-mutmut target inventory."""
+def _mutation_policy(
+    targets: tuple[str, ...],
+    *,
+    test_paths: tuple[str, ...],
+    deselected_tests: tuple[str, ...] = (),
+) -> MutationPolicy:
+    """Build one exact policy from the closed target/function registries."""
     required = tuple(
         (
             target,
@@ -383,15 +606,99 @@ def initial_mutation_policy() -> MutationPolicy:
                 for local_function in _REQUIRED_LOCAL_FUNCTIONS[target]
             ),
         )
-        for target in _INITIAL_TARGETS
+        for target in targets
     )
     return MutationPolicy(
-        targets=_INITIAL_TARGETS,
+        targets=targets,
         killed_exit_codes=frozenset({1}),
         accepted_exit_codes=frozenset({-24, 0, 1, 33}),
         minimum_killed_percent=65,
         required_functions=required,
+        test_paths=test_paths,
+        deselected_tests=deselected_tests,
     )
+
+
+def mutation_policy_for_targets(targets: tuple[str, ...]) -> MutationPolicy:
+    """Return the exact reviewed mutation policy for one approved target tuple."""
+    if type(targets) is not tuple or any(type(target) is not str for target in targets):
+        _fail("mutation request does not match the closed initial policy")
+    if targets == _INITIAL_TARGETS:
+        return _mutation_policy(
+            targets,
+            test_paths=(
+                "tests/security/test_security.py",
+                "tests/security/test_tokens.py",
+                "tests/security/test_downloader.py",
+                "tests/unit/test_storage.py",
+                "tests/property/test_storage_properties.py",
+                "tests/unit/test_errors.py",
+                "tests/unit/test_delete_render.py",
+                "tests/unit/test_smoke_live.py",
+                "tests/unit/test_quality_gate.py",
+            ),
+            deselected_tests=(
+                "tests/unit/test_errors.py::test_detail_mapping_growth_during_copy_fails_closed",
+                "tests/unit/test_errors.py::test_detail_list_growth_during_copy_fails_closed",
+                "tests/unit/test_quality_gate.py::test_git_snapshot_hashes_logical_index_and_refs_without_mutation",
+            ),
+        )
+    if targets == _TASK_NINE_TARGETS:
+        return _mutation_policy(
+            targets,
+            test_paths=(
+                "tests/contracts/test_pydantic_contracts.py",
+                "tests/property/test_contract_properties.py",
+                "tests/unit/test_tools.py",
+                (
+                    "tests/contracts/test_frozen_baseline.py::"
+                    "test_frozen_case_replays_through_parse_and_handle_against_independent_oracle"
+                ),
+            ),
+        )
+    if targets == _TASK_TEN_TARGETS:
+        return _mutation_policy(
+            targets,
+            test_paths=("tests/contracts/test_zod_contracts.py",),
+        )
+    if targets == _TASK_ELEVEN_AND_FOURTEEN_TARGETS:
+        return _mutation_policy(
+            targets,
+            test_paths=(
+                "tests/contracts/test_sdk_client.py",
+                "tests/contracts/test_sdk_boundary.py",
+                "tests/contracts/test_sdk_parity.py",
+                "tests/conformance/test_mcp_http.py",
+                "tests/unit/test_errors.py",
+            ),
+            deselected_tests=(
+                "tests/unit/test_errors.py::test_detail_mapping_growth_during_copy_fails_closed",
+                "tests/unit/test_errors.py::test_detail_list_growth_during_copy_fails_closed",
+            ),
+        )
+    if targets == _TASK_TWELVE_TARGETS:
+        return _mutation_policy(
+            targets,
+            test_paths=("tests/contracts/test_sdk_parity.py",),
+        )
+    if targets == _TASK_THIRTEEN_TARGETS:
+        return _mutation_policy(
+            targets,
+            test_paths=(
+                "tests/conformance/test_mcp_http.py",
+                "tests/contracts/test_sdk_parity.py",
+                "tests/unit/test_app_lifespan.py",
+                "tests/unit/test_json_preflight.py",
+                "tests/property/test_json_preflight_properties.py",
+                "tests/unit/test_config.py",
+            ),
+        )
+    _fail("mutation request does not match the closed initial policy")
+
+
+def initial_mutation_policy() -> MutationPolicy:
+    """Return Task 7's exact reviewed pinned-mutmut target inventory."""
+    return mutation_policy_for_targets(_INITIAL_TARGETS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,8 +712,8 @@ class _TargetMetadata:
 def _validated_target_metadata(payload: bytes) -> _TargetMetadata:
     metadata = _load_meta(payload)
     exit_codes_value = metadata["exit_code_by_key"]
-    if type(exit_codes_value) is not dict or not exit_codes_value:
-        _fail("mutation target has no generated mutant results")
+    if type(exit_codes_value) is not dict:
+        _fail("mutation target results are malformed")
     values = (
         metadata["hash_by_function_name"],
         metadata["durations_by_key"],
@@ -500,11 +807,9 @@ def parse_mutation_results(
     payloads: tuple[tuple[str, bytes], ...],
 ) -> MutationSummary:
     """Parse exact pinned-mutmut per-target results."""
-    policy = initial_mutation_policy()
-    required = dict(policy.required_functions)
     supplied_targets = tuple(target for target, _payload in payloads)
-    if supplied_targets != policy.targets:
-        _fail("mutation evidence targets do not exactly match the policy")
+    policy = mutation_policy_for_targets(supplied_targets)
+    required = dict(policy.required_functions)
     total = 0
     killed = 0
     seen_mutants: set[str] = set()
@@ -583,6 +888,10 @@ def _validate_snapshot_inputs(
 
 def _mutation_configuration(policy: MutationPolicy) -> bytes:
     targets = "\n".join(f"    {target}" for target in policy.targets)
+    deselections = "".join(
+        f"    --deselect\n    {test}\n" for test in policy.deselected_tests
+    )
+    test_selection = "".join(f"    {test}\n" for test in policy.test_paths)
     return (
         "[mutmut]\n"
         "source_paths =\n"
@@ -593,26 +902,13 @@ def _mutation_configuration(policy: MutationPolicy) -> bytes:
         "    --strict-config\n"
         "    -p\n"
         "    no:cacheprovider\n"
-        "    --deselect\n"
-        "    tests/unit/test_errors.py::test_detail_mapping_growth_"
-        "during_copy_fails_closed\n"
-        "    --deselect\n"
-        "    tests/unit/test_errors.py::test_detail_list_growth_"
-        "during_copy_fails_closed\n"
-        "    --deselect\n"
-        "    tests/unit/test_quality_gate.py::test_git_snapshot_hashes_"
-        "logical_index_and_refs_without_mutation\n"
+        f"{deselections}"
         "pytest_add_cli_args_test_selection =\n"
-        "    tests/security/test_security.py\n"
-        "    tests/security/test_tokens.py\n"
-        "    tests/security/test_downloader.py\n"
-        "    tests/unit/test_storage.py\n"
-        "    tests/property/test_storage_properties.py\n"
-        "    tests/unit/test_errors.py\n"
-        "    tests/unit/test_delete_render.py\n"
-        "    tests/unit/test_smoke_live.py\n"
-        "    tests/unit/test_quality_gate.py\n"
+        f"{test_selection}"
         "also_copy =\n"
+        "    contracts\n"
+        "    pyproject.toml\n"
+        "    requirements.in\n"
         "    src/nplg_mcp\n"
         "    scripts\n"
         "    security\n"
@@ -655,6 +951,7 @@ def _closed_environment(output: Path) -> tuple[tuple[str, str], ...]:
                 **{name: path.as_posix() for name, path in directories.items()},
                 "LANG": "C.UTF-8",
                 "LC_ALL": "C.UTF-8",
+                "NPLG_PYTHON_ONLY_CONTRACT_GATE": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONHASHSEED": "0",
             }.items()
@@ -1042,7 +1339,9 @@ def run_mutation_gate(
 ) -> MutationGateResult:
     """Run mutation testing only in an external disposable workspace."""
     del filesystem
-    policy = initial_mutation_policy()
+    if type(request) is not MutationGateRequest:
+        _fail("mutation request does not match the closed initial policy")
+    policy = mutation_policy_for_targets(request.targets)
     release_mode = _release_mode(request, policy)
 
     root = _canonical_worktree(request.worktree)

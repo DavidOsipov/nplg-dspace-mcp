@@ -4,28 +4,47 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import re
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol, cast
 from uuid import uuid4
 
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    ValidationError,
-    ValidationInfo,
-    field_validator,
-)
+from pydantic import Field, StringConstraints, ValidationError
 
 from .config import (
-    HARD_MAX_TILE_DIMENSION,
-    HARD_MAX_TILE_OVERLAP,
     AppConfig,
     validate_deployment_profile,
+)
+from .contracts import (
+    ArtifactInput,
+    DeploymentProfile,
+    DocumentFilesOutput,
+    DocumentMetadataOutput,
+    DownloadDocumentInput,
+    DownloadDocumentOutput,
+    HandleInput,
+    MonotonicDeadline,
+    PdfInspectionOutput,
+    RegisteredTool,
+    RenderIdInput,
+    RenderManifestOutput,
+    RenderPagesInput,
+    RenderPagesOutput,
+    RenderTilesInput,
+    RenderTilesOutput,
+    SearchDocumentsInput,
+    SearchDocumentsOutput,
+    StrictModel,
+    StrictOutput,
+    ToolAnnotations,
+    ToolCatalog,
+    ToolDefinition,
 )
 from .errors import AppError, ErrorCode
 from .json_types import (
@@ -33,120 +52,75 @@ from .json_types import (
     dataclass_to_json,
     load_json_value,
     require_json_object,
-    validation_details,
 )
+from .profiles import tool_names_for_profile
 from .tokens import sign_asset_token
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from pydantic import BaseModel
+
     from .downloader import DownloadResult
     from .parsers import Bitstream, DocumentRecord, SearchPage
     from .pdf_executor import PdfExecutor
-    from .pdf_ipc import PdfCommand, PdfSuccess, RenderPagesOutput
+    from .pdf_ipc import (
+        PdfCommand,
+        PdfSuccess,
+    )
+    from .pdf_ipc import (
+        RenderPagesOutput as PdfRenderPagesOutput,
+    )
     from .storage import ContentAddressedStore
 
 _DOCUMENT_ID_RE = re.compile(r"^doc_[0-9a-f]{64}$")
 _RENDER_ID_RE = re.compile(r"^rnd_[0-9a-f]{32}$")
 _PDF_JOB_TIMEOUT_SECONDS = 35.0
+_MAX_RENDER_RESOURCE_INDEX_BYTES = 4096
+_MAX_RENDER_RESOURCE_SCAN_DIRECTORIES = 4096
+_METADATA_PROFILES = frozenset(
+    {
+        DeploymentProfile.ALPIC_METADATA,
+        DeploymentProfile.PRIVATE_FULL,
+        DeploymentProfile.DISTRIBUTED_FULL,
+    }
+)
+_FULL_PROFILES = frozenset(
+    {
+        DeploymentProfile.PRIVATE_FULL,
+        DeploymentProfile.DISTRIBUTED_FULL,
+    }
+)
+_CACHE_WRITING_TOOLS = frozenset(
+    {
+        "download_document_file",
+        "render_pdf_page_tiles",
+        "render_pdf_pages",
+    }
+)
+_OPEN_WORLD_TOOLS = frozenset(
+    {
+        "download_document_file",
+        "get_document_metadata",
+        "list_document_files",
+        "search_documents",
+    }
+)
 
 
-class StrictInput(BaseModel):
-    """Strict base model for every public tool-input boundary."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-
-class SearchDocumentsInput(StrictInput):
-    """Validated input for repository search."""
-
-    query: str = Field(min_length=1, max_length=500)
-    cursor: str | None = Field(default=None, max_length=128)
-    page_size: int = Field(default=20, ge=1, le=50)
-    scope_handle: str | None = Field(default=None, max_length=128)
-
-    @field_validator("query")
-    @classmethod
-    def non_blank_query(cls, value: str) -> str:
-        """Normalize internal whitespace and reject an empty query."""
-        normalized = " ".join(value.split())
-        if not normalized:
-            msg = "query must contain non-whitespace characters"
-            raise ValueError(msg)
-        return normalized
-
-
-class HandleInput(StrictInput):
-    """Validated canonical-handle input."""
-
-    handle: str = Field(min_length=3, max_length=128)
-
-
-class DownloadDocumentInput(HandleInput):
-    """Validated input for one discovered document bitstream."""
-
-    bitstream_id: str = Field(min_length=1, max_length=128)
-
-
-class ArtifactInput(StrictInput):
-    """Validated content-addressed document identifier."""
-
-    artifact_id: str = Field(pattern=r"^doc_[0-9a-f]{64}$")
-
-
-class RenderPagesInput(ArtifactInput):
-    """Validated page-render request."""
-
-    pages: list[int] = Field(min_length=1, max_length=8)
-    mode: str = Field(default="native", pattern=r"^native$")
-
-
-class RenderTilesInput(StrictInput):
-    """Validated crop-only tile request."""
-
-    render_id: str = Field(pattern=r"^rnd_[0-9a-f]{32}$")
-    page_number: int = Field(ge=1)
-    tile_width: int | None = Field(default=None, ge=256, le=HARD_MAX_TILE_DIMENSION)
-    tile_height: int | None = Field(default=None, ge=256, le=HARD_MAX_TILE_DIMENSION)
-    overlap: int | None = Field(default=None, ge=0, le=HARD_MAX_TILE_OVERLAP)
-
-    @field_validator("overlap")
-    @classmethod
-    def overlap_must_fit_explicit_geometry(
-        cls, value: int | None, info: ValidationInfo[dict[str, object] | None]
-    ) -> int | None:
-        """Reject an overlap that consumes either explicit tile dimension."""
-        if value is None:
-            return value
-        raw_data: object = info.data
-        data = cast("dict[str, object]", raw_data)
-        width = data.get("tile_width")
-        height = data.get("tile_height")
-        if type(width) is int and value >= width:
-            msg = "overlap must be smaller than tile_width"
-            raise ValueError(msg)
-        if type(height) is int and value >= height:
-            msg = "overlap must be smaller than tile_height"
-            raise ValueError(msg)
-        return value
-
-
-class RenderIdInput(StrictInput):
-    """Validated deterministic render identifier."""
-
-    render_id: str = Field(pattern=r"^rnd_[0-9a-f]{32}$")
+def _tool_annotations(name: str) -> ToolAnnotations:
+    """Return the closed reviewed annotations for one known tool name."""
+    return ToolAnnotations(
+        read_only_hint=name not in _CACHE_WRITING_TOOLS,
+        destructive_hint=False,
+        idempotent_hint=name != "download_document_file",
+        open_world_hint=name in _OPEN_WORLD_TOOLS,
+    )
 
 
 def _json_string(value: object, *, context: str) -> str:
     if not isinstance(value, str):
         msg = f"{context} must be a string"
-        raise TypeError(msg)
-    return value
-
-
-def _json_integer(value: object, *, context: str) -> int:
-    if type(value) is not int:
-        msg = f"{context} must be an integer"
         raise TypeError(msg)
     return value
 
@@ -157,6 +131,63 @@ def _model_json(value: BaseModel, *, context: str) -> JsonObject:
         load_json_value(value.model_dump_json()),
         context=context,
     )
+
+
+def _public_model_schema(
+    model: type[StrictModel],
+    *,
+    context: str,
+    mode: Literal["validation", "serialization"],
+) -> JsonObject:
+    """Return one closed public model schema without presentation-only headings."""
+    raw_schema: object = model.model_json_schema(mode=mode)
+    schema = require_json_object(raw_schema, context=context)
+    _ = schema.pop("title", None)
+    _ = schema.pop("description", None)
+    return schema
+
+
+def _frozen_protocol_input_schema(name: str, schema: JsonObject) -> JsonObject:
+    """Project the strict model schema onto the frozen pre-SDK wire contract."""
+    if name != "search_documents":
+        return schema
+
+    properties_value = schema.get("properties")
+    if type(properties_value) is not dict:
+        msg = "search input schema properties are malformed"
+        raise TypeError(msg)
+    properties = properties_value
+
+    query_value = properties.get("query")
+    if type(query_value) is not dict:
+        msg = "search query schema is malformed"
+        raise TypeError(msg)
+    query = query_value
+    if type(query.pop("pattern", None)) is not str:
+        msg = "search query schema lacks the strict text pattern"
+        raise ValueError(msg)
+
+    cursor_value = properties.get("cursor")
+    if type(cursor_value) is not dict:
+        msg = "search cursor schema is malformed"
+        raise TypeError(msg)
+    cursor = cursor_value
+    alternatives_value = cursor.get("anyOf")
+    if (
+        type(alternatives_value) is not list
+        or not alternatives_value
+        or type(alternatives_value[0]) is not dict
+    ):
+        msg = "search cursor alternatives are malformed"
+        raise TypeError(msg)
+    string_alternative = alternatives_value[0]
+    if type(string_alternative.pop("minLength", None)) is not int:
+        msg = "search cursor schema lacks the strict minimum length"
+        raise ValueError(msg)
+    if type(string_alternative.pop("pattern", None)) is not str:
+        msg = "search cursor schema lacks the strict text pattern"
+        raise ValueError(msg)
+    return schema
 
 
 class RepositoryProtocol(Protocol):
@@ -190,20 +221,20 @@ class DownloaderProtocol(Protocol):
         ...
 
 
-Handler = Callable[[BaseModel], Awaitable[JsonObject]]
 UtcClock = Callable[[], datetime]
+MonotonicClock = Callable[[], float]
 
 
 def _system_utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def _validated_serialized_pdf_capacity(executor: object, capacity: object) -> int:
-    if type(executor) is not str or executor != "serialized":
-        msg = "PDF_EXECUTOR must be serialized"
+def _validated_pdf_worker_capacity(executor: object, capacity: object) -> int:
+    if type(executor) is not str or executor not in {"serialized", "unix-worker"}:
+        msg = "PDF_EXECUTOR must be serialized or unix-worker"
         raise ValueError(msg)
     if type(capacity) is not int or capacity != 1:
-        msg = "MAX_CONCURRENT_PDF_JOBS must equal 1 for serialized PDF_EXECUTOR"
+        msg = "MAX_CONCURRENT_PDF_JOBS must equal 1 for PDF_EXECUTOR"
         raise ValueError(msg)
     return capacity
 
@@ -222,6 +253,53 @@ class ToolServiceDependencies:
     store: ContentAddressedStore | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _RegisteredArtifact:
+    """One render-owned immutable binary addressable through an artifact URI."""
+
+    relative_path: str
+    sha256: str
+    size: int
+    media_type: Literal["application/json", "image/jpeg"]
+    render_id: str
+    expires_at: int
+
+
+@dataclass(frozen=True, slots=True)
+class _LoadedArtifactIndex:
+    owners: tuple[_RegisteredArtifact, ...]
+    sha256: str
+
+
+class _ArtifactIndexEntry(StrictModel):
+    """One strict, bounded persisted authorization for a render artifact."""
+
+    version: Literal[1]
+    artifact_id: Annotated[
+        str,
+        StringConstraints(strict=True, pattern=r"^doc_[0-9a-f]{64}$"),
+    ]
+    relative_path: Annotated[
+        str,
+        StringConstraints(strict=True, min_length=1, max_length=1024),
+    ]
+    sha256: Annotated[
+        str,
+        StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$"),
+    ]
+    size: Annotated[int, Field(strict=True, ge=1)]
+    media_type: Literal["application/json", "image/jpeg"]
+    render_id: Annotated[
+        str,
+        StringConstraints(strict=True, pattern=r"^rnd_[0-9a-f]{32}$"),
+    ]
+    expires_at: Annotated[int, Field(strict=True, ge=0)]
+
+
+def _registered_artifact_sort_key(item: _RegisteredArtifact) -> tuple[str, str]:
+    return item.render_id, item.relative_path
+
+
 class ToolService:
     """Validated, stateless orchestration layer exposed through MCP tools."""
 
@@ -231,49 +309,64 @@ class ToolService:
         dependencies: ToolServiceDependencies,
         config: AppConfig,
         utc_now: UtcClock = _system_utc_now,
+        monotonic_clock: MonotonicClock = time.monotonic,
     ) -> None:
         """Bind validated configuration and typed runtime collaborators."""
         super().__init__()
         self.repository = dependencies.repository
         self.config = config
         self._utc_now = utc_now
+        self._monotonic_clock = monotonic_clock
+        self._resource_artifacts: dict[str, tuple[_RegisteredArtifact, ...]] = {}
         profile = validate_deployment_profile(config.deployment_profile)
-        self._profile = profile
+        self._profile = DeploymentProfile(profile)
         if profile == "alpic-metadata":
-            metadata_definitions: dict[
-                str,
-                tuple[str, str, type[StrictInput], Handler],
-            ] = {
-                "get_document_metadata": (
-                    "Read full document metadata",
-                    _joined_text(
-                        "Read rich Dublin Core metadata for an NPLG item, preferring",
-                        "OAI-DIM and falling back to the full XMLUI/Manakin record.",
+            self._catalog = ToolCatalog(
+                (
+                    ToolDefinition[HandleInput, DocumentMetadataOutput](
+                        name="get_document_metadata",
+                        title="Read full document metadata",
+                        description=_joined_text(
+                            "Read rich Dublin Core metadata for an NPLG item,",
+                            "preferring OAI-DIM and falling back to the full",
+                            "XMLUI/Manakin record.",
+                        ),
+                        input_model=HandleInput,
+                        output_model=DocumentMetadataOutput,
+                        handler=self._get_metadata,
+                        annotations=_tool_annotations("get_document_metadata"),
+                        profiles=_METADATA_PROFILES,
                     ),
-                    HandleInput,
-                    self._get_metadata,
-                ),
-                "list_document_files": (
-                    "List document files",
-                    _joined_text(
-                        "List public or restricted bitstreams bound to a canonical",
-                        "NPLG item handle.",
+                    ToolDefinition[HandleInput, DocumentFilesOutput](
+                        name="list_document_files",
+                        title="List document files",
+                        description=_joined_text(
+                            "List public or restricted bitstreams bound to a",
+                            "canonical NPLG item handle.",
+                        ),
+                        input_model=HandleInput,
+                        output_model=DocumentFilesOutput,
+                        handler=self._list_files,
+                        annotations=_tool_annotations("list_document_files"),
+                        profiles=_METADATA_PROFILES,
                     ),
-                    HandleInput,
-                    self._list_files,
-                ),
-                "search_documents": (
-                    "Search NPLG Iverieli",
-                    _joined_text(
-                        "Search the NPLG DSpace repository, optionally within a",
-                        "canonical collection handle, and return an opaque",
-                        "continuation cursor.",
+                    ToolDefinition[SearchDocumentsInput, SearchDocumentsOutput](
+                        name="search_documents",
+                        title="Search NPLG Iverieli",
+                        description=_joined_text(
+                            "Search the NPLG DSpace repository, optionally within",
+                            "a canonical collection handle, and return an opaque",
+                            "continuation cursor.",
+                        ),
+                        input_model=SearchDocumentsInput,
+                        output_model=SearchDocumentsOutput,
+                        handler=self._search,
+                        annotations=_tool_annotations("search_documents"),
+                        profiles=_METADATA_PROFILES,
                     ),
-                    SearchDocumentsInput,
-                    self._search,
-                ),
-            }
-            self._definitions = metadata_definitions
+                )
+            )
+            self._ensure_profile_catalog()
             return
         if profile == "distributed-full":
             msg = "distributed-full is not implemented and must remain disabled"
@@ -284,7 +377,7 @@ class ToolService:
         if downloader is None or pdf is None or store is None:
             msg = "private-full requires downloader, PDF, and store dependencies"
             raise ValueError(msg)
-        max_concurrent_pdf_jobs = _validated_serialized_pdf_capacity(
+        max_concurrent_pdf_jobs = _validated_pdf_worker_capacity(
             config.pdf_executor,
             config.max_concurrent_pdf_jobs,
         )
@@ -292,120 +385,155 @@ class ToolService:
         self.pdf = pdf
         self.store = store
         self._pdf_jobs = asyncio.Semaphore(max_concurrent_pdf_jobs)
-        definitions: dict[str, tuple[str, str, type[StrictInput], Handler]] = {
-            "download_document_file": (
-                "Download a public PDF",
-                _joined_text(
+        definitions: tuple[RegisteredTool, ...] = (
+            ToolDefinition[DownloadDocumentInput, DownloadDocumentOutput](
+                name="download_document_file",
+                title="Download a public PDF",
+                description=_joined_text(
                     "Download a PDF bitstream previously discovered on the",
                     "requested NPLG item page. Arbitrary URLs are not accepted.",
                 ),
-                DownloadDocumentInput,
-                self._download_document,
+                input_model=DownloadDocumentInput,
+                output_model=DownloadDocumentOutput,
+                handler=self._download_document,
+                annotations=_tool_annotations("download_document_file"),
+                profiles=_FULL_PROFILES,
             ),
-            "get_document_metadata": (
-                "Read full document metadata",
-                _joined_text(
+            ToolDefinition[HandleInput, DocumentMetadataOutput](
+                name="get_document_metadata",
+                title="Read full document metadata",
+                description=_joined_text(
                     "Read rich Dublin Core metadata for an NPLG item, preferring",
                     "OAI-DIM and falling back to the full XMLUI/Manakin record.",
                 ),
-                HandleInput,
-                self._get_metadata,
+                input_model=HandleInput,
+                output_model=DocumentMetadataOutput,
+                handler=self._get_metadata,
+                annotations=_tool_annotations("get_document_metadata"),
+                profiles=_METADATA_PROFILES,
             ),
-            "get_render_manifest": (
-                "Read a render manifest",
-                _joined_text(
+            ToolDefinition[RenderIdInput, RenderManifestOutput](
+                name="get_render_manifest",
+                title="Read a render manifest",
+                description=_joined_text(
                     "Read deterministic page-render metadata and signed image",
                     "URLs for an existing render identifier.",
                 ),
-                RenderIdInput,
-                self._get_render_manifest,
+                input_model=RenderIdInput,
+                output_model=RenderManifestOutput,
+                handler=self._get_render_manifest,
+                annotations=_tool_annotations("get_render_manifest"),
+                profiles=_FULL_PROFILES,
             ),
-            "inspect_pdf": (
-                "Inspect a downloaded PDF",
-                _joined_text(
+            ToolDefinition[ArtifactInput, PdfInspectionOutput](
+                name="inspect_pdf",
+                title="Inspect a downloaded PDF",
+                description=_joined_text(
                     "Classify every PDF page and report embedded scan dimensions,",
                     "effective DPI, crop, rotation, and text-overlay characteristics.",
                 ),
-                ArtifactInput,
-                self._inspect_pdf,
+                input_model=ArtifactInput,
+                output_model=PdfInspectionOutput,
+                handler=self._inspect_pdf,
+                annotations=_tool_annotations("inspect_pdf"),
+                profiles=_FULL_PROFILES,
             ),
-            "list_document_files": (
-                "List document files",
-                _joined_text(
+            ToolDefinition[HandleInput, DocumentFilesOutput](
+                name="list_document_files",
+                title="List document files",
+                description=_joined_text(
                     "List public or restricted bitstreams bound to a canonical",
                     "NPLG item handle.",
                 ),
-                HandleInput,
-                self._list_files,
+                input_model=HandleInput,
+                output_model=DocumentFilesOutput,
+                handler=self._list_files,
+                annotations=_tool_annotations("list_document_files"),
+                profiles=_METADATA_PROFILES,
             ),
-            "render_pdf_page_tiles": (
-                "Create crop-only page tiles",
-                _joined_text(
+            ToolDefinition[RenderTilesInput, RenderTilesOutput](
+                name="render_pdf_page_tiles",
+                title="Create crop-only page tiles",
+                description=_joined_text(
                     "Crop a rendered page into overlapping JPEG tiles without",
                     "resizing. Defaults are 2048\N{MULTIPLICATION SIGN}2048 with",
                     "128-pixel overlap.",
                 ),
-                RenderTilesInput,
-                self._render_tiles,
+                input_model=RenderTilesInput,
+                output_model=RenderTilesOutput,
+                handler=self._render_tiles,
+                annotations=_tool_annotations("render_pdf_page_tiles"),
+                profiles=_FULL_PROFILES,
             ),
-            "render_pdf_pages": (
-                "Render PDF pages as JPEG",
-                _joined_text(
+            ToolDefinition[RenderPagesInput, RenderPagesOutput](
+                name="render_pdf_pages",
+                title="Render PDF pages as JPEG",
+                description=_joined_text(
                     "Render selected pages on their native embedded-scan pixel",
                     "grid when determinable; otherwise use an explicitly labelled",
                     "400-DPI fallback.",
                 ),
-                RenderPagesInput,
-                self._render_pages,
+                input_model=RenderPagesInput,
+                output_model=RenderPagesOutput,
+                handler=self._render_pages,
+                annotations=_tool_annotations("render_pdf_pages"),
+                profiles=_FULL_PROFILES,
             ),
-            "search_documents": (
-                "Search NPLG Iverieli",
-                _joined_text(
+            ToolDefinition[SearchDocumentsInput, SearchDocumentsOutput](
+                name="search_documents",
+                title="Search NPLG Iverieli",
+                description=_joined_text(
                     "Search the NPLG DSpace repository, optionally within a",
                     "canonical collection handle, and return an opaque",
                     "continuation cursor.",
                 ),
-                SearchDocumentsInput,
-                self._search,
+                input_model=SearchDocumentsInput,
+                output_model=SearchDocumentsOutput,
+                handler=self._search,
+                annotations=_tool_annotations("search_documents"),
+                profiles=_METADATA_PROFILES,
             ),
-        }
-        self._definitions = definitions
+        )
+        self._catalog = ToolCatalog(definitions)
+        self._ensure_profile_catalog()
+
+    def _ensure_profile_catalog(self) -> None:
+        """Reject accidental profile widening or narrowing during composition."""
+        actual = tuple(definition.name for definition in self._catalog.definitions)
+        expected = tool_names_for_profile(self._profile)
+        if actual != expected:
+            message = "tool catalog does not match the deployment profile"
+            raise ValueError(message)
 
     def list_tools(self) -> list[JsonObject]:
-        """Return the deterministic tool catalog and strict input schemas."""
+        """Return the deterministic catalog with closed input and output schemas."""
         tools: list[JsonObject] = []
-        cache_writing_tools = {
-            "download_document_file",
-            "render_pdf_pages",
-            "render_pdf_page_tiles",
-        }
-        for name in sorted(self._definitions):
-            title, description, model, _ = self._definitions[name]
-            raw_schema: object = model.model_json_schema()
-            schema = require_json_object(raw_schema, context="tool input schema")
-            # Pydantic emits titles that provide no protocol value and make tool
-            # catalogs noisier. Class docstrings likewise describe Python model
-            # internals rather than the tool. Preserve field-level descriptions
-            # and constraints.
-            _ = schema.pop("title", None)
-            _ = schema.pop("description", None)
+        for definition in self._catalog.definitions:
+            input_schema = _frozen_protocol_input_schema(
+                definition.name,
+                _public_model_schema(
+                    definition.input_model,
+                    context="tool input schema",
+                    mode="validation",
+                ),
+            )
+            output_schema = _public_model_schema(
+                definition.output_model,
+                context="tool output schema",
+                mode="serialization",
+            )
             tools.append(
                 {
-                    "name": name,
-                    "title": title,
-                    "description": description,
-                    "inputSchema": schema,
+                    "name": definition.name,
+                    "title": definition.title,
+                    "description": definition.description,
+                    "inputSchema": input_schema,
+                    "outputSchema": output_schema,
                     "annotations": {
-                        "readOnlyHint": name not in cache_writing_tools,
-                        "destructiveHint": False,
-                        "idempotentHint": name != "download_document_file",
-                        "openWorldHint": name
-                        in {
-                            "search_documents",
-                            "get_document_metadata",
-                            "list_document_files",
-                            "download_document_file",
-                        },
+                        "readOnlyHint": definition.annotations.read_only_hint,
+                        "destructiveHint": definition.annotations.destructive_hint,
+                        "idempotentHint": definition.annotations.idempotent_hint,
+                        "openWorldHint": definition.annotations.open_world_hint,
                     },
                 }
             )
@@ -429,25 +557,9 @@ class ToolService:
                 http_status=503,
             ) from exc
 
-    async def call(self, name: str, arguments: JsonObject) -> JsonObject:
-        """Validate arguments and invoke one advertised tool handler."""
-        definition = self._definitions.get(name)
-        if definition is None:
-            raise AppError(
-                ErrorCode.INVALID_INPUT, "The requested tool does not exist."
-            )
-        _, _, model, handler = definition
-        try:
-            parsed = model.model_validate(arguments)
-        except ValidationError as exc:
-            raw_errors: object = exc.errors(include_url=False, include_input=False)
-            details = validation_details(raw_errors)
-            raise AppError(
-                ErrorCode.INVALID_INPUT,
-                "Tool arguments did not match the declared schema.",
-                safe_details={"validation": details},
-            ) from exc
-        return await handler(parsed)
+    async def call(self, name: str, arguments: JsonObject) -> StrictOutput:
+        """Strictly validate arguments and the selected handler's output."""
+        return await self._catalog.call(name, arguments)
 
     def list_resources(self) -> list[JsonObject]:
         """Return deterministic compatibility resource definitions."""
@@ -464,30 +576,340 @@ class ToolService:
             }
         ]
 
+    def _utc_timestamp(self) -> int:
+        now = self._utc_now()
+        if now.tzinfo is None or now.utcoffset() != timedelta(0):
+            msg = "ToolService UTC clock must return a timezone-aware UTC value"
+            raise ValueError(msg)
+        return int(now.timestamp())
+
+    @staticmethod
+    def _resource_index_subtree(render_id: str, artifact_id: str) -> str:
+        return f"renders/{render_id}/resources/{artifact_id}"
+
+    @classmethod
+    def _resource_index_relative_path(
+        cls,
+        render_id: str,
+        artifact_id: str,
+    ) -> str:
+        return f"{cls._resource_index_subtree(render_id, artifact_id)}/index.json"
+
+    @staticmethod
+    def _validate_registered_artifact(entry: _ArtifactIndexEntry) -> None:
+        relative_path = entry.relative_path
+        invalid_path = (
+            not relative_path.startswith(f"renders/{entry.render_id}/")
+            or relative_path.startswith(f"renders/{entry.render_id}/resources/")
+            or (entry.media_type == "image/jpeg" and not relative_path.endswith(".jpg"))
+            or (
+                entry.media_type == "application/json"
+                and not relative_path.endswith("/manifest.json")
+            )
+        )
+        if entry.artifact_id != f"doc_{entry.sha256}" or invalid_path:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact provenance is invalid.",
+                http_status=500,
+            )
+
+    def _prune_resource_index(self, render_id: str, artifact_id: str) -> None:
+        cached = self._resource_artifacts.get(artifact_id, ())
+        retained = tuple(item for item in cached if item.render_id != render_id)
+        if retained:
+            self._resource_artifacts[artifact_id] = retained
+        elif artifact_id in self._resource_artifacts:
+            del self._resource_artifacts[artifact_id]
+        _ = self.store.delete_render_subtree(
+            self._resource_index_subtree(render_id, artifact_id)
+        )
+
+    def _load_render_resource_index(
+        self,
+        render_directory: Path,
+        artifact_id: str,
+    ) -> _LoadedArtifactIndex | None:
+        render_id = render_directory.name
+        if (
+            not _RENDER_ID_RE.fullmatch(render_id)
+            or render_directory.is_symlink()
+            or not render_directory.is_dir()
+        ):
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Render storage is corrupted.",
+                http_status=500,
+            )
+        index_path = render_directory / "resources" / artifact_id / "index.json"
+        try:
+            metadata = index_path.lstat()
+        except FileNotFoundError:
+            return None
+        if (
+            index_path.is_symlink()
+            or not index_path.is_file()
+            or metadata.st_size < 1
+            or metadata.st_size > _MAX_RENDER_RESOURCE_INDEX_BYTES
+        ):
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact index is invalid.",
+                http_status=500,
+            )
+        try:
+            raw_index = index_path.read_bytes()
+            entry = _ArtifactIndexEntry.model_validate_json(
+                raw_index,
+                strict=True,
+            )
+        except FileNotFoundError:
+            return None
+        except (OSError, ValidationError) as exc:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact index is invalid.",
+                http_status=500,
+            ) from exc
+        self._validate_registered_artifact(entry)
+        if entry.artifact_id != artifact_id or entry.render_id != render_id:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact provenance is invalid.",
+                http_status=500,
+            )
+        if entry.expires_at <= self._utc_timestamp():
+            self._prune_resource_index(render_id, artifact_id)
+            return None
+        return _LoadedArtifactIndex(
+            owners=(
+                _RegisteredArtifact(
+                    relative_path=entry.relative_path,
+                    sha256=entry.sha256,
+                    size=entry.size,
+                    media_type=entry.media_type,
+                    render_id=entry.render_id,
+                    expires_at=entry.expires_at,
+                ),
+            ),
+            sha256=hashlib.sha256(raw_index).hexdigest(),
+        )
+
+    def _discover_render_artifact(
+        self,
+        artifact_id: str,
+    ) -> tuple[_RegisteredArtifact, ...] | None:
+        renders_root = self.store.root / "renders"
+        if not renders_root.exists():
+            return None
+        if renders_root.is_symlink() or not renders_root.is_dir():
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Render storage is corrupted.",
+                http_status=500,
+            )
+        discovered: list[_RegisteredArtifact] = []
+        scanned = 0
+        try:
+            render_directories = renders_root.iterdir()
+            for render_directory in render_directories:
+                scanned += 1
+                if scanned > _MAX_RENDER_RESOURCE_SCAN_DIRECTORIES:
+                    raise AppError(
+                        ErrorCode.INTERNAL_ERROR,
+                        "Render resource index exceeds its scan bound.",
+                        http_status=500,
+                    )
+                loaded = self._load_render_resource_index(
+                    render_directory,
+                    artifact_id,
+                )
+                if loaded is None:
+                    continue
+                for candidate in loaded.owners:
+                    if discovered and any(
+                        item.sha256 != candidate.sha256
+                        or item.size != candidate.size
+                        or item.media_type != candidate.media_type
+                        or (
+                            item.render_id == candidate.render_id
+                            and item.relative_path == candidate.relative_path
+                        )
+                        for item in discovered
+                    ):
+                        raise AppError(
+                            ErrorCode.INTERNAL_ERROR,
+                            "Rendered artifact provenance is ambiguous.",
+                            http_status=500,
+                        )
+                    discovered.append(candidate)
+        except OSError as exc:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Render resource index is unavailable.",
+                http_status=500,
+            ) from exc
+        if not discovered:
+            return None
+        registered = tuple(sorted(discovered, key=_registered_artifact_sort_key))
+        self._resource_artifacts[artifact_id] = registered
+        return registered
+
+    def _registered_artifact(
+        self,
+        artifact_id: str,
+    ) -> tuple[_RegisteredArtifact, ...] | None:
+        registered = self._resource_artifacts.get(artifact_id)
+        if registered is None:
+            return self._discover_render_artifact(artifact_id)
+        now = self._utc_timestamp()
+        for item in registered:
+            if item.expires_at <= now:
+                self._prune_resource_index(item.render_id, artifact_id)
+        retained = self._resource_artifacts.get(artifact_id)
+        if not retained:
+            return None
+        return retained
+
+    def _about_resource(self) -> dict[str, str]:
+        payload: JsonObject = {
+            "name": "nplg-dspace-mcp",
+            "read_only": True,
+            "upstream": self.config.nplg_base_url,
+            "visual_analysis": {
+                "ocr_is_not_authoritative": True,
+                "page_images": "native embedded-scan grid when determinable",
+                "fallback": "400 DPI, explicitly labelled",
+                "tiles": {
+                    "width": self.config.tile_width,
+                    "height": self.config.tile_height,
+                    "overlap": self.config.tile_overlap,
+                    "resize": False,
+                },
+            },
+        }
+        return {
+            "uri": "nplg://about",
+            "mime_type": "application/json",
+            "text": json.dumps(
+                payload,
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        }
+
+    def _read_registered_owner_group(
+        self,
+        artifact_id: str,
+        owners: tuple[_RegisteredArtifact, ...],
+    ) -> tuple[Path, bytes, _RegisteredArtifact] | None:
+        selected: tuple[Path, bytes, _RegisteredArtifact] | None = None
+        for candidate in owners:
+            try:
+                candidate_path = self.store.resolve_asset(candidate.relative_path)
+                candidate_content = candidate_path.read_bytes()
+            except (FileNotFoundError, AppError) as exc:
+                if isinstance(exc, AppError) and exc.code is not ErrorCode.NOT_FOUND:
+                    raise
+                self._prune_resource_index(candidate.render_id, artifact_id)
+                return None
+            actual_sha256 = hashlib.sha256(candidate_content).hexdigest()
+            if (
+                actual_sha256 != candidate.sha256
+                or len(candidate_content) != candidate.size
+            ):
+                raise AppError(
+                    ErrorCode.INTERNAL_ERROR,
+                    "Stored artifact integrity verification failed.",
+                    http_status=500,
+                )
+            if selected is None:
+                selected = (candidate_path, candidate_content, candidate)
+        return selected
+
+    def _read_artifact_resource(self, uri: str, artifact_id: str) -> dict[str, str]:
+        registered_owners = self._registered_artifact(artifact_id)
+        path: Path
+        content: bytes
+        if registered_owners is None:
+            path = self._resolve_document(artifact_id)
+            media_type = "application/pdf"
+            expected_sha256 = artifact_id.removeprefix("doc_")
+            render_id = ""
+            expected_size: int | None = None
+            try:
+                content = path.read_bytes()
+            except FileNotFoundError as exc:
+                raise AppError(
+                    ErrorCode.NOT_FOUND,
+                    "The requested MCP resource was not found.",
+                    http_status=404,
+                ) from exc
+        else:
+            selected: tuple[Path, bytes, _RegisteredArtifact] | None = None
+            owners_by_render: dict[str, list[_RegisteredArtifact]] = {}
+            for candidate in registered_owners:
+                owners_by_render.setdefault(candidate.render_id, []).append(candidate)
+            for owner_group in owners_by_render.values():
+                selected = self._read_registered_owner_group(
+                    artifact_id,
+                    tuple(owner_group),
+                )
+                if selected is not None:
+                    break
+            if selected is None:
+                raise AppError(
+                    ErrorCode.NOT_FOUND,
+                    "The requested MCP resource was not found.",
+                    http_status=404,
+                )
+            selected_path, selected_content, selected_owner = selected
+            path = selected_path
+            content = selected_content
+            media_type = selected_owner.media_type
+            expected_sha256 = selected_owner.sha256
+            expected_size = selected_owner.size
+            retained_owners = self._resource_artifacts.get(
+                artifact_id,
+                registered_owners,
+            )
+            owner_render_ids = {owner.render_id for owner in retained_owners}
+            render_id = selected_owner.render_id if len(owner_render_ids) == 1 else ""
+        actual_sha256 = hashlib.sha256(content).hexdigest()
+        if actual_sha256 != expected_sha256 or (
+            expected_size is not None and len(content) != expected_size
+        ):
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Stored artifact integrity verification failed.",
+                http_status=500,
+            )
+        payload = {
+            "artifact_id": artifact_id,
+            "sha256": expected_sha256,
+            "size": len(content),
+            "media_type": media_type,
+            "render_id": render_id,
+            "asset_url": self._signed_asset_url(
+                path.relative_to(self.store.root).as_posix(),
+                media_type,
+            ),
+        }
+        return {
+            "uri": uri,
+            "mime_type": media_type,
+            "text": json.dumps(payload, allow_nan=False, sort_keys=True),
+            "blob": base64.b64encode(content).decode("ascii"),
+            "sha256": expected_sha256,
+            "size": str(len(content)),
+            "render_id": render_id,
+        }
+
     async def read_resource(self, uri: str) -> dict[str, str]:
         """Read one bounded compatibility resource by URI."""
         if uri == "nplg://about":
-            payload: JsonObject = {
-                "name": "nplg-dspace-mcp",
-                "read_only": True,
-                "upstream": self.config.nplg_base_url,
-                "visual_analysis": {
-                    "ocr_is_not_authoritative": True,
-                    "page_images": "native embedded-scan grid when determinable",
-                    "fallback": "400 DPI, explicitly labelled",
-                    "tiles": {
-                        "width": self.config.tile_width,
-                        "height": self.config.tile_height,
-                        "overlap": self.config.tile_overlap,
-                        "resize": False,
-                    },
-                },
-            }
-            return {
-                "uri": uri,
-                "mime_type": "application/json",
-                "text": json.dumps(payload, ensure_ascii=False, sort_keys=True),
-            }
+            return self._about_resource()
 
         if self._profile != "private-full":
             raise AppError(
@@ -499,31 +921,25 @@ class ToolService:
         document_match = re.fullmatch(r"nplg://artifact/(doc_[0-9a-f]{64})", uri)
         if document_match:
             artifact_id = uri.removeprefix("nplg://artifact/")
-            path = self._resolve_document(artifact_id)
-            payload = {
-                "artifact_id": artifact_id,
-                "sha256": artifact_id.removeprefix("doc_"),
-                "asset_url": self._signed_asset_url(
-                    path.relative_to(self.store.root).as_posix(),
-                    "application/pdf",
-                ),
-            }
-            return {
-                "uri": uri,
-                "mime_type": "application/json",
-                "text": json.dumps(payload, sort_keys=True),
-            }
+            return self._read_artifact_resource(uri, artifact_id)
 
         render_match = re.fullmatch(r"nplg://render/(rnd_[0-9a-f]{32})/manifest", uri)
         if render_match:
             render_id = uri.removeprefix("nplg://render/").removesuffix("/manifest")
-            payload = await self._get_render_manifest(
-                RenderIdInput(render_id=render_id)
+            result = await self._get_render_manifest(RenderIdInput(render_id=render_id))
+            payload = cast(
+                "JsonObject",
+                result.model_dump(mode="json", by_alias=True),
             )
             return {
                 "uri": uri,
                 "mime_type": "application/json",
-                "text": json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                "text": json.dumps(
+                    payload,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
             }
         raise AppError(
             ErrorCode.NOT_FOUND,
@@ -532,10 +948,7 @@ class ToolService:
         )
 
     def _signed_asset_url(self, relative_path: str, media_type: str) -> str:
-        now = self._utc_now()
-        if now.tzinfo is None or now.utcoffset() != timedelta(0):
-            msg = "ToolService UTC clock must return a timezone-aware UTC value"
-            raise ValueError(msg)
+        now = datetime.fromtimestamp(self._utc_timestamp(), tz=UTC)
         token = sign_asset_token(
             self.config.asset_signing_secret,
             path=relative_path,
@@ -551,7 +964,7 @@ class ToolService:
             )
         return self.store.resolve_asset(f"documents/{artifact_id}/source.pdf")
 
-    def _manifest_dict(self, manifest: RenderPagesOutput) -> JsonObject:
+    def _manifest_dict(self, manifest: PdfRenderPagesOutput) -> JsonObject:
         payload = _model_json(manifest, context="render manifest")
         pages_value = payload.get("pages")
         if not isinstance(pages_value, list):
@@ -564,11 +977,15 @@ class ToolService:
                 _json_string(page.get("media_type"), context="media_type"),
             )
             render_id = _json_string(payload.get("render_id"), context="render_id")
-            page_number = _json_integer(
-                page.get("page_number"),
-                context="page_number",
+            artifact_id = self._register_render_artifact(
+                relative_path=_json_string(
+                    page.get("relative_path"), context="relative_path"
+                ),
+                sha256=_json_string(page.get("sha256"), context="sha256"),
+                media_type=_json_string(page.get("media_type"), context="media_type"),
+                render_id=render_id,
             )
-            page["resource_uri"] = f"nplg://render/{render_id}/page/{page_number}"
+            page["resource_uri"] = f"nplg://artifact/{artifact_id}"
         payload["manifest_asset_url"] = self._signed_asset_url(
             _json_string(
                 payload.get("manifest_relative_path"),
@@ -580,33 +997,327 @@ class ToolService:
         payload["resource_uri"] = f"nplg://render/{render_id}/manifest"
         return payload
 
-    async def _search(self, parsed: BaseModel) -> JsonObject:
-        values = SearchDocumentsInput.model_validate(parsed)
+    def _render_artifact_content_identity(
+        self,
+        *,
+        relative_path: str,
+        sha256: str | None,
+        media_type: str,
+        render_id: str,
+    ) -> tuple[str, int, Literal["application/json", "image/jpeg"]]:
+        if media_type not in {"application/json", "image/jpeg"}:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact media type is invalid.",
+                http_status=500,
+            )
+        if not _RENDER_ID_RE.fullmatch(render_id) or not relative_path.startswith(
+            f"renders/{render_id}/"
+        ):
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact provenance is invalid.",
+                http_status=500,
+            )
+        path = self.store.resolve_asset(relative_path)
+        size = path.stat().st_size
+        if size < 1 or size > self.config.cache_max_bytes:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact size is invalid.",
+                http_status=500,
+            )
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+        except OSError as exc:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact integrity verification failed.",
+                http_status=500,
+            ) from exc
+        actual_sha256 = digest.hexdigest()
+        if sha256 is not None and actual_sha256 != sha256:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact integrity verification failed.",
+                http_status=500,
+            )
+        return (
+            actual_sha256,
+            size,
+            cast("Literal['application/json', 'image/jpeg']", media_type),
+        )
+
+    def _persist_render_resource_index(
+        self,
+        artifact_id: str,
+        owner: _RegisteredArtifact,
+    ) -> None:
+        payload = self._render_resource_index_payload(artifact_id, owner)
+        index_relative_path = self._resource_index_relative_path(
+            owner.render_id,
+            artifact_id,
+        )
+        written_path, _ = self.store.put_render_bytes(index_relative_path, payload)
+        if written_path != index_relative_path:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact index path mismatch.",
+                http_status=500,
+            )
+
+    def _render_resource_index_payload(
+        self,
+        artifact_id: str,
+        owner: _RegisteredArtifact,
+    ) -> bytes:
+        entry = _ArtifactIndexEntry(
+            version=1,
+            artifact_id=artifact_id,
+            relative_path=owner.relative_path,
+            sha256=owner.sha256,
+            size=owner.size,
+            media_type=owner.media_type,
+            render_id=owner.render_id,
+            expires_at=owner.expires_at,
+        )
+        payload = json.dumps(
+            _model_json(entry, context="render artifact index"),
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(payload) > _MAX_RENDER_RESOURCE_INDEX_BYTES:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact index is invalid.",
+                http_status=500,
+            )
+        return payload
+
+    def _replace_render_resource_index(
+        self,
+        artifact_id: str,
+        owner: _RegisteredArtifact,
+        *,
+        expected_index_sha256: str,
+    ) -> None:
+        payload = self._render_resource_index_payload(artifact_id, owner)
+        index_relative_path = self._resource_index_relative_path(
+            owner.render_id,
+            artifact_id,
+        )
+        written_path, _ = self.store.replace_render_bytes_if_matches(
+            index_relative_path,
+            payload,
+            expected_sha256=expected_index_sha256,
+        )
+        if written_path != index_relative_path:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact index path mismatch.",
+                http_status=500,
+            )
+
+    def _validated_representative_candidate(
+        self,
+        owner: _RegisteredArtifact,
+    ) -> Path | None:
+        candidate = self.store.root / owner.relative_path
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            return None
+        if candidate.is_symlink() or not candidate.is_file():
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact provenance is invalid.",
+                http_status=500,
+            )
+        if metadata.st_size < 1:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Stored artifact integrity verification failed.",
+                http_status=500,
+            )
+        return candidate
+
+    def _representative_is_missing(self, owner: _RegisteredArtifact) -> bool:
+        candidate = self._validated_representative_candidate(owner)
+        if candidate is None:
+            return True
+        try:
+            path = self.store.resolve_asset(owner.relative_path)
+        except AppError as exc:
+            if exc.code is not ErrorCode.NOT_FOUND:
+                raise
+            refreshed = self._validated_representative_candidate(owner)
+            if refreshed is None:
+                return True
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Render resource index is unavailable.",
+                http_status=500,
+            ) from exc
+        try:
+            content = path.read_bytes()
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Stored artifact integrity verification failed.",
+                http_status=500,
+            ) from exc
+        if (
+            len(content) != owner.size
+            or hashlib.sha256(content).hexdigest() != owner.sha256
+        ):
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Stored artifact integrity verification failed.",
+                http_status=500,
+            )
+        return False
+
+    def _register_render_artifact(
+        self,
+        *,
+        relative_path: str,
+        sha256: str | None,
+        media_type: str,
+        render_id: str,
+    ) -> str:
+        """Register one validated render binary under its content-derived URI."""
+        actual_sha256, size, strict_media_type = self._render_artifact_content_identity(
+            relative_path=relative_path,
+            sha256=sha256,
+            media_type=media_type,
+            render_id=render_id,
+        )
+        artifact_id = f"doc_{actual_sha256}"
+        existing_owners = self._registered_artifact(artifact_id)
+        matching_owner = (
+            self._matching_render_owner(
+                existing_owners,
+                content_identity=(actual_sha256, size, media_type),
+                render_id=render_id,
+            )
+            if existing_owners is not None
+            else None
+        )
+        if matching_owner is not None and existing_owners is not None:
+            render_directory = self.store.root / "renders" / render_id
+            loaded = self._load_render_resource_index(render_directory, artifact_id)
+            if loaded is None or loaded.owners != (matching_owner,):
+                raise AppError(
+                    ErrorCode.INTERNAL_ERROR,
+                    "Rendered artifact index is invalid.",
+                    http_status=500,
+                )
+            if not self._representative_is_missing(matching_owner):
+                return artifact_id
+            replacement = _RegisteredArtifact(
+                relative_path=relative_path,
+                sha256=actual_sha256,
+                size=size,
+                media_type=strict_media_type,
+                render_id=render_id,
+                expires_at=matching_owner.expires_at,
+            )
+            self._replace_render_resource_index(
+                artifact_id,
+                replacement,
+                expected_index_sha256=loaded.sha256,
+            )
+            self._resource_artifacts[artifact_id] = tuple(
+                replacement if item.render_id == render_id else item
+                for item in existing_owners
+            )
+            return artifact_id
+        registered = _RegisteredArtifact(
+            relative_path=relative_path,
+            sha256=actual_sha256,
+            size=size,
+            media_type=strict_media_type,
+            render_id=render_id,
+            expires_at=self._utc_timestamp() + self.config.asset_ttl_seconds,
+        )
+        owners = (*existing_owners, registered) if existing_owners else (registered,)
+        self._persist_render_resource_index(
+            artifact_id,
+            registered,
+        )
+        self._resource_artifacts[artifact_id] = tuple(
+            sorted(owners, key=_registered_artifact_sort_key)
+        )
+        return artifact_id
+
+    @staticmethod
+    def _matching_render_owner(
+        owners: tuple[_RegisteredArtifact, ...],
+        *,
+        content_identity: tuple[str, int, str],
+        render_id: str,
+    ) -> _RegisteredArtifact | None:
+        sha256, size, media_type = content_identity
+        if any(
+            item.sha256 != sha256 or item.size != size or item.media_type != media_type
+            for item in owners
+        ):
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact provenance is ambiguous.",
+                http_status=500,
+            )
+        return next((item for item in owners if item.render_id == render_id), None)
+
+    async def _search(
+        self,
+        values: SearchDocumentsInput,
+    ) -> SearchDocumentsOutput:
         page = await self.repository.search(
             values.query,
             cursor=values.cursor,
             page_size=values.page_size,
             scope_handle=values.scope_handle,
         )
-        return dataclass_to_json(page, context="search page")
-
-    async def _get_metadata(self, parsed: BaseModel) -> JsonObject:
-        values = HandleInput.model_validate(parsed)
-        return dataclass_to_json(
-            await self.repository.get_metadata(values.handle),
-            context="document metadata",
+        return SearchDocumentsOutput.model_validate(
+            dataclass_to_json(page, context="search page"),
+            strict=True,
         )
 
-    async def _list_files(self, parsed: BaseModel) -> JsonObject:
-        values = HandleInput.model_validate(parsed)
-        files = await self.repository.list_files(values.handle)
-        return {
-            "handle": values.handle,
-            "files": [dataclass_to_json(item, context="bitstream") for item in files],
-        }
+    async def _get_metadata(
+        self,
+        values: HandleInput,
+    ) -> DocumentMetadataOutput:
+        return DocumentMetadataOutput.model_validate(
+            dataclass_to_json(
+                await self.repository.get_metadata(values.handle),
+                context="document metadata",
+            ),
+            strict=True,
+        )
 
-    async def _download_document(self, parsed: BaseModel) -> JsonObject:
-        values = DownloadDocumentInput.model_validate(parsed)
+    async def _list_files(self, values: HandleInput) -> DocumentFilesOutput:
+        files = await self.repository.list_files(values.handle)
+        file_values: list[JsonObject] = [
+            dataclass_to_json(item, context="bitstream") for item in files
+        ]
+        payload: dict[str, object] = {
+            "handle": values.handle,
+            "files": file_values,
+        }
+        return DocumentFilesOutput.model_validate(payload, strict=True)
+
+    async def _download_document(
+        self,
+        values: DownloadDocumentInput,
+    ) -> DownloadDocumentOutput:
         files = await self.repository.list_files(values.handle)
         bitstream = next(
             (item for item in files if item.bitstream_id == values.bitstream_id), None
@@ -619,37 +1330,48 @@ class ToolService:
             )
         result = await self.downloader.download(bitstream)
         artifact = result.artifact
-        return {
+        payload: dict[str, object] = {
             "artifact_id": artifact.object_id,
             "sha256": artifact.sha256,
             "size": artifact.size,
             "media_type": artifact.media_type,
             "relative_path": artifact.relative_path,
             "asset_url": self._signed_asset_url(
-                artifact.relative_path, artifact.media_type
+                artifact.relative_path,
+                artifact.media_type,
             ),
             "resource_uri": f"nplg://artifact/{artifact.object_id}",
             "source_bitstream_id": result.source_bitstream_id,
             "source_url": result.source_url,
             "bytes_downloaded": result.bytes_downloaded,
         }
+        return DownloadDocumentOutput.model_validate(payload, strict=True)
 
     async def _run_pdf_job(
         self,
         command: PdfCommand,
     ) -> PdfSuccess:
         from .pdf_executor import (  # noqa: PLC0415
-            MonotonicDeadline,
             PdfWorkerError,
             PdfWorkerUnavailableError,
         )
         from .pdf_ipc import PdfFailure  # noqa: PLC0415
 
-        deadline = MonotonicDeadline.after(_PDF_JOB_TIMEOUT_SECONDS)
+        deadline = MonotonicDeadline.after(
+            _PDF_JOB_TIMEOUT_SECONDS,
+            clock=self._monotonic_clock,
+        )
         acquired = False
         try:
             try:
-                async with asyncio.timeout(deadline.remaining()):
+                remaining = deadline.remaining(now=self._monotonic_clock())
+                if remaining <= 0.0:
+                    raise AppError(
+                        ErrorCode.PDF_PROCESSING_FAILED,
+                        "The PDF worker is temporarily unavailable.",
+                        http_status=503,
+                    )
+                async with asyncio.timeout(remaining):
                     _ = await self._pdf_jobs.acquire()
             except TimeoutError as exc:
                 raise AppError(
@@ -685,7 +1407,10 @@ class ToolService:
     def _document_relative_path(artifact_id: str) -> str:
         return f"documents/{artifact_id}/source.pdf"
 
-    async def _inspect_pdf(self, parsed: BaseModel) -> JsonObject:
+    async def _inspect_pdf(
+        self,
+        values: ArtifactInput,
+    ) -> PdfInspectionOutput:
         from .pdf_executor import PdfWorkerError  # noqa: PLC0415
         from .pdf_ipc import (  # noqa: PLC0415
             InspectCommand,
@@ -693,7 +1418,6 @@ class ToolService:
             InspectPayload,
         )
 
-        values = ArtifactInput.model_validate(parsed)
         _ = self._resolve_document(values.artifact_id)
         result = await self._run_pdf_job(
             InspectCommand(
@@ -709,9 +1433,12 @@ class ToolService:
         payload = _model_json(result.payload.value, context="PDF inspection")
         payload["artifact_id"] = values.artifact_id
         payload["resource_uri"] = f"nplg://artifact/{values.artifact_id}"
-        return payload
+        return PdfInspectionOutput.model_validate(payload, strict=True)
 
-    async def _render_pages(self, parsed: BaseModel) -> JsonObject:
+    async def _render_pages(
+        self,
+        values: RenderPagesInput,
+    ) -> RenderPagesOutput:
         from .pdf_executor import PdfWorkerError  # noqa: PLC0415
         from .pdf_ipc import (  # noqa: PLC0415
             RenderPagesCommand,
@@ -719,7 +1446,6 @@ class ToolService:
             RenderPagesPayload,
         )
 
-        values = RenderPagesInput.model_validate(parsed)
         _ = self._resolve_document(values.artifact_id)
         result = await self._run_pdf_job(
             RenderPagesCommand(
@@ -737,9 +1463,12 @@ class ToolService:
             raise PdfWorkerError(message)
         payload = self._manifest_dict(result.payload.value)
         payload["artifact_id"] = values.artifact_id
-        return payload
+        return RenderPagesOutput.model_validate(payload, strict=True)
 
-    async def _render_tiles(self, parsed: BaseModel) -> JsonObject:
+    async def _render_tiles(
+        self,
+        values: RenderTilesInput,
+    ) -> RenderTilesOutput:
         from .pdf_executor import PdfWorkerError  # noqa: PLC0415
         from .pdf_ipc import (  # noqa: PLC0415
             RenderTilesCommand,
@@ -747,7 +1476,15 @@ class ToolService:
             RenderTilesPayload,
         )
 
-        values = RenderTilesInput.model_validate(parsed)
+        if values.overlap is not None and (
+            (values.tile_width is not None and values.overlap >= values.tile_width)
+            or (values.tile_height is not None and values.overlap >= values.tile_height)
+        ):
+            raise AppError(
+                ErrorCode.INVALID_INPUT,
+                "Tool arguments did not match the declared schema.",
+            )
+
         result = await self._run_pdf_job(
             RenderTilesCommand(
                 request_id=uuid4(),
@@ -775,9 +1512,15 @@ class ToolService:
                 _json_string(tile.get("relative_path"), context="relative_path"),
                 _json_string(tile.get("media_type"), context="media_type"),
             )
-            tile_id = _json_string(tile.get("tile_id"), context="tile_id")
-            page_uri = f"nplg://render/{values.render_id}/page/{values.page_number}"
-            tile["resource_uri"] = f"{page_uri}/tile/{tile_id}"
+            artifact_id = self._register_render_artifact(
+                relative_path=_json_string(
+                    tile.get("relative_path"), context="relative_path"
+                ),
+                sha256=_json_string(tile.get("sha256"), context="sha256"),
+                media_type=_json_string(tile.get("media_type"), context="media_type"),
+                render_id=values.render_id,
+            )
+            tile["resource_uri"] = f"nplg://artifact/{artifact_id}"
         payload["manifest_asset_url"] = self._signed_asset_url(
             _json_string(
                 payload.get("manifest_relative_path"),
@@ -785,17 +1528,22 @@ class ToolService:
             ),
             "application/json",
         )
-        geometry_key = (
-            f"w{_json_integer(payload.get('tile_width'), context='tile_width'):04d}"
-            f"-h{_json_integer(payload.get('tile_height'), context='tile_height'):04d}"
-            f"-o{_json_integer(payload.get('overlap'), context='overlap'):03d}"
+        manifest_artifact_id = self._register_render_artifact(
+            relative_path=_json_string(
+                payload.get("manifest_relative_path"),
+                context="manifest_relative_path",
+            ),
+            sha256=None,
+            media_type="application/json",
+            render_id=values.render_id,
         )
-        payload["resource_uri"] = (
-            f"nplg://render/{values.render_id}/page/{values.page_number}/tiles/{geometry_key}"
-        )
-        return payload
+        payload["resource_uri"] = f"nplg://artifact/{manifest_artifact_id}"
+        return RenderTilesOutput.model_validate(payload, strict=True)
 
-    async def _get_render_manifest(self, parsed: BaseModel) -> JsonObject:
+    async def _get_render_manifest(
+        self,
+        values: RenderIdInput,
+    ) -> RenderManifestOutput:
         from .pdf_executor import PdfWorkerError  # noqa: PLC0415
         from .pdf_ipc import (  # noqa: PLC0415
             ManifestCommand,
@@ -803,7 +1551,6 @@ class ToolService:
             ManifestPayload,
         )
 
-        values = RenderIdInput.model_validate(parsed)
         result = await self._run_pdf_job(
             ManifestCommand(
                 request_id=uuid4(),
@@ -814,4 +1561,7 @@ class ToolService:
         if not isinstance(result.payload, ManifestPayload):
             message = "PDF worker returned an unexpected manifest payload"
             raise PdfWorkerError(message)
-        return self._manifest_dict(result.payload.value)
+        return RenderManifestOutput.model_validate(
+            self._manifest_dict(result.payload.value),
+            strict=True,
+        )

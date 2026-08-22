@@ -24,7 +24,7 @@ No OCR is performed. The companion skill tells agents to verify Georgian text vi
 ## MCP tools
 
 | Tool | Purpose |
-|---|---|
+| --- | --- |
 | `search_documents` | Search Iverieli, optionally within a collection handle. |
 | `get_document_metadata` | Read rich metadata for a canonical handle. |
 | `list_document_files` | List public and restricted bitstreams attached to an item. |

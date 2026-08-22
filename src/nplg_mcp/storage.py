@@ -24,6 +24,7 @@ _ALLOWED_NAMESPACES = {"documents": "doc", "renders": "rnd"}
 _DEFAULT_MAX_BYTES = 20 * 1024 * 1024 * 1024
 _RENDER_ID_LENGTH = 36
 _MIN_RENDER_SUBTREE_PARTS = 2
+_SHA256_HEX_LENGTH = 64
 
 
 def _sha256_path(path: Path) -> str:
@@ -136,11 +137,19 @@ class _StagedRenderCommit:
 
 
 @dataclass(frozen=True, slots=True)
+class _StagedRenderReplacement:
+    relative_path: str
+    expected_sha256: str
+    snapshot: _StagedSnapshot
+
+
+@dataclass(frozen=True, slots=True)
 class _StagedOperations:
     reserve: Callable[[Path, int], None]
     release: Callable[[Path, int], None]
     commit_file: Callable[[Path, _StagedFileCommit], StoredArtifact]
     commit_render: Callable[[Path, _StagedRenderCommit], tuple[str, str]]
+    replace_render: Callable[[Path, _StagedRenderReplacement], tuple[str, str]]
     discard: Callable[[Path], None]
 
 
@@ -257,6 +266,15 @@ class _StagedWriter:
             self._stream.close()
             self._stream = None
 
+    def prepare_for_scan(self) -> tuple[Path, str]:
+        """Return a stable staged pathname and digest before trusted publication.
+
+        The follow-up ``commit`` repeats the snapshot check, so a scanner cannot
+        turn a clean verdict for one byte sequence into publication of another.
+        """
+        snapshot = self._snapshot()
+        return self._path, snapshot.sha256
+
     def commit_render(self, relative_path: str) -> tuple[str, str]:
         if self._stream is None:
             msg = "staged writer is not open"
@@ -267,6 +285,29 @@ class _StagedWriter:
                 self._path,
                 _StagedRenderCommit(
                     relative_path=relative_path,
+                    snapshot=snapshot,
+                ),
+            )
+        finally:
+            self._stream.close()
+            self._stream = None
+
+    def replace_render(
+        self,
+        relative_path: str,
+        *,
+        expected_sha256: str,
+    ) -> tuple[str, str]:
+        if self._stream is None:
+            msg = "staged writer is not open"
+            raise RuntimeError(msg)
+        snapshot = self._snapshot()
+        try:
+            return self._operations.replace_render(
+                self._path,
+                _StagedRenderReplacement(
+                    relative_path=relative_path,
+                    expected_sha256=expected_sha256,
                     snapshot=snapshot,
                 ),
             )
@@ -648,6 +689,7 @@ class ContentAddressedStore:
                     release=self._release_staging_bytes,
                     commit_file=self._commit_staged_file,
                     commit_render=self._commit_staged_render,
+                    replace_render=self._replace_staged_render,
                     discard=self._discard_staged_file,
                 ),
                 path,
@@ -811,15 +853,7 @@ class ContentAddressedStore:
             absolute_path=destination,
         )
 
-    def _commit_staged_render(
-        self,
-        staged: Path,
-        request: _StagedRenderCommit,
-    ) -> tuple[str, str]:
-        relative_path = request.relative_path
-        snapshot = request.snapshot
-        sha256 = snapshot.sha256
-        size = snapshot.size
+    def _validated_render_destination(self, relative_path: str) -> tuple[Path, Path]:
         pure = PurePosixPath(relative_path)
         if (
             pure.is_absolute()
@@ -846,6 +880,18 @@ class ContentAddressedStore:
                 "Render storage is corrupted.",
                 http_status=500,
             )
+        return destination, parent
+
+    def _commit_staged_render(
+        self,
+        staged: Path,
+        request: _StagedRenderCommit,
+    ) -> tuple[str, str]:
+        relative_path = request.relative_path
+        snapshot = request.snapshot
+        sha256 = snapshot.sha256
+        size = snapshot.size
+        destination, parent = self._validated_render_destination(relative_path)
         with self._lock:
             parent.mkdir(parents=True, exist_ok=True)
             self._validate_staged_identity(
@@ -900,11 +946,93 @@ class ContentAddressedStore:
         _fsync_directory(self.staging_dir)
         return relative_path, sha256
 
+    def _replace_staged_render(
+        self,
+        staged: Path,
+        request: _StagedRenderReplacement,
+    ) -> tuple[str, str]:
+        relative_path = request.relative_path
+        expected_sha256 = request.expected_sha256
+        if len(expected_sha256) != _SHA256_HEX_LENGTH or any(
+            character not in "0123456789abcdef" for character in expected_sha256
+        ):
+            raise AppError(
+                ErrorCode.INVALID_INPUT,
+                "Expected render digest is invalid.",
+            )
+        snapshot = request.snapshot
+        sha256 = snapshot.sha256
+        size = snapshot.size
+        destination, parent = self._validated_render_destination(relative_path)
+        with self._lock:
+            self._validate_staged_identity(staged, snapshot)
+            reserved = self._staging_reservations.get(staged)
+            if reserved is None:
+                raise AppError(
+                    ErrorCode.INVALID_INPUT,
+                    "Staged artifact is not managed by this store.",
+                )
+            if size != reserved:
+                raise AppError(
+                    ErrorCode.INTERNAL_ERROR,
+                    "Staged render accounting is inconsistent.",
+                    http_status=500,
+                )
+            if (
+                not destination.is_file()
+                or destination.is_symlink()
+                or _sha256_path(destination) != expected_sha256
+            ):
+                raise AppError(
+                    ErrorCode.INTERNAL_ERROR,
+                    "Render replacement precondition failed.",
+                    http_status=500,
+                )
+            replaced_size = destination.stat().st_size
+            self._validate_staged_identity(staged, snapshot)
+            _ = staged.replace(destination)
+            published = destination.lstat()
+            if (
+                published.st_dev != snapshot.device
+                or published.st_ino != snapshot.inode
+                or published.st_size != size
+                or published.st_mtime_ns != snapshot.mtime_ns
+            ):
+                try:
+                    destination.unlink(missing_ok=True)
+                finally:
+                    self._used_bytes = self._scan_existing_bytes()
+                raise AppError(
+                    ErrorCode.INVALID_INPUT,
+                    "Staged artifact identity changed during commit.",
+                )
+            del self._staging_reservations[staged]
+            self._reserved_bytes -= reserved
+            self._used_bytes += size - replaced_size
+        _fsync_directory(parent)
+        _fsync_directory(self.staging_dir)
+        return relative_path, sha256
+
     def put_render_bytes(self, relative_path: str, data: bytes) -> tuple[str, str]:
         """Publish a deterministic render asset and return its path and digest."""
         with self.stage(suffix=Path(relative_path).suffix) as stream:
             _ = stream.write(data)
             return stream.commit_render(relative_path)
+
+    def replace_render_bytes_if_matches(
+        self,
+        relative_path: str,
+        data: bytes,
+        *,
+        expected_sha256: str,
+    ) -> tuple[str, str]:
+        """Atomically replace one render file when its digest is unchanged."""
+        with self.stage(suffix=Path(relative_path).suffix) as stream:
+            _ = stream.write(data)
+            return stream.replace_render(
+                relative_path,
+                expected_sha256=expected_sha256,
+            )
 
     def resolve_asset(self, relative_path: str) -> Path:
         """Resolve an existing regular asset inside an approved namespace."""

@@ -16,7 +16,9 @@ from pypdf import PdfWriter
 
 import nplg_mcp.app as app_module
 from nplg_mcp.config import ApiPrincipalCredential, load_config
+from nplg_mcp.contracts import PdfInspectionOutput
 from nplg_mcp.errors import AppError, ErrorCode
+from nplg_mcp.services import FullServiceComposition
 from tests.helpers.app_factory import base_environment
 from tests.helpers.pdf_factory import make_raster_pdf
 
@@ -78,7 +80,7 @@ config = load_config({
 })
 application = create_app(config)
 assert application.services is not None
-assert application.services.store is None
+assert not hasattr(application.services, "store")
 assert [item["name"] for item in application.services.tools.list_tools()] == [
     "get_document_metadata",
     "list_document_files",
@@ -127,6 +129,7 @@ import nplg_mcp.app as app_module
 from nplg_mcp.app import create_app
 from nplg_mcp.config import load_config
 from nplg_mcp.pdf_worker_client import SubprocessPdfExecutor
+from nplg_mcp.services import FullServiceComposition
 
 assert Path(app_module.__file__).resolve().is_relative_to(source_root)
 
@@ -140,8 +143,49 @@ with tempfile.TemporaryDirectory() as cache_dir:
     })
     application = create_app(config)
     assert application.services is not None
+    assert isinstance(application.services, FullServiceComposition)
     assert isinstance(application.services.tools.pdf, SubprocessPdfExecutor)
     assert "nplg_mcp.pdf" not in sys.modules
+    assert application.services.http_client is not None
+    asyncio.run(application.services.http_client.aclose())
+"""
+
+    completed = subprocess.run(  # noqa: S603
+        (sys.executable, "-I", "-c", script),
+        cwd=_PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_private_full_can_select_the_unix_socket_pdf_worker() -> None:
+    """Exercise the profile composition seam for the isolated worker transport."""
+    script = r"""
+import asyncio
+import tempfile
+from nplg_mcp.app import create_app
+from nplg_mcp.config import load_config
+from nplg_mcp.services import FullServiceComposition
+
+with tempfile.TemporaryDirectory() as cache_dir:
+    config = load_config({
+        "NODE_ENV": "test",
+        "DEPLOYMENT_PROFILE": "private-full",
+        "PDF_EXECUTOR": "unix-worker",
+        "CACHE_DIR": cache_dir,
+        "ASSET_SIGNING_SECRET": "s" * 32,
+        "ALLOW_ANONYMOUS": "true",
+    })
+    application = create_app(config)
+    assert isinstance(application.services, FullServiceComposition)
+    assert type(application.services.tools.pdf).__name__ == "UnixSocketPdfExecutor"
+    scanner = application.services.tools.downloader.scanner
+    assert type(scanner).__name__ == "ClamAvUnixSocketScanner"
+    assert application.services.tools.downloader.require_scanner
     assert application.services.http_client is not None
     asyncio.run(application.services.http_client.aclose())
 """
@@ -170,8 +214,7 @@ async def test_private_full_tool_call_crosses_the_disposable_worker_boundary(
     )
     application = app_module.create_app(config)
     services = application.services
-    assert services is not None
-    assert services.store is not None
+    assert isinstance(services, FullServiceComposition)
     store = cast("ContentAddressedStore", services.store)
     fixture = make_raster_pdf(
         tmp_path / "profile-worker-source.pdf",
@@ -194,8 +237,9 @@ async def test_private_full_tool_call_crosses_the_disposable_worker_boundary(
         assert services.http_client is not None
         await services.http_client.aclose()
 
-    assert inspected.get("artifact_id") == artifact.object_id
-    assert inspected.get("page_count") == 1
+    assert isinstance(inspected, PdfInspectionOutput)
+    assert inspected.artifact_id == artifact.object_id
+    assert inspected.page_count == 1
 
 
 @pytest.mark.asyncio
@@ -211,8 +255,7 @@ async def test_private_full_worker_preserves_configured_render_ceiling(
     )
     application = app_module.create_app(config)
     services = application.services
-    assert services is not None
-    assert services.store is not None
+    assert isinstance(services, FullServiceComposition)
     store = cast("ContentAddressedStore", services.store)
     writer = PdfWriter()
     _ = writer.add_blank_page(width=72, height=72)

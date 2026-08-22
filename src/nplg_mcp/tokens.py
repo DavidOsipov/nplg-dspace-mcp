@@ -84,7 +84,11 @@ def sign_asset_token(
     }
     encoded_payload = _b64encode(
         json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            payload,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
         ).encode("utf-8")
     )
     signature = hmac.new(

@@ -926,6 +926,7 @@ def _expected_error_response(
     }
     body = json.dumps(
         error_payload,
+        allow_nan=False,
         ensure_ascii=False,
     ).encode("utf-8")
     body_base64, body_sha256 = _body_evidence(body)

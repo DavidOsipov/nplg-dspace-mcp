@@ -20,31 +20,13 @@ from .config import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from .contracts import MonotonicDeadline
     from .pdf_ipc import PdfCommand, PdfResult
 
 _MAX_TERMINATION_GRACE_SECONDS = 5.0
 _MAX_CIRCUIT_FAILURE_THRESHOLD = 100
 _MAX_CIRCUIT_OPEN_SECONDS = 3_600.0
 DEFAULT_FALLBACK_DPI = 400
-
-
-@dataclass(frozen=True, slots=True)
-class MonotonicDeadline:
-    """One absolute event-loop deadline shared by a PDF operation."""
-
-    expires_at: float
-
-    @classmethod
-    def after(cls, seconds: float) -> MonotonicDeadline:
-        """Create a deadline relative to the current event loop clock."""
-        if not math.isfinite(seconds) or seconds <= 0:
-            message = "deadline duration must be positive and finite"
-            raise ValueError(message)
-        return cls(time.monotonic() + seconds)
-
-    def remaining(self) -> float:
-        """Return remaining seconds, clamped at zero."""
-        return max(0.0, self.expires_at - time.monotonic())
 
 
 @dataclass(frozen=True, slots=True)

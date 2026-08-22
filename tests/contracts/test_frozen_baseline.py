@@ -37,19 +37,27 @@ from pydantic import (
     model_validator,
 )
 
+from nplg_mcp.contracts import (
+    DocumentMetadataOutput,
+    DownloadDocumentOutput,
+    PdfInspectionOutput,
+    RenderPagesOutput,
+    RenderTilesOutput,
+    SearchDocumentsOutput,
+    StrictOutput,
+)
 from nplg_mcp.json_types import (
     JsonObject,
     JsonValue,
     load_json_value,
     require_json_object,
 )
-from nplg_mcp.protocol import McpProtocol
 from scripts import baseline_capture_io, baseline_replay, capture_baseline
 from tests.helpers import pdf_factory
 from tests.helpers.app_factory import make_tool_service
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Mapping
+    from collections.abc import Awaitable, Callable, Mapping
     from typing import Self, TypedDict
 
     from nplg_mcp.tools import ToolService
@@ -64,6 +72,25 @@ if TYPE_CHECKING:
         base_tree: str
         index_transition: baseline_capture_io.IndexTransitionIdentity
         included_untracked_paths: baseline_capture_io.IncludedUntrackedPaths
+
+    class ReplayBehaviorCase(Protocol):
+        """Narrow immutable behavior-case view required by fault tests."""
+
+        case_id: str
+        expected_status: int
+        fixture: str
+        outcome: str
+        setup: object
+
+    class ReplayPrivateCallable(Protocol):
+        """Private synchronous replay seam under adversarial test."""
+
+        def __call__(self, *args: object, **kwargs: object) -> object: ...
+
+    class AsyncReplayPrivateCallable(Protocol):
+        """Private asynchronous replay seam under adversarial test."""
+
+        def __call__(self, *args: object) -> Awaitable[None]: ...
 
 
 BASELINE_DIR = Path("contracts/baseline")
@@ -105,6 +132,435 @@ EXPECTED_TOOL_NAMES: frozenset[ToolName] = frozenset(
         "search_documents",
     },
 )
+
+
+def _replay_private(name: str) -> object:
+    """Resolve one deliberately tested private replay seam without static coupling."""
+    return cast("object", object.__getattribute__(baseline_replay, f"_{name}"))
+
+
+_CASE_DEFINITIONS = cast(
+    "Callable[[], tuple[ReplayBehaviorCase, ...]]",
+    _replay_private("case_definitions"),
+)
+_RESOURCE_CASES = cast(
+    "Callable[[], list[ReplayBehaviorCase]]",
+    _replay_private("resource_cases"),
+)
+_PRIVATE_REPLAY_CALLS = {
+    name: cast("ReplayPrivateCallable", _replay_private(name.removeprefix("_")))
+    for name in (
+        "_empty_setup",
+        "_frozen_error_object",
+        "_frozen_result_object",
+        "_load_frozen_fixtures",
+        "_payload_result",
+        "_core_server_info",
+        "_matches_artifact_resource",
+        "_matches_live_sdk_case",
+        "_matches_render_resource",
+        "_normalize_render_collection",
+        "_normalized_render_pages",
+        "_replay_tool_result",
+        "_sdk_error",
+        "_sdk_object",
+        "_single_resource_content",
+        "_stable_catalog_bytes",
+        "_validate_behavior_outcome",
+        "_validate_fixture_allocation",
+        "_validate_generic_error",
+        "_validate_protocol_error",
+        "_validate_resource_list",
+        "_validate_resource_read",
+        "_validate_setup_allocation",
+        "_validate_tool_outcome",
+    )
+}
+_APPLY_REPLAY_SETUP = cast(
+    "AsyncReplayPrivateCallable",
+    _replay_private("apply_replay_setup"),
+)
+
+
+def _replay_case(outcome: str) -> ReplayBehaviorCase:
+    """Return one immutable production case for a requested outcome branch."""
+    return next(case for case in _CASE_DEFINITIONS() if case.outcome == outcome)
+
+
+def _replay_expected(
+    payload: JsonObject | None,
+    *,
+    status: int = 200,
+) -> baseline_replay.ReplayExpected:
+    """Construct a bounded outcome fixture for direct fail-closed validation."""
+    return baseline_replay.ReplayExpected.model_construct(
+        status=status,
+        payload=payload,
+    )
+
+
+def test_replay_expected_rejects_semantically_unnormalized_numbers() -> None:
+    expected = _replay_expected({"value": 1.0})
+    validate = cast(
+        "Callable[[], baseline_replay.ReplayExpected]",
+        object.__getattribute__(expected, "normalized_and_bounded"),
+    )
+    with pytest.raises(ValueError, match="semantically number-normalized"):
+        _ = validate()
+
+
+def test_replay_case_matrix_rejects_wrong_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(baseline_replay, "BEHAVIOR_CASE_COUNT", 0)
+
+    with pytest.raises(baseline_capture_io.BaselineCaptureError, match="66 unique"):
+        _ = _CASE_DEFINITIONS()
+
+
+def test_replay_case_matrix_rejects_wrong_fixture_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource_case_count = len(_RESOURCE_CASES())
+    monkeypatch.setattr(baseline_replay, "_resource_cases", lambda: ())
+    monkeypatch.setattr(
+        baseline_replay,
+        "BEHAVIOR_CASE_COUNT",
+        baseline_replay.BEHAVIOR_CASE_COUNT - resource_case_count,
+    )
+
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError,
+        match="fixture allocation",
+    ):
+        _ = _CASE_DEFINITIONS()
+
+
+def test_replay_setup_allocation_rejects_unexpected_tree(tmp_path: Path) -> None:
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError,
+        match="unexpected file or directory",
+    ):
+        _ = _PRIVATE_REPLAY_CALLS["_validate_setup_allocation"](
+            tmp_path,
+            _PRIVATE_REPLAY_CALLS["_empty_setup"](),
+        )
+
+
+@pytest.mark.parametrize("payload", [None, {"wrong": {}}])
+def test_replay_payload_result_rejects_missing_result(
+    payload: JsonObject | None,
+) -> None:
+    with pytest.raises(baseline_capture_io.BaselineCaptureError, match="behavior case"):
+        _ = _PRIVATE_REPLAY_CALLS["_payload_result"](_replay_expected(payload))
+
+
+@pytest.mark.parametrize(
+    ("outcome", "result", "message"),
+    [
+        ("tool-success", {"isError": True, "structuredContent": {}}, "envelope"),
+        ("tool-success", {"isError": False}, "structured content"),
+        (
+            "strict-error",
+            {"isError": True, "structuredContent": {"code": "OTHER"}},
+            "strict tool rejection",
+        ),
+        (
+            "app-error",
+            {"isError": True, "structuredContent": {"code": "OTHER"}},
+            "application-error sanitization",
+        ),
+    ],
+)
+def test_replay_tool_outcome_rejects_semantic_drift(
+    outcome: str,
+    result: JsonObject,
+    message: str,
+) -> None:
+    case = _replay_case(outcome)
+    expected = _replay_expected({"result": result}, status=case.expected_status)
+
+    with pytest.raises(baseline_capture_io.BaselineCaptureError, match=message):
+        _ = _PRIVATE_REPLAY_CALLS["_validate_tool_outcome"](case, expected)
+
+
+def test_replay_generic_error_rejects_wrong_code() -> None:
+    case = _replay_case("generic-error")
+    expected = _replay_expected(
+        {"error": {"code": -32602}},
+        status=case.expected_status,
+    )
+
+    with pytest.raises(baseline_capture_io.BaselineCaptureError, match="generic-error"):
+        _ = _PRIVATE_REPLAY_CALLS["_validate_generic_error"](case, expected)
+
+
+def test_replay_resource_list_rejects_non_about_catalog() -> None:
+    case = _replay_case("resource-list")
+    expected = _replay_expected(
+        {"result": {"resources": []}},
+        status=case.expected_status,
+    )
+
+    with pytest.raises(baseline_capture_io.BaselineCaptureError, match="about-only"):
+        _ = _PRIVATE_REPLAY_CALLS["_validate_resource_list"](case, expected)
+
+
+def test_replay_resource_read_rejects_multiple_contents() -> None:
+    case = _replay_case("resource-read")
+    expected = _replay_expected(
+        {"result": {"contents": [{}, {}]}},
+        status=case.expected_status,
+    )
+
+    with pytest.raises(baseline_capture_io.BaselineCaptureError, match="exactly one"):
+        _ = _PRIVATE_REPLAY_CALLS["_validate_resource_read"](case, expected)
+
+
+def test_replay_protocol_error_rejects_wrong_code() -> None:
+    case = _replay_case("protocol-error")
+    expected = _replay_expected(
+        {"error": {"code": 0}},
+        status=case.expected_status,
+    )
+
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError, match="protocol error"
+    ):
+        _ = _PRIVATE_REPLAY_CALLS["_validate_protocol_error"](case, expected)
+
+
+def test_replay_behavior_rejects_status_drift() -> None:
+    case = _replay_case("tool-success")
+    expected = _replay_expected(None, status=case.expected_status + 1)
+
+    with pytest.raises(baseline_capture_io.BaselineCaptureError, match="status"):
+        _ = _PRIVATE_REPLAY_CALLS["_validate_behavior_outcome"](case, expected)
+
+
+def test_replay_behavior_rejects_private_canary() -> None:
+    case = _replay_case("tool-success")
+    expected = _replay_expected(
+        {
+            "result": {
+                "isError": False,
+                "structuredContent": {
+                    "value": baseline_replay.FIXTURE_ERROR_CANARY,
+                },
+            }
+        },
+        status=case.expected_status,
+    )
+
+    with pytest.raises(baseline_capture_io.BaselineCaptureError, match="canary"):
+        _ = _PRIVATE_REPLAY_CALLS["_validate_behavior_outcome"](case, expected)
+
+
+def test_frozen_fixture_loader_rejects_non_object_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def non_object_fixture(_path: Path) -> bytes:
+        return b"[]"
+
+    monkeypatch.setattr(Path, "read_bytes", non_object_fixture)
+
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError, match="must be an object"
+    ):
+        _ = _PRIVATE_REPLAY_CALLS["_load_frozen_fixtures"]()
+
+
+def test_fixture_allocation_rejects_cross_file_case_reuse() -> None:
+    first = _replay_case("tool-success")
+    duplicate = copy.copy(first)
+    object.__setattr__(duplicate, "fixture", "error-cases.json")
+    fixtures: dict[BaselineFileName, dict[str, object]] = {
+        "tool-catalog.json": {},
+        "resources.json": {},
+        "result-cases.json": {first.case_id: {}},
+        "error-cases.json": {first.case_id: {}},
+    }
+
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError, match="repeats a case ID"
+    ):
+        _ = _PRIVATE_REPLAY_CALLS["_validate_fixture_allocation"](
+            fixtures,
+            (first, duplicate),
+        )
+
+
+def test_stable_catalog_projection_rejects_non_object_entry() -> None:
+    catalog: dict[str, object] = {"bad": []}
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError, match="entry is invalid"
+    ):
+        _ = _PRIVATE_REPLAY_CALLS["_stable_catalog_bytes"](catalog)
+
+
+@pytest.mark.parametrize("kind", ["result", "error"])
+def test_live_oracle_fixture_helpers_reject_missing_object(kind: str) -> None:
+    fixtures: dict[BaselineFileName, dict[str, object]] = {
+        "tool-catalog.json": {},
+        "resources.json": {},
+        "result-cases.json": {},
+        "error-cases.json": {},
+    }
+
+    def action() -> object:
+        if kind == "result":
+            return _PRIVATE_REPLAY_CALLS["_frozen_result_object"](
+                fixtures,
+                "result-cases.json",
+                "missing",
+            )
+        return _PRIVATE_REPLAY_CALLS["_frozen_error_object"](fixtures, "missing")
+
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError, match="fixture is invalid"
+    ):
+        _ = action()
+
+
+class _SdkProjection:
+    def __init__(self, value: object) -> None:
+        super().__init__()
+        self.value = value
+
+    def model_dump(
+        self,
+        *,
+        mode: str,
+        by_alias: bool,
+        exclude_none: bool,
+    ) -> object:
+        assert (mode, by_alias, exclude_none) == ("json", True, True)
+        return self.value
+
+
+class _SdkProjectionError(Exception):
+    def __init__(self, error: object) -> None:
+        super().__init__("sdk error projection")
+        self.error = error
+
+
+@pytest.mark.parametrize("value", [object(), _SdkProjection([])])
+def test_live_sdk_object_requires_a_typed_object_projection(value: object) -> None:
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError,
+        match="live official SDK returned",
+    ):
+        _ = _PRIVATE_REPLAY_CALLS["_sdk_object"](value, context="sentinel")
+
+
+@pytest.mark.parametrize(
+    "collection",
+    [["not-an-object"], [{"sha256": "a" * 64, "resource_uri": "mutant"}]],
+)
+def test_live_render_collection_rejects_invalid_items_and_mutant_uris(
+    collection: list[object],
+) -> None:
+    payload: JsonObject = {"pages": cast("list[JsonValue]", collection)}
+    with pytest.raises(baseline_capture_io.BaselineCaptureError):
+        _ = _PRIVATE_REPLAY_CALLS["_normalize_render_collection"](
+            payload,
+            "pages",
+            live=True,
+        )
+
+
+def test_live_resource_normalizers_reject_noncanonical_shapes() -> None:
+    multiple_contents: list[JsonValue] = [{}, {}]
+    invalid_pages: list[JsonValue] = [1]
+    mutant_pages: list[JsonValue] = [{"sha256": "a" * 64, "resource_uri": "mutant"}]
+    empty_page: list[JsonValue] = [{}]
+    assert _PRIVATE_REPLAY_CALLS["_single_resource_content"]({}) is None
+    assert _PRIVATE_REPLAY_CALLS["_single_resource_content"](multiple_contents) is None
+    assert _PRIVATE_REPLAY_CALLS["_normalized_render_pages"]({}, []) is None
+    assert (
+        _PRIVATE_REPLAY_CALLS["_normalized_render_pages"](
+            invalid_pages,
+            invalid_pages,
+        )
+        is None
+    )
+    assert (
+        _PRIVATE_REPLAY_CALLS["_normalized_render_pages"](
+            mutant_pages,
+            empty_page,
+        )
+        is None
+    )
+    assert _PRIVATE_REPLAY_CALLS["_core_server_info"]([]) is None
+
+
+def test_live_sdk_error_rejects_private_canary() -> None:
+    error = _SdkProjectionError(
+        _SdkProjection(
+            {"code": -32603, "message": baseline_replay.FIXTURE_ERROR_CANARY}
+        )
+    )
+
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError,
+        match="private error canary",
+    ):
+        _ = _PRIVATE_REPLAY_CALLS["_sdk_error"](error)
+
+
+def test_live_tile_manifest_rejects_mutant_top_level_uri() -> None:
+    case = next(
+        item
+        for item in _CASE_DEFINITIONS()
+        if item.case_id == "tool.render_pdf_page_tiles.modern.success"
+    )
+    result: JsonObject = {"structuredContent": {"resource_uri": "mutant", "tiles": []}}
+
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError,
+        match="tile manifest URI is not canonical",
+    ):
+        _ = _PRIVATE_REPLAY_CALLS["_replay_tool_result"](case, result, live=True)
+
+
+def test_live_resource_matchers_reject_missing_and_malformed_content() -> None:
+    assert _PRIVATE_REPLAY_CALLS["_matches_artifact_resource"]({}, []) is False
+    assert _PRIVATE_REPLAY_CALLS["_matches_render_resource"]({}, []) is False
+    malformed_content: list[JsonValue] = [{"text": "[]"}]
+    assert (
+        _PRIVATE_REPLAY_CALLS["_matches_render_resource"](
+            malformed_content,
+            malformed_content,
+        )
+        is False
+    )
+    invalid_pages_content: list[JsonValue] = [{"text": '{"pages":{}}'}]
+    assert (
+        _PRIVATE_REPLAY_CALLS["_matches_render_resource"](
+            invalid_pages_content,
+            invalid_pages_content,
+        )
+        is False
+    )
+
+
+def test_live_case_matcher_executes_default_protocol_comparison() -> None:
+    case = copy.copy(_replay_case("tool-success"))
+    object.__setattr__(case, "outcome", "unknown")
+    object.__setattr__(case, "scenario", "unknown")
+
+    assert (
+        _PRIVATE_REPLAY_CALLS["_matches_live_sdk_case"](
+            case,
+            _SdkProjection({}),
+            None,
+            {},
+            None,
+        )
+        is True
+    )
+
+
 INCLUDED_UNTRACKED_PATHS: baseline_capture_io.IncludedUntrackedPaths = (
     "contracts/zod/asvs-evidence-contracts.mjs",
     "contracts/zod/baseline-contracts.mjs",
@@ -208,7 +664,6 @@ PRIVATE_FILE_MODE = 0o600
 REVIEWED_SOURCE_FILE_MODE = 0o644
 EXPECTED_CLI_ERROR_EXIT = 2
 INJECTED_FAILURE_CALL = 3
-BAD_REQUEST_STATUS = 400
 EXPECTED_BEHAVIOR_CASES = 66
 EXPECTED_RESULT_CASES = 20
 EXPECTED_ERROR_CASES = 38
@@ -1584,7 +2039,133 @@ async def test_replay_verifier_rejects_catalog_drift_from_the_supplied_fixture(
         drifted_catalog_service,
     )
 
-    with pytest.raises(capture_baseline.BaselineCaptureError, match="live service"):
+    with pytest.raises(
+        capture_baseline.BaselineCaptureError,
+        match="live official SDK",
+    ):
+        await baseline_replay.verify_replay_fixture_records(fixtures, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_replay_verifier_rejects_live_official_tool_result_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fixture-only replay cannot conceal drift in the live official SDK path."""
+    fixtures: BaselineFixtures = {
+        name: load_fixture_index(name) for name in BASELINE_FILE_NAMES
+    }
+
+    def mutant_service(
+        root: Path,
+        *,
+        fault_mode: baseline_replay.CaseFaultMode,
+    ) -> ToolService:
+        service = make_tool_service(root, fault_mode=fault_mode, frozen_origin=True)
+        live_call = service.call
+
+        async def mutant_call(name: str, arguments: JsonObject) -> StrictOutput:
+            result = await live_call(name, arguments)
+            if name == "search_documents":
+                assert isinstance(result, SearchDocumentsOutput)
+                object.__setattr__(result.items[0], "title", "live-mutant-title")
+            return result
+
+        monkeypatch.setattr(service, "call", mutant_call)
+        return service
+
+    monkeypatch.setattr(
+        "tests.helpers.app_factory.make_tool_service",
+        mutant_service,
+    )
+
+    with pytest.raises(
+        capture_baseline.BaselineCaptureError,
+        match="live official SDK",
+    ):
+        await baseline_replay.verify_replay_fixture_records(fixtures, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_replay_verifier_rejects_live_metadata_behavior_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every frozen tool case must execute its equivalent live SDK behavior."""
+    fixtures: BaselineFixtures = {
+        name: load_fixture_index(name) for name in BASELINE_FILE_NAMES
+    }
+
+    def mutant_service(
+        root: Path,
+        *,
+        fault_mode: baseline_replay.CaseFaultMode,
+    ) -> ToolService:
+        service = make_tool_service(root, fault_mode=fault_mode, frozen_origin=True)
+        live_call = service.call
+
+        async def mutant_call(name: str, arguments: JsonObject) -> StrictOutput:
+            result = await live_call(name, arguments)
+            if name == "get_document_metadata":
+                assert isinstance(result, DocumentMetadataOutput)
+                object.__setattr__(result, "title", "live-mutant-title")
+            return result
+
+        monkeypatch.setattr(service, "call", mutant_call)
+        return service
+
+    monkeypatch.setattr(
+        "tests.helpers.app_factory.make_tool_service",
+        mutant_service,
+    )
+
+    with pytest.raises(
+        capture_baseline.BaselineCaptureError,
+        match="live official SDK",
+    ):
+        await baseline_replay.verify_replay_fixture_records(fixtures, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_replay_verifier_binds_tile_uri_to_persisted_manifest_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixtures: BaselineFixtures = {
+        name: load_fixture_index(name) for name in BASELINE_FILE_NAMES
+    }
+
+    def mutant_service(
+        root: Path,
+        *,
+        fault_mode: baseline_replay.CaseFaultMode,
+    ) -> ToolService:
+        service = make_tool_service(root, fault_mode=fault_mode, frozen_origin=True)
+        live_call = service.call
+
+        async def mutant_call(name: str, arguments: JsonObject) -> StrictOutput:
+            result = await live_call(name, arguments)
+            if name == "render_pdf_page_tiles":
+                assert isinstance(result, RenderTilesOutput)
+                object.__setattr__(
+                    result,
+                    "resource_uri",
+                    "nplg://artifact/doc_" + "0" * 64,
+                )
+            return result
+
+        monkeypatch.setattr(service, "call", mutant_call)
+        return service
+
+    monkeypatch.setattr(
+        "tests.helpers.app_factory.make_tool_service",
+        mutant_service,
+    )
+
+    with pytest.raises(
+        capture_baseline.BaselineCaptureError,
+        match="tile manifest URI",
+    ):
         await baseline_replay.verify_replay_fixture_records(fixtures, tmp_path)
 
 
@@ -1603,12 +2184,22 @@ async def test_replay_capture_rejects_nonreproducible_setup_identifiers(
         service = make_tool_service(root, fault_mode=fault_mode, frozen_origin=True)
         call = service.call
 
-        async def faulty_call(name: str, arguments: JsonObject) -> JsonObject:
+        async def faulty_call(name: str, arguments: JsonObject) -> StrictOutput:
             result = await call(name, arguments)
-            if fault == "document-id" and name == "download_document_file":
-                result["artifact_id"] = ZERO_ARTIFACT_ID
-            elif fault == "render-id" and name == "render_pdf_pages":
-                result["render_id"] = ZERO_RENDER_ID
+            if (
+                fault == "document-id"
+                and name == "download_document_file"
+                and isinstance(result, DownloadDocumentOutput)
+            ):
+                object.__setattr__(result, "artifact_id", ZERO_ARTIFACT_ID)
+                return result
+            if (
+                fault == "render-id"
+                and name == "render_pdf_pages"
+                and isinstance(result, RenderPagesOutput)
+            ):
+                object.__setattr__(result, "render_id", ZERO_RENDER_ID)
+                return result
             return result
 
         monkeypatch.setattr(service, "call", faulty_call)
@@ -1670,7 +2261,6 @@ def test_internal_replay_main_restores_logging_and_writes_only_on_success(
     assert logging.root.manager.disable == before_disable
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "field",
     ["expected", "status", "setup", "profile", "scenario", "header", "request"],
@@ -1774,7 +2364,8 @@ async def apply_normative_replay_setup(
         "download_document_file",
         {"handle": "1234/560449", "bitstream_id": "bs_public"},
     )
-    assert downloaded["artifact_id"] == FIXED_ARTIFACT_ID
+    assert isinstance(downloaded, DownloadDocumentOutput)
+    assert downloaded.artifact_id == FIXED_ARTIFACT_ID
     if setup_kind == "render":
         rendered = await service.call(
             "render_pdf_pages",
@@ -1784,7 +2375,8 @@ async def apply_normative_replay_setup(
                 "mode": "native",
             },
         )
-        assert rendered["render_id"] == FIXED_RENDER_ID
+        assert isinstance(rendered, RenderPagesOutput)
+        assert rendered.render_id == FIXED_RENDER_ID
 
 
 def _assert_tool_outcome(case: NormativeReplayCase, payload: JsonObject) -> None:
@@ -1858,14 +2450,12 @@ def assert_normative_replay_outcome(
         assert result.get("resultType") == "complete"
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case",
     normative_replay_cases(),
     ids=_normative_case_id,
 )
-async def test_frozen_case_replays_through_parse_and_handle_against_independent_oracle(
-    tmp_path: Path,
+def test_frozen_case_matches_digest_bound_independent_oracle(
     case: NormativeReplayCase,
 ) -> None:
     fixture = load_fixture_index(case.fixture)
@@ -1885,33 +2475,14 @@ async def test_frozen_case_replays_through_parse_and_handle_against_independent_
     )
     assert record.expected.status == case.status
 
-    root_name = hashlib.sha256(case.case_id.encode("utf-8")).hexdigest()
-    root = tmp_path / root_name
-    root.mkdir(mode=PRIVATE_DIRECTORY_MODE)
-    roots = await asyncio.to_thread(directory_children, tmp_path)
-    assert {path.name for path in roots} == {root_name}
-    assert await asyncio.to_thread(path_mode, root) == PRIVATE_DIRECTORY_MODE
-    fault_mode: baseline_replay.CaseFaultMode
-    if case.outcome == "app-error":
-        fault_mode = "app_error"
-    elif case.outcome == "generic-error":
-        fault_mode = "generic_error"
-    else:
-        fault_mode = "none"
-    service = make_tool_service(root, fault_mode=fault_mode, frozen_origin=True)
-    await apply_normative_replay_setup(service, case.setup_kind)
-    parsed = McpProtocol.parse_json(record.request.body_bytes())
-    response = await McpProtocol(service).handle(
-        parsed,
-        record.request.header_mapping(),
+    normalized_payload = baseline_replay.normalize_response_numbers(
+        record.expected.payload
     )
-    normalized_payload = baseline_replay.normalize_response_numbers(response.payload)
     assert_normative_replay_outcome(
         case,
-        status=response.status,
+        status=record.expected.status,
         payload=normalized_payload,
     )
-    assert response.status == record.expected.status
     assert canonical_test_bytes(normalized_payload) == canonical_test_bytes(
         record.expected.payload,
     )
@@ -4913,82 +5484,11 @@ async def test_fixture_factory_downloads_a_real_inspectable_pdf(tmp_path: Path) 
         "download_document_file",
         {"handle": "1234/560449", "bitstream_id": "bs_public"},
     )
-    artifact_id = downloaded["artifact_id"]
-    assert isinstance(artifact_id, str)
+    assert isinstance(downloaded, DownloadDocumentOutput)
+    artifact_id = downloaded.artifact_id
     inspected = await service.call("inspect_pdf", {"artifact_id": artifact_id})
-    assert inspected["page_count"] == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("payload", "headers"),
-    [
-        (
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {"protocolVersion": "2025-11-25"},
-                "unexpected": True,
-            },
-            {},
-        ),
-        (
-            {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-11-25",
-                    "unexpected": True,
-                },
-            },
-            {},
-        ),
-        (
-            {
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/list",
-                "params": {"unexpected": True},
-            },
-            {"MCP-Protocol-Version": "2025-11-25"},
-        ),
-        (
-            {
-                "jsonrpc": "2.0",
-                "id": 4,
-                "method": "server/discover",
-                "params": {
-                    "unexpected": True,
-                    "_meta": {
-                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                        "io.modelcontextprotocol/clientCapabilities": {},
-                    },
-                },
-            },
-            {
-                "MCP-Protocol-Version": "2026-07-28",
-                "Mcp-Method": "server/discover",
-            },
-        ),
-    ],
-)
-async def test_protocol_rejects_unknown_envelope_and_method_parameters(
-    tmp_path: Path,
-    payload: JsonObject,
-    headers: dict[str, str],
-) -> None:
-    response = await McpProtocol(
-        make_tool_service(tmp_path, frozen_origin=True)
-    ).handle(payload, headers)
-    assert response.status == BAD_REQUEST_STATUS
-    assert response.payload is not None
-    error = response.payload["error"]
-    assert isinstance(error, dict)
-    error_code = error["code"]
-    assert isinstance(error_code, int)
-    assert error_code in {-32600, -32602}
+    assert isinstance(inspected, PdfInspectionOutput)
+    assert inspected.page_count == 1
 
 
 def test_frozen_baseline_is_complete_and_digest_bound(
@@ -5208,7 +5708,6 @@ TASK1_OWNED_PYTHON_FILES = (
     "scripts/bootstrap_toolchain.py",
     "tests/contracts/test_frozen_baseline.py",
     "tests/helpers/pdf_factory.py",
-    "src/nplg_mcp/protocol.py",
 )
 PYRIGHT_DIRECTIVE_PREFIX_PATTERN = re.compile(r"#\s*pyright:\s*")
 PYRIGHT_CONFIGURATION_ASSIGNMENT_PATTERN = re.compile(
@@ -5435,7 +5934,7 @@ EXPECTED_TASK1_SUPPRESSIONS = (
     ),
     SuppressionOccurrence(
         path="tests/contracts/test_frozen_baseline.py",
-        line=432,
+        line=887,
         rationale=(
             (
                 "# Security rationale: GIT_EXECUTABLE is absolute; fixed "
@@ -5451,7 +5950,7 @@ EXPECTED_TASK1_SUPPRESSIONS = (
     ),
     SuppressionOccurrence(
         path="tests/contracts/test_frozen_baseline.py",
-        line=3615,
+        line=4186,
         rationale=(
             (
                 "# Security rationale: sys.executable launches only the "
@@ -5467,29 +5966,6 @@ EXPECTED_TASK1_SUPPRESSIONS = (
             ),
         ),
         directive="# noqa: S603",
-    ),
-    SuppressionOccurrence(
-        path="src/nplg_mcp/protocol.py",
-        line=750,
-        rationale=(
-            "# Security rationale: this is the final fail-closed JSON-RPC sanitizer.",
-            (
-                "# BLE001 cannot infer that unexpected failures must become "
-                "generic errors."
-            ),
-            "# See https://docs.astral.sh/ruff/rules/blind-except/.",
-        ),
-        directive="# noqa: BLE001",
-    ),
-    SuppressionOccurrence(
-        path="src/nplg_mcp/protocol.py",
-        line=754,
-        rationale=(
-            "# Security rationale: tracebacks can contain untrusted or private data.",
-            "# TRY400's logger.exception alternative would disclose that data.",
-            ("# See https://docs.astral.sh/ruff/rules/error-instead-of-exception/."),
-        ),
-        directive="# noqa: TRY400",
     ),
 )
 
@@ -6115,3 +6591,59 @@ def test_task1_inventory_rejects_active_inline_comment_directives(
         _inventory_with_injected_source(monkeypatch, injected_source)
         != EXPECTED_TASK1_SUPPRESSIONS
     )
+
+
+class _WrongDownloadSetupTools:
+    """Return the wrong strict model at the replay setup boundary."""
+
+    async def call(self, _name: str, _arguments: JsonObject) -> JsonObject:
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_replay_setup_rejects_wrong_download_output_model() -> None:
+    setup = next(
+        case.setup
+        for case in _CASE_DEFINITIONS()
+        if isinstance(case.setup, baseline_replay.DocumentReplaySetup)
+    )
+
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError,
+        match="document setup returned the wrong strict output model",
+    ):
+        await _APPLY_REPLAY_SETUP(
+            cast("ToolService", _WrongDownloadSetupTools()),
+            setup,
+        )
+
+
+@pytest.mark.asyncio
+async def test_replay_setup_rejects_wrong_render_output_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = make_tool_service(tmp_path)
+    setup = next(
+        case.setup
+        for case in _CASE_DEFINITIONS()
+        if isinstance(case.setup, baseline_replay.RenderReplaySetup)
+    )
+    original_call = type(tools).call
+
+    async def wrong_render_call(
+        service: ToolService,
+        name: str,
+        arguments: JsonObject,
+    ) -> StrictOutput:
+        if name == "render_pdf_pages":
+            return cast("StrictOutput", {})
+        return await original_call(service, name, arguments)
+
+    monkeypatch.setattr(type(tools), "call", wrong_render_call)
+
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError,
+        match="render setup returned the wrong strict output model",
+    ):
+        await _APPLY_REPLAY_SETUP(tools, setup)

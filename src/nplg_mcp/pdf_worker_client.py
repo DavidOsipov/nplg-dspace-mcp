@@ -9,14 +9,16 @@ import hmac
 import os
 import shutil
 import signal
+import socket
 import stat
 import sys
 import tempfile
 import time
 from contextlib import suppress
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Protocol, TypeVar, cast, override, runtime_checkable
 
 from PIL import Image, UnidentifiedImageError
 
@@ -27,7 +29,6 @@ from .bounded_work import (
 )
 from .errors import AppError
 from .pdf_executor import (
-    MonotonicDeadline,
     PdfCircuitBreaker,
     PdfWorkerError,
     PdfWorkerOperationalError,
@@ -60,7 +61,36 @@ if TYPE_CHECKING:
     from asyncio.subprocess import Process
     from collections.abc import Callable
 
+    from .contracts import MonotonicDeadline
+    from .pdf_worker_slot import WorkerStagingQuota
     from .storage import ContentAddressedStore
+
+
+@runtime_checkable
+class _UnixSocketPeer(Protocol):
+    """The narrow socket capability required for local peer verification."""
+
+    family: socket.AddressFamily
+
+    def getsockopt(self, level: int, option: int, buffer_size: int) -> bytes:
+        """Return the fixed-width peer-credential record."""
+        ...
+
+
+_PEER_CREDENTIAL_BYTES = 12
+
+
+def _peer_credentials(value: bytes) -> tuple[int, int, int]:
+    """Decode exactly one native Linux ``ucred`` record without dynamic types."""
+    if len(value) != _PEER_CREDENTIAL_BYTES:
+        message = "PDF worker peer credentials are malformed"
+        raise PdfWorkerOperationalError(message)
+    return (
+        int.from_bytes(value[0:4], byteorder=sys.byteorder, signed=True),
+        int.from_bytes(value[4:8], byteorder=sys.byteorder, signed=True),
+        int.from_bytes(value[8:12], byteorder=sys.byteorder, signed=True),
+    )
+
 
 _FRAME_PREFIX_BYTES = 4
 _WORKER_JOB_DIRECTORY = ".pdf-worker-jobs"
@@ -102,6 +132,7 @@ class SubprocessPdfExecutor:
             policy=actual_policy.circuit,
             clock=monotonic_clock,
         )
+        self._monotonic_clock = monotonic_clock
         self._worker_argv = argv
         self._permit = asyncio.Semaphore(actual_policy.capacity)
         # Cleanup cannot share fail-fast publication capacity: a rejected staging
@@ -134,7 +165,11 @@ class SubprocessPdfExecutor:
         acquired = False
         try:
             try:
-                async with asyncio.timeout(deadline.remaining()):
+                remaining = deadline.remaining(now=self._monotonic_clock())
+                if remaining <= 0.0:
+                    message = "PDF worker deadline expired before capacity acquisition"
+                    raise PdfWorkerOperationalError(message)
+                async with asyncio.timeout(remaining):
                     _ = await self._permit.acquire()
             except TimeoutError as exc:
                 message = "PDF worker exceeded its deadline while awaiting capacity"
@@ -204,7 +239,7 @@ class SubprocessPdfExecutor:
             try:
                 result = await asyncio.wait_for(
                     self._exchange(process, command),
-                    timeout=deadline.remaining(),
+                    timeout=deadline.remaining(now=self._monotonic_clock()),
                 )
             except TimeoutError as exc:
                 message = "PDF worker exceeded its deadline"
@@ -349,9 +384,8 @@ class SubprocessPdfExecutor:
             "NPLG_PDF_MAX_TILES_PER_PAGE": str(settings.max_tiles_per_page),
         }
 
-    @staticmethod
-    def _require_deadline(deadline: MonotonicDeadline, *, phase: str) -> None:
-        if deadline.remaining() <= 0:
+    def _require_deadline(self, deadline: MonotonicDeadline, *, phase: str) -> None:
+        if deadline.remaining(now=self._monotonic_clock()) <= 0:
             message = f"PDF worker deadline expired during {phase}"
             raise PdfWorkerOperationalError(message)
 
@@ -379,15 +413,14 @@ class SubprocessPdfExecutor:
         self._copy_regular_tree(source_root, destination_root, deadline=deadline)
         return None
 
-    @classmethod
     def _copy_regular_file(
-        cls,
+        self,
         source: Path,
         destination: Path,
         *,
         deadline: MonotonicDeadline,
     ) -> str:
-        cls._require_deadline(deadline, phase="input staging")
+        self._require_deadline(deadline, phase="input staging")
         before_open = source.lstat()
         if not stat.S_ISREG(before_open.st_mode) or before_open.st_nlink < 1:
             message = "PDF worker input is not a regular file"
@@ -410,7 +443,7 @@ class SubprocessPdfExecutor:
                 destination.open("xb") as output_stream,
             ):
                 while chunk := input_stream.read(1024 * 1024):
-                    cls._require_deadline(deadline, phase="input staging")
+                    self._require_deadline(deadline, phase="input staging")
                     digest.update(chunk)
                     written = output_stream.write(chunk)
                     if written != len(chunk):
@@ -418,7 +451,7 @@ class SubprocessPdfExecutor:
                         raise PdfWorkerError(message)
                 output_stream.flush()
                 os.fsync(output_stream.fileno())
-                cls._require_deadline(deadline, phase="input staging")
+                self._require_deadline(deadline, phase="input staging")
             after_copy = os.fstat(descriptor)
             if opened.st_size != after_copy.st_size or (
                 opened.st_dev,
@@ -439,21 +472,20 @@ class SubprocessPdfExecutor:
         destination.chmod(0o600)
         return digest.hexdigest()
 
-    @classmethod
     def _copy_regular_tree(
-        cls,
+        self,
         source: Path,
         destination: Path,
         *,
         deadline: MonotonicDeadline,
     ) -> None:
-        cls._require_deadline(deadline, phase="input staging")
+        self._require_deadline(deadline, phase="input staging")
         if source.is_symlink() or not source.is_dir():
             message = "PDF worker render input is unavailable"
             raise PdfWorkerError(message)
         destination.mkdir(parents=True, mode=0o700)
         for directory, directories, files in os.walk(source, followlinks=False):
-            cls._require_deadline(deadline, phase="input staging")
+            self._require_deadline(deadline, phase="input staging")
             current = Path(directory)
             relative = current.relative_to(source)
             for name in directories:
@@ -463,7 +495,7 @@ class SubprocessPdfExecutor:
                     raise PdfWorkerError(message)
                 (destination / relative / name).mkdir(mode=0o700)
             for name in files:
-                _ = cls._copy_regular_file(
+                _ = self._copy_regular_file(
                     current / name,
                     destination / relative / name,
                     deadline=deadline,
@@ -1127,9 +1159,8 @@ class SubprocessPdfExecutor:
             return False
         return True
 
-    @classmethod
     def _sha256_path(
-        cls,
+        self,
         path: Path,
         *,
         deadline: MonotonicDeadline,
@@ -1137,7 +1168,7 @@ class SubprocessPdfExecutor:
         digest = hashlib.sha256()
         with path.open("rb") as stream:
             while chunk := stream.read(1024 * 1024):
-                cls._require_deadline(deadline, phase="authoritative comparison")
+                self._require_deadline(deadline, phase="authoritative comparison")
                 digest.update(chunk)
         return digest.hexdigest()
 
@@ -1169,3 +1200,190 @@ class SubprocessPdfExecutor:
                 _ = staged.commit_render(relative_path)
         finally:
             os.close(descriptor)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerStagingBinding:
+    """Bind a Unix worker to one dedicated root and optional quota lease."""
+
+    root: Path
+    quota: WorkerStagingQuota | None = None
+
+    def __post_init__(self) -> None:
+        """Keep runtime-selected staging outside the authoritative store."""
+        if not self.root.is_absolute() or "\x00" in str(self.root):
+            message = "PDF worker staging root is invalid"
+            raise ValueError(message)
+        if self.quota is not None and self.root != self.quota.root.path:
+            message = "PDF worker staging quota does not bind its dedicated root"
+            raise ValueError(message)
+
+
+class UnixSocketPdfExecutor(SubprocessPdfExecutor):
+    """Use a separately confined worker through one authenticated AF_UNIX socket."""
+
+    def __init__(
+        self,
+        *,
+        store: ContentAddressedStore,
+        socket_path: Path,
+        staging: WorkerStagingBinding | None = None,
+        policy: PdfWorkerPolicy | None = None,
+        monotonic_clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Keep staging/publication in the parent and parsing out of process."""
+        if not socket_path.is_absolute() or "\x00" in str(socket_path):
+            message = "PDF worker socket path is invalid"
+            raise ValueError(message)
+        super().__init__(
+            store=store,
+            policy=policy,
+            monotonic_clock=monotonic_clock,
+        )
+        self._socket_path = socket_path
+        self._expected_peer_uid = os.geteuid()
+        selected_work_root = (
+            staging.root
+            if staging is not None
+            else self._store.root / _WORKER_JOB_DIRECTORY
+        )
+        if (
+            not selected_work_root.is_absolute()
+            or "\x00" in str(selected_work_root)
+            or (
+                staging is not None
+                and selected_work_root.is_relative_to(self._store.root)
+            )
+        ):
+            message = "PDF worker requires a dedicated staging root"
+            raise ValueError(message)
+        self._work_root = selected_work_root
+        self._staging_quota = staging.quota if staging is not None else None
+
+    @override
+    async def _execute_with_permit(
+        self,
+        command: PdfCommand,
+        *,
+        deadline: MonotonicDeadline,
+    ) -> PdfResult:
+        """Reserve the complete dedicated slot before any parent-side staging."""
+        if self._staging_quota is not None:
+            with self._staging_quota.lease() as bound_root:
+                return await self._execute_in_work_root(
+                    command,
+                    deadline=deadline,
+                    work_parent=bound_root.path,
+                )
+        return await self._execute_in_work_root(
+            command,
+            deadline=deadline,
+            work_parent=self._work_root,
+        )
+
+    @staticmethod
+    def _prepare_work_parent(work_parent: Path) -> None:
+        """Create and verify the parent-controlled root outside the event loop."""
+        work_parent.mkdir(mode=0o700, exist_ok=True)
+        metadata = work_parent.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            message = "PDF worker job root is not a private directory"
+            raise PdfWorkerError(message)
+        work_parent.chmod(0o700)
+
+    async def _execute_in_work_root(
+        self,
+        command: PdfCommand,
+        *,
+        deadline: MonotonicDeadline,
+        work_parent: Path,
+    ) -> PdfResult:
+        """Exchange one frame and publish only parent-verified outputs."""
+        await self._run_storage(partial(self._prepare_work_parent, work_parent))
+        job_path = work_parent / command.request_id.hex
+        try:
+            job_path.mkdir(mode=0o700)
+        except FileExistsError as exc:
+            message = "PDF worker request identifier was reused"
+            raise PdfWorkerOperationalError(message) from exc
+        try:
+            self._require_deadline(deadline, phase="input staging")
+            expected_source_sha256 = await self._run_storage(
+                partial(
+                    self._stage_inputs,
+                    command,
+                    job_path,
+                    deadline=deadline,
+                )
+            )
+            self._require_deadline(deadline, phase="input staging")
+            try:
+                result = await asyncio.wait_for(
+                    self._exchange_unix(command),
+                    timeout=deadline.remaining(now=self._monotonic_clock()),
+                )
+            except TimeoutError as exc:
+                message = "PDF worker exceeded its deadline"
+                raise PdfWorkerOperationalError(message) from exc
+            except asyncio.CancelledError:
+                raise
+            except (asyncio.IncompleteReadError, OSError, ValueError) as exc:
+                message = "PDF worker transport failed"
+                raise PdfWorkerOperationalError(message) from exc
+            await self._run_storage(
+                partial(
+                    self._validate_and_publish,
+                    command,
+                    result,
+                    job_path,
+                    expected_source_sha256=expected_source_sha256,
+                    deadline=deadline,
+                )
+            )
+            self._require_deadline(deadline, phase="result validation")
+            return result
+        finally:
+            cleanup = asyncio.create_task(self._cleanup_worker(None, job_path))
+            await self._wait_for_cleanup(cleanup)
+
+    def _verify_socket_path(self) -> None:
+        try:
+            metadata = self._socket_path.lstat()
+        except OSError as exc:
+            message = "PDF worker socket is unavailable"
+            raise PdfWorkerOperationalError(message) from exc
+        if (
+            not stat.S_ISSOCK(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != self._expected_peer_uid
+            or metadata.st_mode & 0o077
+        ):
+            message = "PDF worker socket ownership or mode is invalid"
+            raise PdfWorkerOperationalError(message)
+
+    async def _exchange_unix(self, command: PdfCommand) -> PdfResult:
+        self._verify_socket_path()
+        reader, writer = await asyncio.open_unix_connection(str(self._socket_path))
+        try:
+            stream_socket = cast("object", writer.get_extra_info("socket"))
+            if (
+                not isinstance(stream_socket, _UnixSocketPeer)
+                or stream_socket.family != socket.AF_UNIX
+            ):
+                message = "PDF worker transport is not AF_UNIX"
+                raise PdfWorkerOperationalError(message)
+            peer = stream_socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            _process_id, peer_uid, _peer_group = _peer_credentials(peer)
+            if peer_uid != self._expected_peer_uid:
+                message = "PDF worker peer identity is invalid"
+                raise PdfWorkerOperationalError(message)
+            writer.write(encode_frame(command, maximum=MAX_COMMAND_FRAME_BYTES))
+            await writer.drain()
+            writer.write_eof()
+            await writer.drain()
+            body = await self._read_result_body(reader)
+            return parse_result_frame(body)
+        finally:
+            writer.close()
+            with suppress(OSError):
+                await writer.wait_closed()

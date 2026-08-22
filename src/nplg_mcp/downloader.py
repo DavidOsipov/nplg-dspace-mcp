@@ -4,16 +4,20 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 from urllib.parse import urljoin, urlsplit
 
 import httpx
 
 from .bounded_work import DNS_WORK, STORAGE_WORK, BlockingWorkCapacityError
+from .contracts import MonotonicDeadline
 from .errors import AppError, ErrorCode
 from .http_types import HttpClientProtocol, HttpResponseProtocol
+from .malware import MalwareScanError, MalwareScanner, validate_clean_scan_result
 from .parsers import Bitstream
 from .rate_limit import RateLimiter
 from .security import (
@@ -56,6 +60,19 @@ _DOWNLOAD_DEADLINE_MESSAGE = (
 _STREAM_LIMIT_MESSAGE = (
     "The repository file exceeded the configured download limit while streaming."
 )
+
+
+class ScanClock(Protocol):
+    """Supply a UTC observation used to evaluate scanner signature freshness."""
+
+    def __call__(self) -> datetime:
+        """Return one timezone-aware UTC clock observation."""
+        raise NotImplementedError
+
+
+def _system_scan_now() -> datetime:
+    """Return the authoritative UTC wall-clock sample for verdict freshness."""
+    return datetime.now(tz=UTC)
 
 
 def _validate_nplg_dns() -> None:
@@ -107,6 +124,9 @@ class DocumentDownloader:
     max_redirects: int = 3
     limiter: RateLimiter | None = None
     total_timeout_seconds: float = 120.0
+    scanner: MalwareScanner | None = None
+    scan_now: ScanClock = _system_scan_now
+    require_scanner: bool = False
 
     def __post_init__(self) -> None:
         """Reject invalid downloader limits before any upstream operation."""
@@ -118,6 +138,13 @@ class DocumentDownloader:
             raise ValueError(msg)
         if self.total_timeout_seconds <= 0:
             msg = "total_timeout_seconds must be positive"
+            raise ValueError(msg)
+        require_scanner = cast("object", self.require_scanner)
+        if type(require_scanner) is not bool:
+            msg = "require_scanner must be a boolean"
+            raise ValueError(msg)
+        if self.require_scanner and self.scanner is None:
+            msg = "private-full downloads require a malware scanner"
             raise ValueError(msg)
 
     async def _ensure_dns(self) -> None:
@@ -306,6 +333,29 @@ class DocumentDownloader:
                     "The repository response did not contain a valid PDF signature.",
                     http_status=422,
                 )
+            if self.scanner is not None:
+                path, expected_sha256 = destination.prepare_for_scan()
+                try:
+                    result = await self.scanner.scan(
+                        path,
+                        expected_sha256=expected_sha256,
+                        deadline=MonotonicDeadline.after(
+                            min(self.total_timeout_seconds, 60.0),
+                            clock=time.monotonic,
+                        ),
+                    )
+                    validate_clean_scan_result(
+                        path,
+                        expected_sha256=expected_sha256,
+                        result=result,
+                        now=self.scan_now(),
+                    )
+                except (MalwareScanError, OSError, TimeoutError, ValueError) as exc:
+                    raise AppError(
+                        ErrorCode.INVALID_DOCUMENT,
+                        "The downloaded document did not pass security scanning.",
+                        http_status=422,
+                    ) from exc
             artifact = await _run_storage_commit(
                 partial(
                     destination.commit,

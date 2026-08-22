@@ -840,7 +840,7 @@ Security-repair report в репозитории содержит историч
 ## 5. Выбор языка: decision matrix
 
 | Вариант | Безопасность | Скорость достижения результата | MCP Tasks | PDF parity risk | Alpic compatibility | Операционная сложность | Рекомендация |
-|---|---:|---:|---:|---:|---:|---:|---|
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | Python как сейчас + custom protocol | 6.5/10 | 9/10 | Нет standard Tasks | Низкий | Частичная | Средняя | Только временно |
 | Python + official SDK v2 + process worker | 8.5/10 | 8.5/10 | SDK v2.0 gap | Низкий | Лучший documented fit | Средняя | Лучший near-term |
 | Rust `rmcp` control plane + Python worker | 9/10 | 6.5/10 | Да, documented | Низкий/средний | Rust runtime не документирован | Выше | Лучший long-term |

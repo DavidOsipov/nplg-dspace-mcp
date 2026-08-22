@@ -26,6 +26,7 @@
 ### Task 1: Public configuration and token boundaries
 
 **Files:**
+
 - Modify: `src/nplg_mcp/config.py`
 - Modify: `src/nplg_mcp/tokens.py`
 - Modify: `src/nplg_mcp/app.py`
@@ -34,6 +35,7 @@
 - Test: `tests/conformance/test_mcp_http.py`
 
 **Interfaces:**
+
 - Consumes: `load_config(env: Mapping[str, str]) -> AppConfig`, `verify_asset_token(...) -> AssetGrant`.
 - Produces: an explicit loopback-only anonymous-development invariant, credential-domain separation, and maximum signed-asset lifetime enforcement.
 
@@ -68,6 +70,7 @@
 ### Task 2: Release registry and strict Zod oracle closure
 
 **Files:**
+
 - Modify: `security/external-test-gates.json`
 - Modify: `scripts/run_test_gate.py`
 - Modify: `tests/unit/test_test_gate.py`
@@ -79,6 +82,7 @@
 - Test: `tests/contracts/zod_contracts.test.mjs`
 
 **Interfaces:**
+
 - Consumes: live pytest node IDs and Pydantic `ReplayHeader` code-point length semantics.
 - Produces: an exact test registry and a Zod oracle with Unicode code-point, not UTF-16 code-unit, bounds under every strict static gate.
 
@@ -117,6 +121,7 @@
 ### Task 3: PDF writable topology and deterministic cancellation readiness
 
 **Files:**
+
 - Modify: `src/nplg_mcp/pdf_worker_client.py`
 - Modify: `tests/fixtures/pdf_worker_hang.py`
 - Modify: `tests/security/test_pdf_worker.py`
@@ -124,6 +129,7 @@
 - Modify if required by the executable topology test: `compose.yaml`
 
 **Interfaces:**
+
 - Consumes: `AssetStore.root` as the declared writable cache mount.
 - Produces: private mode job directories inside an explicitly writable, private subtree and atomically published PID readiness data.
 
@@ -156,6 +162,7 @@
 ### Task 4: PDF absolute deadline, cleanup, and digest-bound publication
 
 **Files:**
+
 - Modify: `src/nplg_mcp/tools.py`
 - Modify: `src/nplg_mcp/pdf_worker_client.py`
 - Test: `tests/unit/test_tools.py`
@@ -163,6 +170,7 @@
 - Test: `tests/property/test_pdf_ipc_properties.py`
 
 **Interfaces:**
+
 - Consumes: one `MonotonicDeadline` created before PDF queue admission and worker-declared output SHA-256 values.
 - Produces: bounded queue wait, deadline checks across parent phases, unconditional process-group cleanup, and publication that hashes the reopened descriptor before cache commit.
 
@@ -195,6 +203,7 @@
 ### Task 5: Metadata/result and asset-stream resource ceilings
 
 **Files:**
+
 - Modify: `src/nplg_mcp/repository.py`
 - Modify: `src/nplg_mcp/tools.py`
 - Modify: `src/nplg_mcp/app.py`
@@ -206,6 +215,7 @@
 - Test: `tests/conformance/test_mcp_http.py`
 
 **Interfaces:**
+
 - Consumes: request `page_size`, configured upstream byte/deadline ceilings, ASGI send operations.
 - Produces: parser cardinality/aggregate-text ceilings, rejection of oversized search pages, bounded serialization, and per-write/total asset-stream timeouts.
 
@@ -236,11 +246,13 @@
 ### Task 6: Integrated evidence and residual blocker classification
 
 **Files:**
+
 - Modify only if executable evidence exists: `docs/security/asvs-5.0.0-l2-matrix.jsonl`
 - Modify only if executable evidence exists: `docs/security/evidence-manifest.jsonl`
 - Modify: `docs/superpowers/plans/2026-08-20-phase-0-1-audit-remediation.md` checkbox status only during execution.
 
 **Interfaces:**
+
 - Consumes: fresh local gate outputs and externally controlled receipt requirements.
 - Produces: a custody-preserving fixed/unfixed finding map and an exact fail-closed release decision.
 

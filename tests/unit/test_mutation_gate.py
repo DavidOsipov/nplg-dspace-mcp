@@ -25,6 +25,7 @@ from scripts.run_mutation_gate import (
     MutationPolicy,
     cli,
     initial_mutation_policy,
+    mutation_policy_for_targets,
     parse_arguments,
     parse_mutation_results,
     run_mutation_gate,
@@ -48,7 +49,7 @@ _EXPECTED_TARGETS = (
     "scripts/smoke_live.py",
     "scripts/run_quality_gate.py",
 )
-_EXPECTED_MUTANT_COUNT = 138
+_EXPECTED_MUTANT_COUNT = 139
 _MINIMUM_KILLED_PERCENT = 65
 _MUTATION_TIMEOUT_SECONDS = 1_800.0
 _THIRD_ROOT_SCAN = 3
@@ -136,6 +137,7 @@ _EXPECTED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
         "x__snapshot_scalar",
         "x__store_snapshot",
         "x_to_public_error",
+        "x_validate_resource_uri",
     ),
     "scripts/delete_render.py": (
         "x__confirm",
@@ -714,7 +716,7 @@ def test_mutation_gate_cli_rejects_incomplete_target_set_in_real_subprocess(
             "--output-dir",
             output.as_posix(),
             "--targets",
-            "src/nplg_mcp/errors.py",
+            "src/nplg_mcp/sdk_boundary.py",
         ),
         cwd=project,
         environment={
@@ -782,6 +784,222 @@ def test_initial_mutation_policy_matches_the_independent_literal_oracle() -> Non
     assert policy.required_functions == expected_functions
 
 
+def test_phase_two_mutation_policies_are_closed_and_test_selected() -> None:
+    task_nine_targets = (
+        "src/nplg_mcp/contracts/base.py",
+        "src/nplg_mcp/contracts/inputs.py",
+        "src/nplg_mcp/contracts/outputs.py",
+        "src/nplg_mcp/contracts/catalog.py",
+        "src/nplg_mcp/tools.py",
+    )
+    task_ten_targets = (
+        "src/nplg_mcp/contracts/schema.py",
+        "scripts/export_contracts.py",
+    )
+
+    task_nine = mutation_policy_for_targets(task_nine_targets)
+    task_ten = mutation_policy_for_targets(task_ten_targets)
+
+    assert task_nine.targets == task_nine_targets
+    assert task_nine.test_paths == (
+        "tests/contracts/test_pydantic_contracts.py",
+        "tests/property/test_contract_properties.py",
+        "tests/unit/test_tools.py",
+        (
+            "tests/contracts/test_frozen_baseline.py::"
+            "test_frozen_case_replays_through_parse_and_handle_against_independent_oracle"
+        ),
+    )
+    assert dict(task_nine.required_functions)["src/nplg_mcp/contracts/outputs.py"] == ()
+    assert task_ten.targets == task_ten_targets
+    assert task_ten.test_paths == ("tests/contracts/test_zod_contracts.py",)
+    with pytest.raises(MutationGateError, match="closed initial policy"):
+        _ = mutation_policy_for_targets(tuple(reversed(task_ten_targets)))
+
+
+def test_phase_three_mutation_policies_are_closed_and_test_selected() -> None:
+    task_eleven_and_fourteen_targets = (
+        "src/nplg_mcp/mcp_server.py",
+        "src/nplg_mcp/sdk_boundary.py",
+        "src/nplg_mcp/errors.py",
+    )
+    task_twelve_targets = ("src/nplg_mcp/errors.py",)
+    task_thirteen_targets = (
+        "src/nplg_mcp/sdk_boundary.py",
+        "src/nplg_mcp/http_security.py",
+        "src/nplg_mcp/json_preflight.py",
+        "src/nplg_mcp/config.py",
+        "src/nplg_mcp/app.py",
+        "src/nplg_mcp/__main__.py",
+    )
+
+    task_eleven_and_fourteen = mutation_policy_for_targets(
+        task_eleven_and_fourteen_targets
+    )
+    task_twelve = mutation_policy_for_targets(task_twelve_targets)
+    task_thirteen = mutation_policy_for_targets(task_thirteen_targets)
+
+    assert task_eleven_and_fourteen.targets == task_eleven_and_fourteen_targets
+    assert task_eleven_and_fourteen.test_paths == (
+        "tests/contracts/test_sdk_client.py",
+        "tests/contracts/test_sdk_boundary.py",
+        "tests/contracts/test_sdk_parity.py",
+        "tests/conformance/test_mcp_http.py",
+        "tests/unit/test_errors.py",
+    )
+    assert task_eleven_and_fourteen.deselected_tests == (
+        "tests/unit/test_errors.py::test_detail_mapping_growth_during_copy_fails_closed",
+        "tests/unit/test_errors.py::test_detail_list_growth_during_copy_fails_closed",
+    )
+    phase_three_functions = dict(task_eleven_and_fourteen.required_functions)
+    assert phase_three_functions["src/nplg_mcp/mcp_server.py"] == (
+        "nplg_mcp.mcp_server.x_create_mcp_server",
+    )
+    assert phase_three_functions["src/nplg_mcp/sdk_boundary.py"] == (
+        "nplg_mcp.sdk_boundary.x__adapt_resource",
+        "nplg_mcp.sdk_boundary.x__binding_for_tool",
+        "nplg_mcp.sdk_boundary.x__serialized_output",
+    )
+    assert phase_three_functions["src/nplg_mcp/errors.py"] == (
+        "nplg_mcp.errors.x__checked_string_total",
+        "nplg_mcp.errors.x__consume_public_detail_value",
+        "nplg_mcp.errors.x__internal_public_error",
+        "nplg_mcp.errors.x__snapshot_frame",
+        "nplg_mcp.errors.x__snapshot_public_details",
+        "nplg_mcp.errors.x__snapshot_scalar",
+        "nplg_mcp.errors.x__store_snapshot",
+        "nplg_mcp.errors.x_to_public_error",
+        "nplg_mcp.errors.x_validate_resource_uri",
+    )
+    assert task_twelve.targets == task_twelve_targets
+    assert task_twelve.test_paths == ("tests/contracts/test_sdk_parity.py",)
+    assert task_thirteen.targets == task_thirteen_targets
+    assert task_thirteen.test_paths == (
+        "tests/conformance/test_mcp_http.py",
+        "tests/contracts/test_sdk_parity.py",
+        "tests/unit/test_app_lifespan.py",
+        "tests/unit/test_json_preflight.py",
+        "tests/property/test_json_preflight_properties.py",
+        "tests/unit/test_config.py",
+    )
+    with pytest.raises(MutationGateError, match="closed initial policy"):
+        _ = mutation_policy_for_targets(tuple(reversed(task_thirteen_targets)))
+
+
+def test_phase_three_mutation_metadata_accepts_only_exact_generated_functions() -> None:
+    targets = (
+        "src/nplg_mcp/mcp_server.py",
+        "src/nplg_mcp/sdk_boundary.py",
+        "src/nplg_mcp/errors.py",
+    )
+    modules = {
+        targets[0]: "nplg_mcp.mcp_server",
+        targets[1]: "nplg_mcp.sdk_boundary",
+        targets[2]: "nplg_mcp.errors",
+    }
+    local_functions: dict[str, tuple[str, ...]] = {
+        targets[0]: ("x_create_mcp_server",),
+        targets[1]: (
+            "x__adapt_resource",
+            "x__binding_for_tool",
+            "x__serialized_output",
+        ),
+        targets[2]: (
+            "x__checked_string_total",
+            "x__consume_public_detail_value",
+            "x__internal_public_error",
+            "x__snapshot_frame",
+            "x__snapshot_public_details",
+            "x__snapshot_scalar",
+            "x__store_snapshot",
+            "x_to_public_error",
+            "x_validate_resource_uri",
+        ),
+    }
+
+    def payloads_for(
+        functions: dict[str, tuple[str, ...]],
+    ) -> tuple[tuple[str, bytes], ...]:
+        payloads: list[tuple[str, bytes]] = []
+        for target in targets:
+            statuses: dict[str, int] = {
+                f"{modules[target]}.{function}__mutmut_1": 1
+                for function in functions[target]
+            }
+            payloads.append((target, _meta(json.dumps(statuses).encode())))
+        return tuple(payloads)
+
+    expected_count = sum(len(functions) for functions in local_functions.values())
+    summary = parse_mutation_results(payloads_for(local_functions))
+    assert summary.total == expected_count
+    assert summary.killed == expected_count
+
+    unexpected = dict(local_functions)
+    unexpected[targets[1]] = (*local_functions[targets[1]], "x_any_sdk_function")
+    with pytest.raises(MutationGateError, match="unexpected generated functions"):
+        _ = parse_mutation_results(payloads_for(unexpected))
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [
+        cast("tuple[str, ...]", ["src/nplg_mcp/contracts/schema.py"]),
+        cast("tuple[str, ...]", ("src/nplg_mcp/contracts/schema.py", 1)),
+    ],
+)
+def test_mutation_policy_registry_rejects_malformed_runtime_target_types(
+    targets: tuple[str, ...],
+) -> None:
+    with pytest.raises(MutationGateError, match="closed initial policy"):
+        _ = mutation_policy_for_targets(targets)
+
+
+def test_phase_two_mutation_metadata_rejects_non_object_result_map() -> None:
+    targets = (
+        "src/nplg_mcp/contracts/schema.py",
+        "scripts/export_contracts.py",
+    )
+    payloads = (
+        (targets[0], _meta(b"[]")),
+        (targets[1], _meta(b"{}")),
+    )
+
+    with pytest.raises(MutationGateError, match="results are malformed"):
+        _ = parse_mutation_results(payloads)
+
+
+def test_run_mutation_gate_rejects_malformed_request_before_repository_access() -> None:
+    targets = (
+        "src/nplg_mcp/contracts/schema.py",
+        "scripts/export_contracts.py",
+    )
+    executor = _MutationExecutor(mutation_policy_for_targets(targets))
+    clock = _Clock()
+    filesystem = _Filesystem()
+    git = cast("_RealGit", object())
+
+    with pytest.raises(MutationGateError, match="closed initial policy"):
+        _ = run_mutation_gate(
+            MutationGateRequest(
+                worktree=cast("Path", "not-a-path"),
+                output_dir=None,
+                targets=targets,
+            ),
+            executor=executor,
+            clock=clock,
+            filesystem=filesystem,
+            git=git,
+        )
+    with pytest.raises(MutationGateError, match="closed initial policy"):
+        _ = run_mutation_gate(
+            cast("MutationGateRequest", object()),
+            executor=executor,
+            clock=clock,
+            filesystem=filesystem,
+            git=git,
+        )
+
+
 def test_mutation_result_parser_reaches_behavioral_red() -> None:
     exit_codes: dict[str, dict[str, int]] = {
         target: {
@@ -797,7 +1015,7 @@ def test_mutation_result_parser_reaches_behavioral_red() -> None:
         )
         for target in _EXPECTED_TARGETS
     )
-    expected_mutants = 138
+    expected_mutants = 139
 
     summary = parse_mutation_results(payloads)
 
@@ -1000,7 +1218,7 @@ def test_public_argument_parser_and_cli_reject_incomplete_policy(
             "--worktree",
             tmp_path.as_posix(),
             "--targets",
-            "src/nplg_mcp/errors.py",
+            "src/nplg_mcp/sdk_boundary.py",
         ]
     )
 
@@ -1039,7 +1257,7 @@ def test_public_cli_renders_success_from_the_existing_adapter_contract(
     )
 
     assert status == 0
-    assert capsys.readouterr().out == "mutation gate passed: 138/138 killed\n"
+    assert capsys.readouterr().out == "mutation gate passed: 139/139 killed\n"
 
 
 @pytest.mark.parametrize(
@@ -1327,10 +1545,15 @@ def test_run_mutation_gate_reaches_behavioral_red(tmp_path: Path) -> None:
     assert _source_git_state(repository, cache) == before
     assert stat.S_IMODE(output.stat().st_mode) == stat.S_IRWXU
     mutation_configuration = (output / "snapshot" / "setup.cfg").read_text()
-    assert (
-        "also_copy =\n    src/nplg_mcp\n    scripts\n    security\n"
-        in mutation_configuration
-    )
+    expected_copy_policy = """also_copy =
+    contracts
+    pyproject.toml
+    requirements.in
+    src/nplg_mcp
+    scripts
+    security
+"""
+    assert expected_copy_policy in mutation_configuration
     assert (
         "    --deselect\n"
         "    tests/unit/test_errors.py::test_detail_mapping_growth_"
