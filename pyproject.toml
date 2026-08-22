@@ -47,7 +47,7 @@ test = [
   "hypothesis==6.165.9",
   "PyYAML==6.0.3",
   "pypdf==6.16.1",
-  "reportlab==4.4.9",
+  "reportlab==5.0.0",
 ]
 
 [project.scripts]
