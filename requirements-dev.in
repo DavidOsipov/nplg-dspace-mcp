@@ -10,7 +10,7 @@ hypothesis==6.165.9
 jsonschema==4.26.0
 PyYAML==6.0.3
 pypdf==6.16.1
-reportlab==4.4.9
+reportlab==5.0.0
 
 # Static and security quality tools.
 ruff==0.16.3
