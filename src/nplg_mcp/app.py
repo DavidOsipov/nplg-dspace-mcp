@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import importlib
+import logging
 import os
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ from .network import create_bound_http_transport
 from .profiles import DeploymentProfile as SdkDeploymentProfile
 from .rate_limit import AsyncRateLimiter
 from .repository import NplgRepository
+from .resilience import UpstreamGuard, UpstreamGuardPolicy
+from .security import OutboundPurpose, build_outbound_headers
 from .services import (
     AppServices,
     FullServiceComposition,
@@ -36,6 +39,14 @@ from .services import (
 )
 from .tokens import verify_asset_token
 from .tools import ToolService, ToolServiceDependencies
+
+_UPSTREAM_LOGGER = logging.getLogger("nplg_mcp.upstream")
+_UPSTREAM_TRANSITIONS = {
+    ("closed", "open"): "closed_to_open",
+    ("open", "half_open"): "open_to_half_open",
+    ("half_open", "closed"): "half_open_to_closed",
+    ("half_open", "open"): "half_open_to_open",
+}
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Mapping
@@ -335,6 +346,19 @@ def _has_valid_api_credential(request: Request, config: AppConfig) -> bool:
     return _api_principal(request, config) is not None
 
 
+def _observe_upstream_transition(before: str, after: str) -> None:
+    transition = _UPSTREAM_TRANSITIONS.get((before, after))
+    if transition is None:
+        return
+    _UPSTREAM_LOGGER.info(
+        "nplg_upstream_circuit_transition",
+        extra={
+            "upstream_state": after,
+            "upstream_transition": transition,
+        },
+    )
+
+
 def _runtime_services(config: AppConfig) -> AppServices:
     profile = validate_deployment_profile(config.deployment_profile)
     if profile == "distributed-full":
@@ -347,19 +371,29 @@ def _runtime_services(config: AppConfig) -> AppServices:
         trust_env=False,
         limits=limits,
         transport=create_bound_http_transport(limits=limits),
-        headers={
-            "User-Agent": "nplg-dspace-mcp/0.1.0 (+read-only research connector)",
-            "Accept-Encoding": "identity",
-        },
+        headers=build_outbound_headers(OutboundPurpose.METADATA),
         cookies=CookieJar(policy=_RejectAllCookiesPolicy()),
     )
     client = cast("HttpClientProtocol", http_client)
     limiter = AsyncRateLimiter(config.upstream_rate_per_second)
+    guard = UpstreamGuard(
+        policy=UpstreamGuardPolicy(
+            capacity=2,
+            failure_threshold=3,
+            base_open_seconds=1.0,
+            max_open_seconds=30.0,
+            max_attempt_seconds=min(15.0, config.upstream_timeout_seconds),
+            jitter_ratio=0.2,
+        ),
+        transition_observer=_observe_upstream_transition,
+    )
     repository = NplgRepository(
         client=client,
         max_redirects=config.max_redirects,
         limiter=limiter,
-        total_timeout_seconds=config.upstream_timeout_seconds,
+        total_timeout_seconds=float(config.upstream_timeout_seconds),
+        guard=guard,
+        cursor_signing_secret=config.asset_signing_secret,
     )
     if profile == "alpic-metadata":
         tools = ToolService(

@@ -134,6 +134,20 @@ _TASK_THIRTEEN_TARGETS = (
     "src/nplg_mcp/app.py",
     "src/nplg_mcp/__main__.py",
 )
+_TASK_SEVENTEEN_TARGETS = (
+    "src/nplg_mcp/app.py",
+    "src/nplg_mcp/http_types.py",
+    "src/nplg_mcp/security.py",
+    "src/nplg_mcp/network.py",
+    "src/nplg_mcp/resilience.py",
+    "src/nplg_mcp/downloader.py",
+    "scripts/run_live_nplg_canary.py",
+)
+_TASK_EIGHTEEN_TARGETS = (
+    "src/nplg_mcp/parsers.py",
+    "src/nplg_mcp/repository.py",
+    "src/nplg_mcp/tokens.py",
+)
 _TARGET_MODULES = {
     "src/nplg_mcp/security.py": "nplg_mcp.security",
     "src/nplg_mcp/tokens.py": "nplg_mcp.tokens",
@@ -157,6 +171,12 @@ _TARGET_MODULES = {
     "src/nplg_mcp/config.py": "nplg_mcp.config",
     "src/nplg_mcp/app.py": "nplg_mcp.app",
     "src/nplg_mcp/__main__.py": "nplg_mcp.__main__",
+    "src/nplg_mcp/http_types.py": "nplg_mcp.http_types",
+    "src/nplg_mcp/network.py": "nplg_mcp.network",
+    "src/nplg_mcp/resilience.py": "nplg_mcp.resilience",
+    "scripts/run_live_nplg_canary.py": "scripts.run_live_nplg_canary",
+    "src/nplg_mcp/parsers.py": "nplg_mcp.parsers",
+    "src/nplg_mcp/repository.py": "nplg_mcp.repository",
 }
 _REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
     "src/nplg_mcp/security.py": (
@@ -178,6 +198,91 @@ _REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
         "x_verify_asset_token",
     ),
     "src/nplg_mcp/downloader.py": ("x__validate_nplg_dns",),
+    "src/nplg_mcp/http_types.py": (),
+    "src/nplg_mcp/network.py": (
+        "x_create_resolved_endpoint",
+        "xǁBoundAsyncNetworkBackendǁ_deadline",
+        "xǁBoundAsyncNetworkBackendǁconnect_tcp",
+        "xǁBoundAsyncNetworkBackendǁconnect_unix_socket",
+        "xǁBoundAsyncNetworkBackendǁsleep",
+    ),
+    "src/nplg_mcp/resilience.py": (
+        "xǁUpstreamGuardPolicyǁ__post_init__",
+        "xǁUpstreamGuardǁadmit",
+        "xǁUpstreamGuardǁcomplete_attempt",
+        "xǁUpstreamGuardǁ_open_interval",
+    ),
+    "scripts/run_live_nplg_canary.py": (
+        "x_canonical_record_digest",
+        "x_execute_canary_probe",
+        "x_validate_record_digest",
+        "x_write_record_exclusive",
+    ),
+    "src/nplg_mcp/parsers.py": (
+        "x__bitstream_id",
+        "x__canonical_item_from_href",
+        "x__class_contains",
+        "x__collections",
+        "x__dc_fields",
+        "x__dim_fields",
+        "x__extract_handle",
+        "x__field_values",
+        "x__first_descendant",
+        "x__full_fields",
+        "x__has_full_metadata_text",
+        "x__has_next_page_class",
+        "x__has_search_results_class",
+        "x__html_attribute_text",
+        "x__html_field_code_points",
+        "x__html_semantic_text_code_points",
+        "x__local_name",
+        "x__match_group",
+        "x__next_search_offset",
+        "x__normalize",
+        "x__normalize_date",
+        "x__oai_fields",
+        "x__parse_bitstreams",
+        "x__parse_size",
+        "x__parse_xml",
+        "x__preflight_html",
+        "x__preflight_xml",
+        "x__raise_for_oai_error",
+        "x__record_from_fields",
+        "x__require_exact_owned_child",
+        "x__require_preflight_agreement",
+        "x__saturating_increment",
+        "x__search_columns",
+        "x__search_items",
+        "x__search_total",
+        "x__summary_fields",
+        "x__tag_attribute",
+        "x__tag_text",
+        "x__unique",
+        "x__upstream_failure",
+        "x__validate_html_tree",
+        "x__validate_oai_identifier",
+        "x__validate_text_budget",
+        "x__validate_xml_tree",
+        "x_parse_item_page",
+        "x_parse_metadata_formats",
+        "x_parse_oai_record",
+        "x_parse_search_results",
+        "xǁ_HtmlBudgetParserǁ__init__",
+        "xǁ_HtmlBudgetParserǁ_add_attributes",
+        "xǁ_HtmlBudgetParserǁ_add_element",
+        "xǁ_HtmlBudgetParserǁ_add_text",
+        "xǁ_HtmlBudgetParserǁcheck_deadline",
+    ),
+    "src/nplg_mcp/repository.py": (
+        "x__canonical_search_query",
+        "x__publish_metadata_formats",
+        "x__record_dns_app_error",
+        "x__record_transport_error",
+        "x__require_metadata_prefix",
+        "x__validate_nplg_dns",
+        "x_decode_cursor",
+        "x_encode_cursor",
+    ),
     "src/nplg_mcp/storage.py": (
         "x__cleanup_render_tiles",
         "x__cleanup_tile_page",
@@ -489,6 +594,23 @@ _REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+_TASK_EIGHTEEN_REQUIRED_LOCAL_FUNCTIONS = {
+    target: (
+        (
+            "x_derive_cursor_signing_key",
+            "x_cursor_query_hash",
+            "x__reject_duplicate_cursor_keys",
+            "x_sign_cursor",
+            "x__require_matching_signature",
+            "x_verify_cursor",
+            *_REQUIRED_LOCAL_FUNCTIONS[target],
+        )
+        if target == "src/nplg_mcp/tokens.py"
+        else _REQUIRED_LOCAL_FUNCTIONS[target]
+    )
+    for target in _TASK_EIGHTEEN_TARGETS
+}
+
 
 def _fail(message: str) -> NoReturn:
     raise MutationGateError(message)
@@ -596,14 +718,20 @@ def _mutation_policy(
     *,
     test_paths: tuple[str, ...],
     deselected_tests: tuple[str, ...] = (),
+    required_local_functions: dict[str, tuple[str, ...]] | None = None,
 ) -> MutationPolicy:
     """Build one exact policy from the closed target/function registries."""
+    function_registry = (
+        _REQUIRED_LOCAL_FUNCTIONS
+        if required_local_functions is None
+        else required_local_functions
+    )
     required = tuple(
         (
             target,
             tuple(
                 f"{_TARGET_MODULES[target]}.{local_function}"
-                for local_function in _REQUIRED_LOCAL_FUNCTIONS[target]
+                for local_function in function_registry[target]
             ),
         )
         for target in targets
@@ -616,6 +744,48 @@ def _mutation_policy(
         required_functions=required,
         test_paths=test_paths,
         deselected_tests=deselected_tests,
+    )
+
+
+def _later_task_mutation_policy(targets: tuple[str, ...]) -> MutationPolicy:
+    if targets == _TASK_THIRTEEN_TARGETS:
+        return _mutation_policy(
+            targets,
+            test_paths=(
+                "tests/conformance/test_mcp_http.py",
+                "tests/contracts/test_sdk_parity.py",
+                "tests/unit/test_app_lifespan.py",
+                "tests/unit/test_json_preflight.py",
+                "tests/property/test_json_preflight_properties.py",
+                "tests/unit/test_config.py",
+            ),
+        )
+    if targets == _TASK_EIGHTEEN_TARGETS:
+        return _mutation_policy(
+            targets,
+            test_paths=(
+                "tests/unit/test_parsers.py",
+                "tests/integration/test_repository.py",
+                "tests/property/test_parser_properties.py",
+            ),
+            required_local_functions=_TASK_EIGHTEEN_REQUIRED_LOCAL_FUNCTIONS,
+        )
+    return _mutation_policy(
+        targets,
+        test_paths=(
+            "tests/security/test_ssrf_binding.py",
+            "tests/unit/test_upstream_resilience.py",
+            "tests/unit/test_live_nplg_canary.py",
+            "tests/security/test_downloader.py",
+            "tests/integration/test_repository.py",
+            "tests/conformance/test_mcp_http.py",
+        ),
+        deselected_tests=(
+            (
+                "tests/integration/test_repository.py::"
+                "test_live_nplg_canary_uses_bound_public_endpoint"
+            ),
+        ),
     )
 
 
@@ -681,18 +851,12 @@ def mutation_policy_for_targets(targets: tuple[str, ...]) -> MutationPolicy:
             targets,
             test_paths=("tests/contracts/test_sdk_parity.py",),
         )
-    if targets == _TASK_THIRTEEN_TARGETS:
-        return _mutation_policy(
-            targets,
-            test_paths=(
-                "tests/conformance/test_mcp_http.py",
-                "tests/contracts/test_sdk_parity.py",
-                "tests/unit/test_app_lifespan.py",
-                "tests/unit/test_json_preflight.py",
-                "tests/property/test_json_preflight_properties.py",
-                "tests/unit/test_config.py",
-            ),
-        )
+    if targets in {
+        _TASK_THIRTEEN_TARGETS,
+        _TASK_SEVENTEEN_TARGETS,
+        _TASK_EIGHTEEN_TARGETS,
+    }:
+        return _later_task_mutation_policy(targets)
     _fail("mutation request does not match the closed initial policy")
 
 

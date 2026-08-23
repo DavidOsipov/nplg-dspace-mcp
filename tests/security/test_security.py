@@ -139,6 +139,18 @@ def test_non_global_addresses_are_forbidden(value: str | int) -> None:
     assert is_forbidden_address(ipaddress.ip_address(value)) is True
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "::ffff:8.8.8.8",
+        "2606:4700:4700::1111%eth0",
+    ],
+)
+def test_special_form_ipv6_addresses_are_forbidden(value: str) -> None:
+    """Mutation caught: treating mapped or scoped global IPv6 as public."""
+    assert is_forbidden_address(ipaddress.ip_address(value)) is True
+
+
 def test_global_addresses_are_allowed() -> None:
     assert is_forbidden_address(ipaddress.ip_address("1.1.1.1")) is False
     assert is_forbidden_address(ipaddress.ip_address("2606:4700:4700::1111")) is False

@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import Protocol, cast
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -18,18 +20,20 @@ from .contracts import MonotonicDeadline
 from .errors import AppError, ErrorCode
 from .http_types import HttpClientProtocol, HttpResponseProtocol
 from .malware import MalwareScanError, MalwareScanner, validate_clean_scan_result
+from .network import classify_transport_failure
 from .parsers import Bitstream
 from .rate_limit import RateLimiter
+from .resilience import AttemptPermit, UpstreamGuard, UpstreamUnavailableError
 from .security import (
     NPLG_HOST,
+    DnsTransientError,
+    OutboundPurpose,
+    build_outbound_headers,
     parse_handle_input,
     resolve_approved_addresses,
     validate_upstream_url,
 )
 from .storage import ContentAddressedStore, StoredArtifact
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 _RUNTIME_ANNOTATION_TYPES = (
     HttpClientProtocol,
@@ -38,6 +42,7 @@ _RUNTIME_ANNOTATION_TYPES = (
     RateLimiter,
     ContentAddressedStore,
     StoredArtifact,
+    Callable,
 )
 
 _ALLOWED_PDF_TYPES = {
@@ -52,11 +57,32 @@ _HTTP_OK_MIN = 200
 _HTTP_REDIRECT_MIN = 300
 _HTTP_NOT_FOUND = 404
 _HTTP_TOO_MANY_REQUESTS = 429
+_HTTP_SERVER_ERROR_MIN = 500
+_MAX_UPSTREAM_TIMEOUT_SECONDS = 120.0
 _MAX_CONFIGURED_REDIRECTS = 5
 _PDF_SIGNATURE_LENGTH = 8
 _DOWNLOAD_DEADLINE_MESSAGE = (
     "The repository download did not complete within the configured deadline."
 )
+
+
+async def _record_dns_app_error(permit: AttemptPermit, error: AppError) -> None:
+    if isinstance(error, DnsTransientError) or error.code is ErrorCode.RATE_LIMITED:
+        await permit.record_transient_failure()
+    else:
+        await permit.record_excluded_failure()
+
+
+async def _record_transport_error(
+    permit: AttemptPermit,
+    error: TimeoutError | httpx.RequestError,
+) -> None:
+    if classify_transport_failure(error) == "transient":
+        await permit.record_transient_failure()
+    else:
+        await permit.record_excluded_failure()
+
+
 _STREAM_LIMIT_MESSAGE = (
     "The repository file exceeded the configured download limit while streaming."
 )
@@ -127,6 +153,8 @@ class DocumentDownloader:
     scanner: MalwareScanner | None = None
     scan_now: ScanClock = _system_scan_now
     require_scanner: bool = False
+    guard: UpstreamGuard = field(default_factory=UpstreamGuard)
+    clock: Callable[[], float] = time.monotonic
 
     def __post_init__(self) -> None:
         """Reject invalid downloader limits before any upstream operation."""
@@ -136,9 +164,18 @@ class DocumentDownloader:
         if not 0 <= self.max_redirects <= _MAX_CONFIGURED_REDIRECTS:
             msg = "max_redirects must be between 0 and 5"
             raise ValueError(msg)
-        if self.total_timeout_seconds <= 0:
+        if (
+            type(self.total_timeout_seconds) is not float
+            or not math.isfinite(self.total_timeout_seconds)
+            or self.total_timeout_seconds <= 0
+            or self.total_timeout_seconds > _MAX_UPSTREAM_TIMEOUT_SECONDS
+        ):
             msg = "total_timeout_seconds must be positive"
             raise ValueError(msg)
+        guard = cast("object", self.guard)
+        if not isinstance(guard, UpstreamGuard):
+            msg = "guard must be an UpstreamGuard"
+            raise TypeError(msg)
         require_scanner = cast("object", self.require_scanner)
         if type(require_scanner) is not bool:
             msg = "require_scanner must be a boolean"
@@ -157,6 +194,15 @@ class DocumentDownloader:
                     "The DNS resolver is at capacity.",
                     http_status=503,
                 ) from exc
+
+    async def _admit_dependencies(self, permit: AttemptPermit) -> None:
+        try:
+            await self._ensure_dns()
+        except AppError as exc:
+            await _record_dns_app_error(permit, exc)
+            raise
+        if self.limiter is not None:
+            await self.limiter.acquire()
 
     @staticmethod
     def _validate_bitstream(bitstream: Bitstream) -> str:
@@ -182,9 +228,23 @@ class DocumentDownloader:
 
     async def download(self, bitstream: Bitstream) -> DownloadResult:
         """Download and publish a validated public PDF bitstream."""
+        deadline = MonotonicDeadline.after(
+            min(self.total_timeout_seconds, 59.0),
+            clock=self.clock,
+        )
         try:
             async with asyncio.timeout(self.total_timeout_seconds):
-                return await self._download_within_deadline(bitstream)
+                return await self._download_within_deadline(
+                    bitstream,
+                    deadline=deadline,
+                )
+        except UpstreamUnavailableError as exc:
+            raise AppError(
+                ErrorCode.RATE_LIMITED,
+                "The repository is temporarily unavailable.",
+                http_status=503,
+                safe_details={"retry_after": exc.retry_after_seconds},
+            ) from exc
         except (TimeoutError, httpx.RequestError) as exc:
             raise AppError(
                 ErrorCode.UPSTREAM_FAILURE,
@@ -371,7 +431,12 @@ class DocumentDownloader:
                 bytes_downloaded=downloaded,
             )
 
-    async def _download_within_deadline(self, bitstream: Bitstream) -> DownloadResult:
+    async def _download_within_deadline(
+        self,
+        bitstream: Bitstream,
+        *,
+        deadline: MonotonicDeadline,
+    ) -> DownloadResult:
         current = self._validate_bitstream(bitstream)
         if (
             bitstream.reported_size is not None
@@ -387,28 +452,50 @@ class DocumentDownloader:
                 },
             )
         for redirect_index in range(self.max_redirects + 1):
-            await self._ensure_dns()
-            if self.limiter is not None:
-                await self.limiter.acquire()
-            async with self.client.stream(
-                "GET",
-                current,
-                headers={"accept": "application/pdf, application/octet-stream;q=0.8"},
-                follow_redirects=False,
-            ) as response:
-                redirect = self._redirect_target(
-                    response,
-                    current=current,
-                    bitstream=bitstream,
-                    redirect_index=redirect_index,
-                )
-                if redirect is not None:
-                    current = redirect
-                    continue
-                self._validate_response_status(response)
-                self._validate_response_headers(response)
-                return await self._store_response(
-                    response, bitstream=bitstream, source_url=current
-                )
+            async with self.guard.acquire(deadline) as permit:
+                await self._admit_dependencies(permit)
+                timeout = permit.deadline.remaining(now=self.clock())
+                if timeout <= 0.0:
+                    raise TimeoutError
+                try:
+                    async with self.client.stream(
+                        "GET",
+                        current,
+                        headers=build_outbound_headers(OutboundPurpose.DOWNLOAD),
+                        follow_redirects=False,
+                        timeout=timeout,
+                    ) as response:
+                        status = response.status_code
+                        transient = (
+                            status == _HTTP_TOO_MANY_REQUESTS
+                            or status >= _HTTP_SERVER_ERROR_MIN
+                        )
+                        redirect = self._redirect_target(
+                            response,
+                            current=current,
+                            bitstream=bitstream,
+                            redirect_index=redirect_index,
+                        )
+                        if redirect is not None:
+                            await permit.record_success()
+                            current = redirect
+                            continue
+                        if transient:
+                            await permit.record_transient_failure()
+                        elif status < _HTTP_OK_MIN or status >= _HTTP_REDIRECT_MIN:
+                            await permit.record_excluded_failure()
+                        self._validate_response_status(response)
+                        self._validate_response_headers(response)
+                        result = await self._store_response(
+                            response,
+                            bitstream=bitstream,
+                            source_url=current,
+                        )
+                        await permit.record_success()
+                        return result
+                except (TimeoutError, httpx.RequestError) as exc:
+                    if not permit.finalized:
+                        await _record_transport_error(permit, exc)
+                    raise
         msg = "unreachable"
         raise AssertionError(msg)

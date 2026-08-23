@@ -1149,6 +1149,7 @@ def _policy() -> CoveragePolicy:
             "src/nplg_mcp/http_security.py",
             "src/nplg_mcp/json_preflight.py",
             "src/nplg_mcp/network.py",
+            "src/nplg_mcp/resilience.py",
             "src/nplg_mcp/pdf_executor.py",
             "src/nplg_mcp/pdf_ipc.py",
             "src/nplg_mcp/rate_limit.py",
@@ -1156,6 +1157,7 @@ def _policy() -> CoveragePolicy:
             "src/nplg_mcp/security.py",
             "src/nplg_mcp/tokens.py",
             "scripts/delete_render.py",
+            "scripts/run_live_nplg_canary.py",
             "scripts/smoke_live.py",
             "scripts/run_quality_gate.py",
             "scripts/run_test_gate.py",
@@ -1236,11 +1238,13 @@ def test_coverage_policy_parser_reaches_behavioral_red(tmp_path: Path) -> None:
                 b'"decision_modules":["src/nplg_mcp/admission.py",',
                 b'"src/nplg_mcp/errors.py","src/nplg_mcp/http_security.py",',
                 b'"src/nplg_mcp/json_preflight.py","src/nplg_mcp/network.py",',
+                b'"src/nplg_mcp/resilience.py",',
                 b'"src/nplg_mcp/pdf_executor.py","src/nplg_mcp/pdf_ipc.py",',
                 b'"src/nplg_mcp/rate_limit.py",',
                 b'"src/nplg_mcp/sdk_boundary.py",',
                 b'"src/nplg_mcp/security.py","src/nplg_mcp/tokens.py",',
-                b'"scripts/delete_render.py","scripts/smoke_live.py",',
+                b'"scripts/delete_render.py","scripts/run_live_nplg_canary.py",',
+                b'"scripts/smoke_live.py",',
                 b'"scripts/run_quality_gate.py","scripts/run_test_gate.py",',
                 b'"scripts/run_mutation_gate.py","scripts/verify_release.py",',
                 b'"scripts/bootstrap_external_tools.py",',
@@ -1330,6 +1334,37 @@ def test_repository_policy_files_match_the_closed_phase3_contract() -> None:
                     "tests/contracts/test_frozen_baseline.py::"
                     "test_rejected_historical_capture_does_not_freshen_git_metadata"
                 ),
+            ),
+            ExternalGate(
+                kind="live",
+                node_id=(
+                    "tests/integration/test_repository.py::"
+                    "test_live_nplg_canary_uses_bound_public_endpoint"
+                ),
+                gate_id="common.nplg-live-canary",
+                command_id="live.nplg-bound-endpoint.v2",
+                profiles=("alpic-metadata", "private-full"),
+                mode="preexecuted-operational",
+                protected_command=(
+                    "nplg-release-controller",
+                    "external-gate",
+                    "--gate-id",
+                    "common.nplg-live-canary",
+                    "--candidate-battery-json",
+                    "BATTERY",
+                    "--controller-policy",
+                    "EXPECTED_POLICY",
+                    "--network-broker-descriptor",
+                    "BROKER",
+                    "--result-json",
+                    "RESULT_JSON",
+                ),
+                protected_cwd="protected-controller-root",
+                broker_kind="one-operation-exact-nplg-origin",
+                authority="protected-controller-network-broker",
+                timeout_seconds=60,
+                result_schema="nplg-live-canary.v2",
+                signed_proof_schema="nplg-live-canary.v2",
             ),
         ),
     )
@@ -2817,6 +2852,7 @@ settings.register_profile(
         "http_security",
         "json_preflight",
         "network",
+        "resilience",
         "pdf_executor",
         "pdf_ipc",
         "rate_limit",
@@ -2824,6 +2860,7 @@ settings.register_profile(
         "security",
         "tokens",
         "delete_render",
+        "run_live_nplg_canary",
         "smoke_live",
         "run_quality_gate",
         "run_test_gate",
@@ -2841,12 +2878,13 @@ settings.register_profile(
         (
             (
                 "from nplg_mcp import (admission, errors, http_security, "
-                "json_preflight, network, pdf_executor, pdf_ipc, "
+                "json_preflight, network, resilience, pdf_executor, pdf_ipc, "
                 "rate_limit, sdk_boundary, security, tokens)"
             ),
             "from scripts import (",
             "    bootstrap_external_tools,",
             "    delete_render,",
+            "    run_live_nplg_canary,",
             "    run_mutation_gate,",
             "    run_quality_gate,",
             "    run_test_gate,",
@@ -2857,9 +2895,10 @@ settings.register_profile(
             "",
             "MODULES = (",
             "    admission, errors, http_security, json_preflight, network,",
+            "    resilience,",
             "    pdf_executor, pdf_ipc, rate_limit, sdk_boundary,",
             "    security, tokens,",
-            "    delete_render, smoke_live, run_quality_gate,",
+            "    delete_render, run_live_nplg_canary, smoke_live, run_quality_gate,",
             "    run_test_gate, run_mutation_gate, verify_release,",
             "    bootstrap_external_tools, pyright_identity,",
             ")",

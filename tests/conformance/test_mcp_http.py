@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import socket
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
-from http.cookiejar import Cookie
+from http.cookiejar import Cookie, CookieJar
 from typing import TYPE_CHECKING, cast
 
 import httpx
@@ -27,9 +29,11 @@ from nplg_mcp.config import (
     CanonicalHost,
     CanonicalOrigin,
 )
+from nplg_mcp.contracts import MonotonicDeadline
 from nplg_mcp.errors import AppError, ErrorCode
 from nplg_mcp.http_security import McpSecurityMiddleware
 from nplg_mcp.json_types import dump_json, load_json_value, require_json_object
+from nplg_mcp.network import BoundAsyncHTTPTransport
 from nplg_mcp.services import (
     AppServices,
     FullServiceComposition,
@@ -40,7 +44,7 @@ from nplg_mcp.tokens import sign_asset_token
 from tests.helpers.app_factory import make_tool_service
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Callable, Mapping
     from pathlib import Path
 
     from fastapi import FastAPI
@@ -49,7 +53,9 @@ if TYPE_CHECKING:
     from nplg_mcp.contracts import StrictOutput
     from nplg_mcp.http_types import HttpClientProtocol
     from nplg_mcp.json_types import JsonObject, JsonValue
+    from nplg_mcp.repository import NplgRepository
     from nplg_mcp.services import ToolSurface
+    from nplg_mcp.tools import ToolService
 
 MODERN = "2026-07-28"
 LEGACY = "2025-11-25"
@@ -1664,6 +1670,85 @@ async def test_api_key_auth_is_exact_and_rejects_credential_ambiguity(
         == HTTPStatus.UNAUTHORIZED
     )
     assert valid.status_code == HTTPStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_application_assembles_nplg_client_with_pinned_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Catch app assembly without the pinned transport or trust_env=False."""
+    real_client = httpx.AsyncClient
+    captured: dict[str, object] = {}
+
+    def client_spy(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        assert not args
+        captured.update(kwargs)
+        return real_client(
+            timeout=cast("httpx.Timeout", kwargs["timeout"]),
+            follow_redirects=cast("bool", kwargs["follow_redirects"]),
+            trust_env=cast("bool", kwargs["trust_env"]),
+            limits=cast("httpx.Limits", kwargs["limits"]),
+            transport=cast("httpx.AsyncBaseTransport", kwargs["transport"]),
+            headers=cast("Mapping[str, str]", kwargs["headers"]),
+            cookies=cast("CookieJar", kwargs["cookies"]),
+        )
+
+    monkeypatch.setattr("nplg_mcp.app.httpx.AsyncClient", client_spy)
+    application = create_app(config(tmp_path))
+    runtime = application.services
+    assert runtime is not None
+    client = runtime.http_client
+    assert isinstance(client, real_client)
+    assert captured["trust_env"] is False
+    assert isinstance(captured["transport"], BoundAsyncHTTPTransport)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_application_emits_only_sanitized_circuit_transition_fields(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Mutation caught: missing app observer or payload-bearing transition logs."""
+    query_marker = "query-marker-task17"
+    opaque_marker = "opaque-marker-task17"
+    body_marker = "body-marker-task17"
+    monkeypatch.setenv("NPLG_TEST_QUERY_MARKER", query_marker)
+    monkeypatch.setenv("HTTPS_PROXY", f"http://{opaque_marker}.invalid:8080")
+    monkeypatch.setenv("NPLG_TEST_BODY_MARKER", body_marker)
+    caplog.set_level(logging.INFO, logger="nplg_mcp.upstream")
+    application = create_app(config(tmp_path))
+    runtime = application.services
+    assert runtime is not None
+    tools = cast("ToolService", runtime.tools)
+    repository = cast("NplgRepository", tools.repository)
+    guard = repository.guard
+    deadline = MonotonicDeadline.after(30.0, clock=time.monotonic)
+    try:
+        for _ in range(3):
+            async with guard.acquire(deadline) as permit:
+                await permit.record_transient_failure()
+    finally:
+        if runtime.http_client is not None:
+            await runtime.http_client.aclose()
+
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "nplg_mcp.upstream"
+        and record.getMessage() == "nplg_upstream_circuit_transition"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    fields = cast("dict[str, object]", record.__dict__)
+    assert fields["upstream_state"] == "open"
+    assert fields["upstream_transition"] == "closed_to_open"
+    rendered = " ".join(str(value) for value in fields.values())
+    assert query_marker not in rendered
+    assert opaque_marker not in rendered
+    assert body_marker not in rendered
 
 
 @pytest.mark.asyncio

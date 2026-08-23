@@ -402,6 +402,7 @@ _DECISION_MODULES = (
     "src/nplg_mcp/http_security.py",
     "src/nplg_mcp/json_preflight.py",
     "src/nplg_mcp/network.py",
+    "src/nplg_mcp/resilience.py",
     "src/nplg_mcp/pdf_executor.py",
     "src/nplg_mcp/pdf_ipc.py",
     "src/nplg_mcp/rate_limit.py",
@@ -409,6 +410,7 @@ _DECISION_MODULES = (
     "src/nplg_mcp/security.py",
     "src/nplg_mcp/tokens.py",
     "scripts/delete_render.py",
+    "scripts/run_live_nplg_canary.py",
     "scripts/smoke_live.py",
     "scripts/run_quality_gate.py",
     "scripts/run_test_gate.py",
@@ -680,6 +682,17 @@ class ExternalGate:
 
     kind: Literal["live", "staging", "container"]
     node_id: str
+    gate_id: str | None = None
+    command_id: str | None = None
+    profiles: tuple[str, ...] = ()
+    mode: str | None = None
+    protected_command: tuple[str, ...] = ()
+    protected_cwd: str | None = None
+    broker_kind: str | None = None
+    authority: str | None = None
+    timeout_seconds: int | None = None
+    result_schema: str | None = None
+    signed_proof_schema: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -976,22 +989,66 @@ def parse_external_gate_registry(payload: bytes) -> ExternalGateRegistry:
                 "test_rejected_historical_capture_does_not_freshen_git_metadata"
             ),
         },
+        {
+            "kind": "live",
+            "node_id": (
+                "tests/integration/test_repository.py::"
+                "test_live_nplg_canary_uses_bound_public_endpoint"
+            ),
+            "gate_id": "common.nplg-live-canary",
+            "command_id": "live.nplg-bound-endpoint.v2",
+            "profiles": ["alpic-metadata", "private-full"],
+            "mode": "preexecuted-operational",
+            "protected_command": [
+                "nplg-release-controller",
+                "external-gate",
+                "--gate-id",
+                "common.nplg-live-canary",
+                "--candidate-battery-json",
+                "BATTERY",
+                "--controller-policy",
+                "EXPECTED_POLICY",
+                "--network-broker-descriptor",
+                "BROKER",
+                "--result-json",
+                "RESULT_JSON",
+            ],
+            "protected_cwd": "protected-controller-root",
+            "broker_kind": "one-operation-exact-nplg-origin",
+            "authority": "protected-controller-network-broker",
+            "timeout_seconds": 60,
+            "result_schema": "nplg-live-canary.v2",
+            "signed_proof_schema": "nplg-live-canary.v2",
+        },
     ]
     gates = value["gates"]
     if gates == []:
         return ExternalGateRegistry(version=version, gates=())
     if gates != expected:
         _fail("external gate registry does not match the reviewed Phase 1 nodes")
-    return ExternalGateRegistry(
-        version=version,
-        gates=tuple(
+    parsed: list[ExternalGate] = []
+    for raw_gate in expected:
+        gate = cast("dict[str, object]", raw_gate)
+        parsed.append(
             ExternalGate(
                 kind=cast("Literal['live', 'staging', 'container']", gate["kind"]),
-                node_id=gate["node_id"],
+                node_id=cast("str", gate["node_id"]),
+                gate_id=cast("str | None", gate.get("gate_id")),
+                command_id=cast("str | None", gate.get("command_id")),
+                profiles=tuple(cast("list[str]", gate.get("profiles", []))),
+                mode=cast("str | None", gate.get("mode")),
+                protected_command=tuple(
+                    cast("list[str]", gate.get("protected_command", []))
+                ),
+                protected_cwd=cast("str | None", gate.get("protected_cwd")),
+                broker_kind=cast("str | None", gate.get("broker_kind")),
+                authority=cast("str | None", gate.get("authority")),
+                timeout_seconds=cast("int | None", gate.get("timeout_seconds")),
+                result_schema=cast("str | None", gate.get("result_schema")),
+                signed_proof_schema=cast("str | None", gate.get("signed_proof_schema")),
             )
-            for gate in expected
-        ),
-    )
+        )
+    return ExternalGateRegistry(version=version, gates=tuple(parsed))
 
 
 def _is_within(path: Path, root: Path) -> bool:

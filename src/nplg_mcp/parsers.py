@@ -6,24 +6,25 @@ from __future__ import annotations
 import hashlib
 import io
 import re
+import time
 import unicodedata
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from html.parser import HTMLParser
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, Literal, cast, override
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 from bs4 import BeautifulSoup, Tag
+from bs4.element import Comment, Declaration, Doctype, NavigableString
 from defusedxml import ElementTree as DefusedElementTree
 
+from .contracts import StrictModel
 from .errors import AppError, ErrorCode
 from .security import NPLG_ORIGIN, parse_handle_input, validate_upstream_url
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from xml.etree.ElementTree import Element
-
-    from bs4.element import NavigableString
 
 _TOTAL_RE = re.compile(r"\bof\s+([\d,]+)\b", re.IGNORECASE)
 _SIZE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?B)\s*$", re.IGNORECASE)
@@ -42,14 +43,14 @@ _SIZE_CELL_INDEX = 2
 _LANGUAGE_CELL_INDEX = 2
 _FORMAT_CELL_INDEX = 3
 _MAX_SEARCH_ITEMS = 50
-_MAX_HTML_ELEMENTS = 20_000
-_MAX_XML_ELEMENTS = 10_000
-_MAX_TREE_DEPTH = 128
-_MAX_AGGREGATE_TEXT_CODE_POINTS = 1_000_000
-_MAX_METADATA_FIELDS = 512
 _MAX_BITSTREAMS = 256
 _MAX_METADATA_FORMATS = 64
 _MAX_COLLECTIONS = 256
+_OAI_NAMESPACE = "http://www.openarchives.org/OAI/2.0/"
+_OAI_ROOT_TAG = f"{{{_OAI_NAMESPACE}}}OAI-PMH"
+_OAI_LIST_METADATA_FORMATS_TAG = f"{{{_OAI_NAMESPACE}}}ListMetadataFormats"
+_OAI_METADATA_FORMAT_TAG = f"{{{_OAI_NAMESPACE}}}metadataFormat"
+_OAI_METADATA_PREFIX_TAG = f"{{{_OAI_NAMESPACE}}}metadataPrefix"
 _VOID_HTML_ELEMENTS = frozenset(
     {
         "area",
@@ -68,6 +69,56 @@ _VOID_HTML_ELEMENTS = frozenset(
         "wbr",
     }
 )
+
+
+class ParserLimits(StrictModel):
+    """Immutable reviewed maxima for untrusted HTML and XML metadata."""
+
+    markup_bytes: Literal[2_097_152] = 2_097_152
+    max_depth: Literal[64] = 64
+    max_nodes: Literal[50_000] = 50_000
+    max_attributes_per_node: Literal[64] = 64
+    max_total_attributes: Literal[100_000] = 100_000
+    max_field_code_points: Literal[65_536] = 65_536
+    max_total_text_code_points: Literal[1_048_576] = 1_048_576
+    max_metadata_fields: Literal[2_048] = 2_048
+    max_records: Literal[1_000] = 1_000
+    parse_deadline_ms: Literal[2_000] = 2_000
+
+
+PARSER_LIMITS = ParserLimits()
+_parser_clock = time.monotonic
+
+
+@dataclass(frozen=True, slots=True)
+class _MarkupCounts:
+    nodes: int
+    total_attributes: int
+    total_text_code_points: int
+    metadata_fields: int
+    records: int
+    max_field_code_points: int
+
+
+@dataclass(slots=True)
+class _CanonicalTextCounter:
+    """Count semantic text with every whitespace run represented once."""
+
+    code_points: int = 0
+    in_whitespace: bool = False
+
+    def add(self, value: str | None) -> None:
+        if value is None:
+            return
+        for character in value:
+            is_whitespace = character.isspace()
+            if not is_whitespace or not self.in_whitespace:
+                self.code_points = _saturating_increment(
+                    self.code_points,
+                    1,
+                    maximum=PARSER_LIMITS.max_total_text_code_points,
+                )
+            self.in_whitespace = is_whitespace
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,42 +251,127 @@ def _validate_text_budget(
     *,
     source_url: str | None = None,
 ) -> int:
-    updated = current + (len(value) if value is not None else 0)
-    if updated > _MAX_AGGREGATE_TEXT_CODE_POINTS:
+    updated = _saturating_increment(
+        current,
+        len(value) if value is not None else 0,
+        maximum=PARSER_LIMITS.max_total_text_code_points,
+    )
+    if updated > PARSER_LIMITS.max_total_text_code_points:
         msg = "The repository response exceeded the aggregate text limit."
         raise _upstream_failure(msg, source_url=source_url)
     return updated
 
 
+def _saturating_increment(current: int, increment: int, *, maximum: int) -> int:
+    """Increment a non-negative counter, saturating at one past its ceiling."""
+    if increment > maximum - current:
+        return maximum + 1
+    return current + increment
+
+
 class _HtmlBudgetParser(HTMLParser):
     """Reject excessive HTML structure before a complete tree is allocated."""
 
-    def __init__(self, *, source_url: str) -> None:
+    def __init__(self, *, source_url: str, started_at: float) -> None:
         super().__init__(convert_charrefs=True)
         self._elements = 0
         self._open_elements: list[str] = []
         self._source_url = source_url
-        self._text_code_points = 0
+        self._text_counter = _CanonicalTextCounter()
+        self._total_attributes = 0
+        self._started_at = started_at
+        self._contexts: list[str | None] = []
+        self._field_counters: list[_CanonicalTextCounter | None] = []
+        self._metadata_fields = 0
+        self._records = 0
+        self._max_field_code_points = 0
+        self.check_deadline()
 
-    def _add_element(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self._elements += 1
-        if self._elements > _MAX_HTML_ELEMENTS:
+    @property
+    def counts(self) -> _MarkupCounts:
+        return _MarkupCounts(
+            nodes=self._elements,
+            total_attributes=self._total_attributes,
+            total_text_code_points=self._text_counter.code_points,
+            metadata_fields=self._metadata_fields,
+            records=self._records,
+            max_field_code_points=self._max_field_code_points,
+        )
+
+    def check_deadline(self) -> None:
+        if _parser_clock() - self._started_at > PARSER_LIMITS.parse_deadline_ms / 1_000:
+            msg = "The repository response exceeded the parse deadline."
+            raise _upstream_failure(msg, source_url=self._source_url)
+
+    def _add_attributes(self, attrs: list[tuple[str, str | None]]) -> None:
+        if len(attrs) > PARSER_LIMITS.max_attributes_per_node:
+            msg = "The repository response exceeded the per-node attribute limit."
+            raise _upstream_failure(msg, source_url=self._source_url)
+        if len(attrs) > PARSER_LIMITS.max_total_attributes - self._total_attributes:
+            msg = "The repository response exceeded the aggregate attribute limit."
+            raise _upstream_failure(msg, source_url=self._source_url)
+        self._total_attributes = _saturating_increment(
+            self._total_attributes,
+            len(attrs),
+            maximum=PARSER_LIMITS.max_total_attributes,
+        )
+        for key, value in attrs:
+            self._add_text(key)
+            self._add_text(value)
+
+    def _add_text(self, value: str | None) -> None:
+        self._text_counter.add(value)
+        if self._text_counter.code_points > PARSER_LIMITS.max_total_text_code_points:
+            msg = "The repository response exceeded the aggregate text limit."
+            raise _upstream_failure(msg, source_url=self._source_url)
+
+    def _add_element(  # noqa: C901 - bounded lexical state machine
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        self.check_deadline()
+        self._elements = _saturating_increment(
+            self._elements,
+            1,
+            maximum=PARSER_LIMITS.max_nodes,
+        )
+        if self._elements > PARSER_LIMITS.max_nodes:
             msg = "The repository response exceeded the HTML element limit."
             raise _upstream_failure(msg, source_url=self._source_url)
-        for key, value in attrs:
-            self._text_code_points = _validate_text_budget(
-                self._text_code_points,
-                key,
-                source_url=self._source_url,
-            )
-            self._text_code_points = _validate_text_budget(
-                self._text_code_points,
-                value,
-                source_url=self._source_url,
-            )
+        self._add_attributes(attrs)
         if tag not in _VOID_HTML_ELEMENTS:
+            context = self._contexts[-1] if self._contexts else None
+            if tag == "table":
+                class_value = next(
+                    (value for key, value in attrs if key == "class"), None
+                )
+                if class_value is not None and "search-results" in class_value:
+                    context = "search"
+                elif class_value is not None and "itemDisplayTable" in class_value:
+                    context = "metadata"
+            if tag == "tr" and context == "metadata":
+                self._metadata_fields = _saturating_increment(
+                    self._metadata_fields,
+                    1,
+                    maximum=PARSER_LIMITS.max_metadata_fields,
+                )
+                if self._metadata_fields > PARSER_LIMITS.max_metadata_fields:
+                    msg = "The repository response exceeded the metadata field limit."
+                    raise _upstream_failure(msg, source_url=self._source_url)
+            if tag == "tr" and context == "search" and "tbody" in self._open_elements:
+                self._records = _saturating_increment(
+                    self._records,
+                    1,
+                    maximum=PARSER_LIMITS.max_records,
+                )
+                if self._records > PARSER_LIMITS.max_records:
+                    msg = "The repository response exceeded the record limit."
+                    raise _upstream_failure(msg, source_url=self._source_url)
             self._open_elements.append(tag)
-            if len(self._open_elements) > _MAX_TREE_DEPTH:
+            self._contexts.append(context)
+            self._field_counters.append(
+                _CanonicalTextCounter() if tag == "td" else None
+            )
+            if len(self._open_elements) > PARSER_LIMITS.max_depth:
                 msg = "The repository response exceeded the tree depth limit."
                 raise _upstream_failure(msg, source_url=self._source_url)
 
@@ -253,22 +389,16 @@ class _HtmlBudgetParser(HTMLParser):
         tag: str,
         attrs: list[tuple[str, str | None]],
     ) -> None:
-        del tag
-        self._elements += 1
-        if self._elements > _MAX_HTML_ELEMENTS:
+        self.check_deadline()
+        self._elements = _saturating_increment(
+            self._elements,
+            1,
+            maximum=PARSER_LIMITS.max_nodes,
+        )
+        if self._elements > PARSER_LIMITS.max_nodes:
             msg = "The repository response exceeded the HTML element limit."
             raise _upstream_failure(msg, source_url=self._source_url)
-        for key, value in attrs:
-            self._text_code_points = _validate_text_budget(
-                self._text_code_points,
-                key,
-                source_url=self._source_url,
-            )
-            self._text_code_points = _validate_text_budget(
-                self._text_code_points,
-                value,
-                source_url=self._source_url,
-            )
+        self._add_attributes(attrs)
 
     @override
     def handle_endtag(self, tag: str) -> None:
@@ -276,26 +406,40 @@ class _HtmlBudgetParser(HTMLParser):
             return
         while self._open_elements[-1] != tag:
             _ = self._open_elements.pop()
+            _ = self._contexts.pop()
+            _ = self._field_counters.pop()
         _ = self._open_elements.pop()
+        _ = self._contexts.pop()
+        _ = self._field_counters.pop()
 
     @override
     def handle_data(self, data: str) -> None:
-        self._text_code_points = _validate_text_budget(
-            self._text_code_points,
-            data,
-            source_url=self._source_url,
-        )
+        self.check_deadline()
+        for current in self._field_counters:
+            if current is None:
+                continue
+            current.add(data)
+            if current.code_points > PARSER_LIMITS.max_field_code_points:
+                msg = "The repository response exceeded the field code-point limit."
+                raise _upstream_failure(msg, source_url=self._source_url)
+            self._max_field_code_points = max(
+                self._max_field_code_points,
+                current.code_points,
+            )
+        self._add_text(data)
 
-    @override
-    def handle_comment(self, data: str) -> None:
-        self.handle_data(data)
 
-
-def _preflight_html(html: str, *, source_url: str) -> None:
-    parser = _HtmlBudgetParser(source_url=source_url)
+def _preflight_html(html: str, *, source_url: str) -> _MarkupCounts:
+    started_at = _parser_clock()
+    if len(html.encode("utf-8")) > PARSER_LIMITS.markup_bytes:
+        msg = "The repository response exceeded the markup byte limit."
+        raise _upstream_failure(msg, source_url=source_url)
+    parser = _HtmlBudgetParser(source_url=source_url, started_at=started_at)
     try:
         parser.feed(html)
         parser.close()
+        parser.check_deadline()
+        return parser.counts  # noqa: TRY300
     except AppError:
         raise
     except (AssertionError, ValueError) as exc:
@@ -303,32 +447,116 @@ def _preflight_html(html: str, *, source_url: str) -> None:
         raise _upstream_failure(msg, source_url=source_url, cause=exc) from exc
 
 
-def _preflight_xml(xml: str) -> None:
+def _preflight_xml(  # noqa: C901, PLR0912, PLR0915 - bounded event state machine
+    xml: str,
+) -> _MarkupCounts:
+    started_at = _parser_clock()
+    if len(xml.encode("utf-8")) > PARSER_LIMITS.markup_bytes:
+        msg = "The repository response exceeded the markup byte limit."
+        raise _upstream_failure(msg)
     elements = 0
     depth = 0
     text_code_points = 0
+    total_attributes = 0
+    element_names: list[str] = []
+    field_elements: list[bool] = []
+    metadata_fields = 0
+    records = 0
+    max_field_code_points = 0
     try:
         parsed_events = cast(
             "Iterable[tuple[str, Element]]",
             DefusedElementTree.iterparse(
                 io.StringIO(xml),
                 events=("start", "end"),
+                forbid_dtd=True,
+                forbid_entities=True,
+                forbid_external=True,
             ),
         )
         for event, current in parsed_events:
+            if _parser_clock() - started_at > PARSER_LIMITS.parse_deadline_ms / 1_000:
+                msg = "The repository response exceeded the parse deadline."
+                raise _upstream_failure(msg)
             if event == "start":
-                depth += 1
-                elements += 1
-                if depth > _MAX_TREE_DEPTH:
+                name = _local_name(current.tag)
+                parent_name = element_names[-1] if element_names else None
+                depth = _saturating_increment(
+                    depth,
+                    1,
+                    maximum=PARSER_LIMITS.max_depth,
+                )
+                elements = _saturating_increment(
+                    elements,
+                    1,
+                    maximum=PARSER_LIMITS.max_nodes,
+                )
+                if depth > PARSER_LIMITS.max_depth:
                     msg = "The repository response exceeded the tree depth limit."
                     raise _upstream_failure(msg)
-                if elements > _MAX_XML_ELEMENTS:
+                if elements > PARSER_LIMITS.max_nodes:
                     msg = "The repository response exceeded the XML element limit."
                     raise _upstream_failure(msg)
+                attribute_count = len(current.attrib)
+                if attribute_count > PARSER_LIMITS.max_attributes_per_node:
+                    msg = (
+                        "The repository response exceeded the per-node attribute limit."
+                    )
+                    raise _upstream_failure(msg)
+                if (
+                    attribute_count
+                    > PARSER_LIMITS.max_total_attributes - total_attributes
+                ):
+                    msg = (
+                        "The repository response exceeded the aggregate "
+                        "attribute limit."
+                    )
+                    raise _upstream_failure(msg)
+                total_attributes = _saturating_increment(
+                    total_attributes,
+                    attribute_count,
+                    maximum=PARSER_LIMITS.max_total_attributes,
+                )
+                is_field = name == "field" or parent_name == "dc"
+                if is_field:
+                    metadata_fields = _saturating_increment(
+                        metadata_fields,
+                        1,
+                        maximum=PARSER_LIMITS.max_metadata_fields,
+                    )
+                    if metadata_fields > PARSER_LIMITS.max_metadata_fields:
+                        msg = (
+                            "The repository response exceeded the metadata field limit."
+                        )
+                        raise _upstream_failure(msg)
+                if name == "record":
+                    records = _saturating_increment(
+                        records,
+                        1,
+                        maximum=PARSER_LIMITS.max_records,
+                    )
+                    if records > PARSER_LIMITS.max_records:
+                        msg = "The repository response exceeded the record limit."
+                        raise _upstream_failure(msg)
+                element_names.append(name)
+                field_elements.append(is_field)
                 for key, value in current.attrib.items():
                     text_code_points = _validate_text_budget(text_code_points, key)
                     text_code_points = _validate_text_budget(text_code_points, value)
             else:
+                if field_elements[-1] and len(current.text or "") > (
+                    PARSER_LIMITS.max_field_code_points
+                ):
+                    msg = "The repository response exceeded the field code-point limit."
+                    raise _upstream_failure(msg)
+                if field_elements[-1]:
+                    max_field_code_points = max(
+                        max_field_code_points,
+                        min(
+                            len(current.text or ""),
+                            PARSER_LIMITS.max_field_code_points + 1,
+                        ),
+                    )
                 text_code_points = _validate_text_budget(
                     text_code_points,
                     current.text,
@@ -338,7 +566,17 @@ def _preflight_xml(xml: str) -> None:
                     current.tail,
                 )
                 current.clear()
+                _ = element_names.pop()
+                _ = field_elements.pop()
                 depth -= 1
+        return _MarkupCounts(
+            nodes=elements,
+            total_attributes=total_attributes,
+            total_text_code_points=text_code_points,
+            metadata_fields=metadata_fields,
+            records=records,
+            max_field_code_points=max_field_code_points,
+        )
     except AppError:
         raise
     except (DefusedElementTree.ParseError, ValueError) as exc:
@@ -346,50 +584,214 @@ def _preflight_xml(xml: str) -> None:
         raise _upstream_failure(msg, cause=exc) from exc
 
 
-def _validate_html_tree(soup: BeautifulSoup, *, source_url: str) -> None:
+def _html_attribute_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        items = cast("list[object]", value)
+        return " ".join(str(item) for item in items)
+    return str(value)
+
+
+def _html_semantic_text_code_points(
+    root: BeautifulSoup | Tag, *, source_url: str
+) -> int:
+    counter = _CanonicalTextCounter()
+    for key, value in root.attrs.items():
+        counter.add(key)
+        counter.add(_html_attribute_text(value))
+    for current in root.descendants:
+        if isinstance(current, Tag):
+            for key, value in current.attrs.items():
+                counter.add(key)
+                counter.add(_html_attribute_text(value))
+        elif not isinstance(current, (Comment, Declaration, Doctype)):
+            counter.add(str(current))
+        if counter.code_points > PARSER_LIMITS.max_total_text_code_points:
+            msg = "The repository response exceeded the aggregate text limit."
+            raise _upstream_failure(msg, source_url=source_url)
+    return counter.code_points
+
+
+def _html_field_code_points(field: Tag) -> int:
+    counter = _CanonicalTextCounter()
+    for current in field.descendants:
+        if isinstance(current, NavigableString) and not isinstance(
+            current, (Comment, Declaration, Doctype)
+        ):
+            counter.add(str(current))
+    return counter.code_points
+
+
+def _validate_html_tree(  # noqa: C901, PLR0912 - bounded DOM recount
+    soup: BeautifulSoup, *, source_url: str
+) -> _MarkupCounts:
     elements = 0
-    text_code_points = 0
-    stack: list[tuple[Tag, int]] = [(soup, 1)]
+    total_attributes = 0
+    metadata_fields = 0
+    records = 0
+    max_field_code_points = 0
+    stack: list[tuple[Tag, int, str | None, bool]] = [(soup, 1, None, False)]
     while stack:
-        current, depth = stack.pop()
-        if depth > _MAX_TREE_DEPTH:
+        current, depth, context, in_search_body = stack.pop()
+        if depth > PARSER_LIMITS.max_depth + 3:
             msg = "The repository response exceeded the tree depth limit."
             raise _upstream_failure(msg, source_url=source_url)
-        elements += 1
-        if elements > _MAX_HTML_ELEMENTS:
+        elements = _saturating_increment(
+            elements,
+            1,
+            maximum=PARSER_LIMITS.max_nodes + 3,
+        )
+        if elements > PARSER_LIMITS.max_nodes + 3:
             msg = "The repository response exceeded the HTML element limit."
             raise _upstream_failure(msg, source_url=source_url)
+        attribute_count = len(current.attrs)
+        if attribute_count > PARSER_LIMITS.max_attributes_per_node:
+            msg = "The repository response exceeded the per-node attribute limit."
+            raise _upstream_failure(msg, source_url=source_url)
+        if attribute_count > PARSER_LIMITS.max_total_attributes - total_attributes:
+            msg = "The repository response exceeded the aggregate attribute limit."
+            raise _upstream_failure(msg, source_url=source_url)
+        total_attributes = _saturating_increment(
+            total_attributes,
+            attribute_count,
+            maximum=PARSER_LIMITS.max_total_attributes,
+        )
+        if current.name == "tr" and context == "metadata":
+            metadata_fields = _saturating_increment(
+                metadata_fields,
+                1,
+                maximum=PARSER_LIMITS.max_metadata_fields,
+            )
+        if current.name == "tr" and context == "search" and in_search_body:
+            records = _saturating_increment(
+                records,
+                1,
+                maximum=PARSER_LIMITS.max_records,
+            )
+        if current.name == "td":
+            max_field_code_points = max(
+                max_field_code_points,
+                _html_field_code_points(current),
+            )
         for child in current.children:
             if isinstance(child, Tag):
-                stack.append((child, depth + 1))
-            else:
-                text = cast("NavigableString", child)
-                text_code_points = _validate_text_budget(
-                    text_code_points,
-                    str(text),
-                    source_url=source_url,
+                child_context = context
+                if child.name == "table":
+                    class_value = _html_attribute_text(child.get("class", ""))
+                    if "search-results" in class_value:
+                        child_context = "search"
+                    elif "itemDisplayTable" in class_value:
+                        child_context = "metadata"
+                child_in_search_body = in_search_body or (
+                    child_context == "search" and child.name == "tbody"
                 )
+                stack.append(
+                    (
+                        child,
+                        depth + 1,
+                        child_context,
+                        child_in_search_body,
+                    )
+                )
+    return _MarkupCounts(
+        nodes=elements,
+        total_attributes=total_attributes,
+        total_text_code_points=_html_semantic_text_code_points(
+            soup,
+            source_url=source_url,
+        ),
+        metadata_fields=metadata_fields,
+        records=records,
+        max_field_code_points=max_field_code_points,
+    )
 
 
-def _validate_xml_tree(root: Element) -> None:
+def _validate_xml_tree(root: Element) -> _MarkupCounts:
     elements = 0
     text_code_points = 0
-    stack: list[tuple[Element, int]] = [(root, 1)]
+    total_attributes = 0
+    metadata_fields = 0
+    records = 0
+    max_field_code_points = 0
+    stack: list[tuple[Element, int, str | None]] = [(root, 1, None)]
     while stack:
-        current, depth = stack.pop()
-        if depth > _MAX_TREE_DEPTH:
+        current, depth, parent_name = stack.pop()
+        name = _local_name(current.tag)
+        if depth > PARSER_LIMITS.max_depth:
             msg = "The repository response exceeded the tree depth limit."
             raise _upstream_failure(msg)
-        elements += 1
-        if elements > _MAX_XML_ELEMENTS:
+        elements = _saturating_increment(
+            elements,
+            1,
+            maximum=PARSER_LIMITS.max_nodes,
+        )
+        if elements > PARSER_LIMITS.max_nodes:
             msg = "The repository response exceeded the XML element limit."
             raise _upstream_failure(msg)
+        attribute_count = len(current.attrib)
+        if attribute_count > PARSER_LIMITS.max_attributes_per_node:
+            msg = "The repository response exceeded the per-node attribute limit."
+            raise _upstream_failure(msg)
+        if attribute_count > PARSER_LIMITS.max_total_attributes - total_attributes:
+            msg = "The repository response exceeded the aggregate attribute limit."
+            raise _upstream_failure(msg)
+        total_attributes = _saturating_increment(
+            total_attributes,
+            attribute_count,
+            maximum=PARSER_LIMITS.max_total_attributes,
+        )
+        is_field = name == "field" or parent_name == "dc"
+        if is_field:
+            metadata_fields = _saturating_increment(
+                metadata_fields,
+                1,
+                maximum=PARSER_LIMITS.max_metadata_fields,
+            )
+            max_field_code_points = max(
+                max_field_code_points,
+                len(current.text or ""),
+            )
+        if name == "record":
+            records = _saturating_increment(
+                records,
+                1,
+                maximum=PARSER_LIMITS.max_records,
+            )
         text_code_points = _validate_text_budget(text_code_points, current.text)
         text_code_points = _validate_text_budget(text_code_points, current.tail)
         for key, value in current.attrib.items():
             text_code_points = _validate_text_budget(text_code_points, key)
             text_code_points = _validate_text_budget(text_code_points, value)
-        stack.extend((child, depth + 1) for child in current)
+        stack.extend((child, depth + 1, name) for child in current)
+    return _MarkupCounts(
+        nodes=elements,
+        total_attributes=total_attributes,
+        total_text_code_points=text_code_points,
+        metadata_fields=metadata_fields,
+        records=records,
+        max_field_code_points=max_field_code_points,
+    )
+
+
+def _require_preflight_agreement(
+    preflight: _MarkupCounts,
+    constructed: _MarkupCounts,
+    *,
+    compare_nodes: bool,
+    source_url: str | None = None,
+) -> None:
+    matching = (
+        preflight.total_attributes == constructed.total_attributes
+        and preflight.total_text_code_points == constructed.total_text_code_points
+        and preflight.metadata_fields == constructed.metadata_fields
+        and preflight.records == constructed.records
+        and preflight.max_field_code_points == constructed.max_field_code_points
+        and (not compare_nodes or preflight.nodes == constructed.nodes)
+    )
+    if not matching:
+        msg = "The repository parser detected a preflight disagreement."
+        raise _upstream_failure(msg, source_url=source_url)
 
 
 def _tag_text(tag: Tag | None) -> str:
@@ -596,18 +998,27 @@ def parse_search_results(
             ErrorCode.INVALID_INPUT,
             f"page_size must be between 1 and {_MAX_SEARCH_ITEMS}.",
         )
-    _preflight_html(html, source_url=source_url)
+    preflight = _preflight_html(html, source_url=source_url)
     soup = BeautifulSoup(html, "lxml")
-    _validate_html_tree(soup, source_url=source_url)
-    container = soup.find(id="aspect_discovery_SimpleSearch_div_search-results")
-    if not isinstance(container, Tag):
+    constructed = _validate_html_tree(soup, source_url=source_url)
+    _require_preflight_agreement(
+        preflight,
+        constructed,
+        compare_nodes=False,
+        source_url=source_url,
+    )
+    containers = soup.find_all(
+        id="aspect_discovery_SimpleSearch_div_search-results", limit=2
+    )
+    if len(containers) != 1:
         msg = (
-            "The repository search response did not match the expected DSpace contract."
+            "The repository search response had an invalid contract marker cardinality."
         )
         raise _upstream_failure(
             msg,
             source_url=source_url,
         )
+    container = containers[0]
 
     table = container.find("table", class_=_has_search_results_class)
     if not isinstance(table, Tag):
@@ -820,7 +1231,7 @@ def _summary_fields(soup: BeautifulSoup) -> tuple[RawMetadataField, ...]:
             continue
         value = _tag_text(cells[1])
         if value:
-            if len(fields) >= _MAX_METADATA_FIELDS:
+            if len(fields) >= PARSER_LIMITS.max_metadata_fields:
                 msg = "The item response exceeded the metadata field limit."
                 raise _upstream_failure(msg)
             fields.append(RawMetadataField(key=key, value=value))
@@ -844,7 +1255,7 @@ def _full_fields(soup: BeautifulSoup) -> tuple[RawMetadataField, ...]:
         )
         if not value:
             continue
-        if len(fields) >= _MAX_METADATA_FIELDS:
+        if len(fields) >= PARSER_LIMITS.max_metadata_fields:
             msg = "The item response exceeded the metadata field limit."
             raise _upstream_failure(msg)
         fields.append(
@@ -886,12 +1297,20 @@ def parse_item_page(
 ) -> DocumentRecord:
     """Parse one validated DSpace item HTML response."""
     expected = parse_handle_input(expected_handle)
-    _preflight_html(html, source_url=source_url)
+    preflight = _preflight_html(html, source_url=source_url)
     soup = BeautifulSoup(html, "lxml")
-    _validate_html_tree(soup, source_url=source_url)
-    container = soup.find(id="aspect_artifactbrowser_ItemViewer_div_item-view")
-    if not isinstance(container, Tag):
-        msg = "The item response did not match the expected DSpace contract."
+    constructed = _validate_html_tree(soup, source_url=source_url)
+    _require_preflight_agreement(
+        preflight,
+        constructed,
+        compare_nodes=False,
+        source_url=source_url,
+    )
+    containers = soup.find_all(
+        id="aspect_artifactbrowser_ItemViewer_div_item-view", limit=2
+    )
+    if len(containers) != 1:
+        msg = "The item response had an invalid contract marker cardinality."
         raise _upstream_failure(
             msg,
             source_url=source_url,
@@ -909,6 +1328,9 @@ def parse_item_page(
         marker for marker in _RESTRICTED_MARKERS if marker in page_text
     ]
     restricted = bool(matching_restrictions)
+    if restricted and soup.select_one('a[href*="/bitstream/"]') is not None:
+        msg = "The item response contained ambiguous access markers."
+        raise _upstream_failure(msg, source_url=source_url)
     restriction_reason = (
         "Access is limited to the library's internal network or building."
         if restricted
@@ -956,13 +1378,19 @@ def _local_name(tag: str) -> str:
 
 
 def _parse_xml(xml: str) -> Element:
-    _preflight_xml(xml)
+    preflight = _preflight_xml(xml)
     try:
-        root = DefusedElementTree.fromstring(xml)
+        root = DefusedElementTree.fromstring(
+            xml,
+            forbid_dtd=True,
+            forbid_entities=True,
+            forbid_external=True,
+        )
     except (DefusedElementTree.ParseError, ValueError) as exc:
         msg = "The repository returned malformed OAI-PMH XML."
         raise _upstream_failure(msg, cause=exc) from exc
-    _validate_xml_tree(root)
+    constructed = _validate_xml_tree(root)
+    _require_preflight_agreement(preflight, constructed, compare_nodes=True)
     return root
 
 
@@ -972,18 +1400,93 @@ def _first_descendant(root: Element, name: str) -> Element | None:
     )
 
 
+def _require_exact_owned_child(
+    scope: Element,
+    owner: Element,
+    name: str,
+) -> Element:
+    direct = [child for child in owner if _local_name(child.tag) == name]
+    matches = [element for element in scope.iter() if _local_name(element.tag) == name]
+    if len(direct) != 1 or len(matches) != 1 or direct[0] is not matches[0]:
+        msg = "The OAI-PMH response had invalid contract marker structural ownership."
+        raise _upstream_failure(msg)
+    return direct[0]
+
+
 def parse_metadata_formats(xml: str) -> tuple[str, ...]:
     """Parse supported metadata prefixes from an OAI-PMH response."""
     root = _parse_xml(xml)
+    if root.tag != _OAI_ROOT_TAG:
+        msg = "The OAI-PMH response had invalid contract marker structural ownership."
+        raise _upstream_failure(msg)
     error = _first_descendant(root, "error")
     if error is not None:
         msg = "The repository rejected the OAI-PMH metadata format request."
         raise _upstream_failure(msg)
-    formats = _unique(
-        element.text
+    direct_containers = [
+        child for child in root if child.tag == _OAI_LIST_METADATA_FORMATS_TAG
+    ]
+    all_containers = [
+        element
+        for element in root.iter()
+        if _local_name(element.tag) == "ListMetadataFormats"
+    ]
+    if (
+        len(direct_containers) != 1
+        or len(all_containers) != 1
+        or direct_containers[0] is not all_containers[0]
+    ):
+        msg = "The OAI-PMH response had invalid contract marker structural ownership."
+        raise _upstream_failure(msg)
+    container = direct_containers[0]
+    metadata_formats = [
+        child for child in container if child.tag == _OAI_METADATA_FORMAT_TAG
+    ]
+    all_metadata_formats = [
+        element
+        for element in root.iter()
+        if _local_name(element.tag) == "metadataFormat"
+    ]
+    if len(metadata_formats) != len(all_metadata_formats) or any(
+        direct is not discovered
+        for direct, discovered in zip(
+            metadata_formats,
+            all_metadata_formats,
+            strict=True,
+        )
+    ):
+        msg = "The OAI-PMH response had invalid contract marker structural ownership."
+        raise _upstream_failure(msg)
+    prefixes: list[str | None] = []
+    prefix_elements: list[Element] = []
+    for metadata_format in metadata_formats:
+        direct_prefixes = [
+            child for child in metadata_format if child.tag == _OAI_METADATA_PREFIX_TAG
+        ]
+        if len(direct_prefixes) != 1:
+            msg = (
+                "The OAI-PMH response had invalid contract marker structural ownership."
+            )
+            raise _upstream_failure(msg)
+        prefix = direct_prefixes[0]
+        prefix_elements.append(prefix)
+        prefixes.append(prefix.text)
+    all_prefix_elements = [
+        element
         for element in root.iter()
         if _local_name(element.tag) == "metadataPrefix"
-    )
+    ]
+    if len(prefix_elements) != len(all_prefix_elements) or any(
+        direct is not discovered
+        for direct, discovered in zip(
+            prefix_elements,
+            all_prefix_elements,
+            strict=True,
+        )
+    ):
+        msg = "The OAI-PMH response had invalid contract marker structural ownership."
+        raise _upstream_failure(msg)
+    formats = _unique(prefixes)
     if len(formats) > _MAX_METADATA_FORMATS:
         msg = "The repository response exceeded the metadata format limit."
         raise _upstream_failure(msg)
@@ -1005,9 +1508,8 @@ def _raise_for_oai_error(root: Element) -> None:
         )
 
 
-def _validate_oai_identifier(root: Element, *, expected: str) -> None:
-    identifier_element = _first_descendant(root, "identifier")
-    if identifier_element is None or not identifier_element.text:
+def _validate_oai_identifier(identifier_element: Element, *, expected: str) -> None:
+    if not identifier_element.text:
         msg = "The OAI-PMH record did not contain an identifier."
         raise _upstream_failure(msg)
     identifier_text = _normalize(identifier_element.text)
@@ -1016,11 +1518,23 @@ def _validate_oai_identifier(root: Element, *, expected: str) -> None:
         raise _upstream_failure(msg)
 
 
-def _dim_fields(root: Element) -> tuple[RawMetadataField, ...]:
+def _dim_fields(
+    record: Element,
+    metadata: Element,
+) -> tuple[RawMetadataField, ...]:
+    container = _require_exact_owned_child(record, metadata, "dim")
+    if len(metadata) != 1:
+        msg = "The OAI-PMH response had invalid DIM metadata ownership."
+        raise _upstream_failure(msg)
+    approved = [child for child in container if _local_name(child.tag) == "field"]
+    discovered = [
+        element for element in record.iter() if _local_name(element.tag) == "field"
+    ]
+    if len(approved) != len(container) or approved != discovered:
+        msg = "The OAI-PMH response had invalid DIM field ownership."
+        raise _upstream_failure(msg)
     fields: list[RawMetadataField] = []
-    for element in root.iter():
-        if _local_name(element.tag) != "field":
-            continue
+    for element in approved:
         schema = element.attrib.get("mdschema", "dc")
         field_element = element.attrib.get("element")
         if not field_element:
@@ -1029,7 +1543,7 @@ def _dim_fields(root: Element) -> tuple[RawMetadataField, ...]:
         key = f"{schema}.{field_element}" + (f".{qualifier}" if qualifier else "")
         value = _normalize(element.text or "")
         if value:
-            if len(fields) >= _MAX_METADATA_FIELDS:
+            if len(fields) >= PARSER_LIMITS.max_metadata_fields:
                 msg = "The OAI-PMH record exceeded the metadata field limit."
                 raise _upstream_failure(msg)
             fields.append(
@@ -1040,19 +1554,17 @@ def _dim_fields(root: Element) -> tuple[RawMetadataField, ...]:
     return tuple(fields)
 
 
-def _dc_fields(root: Element) -> tuple[RawMetadataField, ...]:
-    metadata = _first_descendant(root, "metadata")
-    if metadata is None:
-        msg = "The OAI-PMH record did not contain metadata."
+def _dc_fields(record: Element, metadata: Element) -> tuple[RawMetadataField, ...]:
+    container = _require_exact_owned_child(record, metadata, "dc")
+    if len(metadata) != 1 or any(len(element) != 0 for element in container):
+        msg = "The OAI-PMH response had invalid Dublin Core field ownership."
         raise _upstream_failure(msg)
     fields: list[RawMetadataField] = []
-    for element in metadata.iter():
+    for element in container:
         name = _local_name(element.tag)
-        if name in {"metadata", "dc"}:
-            continue
         value = _normalize(element.text or "")
         if value:
-            if len(fields) >= _MAX_METADATA_FIELDS:
+            if len(fields) >= PARSER_LIMITS.max_metadata_fields:
                 msg = "The OAI-PMH record exceeded the metadata field limit."
                 raise _upstream_failure(msg)
             fields.append(
@@ -1068,13 +1580,16 @@ def _dc_fields(root: Element) -> tuple[RawMetadataField, ...]:
 
 
 def _oai_fields(
-    root: Element, *, metadata_prefix: str
+    record: Element,
+    metadata: Element,
+    *,
+    metadata_prefix: str,
 ) -> tuple[tuple[RawMetadataField, ...], str]:
     prefix = metadata_prefix.strip()
     if prefix == "dim":
-        return _dim_fields(root), "oai_dim"
+        return _dim_fields(record, metadata), "oai_dim"
     if prefix == "oai_dc":
-        return _dc_fields(root), "oai_dc"
+        return _dc_fields(record, metadata), "oai_dc"
     raise AppError(
         ErrorCode.INVALID_INPUT,
         "Unsupported OAI-PMH metadata format.",
@@ -1089,8 +1604,29 @@ def parse_oai_record(
     expected = parse_handle_input(expected_handle)
     root = _parse_xml(xml)
     _raise_for_oai_error(root)
-    _validate_oai_identifier(root, expected=expected)
-    fields, source = _oai_fields(root, metadata_prefix=metadata_prefix)
+    if _local_name(root.tag) != "OAI-PMH":
+        msg = "The OAI-PMH response had an invalid root element."
+        raise _upstream_failure(msg)
+    get_record = _require_exact_owned_child(root, root, "GetRecord")
+    record = _require_exact_owned_child(root, get_record, "record")
+    header = _require_exact_owned_child(record, record, "header")
+    metadata = _require_exact_owned_child(record, record, "metadata")
+    identifier = _require_exact_owned_child(record, header, "identifier")
+    if any(
+        _local_name(child.tag) not in {"header", "metadata", "about"}
+        for child in record
+    ) or any(
+        _local_name(child.tag) not in {"identifier", "datestamp", "setSpec"}
+        for child in header
+    ):
+        msg = "The OAI-PMH response had invalid record child ownership."
+        raise _upstream_failure(msg)
+    _validate_oai_identifier(identifier, expected=expected)
+    fields, source = _oai_fields(
+        record,
+        metadata,
+        metadata_prefix=metadata_prefix,
+    )
 
     if not fields:
         msg = "The OAI-PMH record did not contain usable metadata fields."

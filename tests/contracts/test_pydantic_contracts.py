@@ -71,6 +71,31 @@ def test_explicit_query_validator_rejects_blank_normalized_text() -> None:
         _ = SearchDocumentsInput.non_blank_query("   ")
 
 
+def test_search_input_preserves_query_for_the_single_repository_boundary() -> None:
+    raw_query = "Georgian  newspaper"
+
+    assert SearchDocumentsInput(query=raw_query).query == raw_query
+
+
+def test_search_cursor_contract_accepts_bound_tokens_and_caps_the_wire_value() -> None:
+    cursor = "x" * 512
+    validated_input = SearchDocumentsInput(query="query", cursor=cursor)
+    output_payload = cast(
+        "dict[str, object]",
+        _valid_search_output().model_dump(mode="json"),
+    )
+    output_payload["next_cursor"] = cursor
+    validated_output = SearchDocumentsOutput.model_validate(output_payload)
+
+    assert validated_input.cursor == cursor
+    assert validated_output.next_cursor == cursor
+    with pytest.raises(ValidationError):
+        _ = SearchDocumentsInput(query="query", cursor="x" * 1_025)
+    output_payload["next_cursor"] = "x" * 1_025
+    with pytest.raises(ValidationError):
+        _ = SearchDocumentsOutput.model_validate(output_payload)
+
+
 def _valid_search_output() -> SearchDocumentsOutput:
     payload: dict[str, object] = {
         "items": [

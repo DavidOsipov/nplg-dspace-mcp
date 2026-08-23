@@ -39,6 +39,7 @@ class HttpClientProtocol(Protocol):
         *,
         headers: collections.abc.Mapping[str, str] | None = None,
         follow_redirects: bool = False,
+        timeout: float,
     ) -> contextlib.AbstractAsyncContextManager[HttpResponseProtocol]:
         """Open a no-redirect streaming response context."""
         ...

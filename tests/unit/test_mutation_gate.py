@@ -54,6 +54,15 @@ _MINIMUM_KILLED_PERCENT = 65
 _MUTATION_TIMEOUT_SECONDS = 1_800.0
 _THIRD_ROOT_SCAN = 3
 _NINTH_META_READ = 9
+_TASK_SEVENTEEN_TARGETS = (
+    "src/nplg_mcp/app.py",
+    "src/nplg_mcp/http_types.py",
+    "src/nplg_mcp/security.py",
+    "src/nplg_mcp/network.py",
+    "src/nplg_mcp/resilience.py",
+    "src/nplg_mcp/downloader.py",
+    "scripts/run_live_nplg_canary.py",
+)
 _EXPECTED_MODULES: dict[str, str] = {
     "src/nplg_mcp/security.py": "nplg_mcp.security",
     "src/nplg_mcp/tokens.py": "nplg_mcp.tokens",
@@ -884,6 +893,147 @@ def test_phase_three_mutation_policies_are_closed_and_test_selected() -> None:
     )
     with pytest.raises(MutationGateError, match="closed initial policy"):
         _ = mutation_policy_for_targets(tuple(reversed(task_thirteen_targets)))
+
+
+def test_task_seventeen_mutation_policy_selects_exact_security_suite() -> None:
+    """Mutation caught: Task 17 falling through to another phase's test policy."""
+    policy = mutation_policy_for_targets(_TASK_SEVENTEEN_TARGETS)
+
+    assert policy.targets == _TASK_SEVENTEEN_TARGETS
+    assert policy.test_paths == (
+        "tests/security/test_ssrf_binding.py",
+        "tests/unit/test_upstream_resilience.py",
+        "tests/unit/test_live_nplg_canary.py",
+        "tests/security/test_downloader.py",
+        "tests/integration/test_repository.py",
+        "tests/conformance/test_mcp_http.py",
+    )
+    assert policy.deselected_tests == (
+        (
+            "tests/integration/test_repository.py::"
+            "test_live_nplg_canary_uses_bound_public_endpoint"
+        ),
+    )
+
+
+def test_task_eighteen_mutation_policy_selects_exact_parser_suite() -> None:
+    """Mutation caught: Task 18 falling through the closed target registry."""
+    targets = (
+        "src/nplg_mcp/parsers.py",
+        "src/nplg_mcp/repository.py",
+        "src/nplg_mcp/tokens.py",
+    )
+
+    policy = mutation_policy_for_targets(targets)
+
+    assert policy.targets == targets
+    assert policy.test_paths == (
+        "tests/unit/test_parsers.py",
+        "tests/integration/test_repository.py",
+        "tests/property/test_parser_properties.py",
+    )
+    assert policy.deselected_tests == ()
+    mutation_configuration = mutation_gate_module._mutation_configuration(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        policy
+    )
+    assert b"--deselect" not in mutation_configuration
+    required = {
+        target: frozenset(name.removeprefix(f"{module}.") for name in names)
+        for (target, names), module in zip(
+            policy.required_functions,
+            ("nplg_mcp.parsers", "nplg_mcp.repository", "nplg_mcp.tokens"),
+            strict=True,
+        )
+    }
+    assert required == {
+        "src/nplg_mcp/parsers.py": frozenset(
+            {
+                "x__bitstream_id",
+                "x__canonical_item_from_href",
+                "x__class_contains",
+                "x__collections",
+                "x__dc_fields",
+                "x__dim_fields",
+                "x__extract_handle",
+                "x__field_values",
+                "x__first_descendant",
+                "x__full_fields",
+                "x__has_full_metadata_text",
+                "x__has_next_page_class",
+                "x__has_search_results_class",
+                "x__html_attribute_text",
+                "x__html_field_code_points",
+                "x__html_semantic_text_code_points",
+                "x__local_name",
+                "x__match_group",
+                "x__next_search_offset",
+                "x__normalize",
+                "x__normalize_date",
+                "x__oai_fields",
+                "x__parse_bitstreams",
+                "x__parse_size",
+                "x__parse_xml",
+                "x__preflight_html",
+                "x__preflight_xml",
+                "x__raise_for_oai_error",
+                "x__record_from_fields",
+                "x__require_exact_owned_child",
+                "x__require_preflight_agreement",
+                "x__saturating_increment",
+                "x__search_columns",
+                "x__search_items",
+                "x__search_total",
+                "x__summary_fields",
+                "x__tag_attribute",
+                "x__tag_text",
+                "x__unique",
+                "x__upstream_failure",
+                "x__validate_html_tree",
+                "x__validate_oai_identifier",
+                "x__validate_text_budget",
+                "x__validate_xml_tree",
+                "x_parse_item_page",
+                "x_parse_metadata_formats",
+                "x_parse_oai_record",
+                "x_parse_search_results",
+                "xǁ_HtmlBudgetParserǁ__init__",
+                "xǁ_HtmlBudgetParserǁ_add_attributes",
+                "xǁ_HtmlBudgetParserǁ_add_element",
+                "xǁ_HtmlBudgetParserǁ_add_text",
+                "xǁ_HtmlBudgetParserǁcheck_deadline",
+            }
+        ),
+        "src/nplg_mcp/repository.py": frozenset(
+            {
+                "x__canonical_search_query",
+                "x__publish_metadata_formats",
+                "x__record_dns_app_error",
+                "x__record_transport_error",
+                "x__require_metadata_prefix",
+                "x__validate_nplg_dns",
+                "x_decode_cursor",
+                "x_encode_cursor",
+            }
+        ),
+        "src/nplg_mcp/tokens.py": frozenset(
+            {
+                "x__b64decode",
+                "x__b64encode",
+                "x__reject_duplicate_cursor_keys",
+                "x__require_matching_signature",
+                "x__validate_asset_claims",
+                "x__validate_path",
+                "x_cursor_query_hash",
+                "x_derive_cursor_signing_key",
+                "x_sign_asset_token",
+                "x_sign_cursor",
+                "x_verify_asset_token",
+                "x_verify_cursor",
+            }
+        ),
+    }
+    with pytest.raises(MutationGateError, match="closed initial policy"):
+        _ = mutation_policy_for_targets(tuple(reversed(targets)))
 
 
 def test_phase_three_mutation_metadata_accepts_only_exact_generated_functions() -> None:

@@ -123,7 +123,7 @@ function codePointLimit(minimum: number, maximum: number): Readonly<CodePointLim
 
 const CODE_POINT_LIMITS = Object.freeze({
   codePoint2: codePointLimit(1, 2),
-  cursor: codePointLimit(0, 128),
+  cursor: codePointLimit(0, 1024),
   handle: codePointLimit(3, 128),
   httpUrl: codePointLimit(8, 4096),
   query: codePointLimit(1, 500),
@@ -132,6 +132,7 @@ const CODE_POINT_LIMITS = Object.freeze({
   text128: codePointLimit(1, 128),
   text256: codePointLimit(1, 256),
   text512: codePointLimit(1, 512),
+  text1024: codePointLimit(1, 1024),
   text8192: codePointLimit(1, 8192),
 });
 
@@ -153,6 +154,7 @@ function inertText(limit: Readonly<CodePointLimit>): z.ZodString {
 const text64 = inertText(CODE_POINT_LIMITS.text64);
 const text128 = inertText(CODE_POINT_LIMITS.text128);
 const text256 = inertText(CODE_POINT_LIMITS.text256);
+const text1024 = inertText(CODE_POINT_LIMITS.text1024);
 const text8192 = inertText(CODE_POINT_LIMITS.text8192);
 const outputHandle = limitedCodePointString(CODE_POINT_LIMITS.handle)
   .regex(/^[1-9][0-9]{0,31}\/[1-9][0-9]{0,31}$/);
@@ -380,7 +382,7 @@ export const searchDocumentsOutput = z.strictObject({
   total: nonnegativeInteger,
   next_offset: nonnegativeInteger.nullable(),
   source_url: httpUrl,
-  next_cursor: text128.nullable().default(null),
+  next_cursor: text1024.nullable().default(null),
 }).describe("One bounded search page with an opaque continuation cursor.");
 
 export const documentMetadataOutput = z.strictObject({
@@ -597,7 +599,7 @@ export const codePointBounds = {
     bound("/$defs/FrozenSequence_Annotated_str__StringConstraints__AfterValidator___MaxLen_max_length_512_/items", CODE_POINT_LIMITS.text8192),
     bound("/$defs/SearchDocumentRecord/properties/canonical_url", CODE_POINT_LIMITS.httpUrl),
     bound("/$defs/SearchDocumentRecord/properties/issue_date/anyOf/0", CODE_POINT_LIMITS.text64),
-    bound("/properties/next_cursor/anyOf/0", CODE_POINT_LIMITS.text128),
+    bound("/properties/next_cursor/anyOf/0", CODE_POINT_LIMITS.text1024),
     bound("/properties/source_url", CODE_POINT_LIMITS.httpUrl),
   ],
 } satisfies Record<ContractKey, readonly CodePointBound[]>;

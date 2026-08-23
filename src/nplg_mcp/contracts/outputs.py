@@ -51,6 +51,16 @@ Text256 = Annotated[
     ),
     AfterValidator(reject_unsafe_text),
 ]
+Text1024 = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        min_length=1,
+        max_length=1_024,
+        pattern=SAFE_TEXT_PATTERN,
+    ),
+    AfterValidator(reject_unsafe_text),
+]
 Text8192 = Annotated[
     str,
     StringConstraints(
@@ -184,7 +194,7 @@ class SearchDocumentsOutput(StrictOutput):
     total: NonnegativeInteger
     next_offset: NonnegativeInteger | None
     source_url: HttpUrl
-    next_cursor: Text128 | None = None
+    next_cursor: Text1024 | None = None
 
 
 class RawMetadataFieldOutput(StrictOutput):

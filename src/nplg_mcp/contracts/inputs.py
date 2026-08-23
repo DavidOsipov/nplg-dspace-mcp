@@ -122,7 +122,7 @@ class SearchDocumentsInput(StrictInput):
     cursor: (
         Annotated[
             ContractText,
-            StringConstraints(min_length=0, max_length=128),
+            StringConstraints(min_length=0, max_length=1_024),
         ]
         | None
     ) = None
@@ -132,12 +132,11 @@ class SearchDocumentsInput(StrictInput):
     @field_validator("query")
     @classmethod
     def non_blank_query(cls, value: str) -> str:
-        """Normalize ordinary spaces and reject an empty search query."""
-        normalized = " ".join(value.split(" "))
-        if not normalized.strip():
+        """Reject an empty search query without transforming repository input."""
+        if not value.strip():
             message = "query must contain non-whitespace characters"
             raise ValueError(message)
-        return reject_unsafe_text(normalized)
+        return reject_unsafe_text(value)
 
 
 class HandleInput(StrictInput):

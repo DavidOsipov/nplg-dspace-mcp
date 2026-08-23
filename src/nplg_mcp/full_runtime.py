@@ -43,7 +43,8 @@ def build_full_services(
         max_bytes=config.max_download_bytes,
         max_redirects=config.max_redirects,
         limiter=limiter,
-        total_timeout_seconds=config.upstream_timeout_seconds,
+        total_timeout_seconds=float(config.upstream_timeout_seconds),
+        guard=repository.guard,
         scanner=ClamAvUnixSocketScanner(
             socket_path=config.scanner_socket_path,
             max_bytes=config.max_download_bytes,

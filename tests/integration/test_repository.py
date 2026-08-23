@@ -4,9 +4,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
+import json
+import os
 import threading
 import time
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast, get_type_hints, override
 from urllib.parse import parse_qs, urlsplit
@@ -14,11 +20,25 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 
+import nplg_mcp.network as network_module
+from nplg_mcp import repository as repository_module
 from nplg_mcp.bounded_work import PARSER_WORK
+from nplg_mcp.contracts import MonotonicDeadline
 from nplg_mcp.errors import AppError, ErrorCode
 from nplg_mcp.http_types import HttpClientProtocol, HttpResponseProtocol
+from nplg_mcp.network import create_bound_http_transport
 from nplg_mcp.parsers import SearchPage, parse_search_results
 from nplg_mcp.repository import NplgRepository, decode_cursor, encode_cursor
+from nplg_mcp.resilience import (
+    AttemptPermit,
+    Closed,
+    Open,
+    UpstreamGuard,
+    UpstreamGuardPolicy,
+)
+from nplg_mcp.security import DnsTransientError
+from nplg_mcp.tokens import derive_cursor_signing_key
+from scripts.run_live_nplg_canary import execute_canary_probe
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable
@@ -28,6 +48,19 @@ _EXPECTED_PAGE_SIZE = 2
 _METADATA_BYTE_LIMIT = 10
 _HTTP_FORBIDDEN = 403
 _HTTP_BAD_GATEWAY = 502
+_SYNTHETIC_BODY_FAILURE = "synthetic body failure"
+_CURSOR_SECRET = b"c" * 32
+_CURSOR_NOW = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+_EXPECTED_DISCOVERY_REQUESTS = 2
+
+
+class _WriteCountingCache(dict[str, object]):
+    writes: int = 0
+
+    @override
+    def __setitem__(self, key: str, value: object) -> None:
+        self.writes += 1
+        super().__setitem__(key, value)
 
 
 class _ReadOnlyPropertyDescriptor(Protocol):
@@ -56,6 +89,27 @@ def _read_only_property_getter(member: object) -> Callable[[object], object]:
 
 def fixture(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
+
+
+def _resign_cursor_payload(token: str, updates: dict[str, object]) -> str:
+    encoded_payload, _ = token.split(".", 1)
+    padded = encoded_payload + "=" * (-len(encoded_payload) % 4)
+    payload = cast(
+        "dict[str, object]",
+        json.loads(base64.urlsafe_b64decode(padded)),
+    )
+    assert isinstance(payload, dict)
+    payload.update(updates)
+    replaced = base64.urlsafe_b64encode(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).rstrip(b"=")
+    signature = hmac.new(
+        derive_cursor_signing_key(_CURSOR_SECRET),
+        replaced,
+        hashlib.sha256,
+    ).digest()
+    encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b"=")
+    return f"{replaced.decode('ascii')}.{encoded_signature.decode('ascii')}"
 
 
 def test_http_protocol_annotations_are_runtime_resolvable() -> None:
@@ -97,7 +151,12 @@ async def test_search_builds_bounded_dspace_request_and_opaque_cursor() -> None:
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        repository = NplgRepository(client=client, validate_dns=False)
+        repository = NplgRepository(
+            client=client,
+            validate_dns=False,
+            cursor_signing_secret=_CURSOR_SECRET,
+            cursor_clock=lambda: _CURSOR_NOW,
+        )
         page = await repository.search("ივერია", page_size=2)
 
     assert len(seen) == 1
@@ -106,7 +165,177 @@ async def test_search_builds_bounded_dspace_request_and_opaque_cursor() -> None:
     assert query["rpp"] == ["2"]
     assert query["start"] == ["0"]
     assert page.next_cursor is not None
-    assert decode_cursor(page.next_cursor) == _EXPECTED_PAGE_SIZE
+    assert (
+        decode_cursor(
+            page.next_cursor,
+            secret=_CURSOR_SECRET,
+            normalized_query="ივერია",
+            scope_handle=None,
+            page_size=2,
+            now=_CURSOR_NOW,
+        )
+        == _EXPECTED_PAGE_SIZE
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_normalizes_once_and_reuses_the_exact_canonical_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_queries: list[str] = []
+    upstream_queries: list[str] = []
+    canonicalize = repository_module._canonical_search_query  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    def observed_canonicalize(value: str) -> str:
+        raw_queries.append(value)
+        return canonicalize(value)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        query = parse_qs(urlsplit(str(request.url)).query)["query"][0]
+        upstream_queries.append(query)
+        return httpx.Response(
+            200,
+            text=fixture("search_results.html"),
+            headers={"content-type": "text/html"},
+        )
+
+    monkeypatch.setattr(
+        repository_module,
+        "_canonical_search_query",
+        observed_canonicalize,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(
+            client=client,
+            validate_dns=False,
+            cursor_signing_secret=_CURSOR_SECRET,
+            cursor_clock=lambda: _CURSOR_NOW,
+        )
+        first = await repository.search("ივერია  გაზეთი", page_size=2)
+        assert first.next_cursor is not None
+        _ = await repository.search(
+            "ივერია გაზეთი",
+            page_size=2,
+            cursor=first.next_cursor,
+        )
+
+    assert raw_queries == ["ივერია  გაზეთი", "ივერია გაზეთი"]
+    assert upstream_queries == ["ივერია გაზეთი", "ივერია გაზეთი"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("replayed_query", "replayed_scope", "replayed_page_size"),
+    [
+        pytest.param("another query", None, 2, id="query"),
+        pytest.param("ივერიელი", "1234/2", 2, id="scope"),
+        pytest.param("ივერიელი", None, 3, id="page-size"),
+    ],
+)
+async def test_search_cursor_replay_is_bound_to_every_pagination_context(
+    replayed_query: str,
+    replayed_scope: str | None,
+    replayed_page_size: int,
+) -> None:
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            text=fixture("search_results.html"),
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(client=client, validate_dns=False)
+        first = await repository.search("ივერიელი", page_size=2)
+        assert first.next_cursor is not None
+
+        with pytest.raises(AppError) as captured:
+            _ = await repository.search(
+                replayed_query,
+                scope_handle=replayed_scope,
+                page_size=replayed_page_size,
+                cursor=first.next_cursor,
+            )
+
+    assert captured.value.code is ErrorCode.INVALID_INPUT
+    assert requests == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "updates",
+    [
+        pytest.param({"version": 2}, id="version"),
+        pytest.param({"algorithm": "none"}, id="algorithm"),
+    ],
+)
+async def test_search_rejects_validly_signed_cursor_confusion_before_network(
+    updates: dict[str, object],
+) -> None:
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            text=fixture("search_results.html"),
+            headers={"content-type": "text/html"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(
+            client=client,
+            validate_dns=False,
+            cursor_signing_secret=_CURSOR_SECRET,
+            cursor_clock=lambda: _CURSOR_NOW,
+        )
+        first = await repository.search("ივერიელი", page_size=2)
+        assert first.next_cursor is not None
+        confused = _resign_cursor_payload(first.next_cursor, updates)
+
+        with pytest.raises(AppError) as captured:
+            _ = await repository.search("ივერიელი", page_size=2, cursor=confused)
+
+    assert captured.value.code is ErrorCode.INVALID_INPUT
+    assert requests == 1
+
+
+@pytest.mark.asyncio
+async def test_search_rejects_expired_cursor_before_network() -> None:
+    requests = 0
+    times = iter((_CURSOR_NOW, _CURSOR_NOW + timedelta(seconds=901)))
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            text=fixture("search_results.html"),
+            headers={"content-type": "text/html"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(
+            client=client,
+            validate_dns=False,
+            cursor_signing_secret=_CURSOR_SECRET,
+            cursor_clock=lambda: next(times),
+        )
+        first = await repository.search("ივერიელი", page_size=2)
+        assert first.next_cursor is not None
+
+        with pytest.raises(AppError) as captured:
+            _ = await repository.search(
+                "ივერიელი", page_size=2, cursor=first.next_cursor
+            )
+
+    assert captured.value.code is ErrorCode.INVALID_INPUT
+    assert requests == 1
 
 
 @pytest.mark.asyncio
@@ -263,6 +492,114 @@ async def test_metadata_response_is_stream_bounded_before_full_body_is_buffered(
 
     assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
     assert stream.yielded == _EXPECTED_PAGE_SIZE
+
+
+@pytest.mark.asyncio
+async def test_post_header_body_transport_failure_counts_as_transient() -> None:
+    """Mutation caught: recording success before a 200 response body completes."""
+
+    class BrokenStream(httpx.AsyncByteStream):
+        @override
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b"<html>"
+            raise httpx.ReadError(_SYNTHETIC_BODY_FAILURE)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            stream=BrokenStream(),
+        )
+
+    guard = UpstreamGuard(
+        policy=UpstreamGuardPolicy(failure_threshold=1),
+        random=lambda: 0.5,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(
+            client=client,
+            validate_dns=False,
+            guard=guard,
+        )
+        with pytest.raises(AppError):
+            _ = await repository.search("test")
+
+    assert isinstance(guard.state, Open)
+
+
+@pytest.mark.asyncio
+async def test_repository_excludes_transport_policy_rejection_but_counts_timeout() -> (
+    None
+):
+    """Mutation caught: poisoning the circuit with a bound-transport rejection."""
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise network_module.TransportPolicyError
+        message = "synthetic connection timeout"
+        raise httpx.ConnectTimeout(message, request=request)
+
+    guard = UpstreamGuard(
+        policy=UpstreamGuardPolicy(failure_threshold=1),
+        random=lambda: 0.5,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(
+            client=client,
+            validate_dns=False,
+            guard=guard,
+        )
+        with pytest.raises(AppError) as rejected:
+            _ = await repository.search("test")
+        assert rejected.value.code is ErrorCode.UPSTREAM_FAILURE
+        closed: object = guard.state
+        assert isinstance(closed, Closed)
+
+        with pytest.raises(AppError) as timed_out:
+            _ = await repository.search("test")
+        assert timed_out.value.code is ErrorCode.UPSTREAM_FAILURE
+        opened: object = guard.state
+        assert isinstance(opened, Open)
+
+
+@pytest.mark.asyncio
+async def test_open_circuit_fails_before_dns_or_rate_limiter_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mutation caught: DNS/global work consumed before circuit admission."""
+    calls = 0
+
+    def resolve(_host: str) -> tuple[str, ...]:
+        nonlocal calls
+        calls += 1
+        return ("1.1.1.1",)
+
+    monkeypatch.setattr("nplg_mcp.repository.resolve_approved_addresses", resolve)
+    guard = UpstreamGuard(
+        policy=UpstreamGuardPolicy(failure_threshold=1),
+        random=lambda: 0.5,
+    )
+    async with guard.acquire(
+        MonotonicDeadline.after(30.0, clock=time.monotonic)
+    ) as failed:
+        await failed.record_transient_failure()
+
+    def unexpected_request(_request: httpx.Request) -> httpx.Response:
+        message = "open circuit reached HTTP transport"
+        raise AssertionError(message)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(unexpected_request)
+    ) as client:
+        repository = NplgRepository(client=client, guard=guard)
+        with pytest.raises(AppError) as captured:
+            _ = await repository.search("test")
+
+    assert captured.value.code is ErrorCode.RATE_LIMITED
+    assert calls == 0
 
 
 @pytest.mark.asyncio
@@ -433,7 +770,14 @@ def test_cursor_encoder_rejects_non_integer_and_out_of_range_offsets(
     offset: int,
 ) -> None:
     with pytest.raises(AppError) as captured:
-        _ = encode_cursor(offset)
+        _ = encode_cursor(
+            offset,
+            secret=_CURSOR_SECRET,
+            normalized_query="query",
+            scope_handle=None,
+            page_size=2,
+            now=_CURSOR_NOW,
+        )
 
     assert captured.value.code is ErrorCode.INVALID_INPUT
 
@@ -453,7 +797,14 @@ def test_cursor_decoder_rejects_malformed_versioned_or_unbounded_payloads(
     cursor: str,
 ) -> None:
     with pytest.raises(AppError) as captured:
-        _ = decode_cursor(cursor)
+        _ = decode_cursor(
+            cursor,
+            secret=_CURSOR_SECRET,
+            normalized_query="query",
+            scope_handle=None,
+            page_size=2,
+            now=_CURSOR_NOW,
+        )
 
     assert captured.value.code is ErrorCode.INVALID_INPUT
 
@@ -687,10 +1038,15 @@ async def test_repository_rejects_invalid_headers_sizes_and_text_encoding(
 
 def _metadata_formats_document(prefix: str) -> str:
     return (
-        "<OAI-PMH><ListMetadataFormats><metadataFormat>"
+        '<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">'
+        "<ListMetadataFormats><metadataFormat>"
         f"<metadataPrefix>{prefix}</metadataPrefix>"
         "</metadataFormat></ListMetadataFormats></OAI-PMH>"
     )
+
+
+def _xml_document(*parts: str) -> str:
+    return "".join(parts)
 
 
 _OAI_DC_RECORD = (
@@ -763,6 +1119,293 @@ async def test_metadata_uses_the_discovered_supported_oai_parser(
 
 
 @pytest.mark.asyncio
+async def test_successful_oai_format_discovery_is_cached_by_upstream_origin() -> None:
+    verbs: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        query = parse_qs(urlsplit(str(request.url)).query)
+        verb = query["verb"][0]
+        verbs.append(verb)
+        if verb == "ListMetadataFormats":
+            return httpx.Response(
+                200,
+                text=_metadata_formats_document("oai_dc"),
+                headers={"content-type": "text/xml"},
+            )
+        identifier = query["identifier"][0]
+        handle = identifier.rsplit(":", 1)[-1]
+        record = _OAI_DC_RECORD.replace("1234/560975", handle)
+        return httpx.Response(
+            200,
+            text=record,
+            headers={"content-type": "text/xml"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(client=client, validate_dns=False)
+        first = await repository.get_metadata("1234/560975")
+        second = await repository.get_metadata("1234/560976")
+
+    assert first.handle == "1234/560975"
+    assert second.handle == "1234/560976"
+    assert verbs == ["ListMetadataFormats", "GetRecord", "GetRecord"]
+
+
+@pytest.mark.asyncio
+async def test_oai_discovery_cache_expires_at_the_exact_monotonic_boundary() -> None:
+    requests = 0
+    samples = iter((0.0, 0.0, 299.0, 300.0, 300.0))
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            text=_metadata_formats_document("dim"),
+            headers={"content-type": "text/xml"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(
+            client=client,
+            validate_dns=False,
+            cache_clock=lambda: next(samples),
+        )
+        deadline = asyncio.get_running_loop().time() + 5.0
+        assert await repository._metadata_formats(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            deadline=deadline
+        ) == ("dim",)
+        assert await repository._metadata_formats(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            deadline=deadline
+        ) == ("dim",)
+        assert await repository._metadata_formats(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            deadline=deadline
+        ) == ("dim",)
+
+    assert requests == _EXPECTED_DISCOVERY_REQUESTS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        pytest.param(200, "<not-closed>", id="malformed"),
+        pytest.param(403, "denied", id="access-denial"),
+        pytest.param(200, "x" * 2_097_153, id="over-markup-budget"),
+        pytest.param(
+            200,
+            _xml_document(
+                "<Envelope><ListMetadataFormats><metadataFormat>",
+                "<metadataPrefix>dim</metadataPrefix>",
+                "</metadataFormat></ListMetadataFormats></Envelope>",
+            ),
+            id="wrong-root",
+        ),
+        pytest.param(
+            200,
+            _xml_document(
+                "<OAI-PMH><wrapper><ListMetadataFormats><metadataFormat>",
+                "<metadataPrefix>dim</metadataPrefix>",
+                "</metadataFormat></ListMetadataFormats></wrapper></OAI-PMH>",
+            ),
+            id="wrapped-list",
+        ),
+        pytest.param(
+            200,
+            _xml_document(
+                "<OAI-PMH><ListMetadataFormats><wrapper><metadataFormat>",
+                "<metadataPrefix>dim</metadataPrefix>",
+                "</metadataFormat></wrapper></ListMetadataFormats></OAI-PMH>",
+            ),
+            id="wrapped-format",
+        ),
+        pytest.param(
+            200,
+            _xml_document(
+                "<OAI-PMH><ListMetadataFormats><metadataFormat><wrapper>",
+                "<metadataPrefix>dim</metadataPrefix>",
+                "</wrapper></metadataFormat></ListMetadataFormats></OAI-PMH>",
+            ),
+            id="nested-prefix",
+        ),
+        pytest.param(
+            200,
+            _xml_document(
+                "<OAI-PMH><ListMetadataFormats>",
+                "<metadataPrefix>misowned</metadataPrefix>",
+                "<metadataFormat><metadataPrefix>dim</metadataPrefix>",
+                "</metadataFormat></ListMetadataFormats></OAI-PMH>",
+            ),
+            id="misowned-prefix",
+        ),
+        pytest.param(
+            200,
+            _xml_document(
+                '<evil:OAI-PMH xmlns:evil="urn:evil">',
+                "<evil:ListMetadataFormats><evil:metadataFormat>",
+                "<evil:metadataPrefix>dim</evil:metadataPrefix>",
+                "</evil:metadataFormat></evil:ListMetadataFormats>",
+                "</evil:OAI-PMH>",
+            ),
+            id="wrong-root-namespace",
+        ),
+        pytest.param(
+            200,
+            _xml_document(
+                '<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/" ',
+                'xmlns:evil="urn:evil"><evil:ListMetadataFormats>',
+                "<evil:metadataFormat><evil:metadataPrefix>dim</evil:metadataPrefix>",
+                "</evil:metadataFormat></evil:ListMetadataFormats></OAI-PMH>",
+            ),
+            id="wrong-list-namespace",
+        ),
+        pytest.param(
+            200,
+            _xml_document(
+                '<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/" ',
+                'xmlns:evil="urn:evil"><ListMetadataFormats>',
+                "<evil:metadataFormat><evil:metadataPrefix>dim</evil:metadataPrefix>",
+                "</evil:metadataFormat></ListMetadataFormats></OAI-PMH>",
+            ),
+            id="wrong-format-namespace",
+        ),
+        pytest.param(
+            200,
+            _xml_document(
+                '<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/" ',
+                'xmlns:evil="urn:evil"><ListMetadataFormats><metadataFormat>',
+                "<evil:metadataPrefix>dim</evil:metadataPrefix>",
+                "</metadataFormat></ListMetadataFormats></OAI-PMH>",
+            ),
+            id="wrong-prefix-namespace",
+        ),
+    ],
+)
+async def test_oai_discovery_failure_is_never_cached_before_validation(
+    status: int,
+    body: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            status,
+            text=body,
+            headers={"content-type": "text/xml"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(client=client, validate_dns=False)
+        writes = _WriteCountingCache()
+        monkeypatch.setattr(repository, "_metadata_format_cache", writes)
+        deadline = asyncio.get_running_loop().time() + 5.0
+        for _ in range(2):
+            with pytest.raises(AppError):
+                _ = await repository._metadata_formats(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                    deadline=deadline
+                )
+            assert repository._metadata_format_cache == {}  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert requests == _EXPECTED_DISCOVERY_REQUESTS
+    assert writes.writes == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cold_oai_discovery_uses_exactly_one_upstream_request() -> (
+    None
+):
+    requests = 0
+    request_started = asyncio.Event()
+    release_response = asyncio.Event()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        request_started.set()
+        _ = await release_response.wait()
+        return httpx.Response(
+            200,
+            text=_metadata_formats_document("dim"),
+            headers={"content-type": "text/xml"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(client=client, validate_dns=False)
+        deadline = asyncio.get_running_loop().time() + 5.0
+        first = asyncio.create_task(
+            repository._metadata_formats(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                deadline=deadline
+            )
+        )
+        second = asyncio.create_task(
+            repository._metadata_formats(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                deadline=deadline
+            )
+        )
+        _ = await request_started.wait()
+        await asyncio.sleep(0)
+        release_response.set()
+        results = await asyncio.gather(first, second)
+        assert results[0] == ("dim",)
+        assert results[1] == ("dim",)
+
+    assert requests == 1
+
+
+@pytest.mark.asyncio
+async def test_backward_cache_clock_invalidates_then_recovery_refetches() -> None:
+    requests = 0
+    samples = iter((10.0, 10.0, 5.0, 20.0, 20.0))
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            text=_metadata_formats_document("dim"),
+            headers={"content-type": "text/xml"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(
+            client=client,
+            validate_dns=False,
+            cache_clock=lambda: next(samples),
+        )
+        deadline = asyncio.get_running_loop().time() + 5.0
+        assert await repository._metadata_formats(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            deadline=deadline
+        ) == ("dim",)
+        with pytest.raises(RuntimeError, match="moved backwards"):
+            _ = await repository._metadata_formats(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                deadline=deadline
+            )
+        assert repository._metadata_format_cache == {}  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        assert await repository._metadata_formats(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            deadline=deadline
+        ) == ("dim",)
+
+    assert requests == _EXPECTED_DISCOVERY_REQUESTS
+
+
+def test_malformed_cursor_signature_is_invalid_input() -> None:
+    with pytest.raises(AppError) as raised:
+        _ = decode_cursor(
+            "payload.%%%",
+            secret=_CURSOR_SECRET,
+            normalized_query="query",
+            scope_handle=None,
+            page_size=2,
+            now=_CURSOR_NOW,
+        )
+
+    assert raised.value.code is ErrorCode.INVALID_INPUT
+
+
+@pytest.mark.asyncio
 async def test_unsupported_oai_formats_fall_back_to_bound_full_item_html() -> None:
     paths: list[str] = []
 
@@ -808,3 +1451,111 @@ async def test_oai_security_rejection_is_not_downgraded_to_html_fallback() -> No
 
     assert captured.value.code is ErrorCode.INVALID_INPUT
     assert requests == 1
+
+
+@pytest.mark.live
+@pytest.mark.asyncio
+async def test_live_nplg_canary_uses_bound_public_endpoint() -> None:
+    """Classify the single protected Task 17 live-oracle node."""
+    if os.environ.get("NPLG_ALLOW_LIVE_TESTS") != "1":
+        pytest.skip("NPLG live-test authority is absent")
+    limits = httpx.Limits(max_connections=1, max_keepalive_connections=0)
+    async with httpx.AsyncClient(
+        transport=create_bound_http_transport(limits=limits),
+        trust_env=False,
+        follow_redirects=False,
+    ) as client:
+        await execute_canary_probe(client, timeout_seconds=15.0)
+
+
+class _RecordingDnsPermit:
+    def __init__(self) -> None:
+        super().__init__()
+        self.outcomes: list[str] = []
+
+    async def record_transient_failure(self) -> None:
+        self.outcomes.append("transient")
+
+    async def record_excluded_failure(self) -> None:
+        self.outcomes.append("excluded")
+
+
+@pytest.mark.asyncio
+async def test_repository_dns_errors_have_exact_circuit_classification() -> None:
+    """Mutation caught: security/local DNS rejection poisoning availability state."""
+    transient = _RecordingDnsPermit()
+    excluded = _RecordingDnsPermit()
+    await repository_module._record_dns_app_error(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        cast("AttemptPermit", transient),
+        DnsTransientError(
+            ErrorCode.UPSTREAM_FAILURE,
+            "The DNS lookup failed.",
+            http_status=502,
+        ),
+    )
+    await repository_module._record_dns_app_error(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        cast("AttemptPermit", excluded),
+        AppError(ErrorCode.INVALID_INPUT, "The DNS answer was rejected."),
+    )
+    assert transient.outcomes == ["transient"]
+    assert excluded.outcomes == ["excluded"]
+
+
+def test_repository_rejects_a_forged_guard() -> None:
+    """Mutation caught: accepting a caller-controlled circuit implementation."""
+    with pytest.raises(TypeError, match="UpstreamGuard"):
+        _ = NplgRepository(
+            client=cast("HttpClientProtocol", object()),
+            guard=cast("UpstreamGuard", object()),
+        )
+
+
+@pytest.mark.asyncio
+async def test_repository_dependency_error_is_classified_before_reraise() -> None:
+    """Mutation caught: DNS AppError escaping without finalizing its permit."""
+
+    class _FailingDnsRepository(NplgRepository):
+        @override
+        async def _ensure_dns(self) -> None:
+            raise AppError(ErrorCode.INVALID_INPUT, "DNS security rejection")
+
+    permit = _RecordingDnsPermit()
+    repository = _FailingDnsRepository(
+        client=cast("HttpClientProtocol", object()),
+    )
+    with pytest.raises(AppError, match="DNS security rejection"):
+        await repository._admit_dependencies(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            cast("AttemptPermit", permit)
+        )
+    assert permit.outcomes == ["excluded"]
+
+
+@pytest.mark.asyncio
+async def test_repository_rejects_deadline_before_and_after_guard_admission() -> None:
+    """Mutation caught: starting network work outside either deadline boundary."""
+    before = NplgRepository(
+        client=cast("HttpClientProtocol", object()),
+        validate_dns=False,
+        guard=UpstreamGuard(clock=lambda: 0.0),
+        clock=lambda: 1.0,
+    )
+    with pytest.raises(TimeoutError):
+        _ = await before._get_text_within_deadline(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            "https://dspace.nplg.gov.ge/simple-search",
+            accepted_types=("text/html",),
+            deadline=0.0,
+        )
+
+    after_times = iter((0.0, 2.0))
+    after = NplgRepository(
+        client=cast("HttpClientProtocol", object()),
+        validate_dns=False,
+        guard=UpstreamGuard(clock=lambda: 0.0),
+        clock=lambda: next(after_times),
+    )
+    with pytest.raises(TimeoutError):
+        _ = await after._get_text_within_deadline(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            "https://dspace.nplg.gov.ge/simple-search",
+            accepted_types=("text/html",),
+            deadline=1.0,
+        )

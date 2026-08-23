@@ -4,18 +4,22 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeVar
+import math
+import secrets
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import TypeVar, cast
 from urllib.parse import urljoin
 
 import httpx
 
 from .bounded_work import DNS_WORK, PARSER_WORK, BlockingWorkCapacityError
+from .contracts import MonotonicDeadline
 from .errors import AppError, ErrorCode
 from .http_types import HttpClientProtocol, HttpResponseProtocol
-from .json_types import JsonObject, dump_json, load_json_value, require_json_object
+from .network import classify_transport_failure
 from .parsers import (
     Bitstream,
     DocumentRecord,
@@ -26,76 +30,178 @@ from .parsers import (
     parse_search_results,
 )
 from .rate_limit import RateLimiter
+from .resilience import AttemptPermit, UpstreamGuard, UpstreamUnavailableError
 from .security import (
     NPLG_HOST,
     NPLG_ORIGIN,
+    DnsTransientError,
     build_item_url,
     parse_handle_input,
     resolve_approved_addresses,
     validate_upstream_url,
 )
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
+from .tokens import (
+    CURSOR_KEY_ID,
+    DEFAULT_CURSOR_TTL_SECONDS,
+    CursorV1,
+    cursor_query_hash,
+    derive_cursor_signing_key,
+    sign_cursor,
+    verify_cursor,
+)
 
 _RUNTIME_ANNOTATION_TYPES = (
     HttpClientProtocol,
     HttpResponseProtocol,
     RateLimiter,
+    Callable,
 )
 
 _MAX_METADATA_BYTES = 10 * 1024 * 1024
 _MAX_SEARCH_PAGE_SIZE = 50
 _MAX_QUERY_LENGTH = 500
-_MAX_CURSOR_OFFSET = 10_000_000
-_MAX_CURSOR_LENGTH = 128
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _RESTRICTED_STATUSES = frozenset({401, 403})
 _HTTP_OK_MIN = 200
 _HTTP_REDIRECT_MIN = 300
 _HTTP_NOT_FOUND = 404
 _HTTP_TOO_MANY_REQUESTS = 429
+_HTTP_SERVER_ERROR_MIN = 500
+_MAX_UPSTREAM_TIMEOUT_SECONDS = 120.0
+_OAI_DISCOVERY_CACHE_TTL_SECONDS = 300.0
+_MAX_OAI_DISCOVERY_CACHE_ENTRIES = 8
 _REQUEST_DEADLINE_MESSAGE = (
     "The repository request did not complete within the configured deadline."
 )
+
+
+def _empty_oai_format_cache() -> dict[str, _OaiFormatCacheEntry]:
+    return {}
+
+
+async def _record_dns_app_error(permit: AttemptPermit, error: AppError) -> None:
+    if isinstance(error, DnsTransientError) or error.code is ErrorCode.RATE_LIMITED:
+        await permit.record_transient_failure()
+    else:
+        await permit.record_excluded_failure()
+
+
+async def _record_transport_error(
+    permit: AttemptPermit,
+    error: TimeoutError | httpx.RequestError,
+) -> None:
+    if classify_transport_failure(error) == "transient":
+        await permit.record_transient_failure()
+    else:
+        await permit.record_excluded_failure()
+
+
 _ParsedT = TypeVar("_ParsedT")
+
+
+@dataclass(frozen=True, slots=True)
+class _OaiFormatCacheEntry:
+    formats: tuple[str, ...]
+    created_at: float
+    expires_at: float
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.created_at) is not float
+            or type(self.expires_at) is not float
+            or not math.isfinite(self.created_at)
+            or not math.isfinite(self.expires_at)
+            or self.created_at < 0.0
+            or not 0.0
+            < self.expires_at - self.created_at
+            <= _OAI_DISCOVERY_CACHE_TTL_SECONDS
+        ):
+            msg = "OAI discovery cache expiry is invalid"
+            raise ValueError(msg)
+
+
+def _publish_metadata_formats(
+    cache: dict[str, _OaiFormatCacheEntry],
+    *,
+    origin: str,
+    formats: tuple[str, ...],
+    stored_at: float,
+) -> None:
+    expired_origins = [
+        key for key, entry in cache.items() if entry.expires_at <= stored_at
+    ]
+    for key in expired_origins:
+        del cache[key]
+    if len(cache) >= _MAX_OAI_DISCOVERY_CACHE_ENTRIES:
+
+        def cache_expiry(cache_key: str) -> float:
+            return cache[cache_key].expires_at
+
+        oldest = min(cache, key=cache_expiry)
+        del cache[oldest]
+    cache[origin] = _OaiFormatCacheEntry(
+        formats=formats,
+        created_at=stored_at,
+        expires_at=stored_at + _OAI_DISCOVERY_CACHE_TTL_SECONDS,
+    )
 
 
 def _validate_nplg_dns() -> None:
     _ = resolve_approved_addresses(NPLG_HOST)
 
 
-def encode_cursor(offset: int) -> str:
-    """Encode a bounded nonnegative repository result offset."""
-    if type(offset) is not int or offset < 0 or offset > _MAX_CURSOR_OFFSET:
-        raise AppError(
-            ErrorCode.INVALID_INPUT, "Cursor offset is outside the supported range."
-        )
-    payload: JsonObject = {"v": 1, "offset": offset}
-    encoded_payload = dump_json(payload, sort_keys=True).encode("utf-8")
-    return base64.urlsafe_b64encode(encoded_payload).decode("ascii").rstrip("=")
+def _canonical_search_query(query: str) -> str:
+    if type(query) is not str:
+        raise AppError(ErrorCode.INVALID_INPUT, "Search query must be text.")
+    return " ".join(query.split())
 
 
-def decode_cursor(cursor: str) -> int:
-    """Decode and validate an opaque repository result cursor."""
-    if type(cursor) is not str or not cursor or len(cursor) > _MAX_CURSOR_LENGTH:
-        raise AppError(ErrorCode.INVALID_INPUT, "Cursor is malformed.")
+def encode_cursor(  # noqa: PLR0913 - explicit authenticated context
+    offset: int,
+    *,
+    secret: bytes,
+    normalized_query: str,
+    scope_handle: str | None,
+    page_size: int,
+    now: datetime,
+) -> str:
+    """Encode an authenticated cursor bound to every search context value."""
     try:
-        padded = cursor + "=" * (-len(cursor) % 4)
-        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
-        payload = require_json_object(
-            load_json_value(decoded.decode("utf-8")), context="cursor payload"
+        payload = CursorV1(
+            version=1,
+            key_id=CURSOR_KEY_ID,
+            query_hash=cursor_query_hash(normalized_query),
+            scope_handle=scope_handle,
+            offset=offset,
+            page_size=page_size,
+            issued_at=now,
+            expires_at=now + timedelta(seconds=DEFAULT_CURSOR_TTL_SECONDS),
         )
-    except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
-        raise AppError(ErrorCode.INVALID_INPUT, "Cursor is malformed.") from exc
-    if payload.get("v") != 1:
-        raise AppError(ErrorCode.INVALID_INPUT, "Cursor version is unsupported.")
-    offset = payload.get("offset")
-    if type(offset) is not int or offset < 0 or offset > _MAX_CURSOR_OFFSET:
+    except ValueError as exc:
         raise AppError(
             ErrorCode.INVALID_INPUT, "Cursor offset is outside the supported range."
-        )
-    return offset
+        ) from exc
+    return sign_cursor(secret, payload)
+
+
+def decode_cursor(  # noqa: PLR0913 - explicit authenticated context
+    cursor: str,
+    *,
+    secret: bytes,
+    normalized_query: str,
+    scope_handle: str | None,
+    page_size: int,
+    now: datetime,
+) -> int:
+    """Decode an authenticated cursor only in its original search context."""
+    return verify_cursor(
+        secret,
+        cursor,
+        normalized_query=normalized_query,
+        scope_handle=scope_handle,
+        page_size=page_size,
+        now=now,
+    ).offset
 
 
 @dataclass(slots=True)
@@ -108,12 +214,39 @@ class NplgRepository:
     max_metadata_bytes: int = _MAX_METADATA_BYTES
     limiter: RateLimiter | None = None
     total_timeout_seconds: float = 120.0
+    guard: UpstreamGuard = field(default_factory=UpstreamGuard)
+    clock: Callable[[], float] = time.monotonic
+    cursor_signing_secret: bytes = field(
+        default_factory=lambda: secrets.token_bytes(32), repr=False
+    )
+    cursor_clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+    cache_clock: Callable[[], float] = time.monotonic
+    _metadata_format_cache: dict[str, _OaiFormatCacheEntry] = field(
+        default_factory=_empty_oai_format_cache,
+        init=False,
+        repr=False,
+    )
+    _metadata_format_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         """Reject an invalid total request deadline."""
-        if self.total_timeout_seconds <= 0:
+        if (
+            type(self.total_timeout_seconds) is not float
+            or not math.isfinite(self.total_timeout_seconds)
+            or self.total_timeout_seconds <= 0
+            or self.total_timeout_seconds > _MAX_UPSTREAM_TIMEOUT_SECONDS
+        ):
             msg = "total_timeout_seconds must be positive"
             raise ValueError(msg)
+        guard = cast("object", self.guard)
+        if not isinstance(guard, UpstreamGuard):
+            msg = "guard must be an UpstreamGuard"
+            raise TypeError(msg)
+        _ = derive_cursor_signing_key(self.cursor_signing_secret)
 
     async def _ensure_dns(self) -> None:
         if self.validate_dns:
@@ -125,6 +258,15 @@ class NplgRepository:
                     "The DNS resolver is at capacity.",
                     http_status=503,
                 ) from exc
+
+    async def _admit_dependencies(self, permit: AttemptPermit) -> None:
+        try:
+            await self._ensure_dns()
+        except AppError as exc:
+            await _record_dns_app_error(permit, exc)
+            raise
+        if self.limiter is not None:
+            await self.limiter.acquire()
 
     async def _get_text(
         self,
@@ -145,7 +287,15 @@ class NplgRepository:
                     url,
                     params=params,
                     accepted_types=accepted_types,
+                    deadline=effective_deadline,
                 )
+        except UpstreamUnavailableError as exc:
+            raise AppError(
+                ErrorCode.RATE_LIMITED,
+                "The repository is temporarily unavailable.",
+                http_status=503,
+                safe_details={"retry_after": exc.retry_after_seconds},
+            ) from exc
         except (TimeoutError, httpx.RequestError) as exc:
             raise AppError(
                 ErrorCode.UPSTREAM_FAILURE,
@@ -313,30 +463,63 @@ class NplgRepository:
         *,
         params: dict[str, str | int] | None = None,
         accepted_types: tuple[str, ...],
+        deadline: float,
     ) -> tuple[str, str]:
         request_url = (
             httpx.URL(url) if params is None else httpx.URL(url, params=params)
         )
         current = validate_upstream_url(str(request_url))
         for redirect_index in range(self.max_redirects + 1):
-            await self._ensure_dns()
-            if self.limiter is not None:
-                await self.limiter.acquire()
-            async with self.client.stream(
-                "GET", current, follow_redirects=False
-            ) as response:
-                redirect = self._redirect_target(
-                    response, current=current, redirect_index=redirect_index
-                )
-                if redirect is not None:
-                    current = redirect
-                    continue
-                self._validate_response_status(response)
-                encoding = self._response_encoding(response)
-                self._validate_content_type(response, accepted_types)
-                return await self._read_response_text(
-                    response, encoding=encoding
-                ), current
+            now = self.clock()
+            remaining = deadline - now
+            if remaining <= 0.0:
+                raise TimeoutError
+            request_deadline = MonotonicDeadline(
+                created_at=now,
+                expires_at=now + min(remaining, 59.0),
+            )
+            async with self.guard.acquire(request_deadline) as permit:
+                await self._admit_dependencies(permit)
+                timeout = permit.deadline.remaining(now=self.clock())
+                if timeout <= 0.0:
+                    raise TimeoutError
+                try:
+                    async with self.client.stream(
+                        "GET",
+                        current,
+                        follow_redirects=False,
+                        timeout=timeout,
+                    ) as response:
+                        status = response.status_code
+                        transient = (
+                            status == _HTTP_TOO_MANY_REQUESTS
+                            or status >= _HTTP_SERVER_ERROR_MIN
+                        )
+                        redirect = self._redirect_target(
+                            response,
+                            current=current,
+                            redirect_index=redirect_index,
+                        )
+                        if redirect is not None:
+                            await permit.record_success()
+                            current = redirect
+                            continue
+                        if transient:
+                            await permit.record_transient_failure()
+                        elif status < _HTTP_OK_MIN or status >= _HTTP_REDIRECT_MIN:
+                            await permit.record_excluded_failure()
+                        self._validate_response_status(response)
+                        encoding = self._response_encoding(response)
+                        self._validate_content_type(response, accepted_types)
+                        text = await self._read_response_text(
+                            response, encoding=encoding
+                        )
+                        await permit.record_success()
+                        return text, current
+                except (TimeoutError, httpx.RequestError) as exc:
+                    if not permit.finalized:
+                        await _record_transport_error(permit, exc)
+                    raise
         msg = "unreachable"
         raise AssertionError(msg)
 
@@ -350,7 +533,7 @@ class NplgRepository:
     ) -> SearchPage:
         """Search public NPLG records with an opaque bounded cursor."""
         deadline = self._new_deadline()
-        normalized_query = " ".join(query.split())
+        normalized_query = _canonical_search_query(query)
         if not normalized_query or len(normalized_query) > _MAX_QUERY_LENGTH:
             raise AppError(
                 ErrorCode.INVALID_INPUT,
@@ -361,12 +544,25 @@ class NplgRepository:
                 ErrorCode.INVALID_INPUT,
                 f"page_size must be between 1 and {_MAX_SEARCH_PAGE_SIZE}.",
             )
-        offset = decode_cursor(cursor) if cursor is not None else 0
         if scope_handle is None:
+            scope = None
             url = f"{NPLG_ORIGIN}/simple-search"
         else:
             scope = parse_handle_input(scope_handle)
             url = f"{NPLG_ORIGIN}/handle/{scope}/simple-search"
+        cursor_now = self.cursor_clock()
+        offset = (
+            decode_cursor(
+                cursor,
+                secret=self.cursor_signing_secret,
+                normalized_query=normalized_query,
+                scope_handle=scope,
+                page_size=page_size,
+                now=cursor_now,
+            )
+            if cursor is not None
+            else 0
+        )
         text, final_url = await self._get_text(
             url,
             params={"query": normalized_query, "rpp": page_size, "start": offset},
@@ -382,7 +578,16 @@ class NplgRepository:
             deadline=deadline,
         )
         return page.with_cursor(
-            encode_cursor(page.next_offset) if page.next_offset is not None else None
+            encode_cursor(
+                page.next_offset,
+                secret=self.cursor_signing_secret,
+                normalized_query=normalized_query,
+                scope_handle=scope,
+                page_size=page_size,
+                now=cursor_now,
+            )
+            if page.next_offset is not None
+            else None
         )
 
     async def get_item(self, handle: str) -> DocumentRecord:
@@ -409,16 +614,41 @@ class NplgRepository:
         return (await self.get_item(handle)).bitstreams
 
     async def _metadata_formats(self, *, deadline: float) -> tuple[str, ...]:
-        text, _ = await self._get_text(
-            f"{NPLG_ORIGIN}/oai/request",
-            params={"verb": "ListMetadataFormats"},
-            accepted_types=("text/xml", "application/xml"),
-            deadline=deadline,
-        )
-        return await self._parse_within_deadline(
-            lambda: parse_metadata_formats(text),
-            deadline=deadline,
-        )
+        async with self._metadata_format_lock:
+            origin = NPLG_ORIGIN
+            now = self.cache_clock()
+            cached = self._metadata_format_cache.get(origin)
+            if cached is not None:
+                if now < cached.created_at:
+                    del self._metadata_format_cache[origin]
+                    msg = "monotonic cache clock moved backwards"
+                    raise RuntimeError(msg)
+                if now < cached.expires_at:
+                    return cached.formats
+                del self._metadata_format_cache[origin]
+            text, _ = await self._get_text(
+                f"{origin}/oai/request",
+                params={"verb": "ListMetadataFormats"},
+                accepted_types=("text/xml", "application/xml"),
+                deadline=deadline,
+            )
+            formats = await self._parse_within_deadline(
+                lambda: parse_metadata_formats(text),
+                deadline=deadline,
+            )
+            stored_at = self.cache_clock()
+            if stored_at < now:
+                if origin in self._metadata_format_cache:
+                    del self._metadata_format_cache[origin]
+                msg = "monotonic cache clock moved backwards"
+                raise RuntimeError(msg)
+            _publish_metadata_formats(
+                self._metadata_format_cache,
+                origin=origin,
+                formats=formats,
+                stored_at=stored_at,
+            )
+            return formats
 
     async def get_metadata(self, handle: str) -> DocumentRecord:
         """Return OAI-PMH metadata with a validated full-HTML fallback."""

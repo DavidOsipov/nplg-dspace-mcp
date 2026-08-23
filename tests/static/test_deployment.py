@@ -339,6 +339,7 @@ def test_runtime_lock_is_complete_and_exactly_pinned() -> None:
         "colorama==0.4.6 ; sys_platform == 'win32'",
         "cryptography==50.0.0",
         "defusedxml==0.7.1",
+        "dnspython==2.8.0",
         "fastapi==0.133.0",
         "h11==0.16.0",
         "httpcore==1.0.9",

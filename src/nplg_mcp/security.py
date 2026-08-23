@@ -6,6 +6,8 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
+from collections.abc import Mapping
+from enum import StrEnum
 from typing import Protocol, TypedDict, Unpack
 from urllib.parse import SplitResult, parse_qs, unquote_to_bytes, urlsplit
 
@@ -26,6 +28,39 @@ _ALLOWED_PATHS = (
 _DEPRECATED_IPV6_SITE_LOCAL = ipaddress.IPv6Network("fec0::/10")
 _C0_CONTROL_END = 0x20
 _DELETE_CHARACTER = 0x7F
+_RUNTIME_ANNOTATION_TYPES = (Mapping,)
+
+
+class OutboundPurpose(StrEnum):
+    """Closed NPLG outbound-header purposes."""
+
+    METADATA = "metadata"
+    DOWNLOAD = "download"
+    CANARY = "canary"
+
+
+def build_outbound_headers(
+    purpose: OutboundPurpose,
+    *,
+    inbound_headers: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build a closed outbound header set for one approved purpose."""
+    if type(purpose) is not OutboundPurpose:
+        message = "outbound header purpose is invalid"
+        raise ValueError(message)
+    del inbound_headers
+    accepted = {
+        OutboundPurpose.METADATA: (
+            "text/html, application/xhtml+xml, application/xml;q=0.9"
+        ),
+        OutboundPurpose.DOWNLOAD: "application/pdf, application/octet-stream;q=0.8",
+        OutboundPurpose.CANARY: "text/html",
+    }
+    return {
+        "Accept": accepted[purpose],
+        "Accept-Encoding": "identity",
+        "User-Agent": "nplg-dspace-mcp/0.1.0 (+read-only research connector)",
+    }
 
 
 def _invalid(message: str, **details: object) -> AppError:
@@ -138,10 +173,14 @@ def is_forbidden_address(
     address: ipaddress.IPv4Address | ipaddress.IPv6Address,
 ) -> bool:
     """Return whether an address is ineligible for upstream connections."""
-    return not address.is_global or (
-        isinstance(address, ipaddress.IPv6Address)
-        and address in _DEPRECATED_IPV6_SITE_LOCAL
-    )
+    if isinstance(address, ipaddress.IPv6Address):
+        return (
+            not address.is_global
+            or address.scope_id is not None
+            or address.ipv4_mapped is not None
+            or address in _DEPRECATED_IPV6_SITE_LOCAL
+        )
+    return not address.is_global
 
 
 SocketAddress = tuple[str, int] | tuple[str, int, int, int] | tuple[int, bytes]
@@ -165,6 +204,14 @@ class Resolver(Protocol):
         ...
 
 
+class DnsTransientError(AppError):
+    """Retryable DNS transport/empty-answer failure."""
+
+
+class DnsSecurityRejectionError(AppError):
+    """Non-retryable DNS target or address-policy rejection."""
+
+
 def _default_resolver(
     host: str, port: int, **options: Unpack[ResolverOptions]
 ) -> list[DnsAnswer]:
@@ -184,7 +231,10 @@ def resolve_approved_addresses(
     """Resolve the NPLG host and reject the full answer set if any IP is unsafe."""
     if host.lower() != NPLG_HOST:
         msg = "DNS resolution is allowed only for the NPLG host"
-        raise _invalid(msg)
+        raise DnsSecurityRejectionError(
+            ErrorCode.INVALID_INPUT,
+            msg,
+        )
     try:
         answers = resolver(
             host,
@@ -193,7 +243,7 @@ def resolve_approved_addresses(
             proto=socket.IPPROTO_TCP,
         )
     except OSError as exc:
-        raise AppError(
+        raise DnsTransientError(
             ErrorCode.UPSTREAM_FAILURE,
             "The repository hostname could not be resolved.",
             http_status=502,
@@ -206,14 +256,14 @@ def resolve_approved_addresses(
         try:
             parsed = ipaddress.ip_address(raw)
         except ValueError as exc:
-            raise AppError(
+            raise DnsSecurityRejectionError(
                 ErrorCode.UPSTREAM_FAILURE,
                 "The repository returned an invalid network address.",
                 http_status=502,
                 internal_details={"address": raw},
             ) from exc
         if is_forbidden_address(parsed):
-            raise AppError(
+            raise DnsSecurityRejectionError(
                 ErrorCode.UPSTREAM_FAILURE,
                 "The repository hostname resolved to a non-public address.",
                 http_status=502,
@@ -223,7 +273,7 @@ def resolve_approved_addresses(
         if normalized not in addresses:
             addresses.append(normalized)
     if not addresses:
-        raise AppError(
+        raise DnsTransientError(
             ErrorCode.UPSTREAM_FAILURE,
             "The repository hostname returned no usable addresses.",
             http_status=502,

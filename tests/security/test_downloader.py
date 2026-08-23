@@ -1,4 +1,5 @@
 # Copyright (c) 2026 David Osipov
+# pyright: reportPrivateUsage=false
 """Adversarial tests for bounded downloader behavior."""
 
 from __future__ import annotations
@@ -6,22 +7,33 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast, get_type_hints, override
 
 import httpx
 import pytest
 
+import nplg_mcp.network as network_module
+from nplg_mcp import downloader as downloader_module
+from nplg_mcp.contracts import MonotonicDeadline
 from nplg_mcp.downloader import DocumentDownloader
 from nplg_mcp.errors import AppError, ErrorCode
 from nplg_mcp.http_types import HttpClientProtocol
 from nplg_mcp.malware import ScanResult, ScanVerdict
 from nplg_mcp.parsers import Bitstream
+from nplg_mcp.resilience import (
+    AttemptPermit,
+    Closed,
+    Open,
+    UpstreamGuard,
+    UpstreamGuardPolicy,
+)
+from nplg_mcp.security import DnsTransientError
 from nplg_mcp.storage import ContentAddressedStore
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Generator
+    from collections.abc import AsyncGenerator, AsyncIterator, Generator
     from pathlib import Path
 
 _DEFAULT_SOURCE_URL = (
@@ -724,3 +736,233 @@ async def test_multiple_stream_chunks_preserve_the_pdf_and_digest(
 
     assert result.artifact.absolute_path.read_bytes() == b"%PDF-1.7\nbody"
     assert result.bytes_downloaded == len(b"%PDF-1.7\nbody")
+
+
+class _RecordingPermit:
+    def __init__(self) -> None:
+        super().__init__()
+        self.outcomes: list[str] = []
+
+    async def record_transient_failure(self) -> None:
+        self.outcomes.append("transient")
+
+    async def record_excluded_failure(self) -> None:
+        self.outcomes.append("excluded")
+
+
+@pytest.mark.asyncio
+async def test_downloader_dns_errors_have_exact_circuit_classification() -> None:
+    """Mutation caught: security/local DNS rejection poisoning availability state."""
+    transient = _RecordingPermit()
+    excluded = _RecordingPermit()
+    await downloader_module._record_dns_app_error(  # noqa: SLF001
+        cast("AttemptPermit", transient),
+        DnsTransientError(
+            ErrorCode.UPSTREAM_FAILURE,
+            "The DNS lookup failed.",
+            http_status=502,
+        ),
+    )
+    await downloader_module._record_dns_app_error(  # noqa: SLF001
+        cast("AttemptPermit", excluded),
+        AppError(ErrorCode.INVALID_INPUT, "The DNS answer was rejected."),
+    )
+    assert transient.outcomes == ["transient"]
+    assert excluded.outcomes == ["excluded"]
+
+
+def test_downloader_rejects_a_forged_guard(tmp_path: Path) -> None:
+    """Mutation caught: accepting a caller-controlled circuit implementation."""
+    with pytest.raises(TypeError, match="UpstreamGuard"):
+        _ = DocumentDownloader(
+            client=cast("HttpClientProtocol", object()),
+            store=ContentAddressedStore(tmp_path),
+            max_bytes=1024,
+            guard=cast("UpstreamGuard", object()),
+        )
+
+
+@pytest.mark.asyncio
+async def test_downloader_dependency_error_is_classified_before_reraise(
+    tmp_path: Path,
+) -> None:
+    """Mutation caught: DNS AppError escaping without finalizing its permit."""
+
+    class _FailingDnsDownloader(DocumentDownloader):
+        @override
+        async def _ensure_dns(self) -> None:
+            raise AppError(ErrorCode.INVALID_INPUT, "DNS security rejection")
+
+    permit = _RecordingPermit()
+    downloader = _FailingDnsDownloader(
+        client=cast("HttpClientProtocol", object()),
+        store=ContentAddressedStore(tmp_path),
+        max_bytes=1024,
+    )
+    with pytest.raises(AppError, match="DNS security rejection"):
+        await downloader._admit_dependencies(cast("AttemptPermit", permit))  # noqa: SLF001
+    assert permit.outcomes == ["excluded"]
+
+
+@pytest.mark.asyncio
+async def test_downloader_maps_open_guard_before_transport(tmp_path: Path) -> None:
+    """Mutation caught: leaking UpstreamUnavailableError through public download."""
+    guard = UpstreamGuard(
+        policy=UpstreamGuardPolicy(failure_threshold=1),
+        clock=lambda: 0.0,
+        random=lambda: 0.5,
+    )
+    permit = await guard.admit(MonotonicDeadline(created_at=0.0, expires_at=10.0))
+    await permit.record_transient_failure()
+    assert isinstance(guard.state, Open)
+    downloader = DocumentDownloader(
+        client=cast("HttpClientProtocol", object()),
+        store=ContentAddressedStore(tmp_path),
+        max_bytes=1024,
+        validate_dns=False,
+        guard=guard,
+        clock=lambda: 0.0,
+    )
+    with pytest.raises(AppError) as captured:
+        _ = await downloader.download(bitstream())
+    assert captured.value.code is ErrorCode.RATE_LIMITED
+
+
+@pytest.mark.asyncio
+async def test_downloader_rejects_expired_attempt_before_transport(
+    tmp_path: Path,
+) -> None:
+    """Mutation caught: starting a request after its admitted deadline expired."""
+    guard = UpstreamGuard(clock=lambda: 0.0)
+    downloader = DocumentDownloader(
+        client=cast("HttpClientProtocol", object()),
+        store=ContentAddressedStore(tmp_path),
+        max_bytes=1024,
+        validate_dns=False,
+        guard=guard,
+        clock=lambda: 2.0,
+    )
+    with pytest.raises(TimeoutError):
+        _ = await downloader._download_within_deadline(  # noqa: SLF001
+            bitstream(),
+            deadline=MonotonicDeadline(created_at=0.0, expires_at=1.0),
+        )
+
+
+@pytest.mark.asyncio
+async def test_downloader_transport_error_finalizes_transient_before_mapping(
+    tmp_path: Path,
+) -> None:
+    """Mutation caught: post-admission transport error releasing as excluded."""
+    guard = UpstreamGuard(
+        policy=UpstreamGuardPolicy(failure_threshold=1),
+        random=lambda: 0.5,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        message = "synthetic transport failure"
+        raise httpx.ConnectError(message, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        downloader = DocumentDownloader(
+            client=client,
+            store=ContentAddressedStore(tmp_path),
+            max_bytes=1024,
+            validate_dns=False,
+            guard=guard,
+        )
+        with pytest.raises(AppError) as captured:
+            _ = await downloader.download(bitstream())
+    assert captured.value.code is ErrorCode.UPSTREAM_FAILURE
+    assert isinstance(guard.state, Open)
+
+
+@pytest.mark.asyncio
+async def test_downloader_excludes_transport_policy_rejection_but_counts_timeout(
+    tmp_path: Path,
+) -> None:
+    """Mutation caught: poisoning the circuit with a bound-transport rejection."""
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise network_module.TransportPolicyError
+        message = "synthetic connection timeout"
+        raise httpx.ConnectTimeout(message, request=request)
+
+    guard = UpstreamGuard(
+        policy=UpstreamGuardPolicy(failure_threshold=1),
+        random=lambda: 0.5,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        downloader = DocumentDownloader(
+            client=client,
+            store=ContentAddressedStore(tmp_path),
+            max_bytes=1024,
+            validate_dns=False,
+            guard=guard,
+        )
+        with pytest.raises(AppError) as rejected:
+            _ = await downloader.download(bitstream())
+        assert rejected.value.code is ErrorCode.UPSTREAM_FAILURE
+        closed: object = guard.state
+        assert isinstance(closed, Closed)
+
+        with pytest.raises(AppError) as timed_out:
+            _ = await downloader.download(bitstream())
+        assert timed_out.value.code is ErrorCode.UPSTREAM_FAILURE
+        opened: object = guard.state
+        assert isinstance(opened, Open)
+
+
+@pytest.mark.asyncio
+async def test_downloader_preserves_transport_error_from_successful_response_teardown(
+    tmp_path: Path,
+) -> None:
+    """Mutation caught: double-finalizing success and masking teardown failure."""
+    teardown_message = "synthetic response teardown failure"
+
+    response = httpx.Response(
+        200,
+        headers={"content-type": "application/pdf"},
+        content=b"%PDF-1.7\nvalid synthetic body",
+    )
+
+    class TeardownFailureClient:
+        @asynccontextmanager
+        async def stream(
+            self,
+            method: str,
+            url: str,
+            *,
+            headers: object = None,
+            follow_redirects: bool = False,
+            timeout: float,  # noqa: ASYNC109 - required client protocol signature.
+        ) -> AsyncGenerator[httpx.Response]:
+            del method, url, headers, follow_redirects, timeout
+            yield response
+            raise httpx.ReadError(teardown_message)
+
+        async def aclose(self) -> None:
+            return
+
+    guard = UpstreamGuard(
+        policy=UpstreamGuardPolicy(failure_threshold=1),
+        random=lambda: 0.5,
+    )
+    downloader = DocumentDownloader(
+        client=cast("HttpClientProtocol", TeardownFailureClient()),
+        store=ContentAddressedStore(tmp_path),
+        max_bytes=1024,
+        validate_dns=False,
+        guard=guard,
+    )
+    with pytest.raises(AppError) as captured:
+        _ = await downloader.download(bitstream())
+
+    assert captured.value.code is ErrorCode.UPSTREAM_FAILURE
+    assert isinstance(captured.value.__cause__, httpx.ReadError)
+    assert teardown_message in str(captured.value.__cause__)
+    assert isinstance(guard.state, Closed)
