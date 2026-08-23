@@ -36,7 +36,7 @@ dependencies = [
   "dnspython==2.8.0",
   "pypdfium2==5.8.0",
   "Pillow==12.3.0",
-  "prometheus-client==0.25.0",
+  "prometheus-client==0.26.0",
 ]
 
 [project.optional-dependencies]
