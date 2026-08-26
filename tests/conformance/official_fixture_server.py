@@ -122,6 +122,7 @@ _config = load_config(
     {
         "NODE_ENV": "test",
         "ASSET_SIGNING_SECRET": "fixture-only-signing-material-0000",
+        "CURSOR_SIGNING_SECRET": "fixture-only-cursor-material-00000",
         "PUBLIC_BASE_URL": f"http://127.0.0.1:{_port}",
         "ALLOW_ANONYMOUS": "true",
         "CACHE_DIR": os.devnull,

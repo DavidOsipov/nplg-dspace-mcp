@@ -9,8 +9,6 @@ from uuid import UUID
 
 import pytest
 
-from nplg_mcp.app import create_app
-from nplg_mcp.config import load_config
 from nplg_mcp.contracts import MonotonicDeadline
 from nplg_mcp.pdf_ipc import InspectCommand, InspectParams
 from nplg_mcp.pdf_worker_client import UnixSocketPdfExecutor, WorkerStagingBinding
@@ -172,28 +170,14 @@ def test_unix_worker_rejects_the_authoritative_store_as_its_slot(
         )
 
 
-def test_private_full_production_rejects_a_missing_worker_slot_policy(
+def test_local_worker_slot_construction_rejects_a_missing_policy(
     tmp_path: Path,
 ) -> None:
-    """Catch startup that selects the worker without validating its hard quota."""
-    config = load_config(
-        {
-            "NODE_ENV": "production",
-            "DEPLOYMENT_PROFILE": "private-full",
-            "PDF_EXECUTOR": "unix-worker",
-            "CACHE_DIR": str(tmp_path / "cache"),
-            "ASSET_SIGNING_SECRET": "s" * 32,
-            "PUBLIC_BASE_URL": "https://mcp.example.test",
-            "API_PRINCIPALS_JSON": (
-                '[{"principal_id":"operator","api_key":"' + ("k" * 32) + '"}]'
-            ),
-            "ALLOW_ANONYMOUS": "false",
-            "PRIVATE_EDGE_TLS": "true",
-        }
-    )
+    """Exercise the missing-policy invariant below the production OAuth gate."""
+    missing_policy = (tmp_path / "pdf-worker-slot-policy.json").resolve()
 
-    with pytest.raises(PdfWorkerSlotError, match="policy"):
-        _ = create_app(config)
+    with pytest.raises(PdfWorkerSlotError, match="cannot be opened safely"):
+        _ = load_pdf_worker_slot_policy(missing_policy)
 
 
 def test_checked_in_worker_slot_policy_keeps_the_reviewed_hard_limits() -> None:

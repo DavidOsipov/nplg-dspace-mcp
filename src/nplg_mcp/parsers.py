@@ -20,7 +20,7 @@ from defusedxml import ElementTree as DefusedElementTree
 
 from .contracts import StrictModel
 from .errors import AppError, ErrorCode
-from .security import NPLG_ORIGIN, parse_handle_input, validate_upstream_url
+from .security import NPLG_HOST, NPLG_ORIGIN, parse_handle_input, validate_upstream_url
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 _TOTAL_RE = re.compile(r"\bof\s+([\d,]+)\b", re.IGNORECASE)
 _SIZE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?B)\s*$", re.IGNORECASE)
 _DC_KEY_RE = re.compile(r"^dc(?:\.[A-Za-z0-9_-]+)+$")
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
 _RESTRICTED_MARKERS = (
     "only available in the library's internal network",
     "only be accessed from the national library's building",
@@ -95,30 +96,40 @@ class _MarkupCounts:
     nodes: int
     total_attributes: int
     total_text_code_points: int
+    semantic_total_text_code_points: int
     metadata_fields: int
     records: int
     max_field_code_points: int
+    semantic_max_field_code_points: int
 
 
 @dataclass(slots=True)
 class _CanonicalTextCounter:
-    """Count semantic text with every whitespace run represented once."""
+    """Track raw limits and whitespace-normalized parser agreement separately."""
 
     code_points: int = 0
+    semantic_code_points: int = 0
     in_whitespace: bool = False
 
     def add(self, value: str | None) -> None:
         if value is None:
             return
-        for character in value:
-            is_whitespace = character.isspace()
-            if not is_whitespace or not self.in_whitespace:
-                self.code_points = _saturating_increment(
-                    self.code_points,
-                    1,
-                    maximum=PARSER_LIMITS.max_total_text_code_points,
-                )
-            self.in_whitespace = is_whitespace
+        self.code_points = _saturating_increment(
+            self.code_points,
+            len(value),
+            maximum=PARSER_LIMITS.max_total_text_code_points,
+        )
+        if not value:
+            return
+        semantic_increment = len(_WHITESPACE_RUN_RE.sub(" ", value))
+        if self.in_whitespace and value[0].isspace():
+            semantic_increment -= 1
+        self.semantic_code_points = _saturating_increment(
+            self.semantic_code_points,
+            semantic_increment,
+            maximum=PARSER_LIMITS.max_total_text_code_points,
+        )
+        self.in_whitespace = value[-1].isspace()
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +296,7 @@ class _HtmlBudgetParser(HTMLParser):
         self._metadata_fields = 0
         self._records = 0
         self._max_field_code_points = 0
+        self._semantic_max_field_code_points = 0
         self.check_deadline()
 
     @property
@@ -293,9 +305,11 @@ class _HtmlBudgetParser(HTMLParser):
             nodes=self._elements,
             total_attributes=self._total_attributes,
             total_text_code_points=self._text_counter.code_points,
+            semantic_total_text_code_points=self._text_counter.semantic_code_points,
             metadata_fields=self._metadata_fields,
             records=self._records,
             max_field_code_points=self._max_field_code_points,
+            semantic_max_field_code_points=self._semantic_max_field_code_points,
         )
 
     def check_deadline(self) -> None:
@@ -425,6 +439,10 @@ class _HtmlBudgetParser(HTMLParser):
             self._max_field_code_points = max(
                 self._max_field_code_points,
                 current.code_points,
+            )
+            self._semantic_max_field_code_points = max(
+                self._semantic_max_field_code_points,
+                current.semantic_code_points,
             )
         self._add_text(data)
 
@@ -573,9 +591,11 @@ def _preflight_xml(  # noqa: C901, PLR0912, PLR0915 - bounded event state machin
             nodes=elements,
             total_attributes=total_attributes,
             total_text_code_points=text_code_points,
+            semantic_total_text_code_points=text_code_points,
             metadata_fields=metadata_fields,
             records=records,
             max_field_code_points=max_field_code_points,
+            semantic_max_field_code_points=max_field_code_points,
         )
     except AppError:
         raise
@@ -593,9 +613,9 @@ def _html_attribute_text(value: object) -> str:
     return str(value)
 
 
-def _html_semantic_text_code_points(
+def _html_text_code_point_counts(
     root: BeautifulSoup | Tag, *, source_url: str
-) -> int:
+) -> tuple[int, int]:
     counter = _CanonicalTextCounter()
     for key, value in root.attrs.items():
         counter.add(key)
@@ -610,17 +630,17 @@ def _html_semantic_text_code_points(
         if counter.code_points > PARSER_LIMITS.max_total_text_code_points:
             msg = "The repository response exceeded the aggregate text limit."
             raise _upstream_failure(msg, source_url=source_url)
-    return counter.code_points
+    return counter.code_points, counter.semantic_code_points
 
 
-def _html_field_code_points(field: Tag) -> int:
+def _html_field_code_point_counts(field: Tag) -> tuple[int, int]:
     counter = _CanonicalTextCounter()
     for current in field.descendants:
         if isinstance(current, NavigableString) and not isinstance(
             current, (Comment, Declaration, Doctype)
         ):
             counter.add(str(current))
-    return counter.code_points
+    return counter.code_points, counter.semantic_code_points
 
 
 def _validate_html_tree(  # noqa: C901, PLR0912 - bounded DOM recount
@@ -631,6 +651,7 @@ def _validate_html_tree(  # noqa: C901, PLR0912 - bounded DOM recount
     metadata_fields = 0
     records = 0
     max_field_code_points = 0
+    semantic_max_field_code_points = 0
     stack: list[tuple[Tag, int, str | None, bool]] = [(soup, 1, None, False)]
     while stack:
         current, depth, context, in_search_body = stack.pop()
@@ -670,9 +691,16 @@ def _validate_html_tree(  # noqa: C901, PLR0912 - bounded DOM recount
                 maximum=PARSER_LIMITS.max_records,
             )
         if current.name == "td":
-            max_field_code_points = max(
-                max_field_code_points,
-                _html_field_code_points(current),
+            field_code_points, semantic_field_code_points = (
+                _html_field_code_point_counts(current)
+            )
+            if field_code_points > PARSER_LIMITS.max_field_code_points:
+                msg = "The repository response exceeded the field code-point limit."
+                raise _upstream_failure(msg, source_url=source_url)
+            max_field_code_points = max(max_field_code_points, field_code_points)
+            semantic_max_field_code_points = max(
+                semantic_max_field_code_points,
+                semantic_field_code_points,
             )
         for child in current.children:
             if isinstance(child, Tag):
@@ -694,16 +722,18 @@ def _validate_html_tree(  # noqa: C901, PLR0912 - bounded DOM recount
                         child_in_search_body,
                     )
                 )
+    total_text_code_points, semantic_total_text_code_points = (
+        _html_text_code_point_counts(soup, source_url=source_url)
+    )
     return _MarkupCounts(
         nodes=elements,
         total_attributes=total_attributes,
-        total_text_code_points=_html_semantic_text_code_points(
-            soup,
-            source_url=source_url,
-        ),
+        total_text_code_points=total_text_code_points,
+        semantic_total_text_code_points=semantic_total_text_code_points,
         metadata_fields=metadata_fields,
         records=records,
         max_field_code_points=max_field_code_points,
+        semantic_max_field_code_points=semantic_max_field_code_points,
     )
 
 
@@ -768,9 +798,11 @@ def _validate_xml_tree(root: Element) -> _MarkupCounts:
         nodes=elements,
         total_attributes=total_attributes,
         total_text_code_points=text_code_points,
+        semantic_total_text_code_points=text_code_points,
         metadata_fields=metadata_fields,
         records=records,
         max_field_code_points=max_field_code_points,
+        semantic_max_field_code_points=max_field_code_points,
     )
 
 
@@ -783,10 +815,18 @@ def _require_preflight_agreement(
 ) -> None:
     matching = (
         preflight.total_attributes == constructed.total_attributes
-        and preflight.total_text_code_points == constructed.total_text_code_points
+        and preflight.total_text_code_points >= constructed.total_text_code_points
+        and (
+            preflight.semantic_total_text_code_points
+            == constructed.semantic_total_text_code_points
+        )
         and preflight.metadata_fields == constructed.metadata_fields
         and preflight.records == constructed.records
-        and preflight.max_field_code_points == constructed.max_field_code_points
+        and preflight.max_field_code_points >= constructed.max_field_code_points
+        and (
+            preflight.semantic_max_field_code_points
+            == constructed.semantic_max_field_code_points
+        )
         and (not compare_nodes or preflight.nodes == constructed.nodes)
     )
     if not matching:
@@ -817,6 +857,10 @@ def _has_next_page_class(value: object) -> bool:
 
 def _has_full_metadata_text(value: object) -> bool:
     return isinstance(value, str) and "full metadata record" in value.lower()
+
+
+def _has_bitstream_href(value: object) -> bool:
+    return isinstance(value, str) and "/bitstream/" in value
 
 
 def _match_group(match: re.Match[str], index: int) -> str:
@@ -1067,13 +1111,13 @@ def _bitstream_id(handle: str, source_url: str) -> str:
 
 
 def _parse_bitstreams(
-    soup: BeautifulSoup, *, handle: str, source_url: str, restricted: bool
+    links: tuple[Tag, ...], *, handle: str, source_url: str, restricted: bool
 ) -> tuple[Bitstream, ...]:
     if restricted:
         return ()
     result: list[Bitstream] = []
     seen_urls: set[str] = set()
-    for link in soup.select('a[href*="/bitstream/"]'):
+    for link in links:
         href = _tag_attribute(link, "href")
         absolute = urljoin(source_url, href)
         try:
@@ -1189,14 +1233,14 @@ def _record_from_fields(
     )
 
 
-def _extract_handle(soup: BeautifulSoup) -> str | None:
-    for code in soup.find_all("code"):
+def _extract_handle(container: Tag) -> str | None:
+    for code in container.find_all("code"):
         text = _tag_text(code)
         try:
             return parse_handle_input(text)
         except AppError:
             continue
-    for link in soup.find_all("a", href=True):
+    for link in container.find_all("a", href=True):
         href = _tag_attribute(link, "href")
         if "/handle/" not in href:
             continue
@@ -1207,7 +1251,24 @@ def _extract_handle(soup: BeautifulSoup) -> str | None:
     return None
 
 
-def _summary_fields(soup: BeautifulSoup) -> tuple[RawMetadataField, ...]:
+type _MetadataRow = tuple[Tag, tuple[Tag, ...]]
+
+
+def _metadata_rows(soup: BeautifulSoup) -> tuple[_MetadataRow, ...]:
+    """Select metadata rows once and retain their direct data cells."""
+    rows: list[_MetadataRow] = []
+    seen: set[int] = set()
+    for table in soup.find_all("table", class_="itemDisplayTable"):
+        for row in table.find_all("tr"):
+            identity = id(row)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            rows.append((row, tuple(row.find_all("td", recursive=False))))
+    return tuple(rows)
+
+
+def _summary_fields(rows: tuple[_MetadataRow, ...]) -> tuple[RawMetadataField, ...]:
     mapping = {
         "title": "dc.title",
         "issue date": "dc.date.issued",
@@ -1221,8 +1282,7 @@ def _summary_fields(soup: BeautifulSoup) -> tuple[RawMetadataField, ...]:
         "type": "dc.type",
     }
     fields: list[RawMetadataField] = []
-    for row in soup.select("table.itemDisplayTable tr"):
-        cells = row.find_all("td", recursive=False)
+    for _, cells in rows:
         if len(cells) < _MIN_METADATA_CELLS:
             continue
         label = _tag_text(cells[0]).rstrip(":").strip().lower()
@@ -1238,10 +1298,9 @@ def _summary_fields(soup: BeautifulSoup) -> tuple[RawMetadataField, ...]:
     return tuple(fields)
 
 
-def _full_fields(soup: BeautifulSoup) -> tuple[RawMetadataField, ...]:
+def _full_fields(rows: tuple[_MetadataRow, ...]) -> tuple[RawMetadataField, ...]:
     fields: list[RawMetadataField] = []
-    for row in soup.select("table.itemDisplayTable tr"):
-        cells = row.find_all("td", recursive=False)
+    for _, cells in rows:
         if len(cells) < _MIN_METADATA_CELLS:
             continue
         key = _tag_text(cells[0])
@@ -1268,10 +1327,12 @@ def _full_fields(soup: BeautifulSoup) -> tuple[RawMetadataField, ...]:
     return tuple(fields)
 
 
-def _collections(soup: BeautifulSoup) -> tuple[str, ...]:
+def _collections(
+    soup: BeautifulSoup,
+    rows: tuple[_MetadataRow, ...],
+) -> tuple[str, ...]:
     values: list[str] = []
-    for row in soup.select("table.itemDisplayTable tr"):
-        cells = row.find_all("td", recursive=False)
+    for _, cells in rows:
         if (
             len(cells) >= _MIN_METADATA_CELLS
             and _tag_text(cells[0]).rstrip(":").lower() == "appears in collections"
@@ -1315,7 +1376,7 @@ def parse_item_page(
             msg,
             source_url=source_url,
         )
-    actual = _extract_handle(soup)
+    actual = _extract_handle(containers[0])
     if actual is None or actual != expected:
         msg = "The item response did not match the requested handle."
         raise _upstream_failure(
@@ -1328,7 +1389,8 @@ def parse_item_page(
         marker for marker in _RESTRICTED_MARKERS if marker in page_text
     ]
     restricted = bool(matching_restrictions)
-    if restricted and soup.select_one('a[href*="/bitstream/"]') is not None:
+    bitstream_links = tuple(soup.find_all("a", href=_has_bitstream_href))
+    if restricted and bitstream_links:
         msg = "The item response contained ambiguous access markers."
         raise _upstream_failure(msg, source_url=source_url)
     restriction_reason = (
@@ -1337,11 +1399,18 @@ def parse_item_page(
         else None
     )
 
-    is_full = bool(soup.find(string=_has_full_metadata_text)) or any(
-        _DC_KEY_RE.fullmatch(_tag_text(cell)) is not None
-        for cell in soup.select("table.itemDisplayTable td:first-child")
-    )
-    fields = _full_fields(soup) if is_full else _summary_fields(soup)
+    metadata_rows = _metadata_rows(soup)
+    is_full = any(
+        cells
+        and next(
+            (child for child in row.children if isinstance(child, Tag)),
+            None,
+        )
+        is cells[0]
+        and _DC_KEY_RE.fullmatch(_tag_text(cells[0])) is not None
+        for row, cells in metadata_rows
+    ) or bool(soup.find(string=_has_full_metadata_text))
+    fields = _full_fields(metadata_rows) if is_full else _summary_fields(metadata_rows)
     if not fields:
         msg = "The item response did not contain recognizable metadata."
         raise _upstream_failure(
@@ -1349,9 +1418,12 @@ def parse_item_page(
             source_url=source_url,
         )
 
-    collections = _collections(soup)
+    collections = _collections(soup, metadata_rows)
     bitstreams = _parse_bitstreams(
-        soup, handle=expected, source_url=source_url, restricted=restricted
+        bitstream_links,
+        handle=expected,
+        source_url=source_url,
+        restricted=restricted,
     )
     title_tag = soup.find("title")
     fallback_title = (
@@ -1404,8 +1476,14 @@ def _require_exact_owned_child(
     scope: Element,
     owner: Element,
     name: str,
+    *,
+    required_tag: str | None = None,
 ) -> Element:
-    direct = [child for child in owner if _local_name(child.tag) == name]
+    direct = (
+        [child for child in owner if child.tag == required_tag]
+        if required_tag is not None
+        else [child for child in owner if _local_name(child.tag) == name]
+    )
     matches = [element for element in scope.iter() if _local_name(element.tag) == name]
     if len(direct) != 1 or len(matches) != 1 or direct[0] is not matches[0]:
         msg = "The OAI-PMH response had invalid contract marker structural ownership."
@@ -1513,7 +1591,7 @@ def _validate_oai_identifier(identifier_element: Element, *, expected: str) -> N
         msg = "The OAI-PMH record did not contain an identifier."
         raise _upstream_failure(msg)
     identifier_text = _normalize(identifier_element.text)
-    if not identifier_text.endswith(f":{expected}"):
+    if identifier_text != f"oai:{NPLG_HOST}:{expected}":
         msg = "The OAI-PMH record did not match the requested handle."
         raise _upstream_failure(msg)
 
@@ -1604,19 +1682,54 @@ def parse_oai_record(
     expected = parse_handle_input(expected_handle)
     root = _parse_xml(xml)
     _raise_for_oai_error(root)
-    if _local_name(root.tag) != "OAI-PMH":
+    if root.tag != _OAI_ROOT_TAG:
         msg = "The OAI-PMH response had an invalid root element."
         raise _upstream_failure(msg)
-    get_record = _require_exact_owned_child(root, root, "GetRecord")
-    record = _require_exact_owned_child(root, get_record, "record")
-    header = _require_exact_owned_child(record, record, "header")
-    metadata = _require_exact_owned_child(record, record, "metadata")
-    identifier = _require_exact_owned_child(record, header, "identifier")
+    get_record = _require_exact_owned_child(
+        root,
+        root,
+        "GetRecord",
+        required_tag=f"{{{_OAI_NAMESPACE}}}GetRecord",
+    )
+    record = _require_exact_owned_child(
+        root,
+        get_record,
+        "record",
+        required_tag=f"{{{_OAI_NAMESPACE}}}record",
+    )
+    header = _require_exact_owned_child(
+        record,
+        record,
+        "header",
+        required_tag=f"{{{_OAI_NAMESPACE}}}header",
+    )
+    metadata = _require_exact_owned_child(
+        record,
+        record,
+        "metadata",
+        required_tag=f"{{{_OAI_NAMESPACE}}}metadata",
+    )
+    identifier = _require_exact_owned_child(
+        record,
+        header,
+        "identifier",
+        required_tag=f"{{{_OAI_NAMESPACE}}}identifier",
+    )
     if any(
-        _local_name(child.tag) not in {"header", "metadata", "about"}
+        child.tag
+        not in {
+            f"{{{_OAI_NAMESPACE}}}header",
+            f"{{{_OAI_NAMESPACE}}}metadata",
+            f"{{{_OAI_NAMESPACE}}}about",
+        }
         for child in record
     ) or any(
-        _local_name(child.tag) not in {"identifier", "datestamp", "setSpec"}
+        child.tag
+        not in {
+            f"{{{_OAI_NAMESPACE}}}identifier",
+            f"{{{_OAI_NAMESPACE}}}datestamp",
+            f"{{{_OAI_NAMESPACE}}}setSpec",
+        }
         for child in header
     ):
         msg = "The OAI-PMH response had invalid record child ownership."

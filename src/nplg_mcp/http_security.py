@@ -17,6 +17,7 @@ from starlette.responses import JSONResponse as StarletteJSONResponse
 from .admission import AdmissionGate, PrincipalAdmission
 from .errors import AppError, ErrorCode, to_public_error
 from .json_preflight import JsonPreflightError, JsonPreflightLimits, preflight_json
+from .resource_admission import InlineResourceAdmission
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -83,7 +84,13 @@ def build_transport_security_settings(
 class McpSecurityMiddleware:
     """Enforce project HTTP admission and canonical response policy."""
 
-    def __init__(self, app: ASGIApp, *, config: AppConfig) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        config: AppConfig,
+        resource_admission: InlineResourceAdmission | None = None,
+    ) -> None:
         """Bind immutable limits and zero-waiter gates to the SDK application."""
         super().__init__()
         if not (
@@ -95,6 +102,7 @@ class McpSecurityMiddleware:
             raise ValueError(msg)
         self._app = app
         self._config = config
+        self._resource_admission = resource_admission or InlineResourceAdmission()
         self._accepting_requests = False
         self._active_requests: set[asyncio.Task[object]] = set()
         self._admission = AdmissionGate(config.max_concurrent_mcp_requests)
@@ -295,31 +303,32 @@ class McpSecurityMiddleware:
             await send(message)
 
         try:
-            try:
-                async with asyncio.timeout(
-                    self._config.mcp_application_deadline_seconds
-                ):
-                    await self._security_call(scope, receive, tracked_send)
-            except TimeoutError:
-                if response_started:
-                    if not response_complete:
-                        closing_body: dict[str, object] = {
-                            "type": "http.response.body",
-                            "body": b"",
-                            "more_body": False,
-                        }
-                        await send(cast("Message", closing_body))
-                    return
-                timed_out = AppError(
-                    ErrorCode.REQUEST_TIMEOUT,
-                    "The MCP request exceeded its application deadline.",
-                    http_status=504,
-                )
-                response = _JSONResponse(
-                    {"error": to_public_error(timed_out)},
-                    status_code=504,
-                )
-                await self._send_response(response, scope, receive, send)
+            with self._resource_admission.request_scope():
+                try:
+                    async with asyncio.timeout(
+                        self._config.mcp_application_deadline_seconds
+                    ):
+                        await self._security_call(scope, receive, tracked_send)
+                except TimeoutError:
+                    if response_started:
+                        if not response_complete:
+                            closing_body: dict[str, object] = {
+                                "type": "http.response.body",
+                                "body": b"",
+                                "more_body": False,
+                            }
+                            await send(cast("Message", closing_body))
+                        return
+                    timed_out = AppError(
+                        ErrorCode.REQUEST_TIMEOUT,
+                        "The MCP request exceeded its application deadline.",
+                        http_status=504,
+                    )
+                    response = _JSONResponse(
+                        {"error": to_public_error(timed_out)},
+                        status_code=504,
+                    )
+                    await self._send_response(response, scope, receive, send)
         finally:
             self._admission.release()
             principal_admission.release(principal_id)

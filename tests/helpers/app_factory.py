@@ -47,6 +47,7 @@ def base_environment(**overrides: str) -> dict[str, str]:
     environment = {
         "NODE_ENV": "test",
         "ASSET_SIGNING_SECRET": "s" * 32,
+        "CURSOR_SIGNING_SECRET": "c" * 32,
         "PUBLIC_BASE_URL": "http://127.0.0.1:8000",
         "ALLOW_ANONYMOUS": "true",
         "CACHE_DIR": ".data/test-cache",

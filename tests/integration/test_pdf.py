@@ -21,6 +21,7 @@ from nplg_mcp.json_types import (
     require_json_object,
 )
 from nplg_mcp.pdf import PdfProcessor
+from nplg_mcp.pdf_identity import PDF_PIPELINE_VERSIONS
 from nplg_mcp.storage import ContentAddressedStore
 from tests.helpers.pdf_factory import (
     make_encrypted_pdf,
@@ -106,6 +107,12 @@ def _manifest_payload(
         context="test manifest",
     )
     return path, payload
+
+
+def _manifest_string(payload: JsonObject, field: str) -> str:
+    value = payload.get(field)
+    assert isinstance(value, str)
+    return value
 
 
 def _first_object(values: JsonValue, *, context: str) -> JsonObject:
@@ -275,6 +282,55 @@ def test_render_manifest_is_deterministic_and_persisted(tmp_path: Path) -> None:
     )
     assert payload["render_id"] == first.render_id
     assert payload["source_sha256"] == first.source_sha256
+
+
+def test_render_and_tile_manifests_bind_every_pipeline_semantic_version(
+    tmp_path: Path,
+) -> None:
+    source = make_raster_pdf(tmp_path / "semantic-versions.pdf", width=120, height=80)
+    service = processor(tmp_path)
+
+    rendered = service.render_pages(source.path, pages=(1,), mode="native")
+    tiled = service.render_tiles(
+        rendered.render_id,
+        page_number=1,
+        tile_width=64,
+        tile_height=64,
+        overlap=8,
+    )
+    expected = {
+        "manifest_schema_version": PDF_PIPELINE_VERSIONS.manifest_schema_version,
+        "render_pipeline_version": PDF_PIPELINE_VERSIONS.render_pipeline_version,
+        "classification_algorithm_version": (
+            PDF_PIPELINE_VERSIONS.classification_algorithm_version
+        ),
+        "tile_pipeline_version": PDF_PIPELINE_VERSIONS.tile_pipeline_version,
+    }
+
+    rendered_versions = {
+        "manifest_schema_version": rendered.manifest_schema_version,
+        "render_pipeline_version": rendered.render_pipeline_version,
+        "classification_algorithm_version": (rendered.classification_algorithm_version),
+        "tile_pipeline_version": rendered.tile_pipeline_version,
+    }
+    tiled_versions = {
+        "manifest_schema_version": tiled.manifest_schema_version,
+        "render_pipeline_version": tiled.render_pipeline_version,
+        "classification_algorithm_version": tiled.classification_algorithm_version,
+        "tile_pipeline_version": tiled.tile_pipeline_version,
+    }
+    assert rendered_versions == expected
+    assert tiled_versions == expected
+    _, render_payload = _manifest_payload(service, rendered.manifest_relative_path)
+    _, tile_payload = _manifest_payload(service, tiled.manifest_relative_path)
+    assert {
+        field: _manifest_string(render_payload, field) for field in expected
+    } == expected
+    assert {
+        field: _manifest_string(tile_payload, field) for field in expected
+    } == expected
+    assert "tpv1-0-0-w0064-h0064-o008" in tiled.manifest_relative_path
+    assert all("tpv1-0-0-w0064-h0064-o008" in tile.tile_id for tile in tiled.tiles)
 
 
 def test_missing_cached_page_is_invalidated_and_rebuilt(tmp_path: Path) -> None:
@@ -1076,18 +1132,55 @@ def test_render_manifest_is_bound_to_requested_identifier(tmp_path: Path) -> Non
     assert raised.value.code is ErrorCode.INTERNAL_ERROR
 
 
-def test_render_manifest_rejects_global_policy_mismatch(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("renderer_version", "untrusted-renderer"),
+        ("manifest_schema_version", "2.0.0"),
+        ("render_pipeline_version", "2.0.0"),
+        ("classification_algorithm_version", "2.0.0"),
+        ("tile_pipeline_version", "2.0.0"),
+    ],
+)
+def test_render_manifest_rejects_global_policy_mismatch(
+    tmp_path: Path,
+    field: str,
+    bad_value: str,
+) -> None:
     source = make_raster_pdf(tmp_path / "manifest-policy.pdf")
     service = processor(tmp_path)
     manifest = service.render_pages(source.path, pages=(1,), mode="native")
     path, payload = _manifest_payload(service, manifest.manifest_relative_path)
-    payload["renderer_version"] = "untrusted-renderer"
+    payload[field] = bad_value
     _write_manifest_payload(path, payload)
 
     with pytest.raises(AppError) as raised:
         _ = service.get_manifest(manifest.render_id)
 
     assert raised.value.code is ErrorCode.INTERNAL_ERROR
+
+
+def test_tile_manifest_semantic_mismatch_is_invalidated_and_rebuilt(
+    tmp_path: Path,
+) -> None:
+    source = make_raster_pdf(
+        tmp_path / "tile-semantic-version.pdf", width=120, height=80
+    )
+    service = processor(tmp_path)
+    rendered = service.render_pages(source.path, pages=(1,), mode="native")
+    first = service.render_tiles(rendered.render_id, page_number=1)
+    path, payload = _manifest_payload(service, first.manifest_relative_path)
+    payload["tile_pipeline_version"] = "2.0.0"
+    _write_manifest_payload(path, payload)
+
+    rebuilt = service.render_tiles(rendered.render_id, page_number=1)
+    _, rebuilt_payload = _manifest_payload(service, rebuilt.manifest_relative_path)
+
+    assert rebuilt == first
+    assert (
+        rebuilt_payload["tile_pipeline_version"]
+        == PDF_PIPELINE_VERSIONS.tile_pipeline_version
+    )
 
 
 def test_render_manifest_rejects_invalid_page_binding(tmp_path: Path) -> None:
@@ -1159,15 +1252,24 @@ def test_wrong_render_manifest_write_path_rolls_back(
 ) -> None:
     source = make_raster_pdf(tmp_path / "wrong-manifest-path.pdf")
     service = processor(tmp_path)
-    real_put = service.store.put_render_bytes
+    attribute_name = "_write_render_asset"
+    real_write = cast(
+        "Callable[[object, str, str, bytes], tuple[str, str]]",
+        getattr(service, attribute_name),
+    )
 
-    def wrong_manifest_path(relative_path: str, data: bytes) -> tuple[str, str]:
-        written, digest = real_put(relative_path, data)
-        if relative_path.endswith("/manifest.json"):
+    def wrong_manifest_path(
+        transaction: object,
+        render_id: str,
+        relative_name: str,
+        data: bytes,
+    ) -> tuple[str, str]:
+        written, digest = real_write(transaction, render_id, relative_name, data)
+        if relative_name == "manifest.json":
             return f"{written}.wrong", digest
         return written, digest
 
-    monkeypatch.setattr(service.store, "put_render_bytes", wrong_manifest_path)
+    monkeypatch.setattr(service, attribute_name, wrong_manifest_path)
 
     with pytest.raises(AppError) as raised:
         _ = service.render_pages(source.path, pages=(1,), mode="native")
@@ -1297,15 +1399,24 @@ def test_wrong_tile_manifest_write_path_rolls_back_only_tiles(
     source = make_raster_pdf(tmp_path / "wrong-tile-manifest-path.pdf", width=120)
     service = processor(tmp_path)
     pages = service.render_pages(source.path, pages=(1,), mode="native")
-    real_put = service.store.put_render_bytes
+    attribute_name = "_write_render_asset"
+    real_write = cast(
+        "Callable[[object, str, str, bytes], tuple[str, str]]",
+        getattr(service, attribute_name),
+    )
 
-    def wrong_manifest_path(relative_path: str, data: bytes) -> tuple[str, str]:
-        written, digest = real_put(relative_path, data)
-        if "/tiles/" in relative_path and relative_path.endswith("/manifest.json"):
+    def wrong_manifest_path(
+        transaction: object,
+        render_id: str,
+        relative_name: str,
+        data: bytes,
+    ) -> tuple[str, str]:
+        written, digest = real_write(transaction, render_id, relative_name, data)
+        if relative_name.endswith("/manifest.json"):
             return f"{written}.wrong", digest
         return written, digest
 
-    monkeypatch.setattr(service.store, "put_render_bytes", wrong_manifest_path)
+    monkeypatch.setattr(service, attribute_name, wrong_manifest_path)
 
     with pytest.raises(AppError) as raised:
         _ = service.render_tiles(pages.render_id, page_number=1)

@@ -189,6 +189,7 @@ def _workflow_text(relative_path: str) -> str:
 
 ROOT = Path(__file__).parents[2]
 COVERAGE_FLOOR = 95
+DECISION_MODULE_COVERAGE_FLOOR = 100
 QUALITY_RUNNER = "run: python scripts/run_quality_gate.py "
 MANAGED_NODE_ARGUMENT = '--node-executable "$(command -v node)" '
 CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
@@ -217,11 +218,13 @@ CONTRACT_SOURCE_INVENTORY = (
     "contracts/zod/baseline-contracts.mjs",
     "contracts/zod/asvs-evidence-contracts.mjs",
     "contracts/zod/capability-contracts.mjs",
+    "contracts/zod/recovery-contracts.mjs",
     "contracts/zod/models.ts",
     "contracts/zod/contract.test.ts",
     "tests/contracts/zod_baseline_contracts.test.mjs",
     "tests/contracts/zod_asvs_evidence_contracts.test.mjs",
     "tests/contracts/zod_contracts.test.mjs",
+    "tests/contracts/zod_recovery_contracts.test.mjs",
 )
 PHASE_TWO_NODE_PINS = {
     "@eslint/js": "10.0.1",
@@ -349,6 +352,32 @@ def test_quality_configuration_is_maximally_strict() -> None:
     )
 
 
+def test_implementation_plan_matches_the_executable_coverage_and_mypy_policy() -> None:
+    plan = (
+        ROOT / "docs" / "2026-08-14-official-mcp-sdk-alpic-tdd-implementation-plan.md"
+    ).read_text(encoding="utf-8")
+    coverage = require_json_object(
+        load_json_value(
+            (ROOT / "security" / "coverage-policy.json").read_text(encoding="utf-8")
+        ),
+        context="security/coverage-policy.json",
+    )
+
+    assert coverage["project_branch_floor"] == COVERAGE_FLOOR
+    assert coverage["diff_line_floor"] == COVERAGE_FLOOR
+    assert coverage["diff_branch_arc_floor"] == COVERAGE_FLOOR
+    assert coverage["decision_module_branch_floor"] == DECISION_MODULE_COVERAGE_FLOOR
+    assert 'mypy_path = "typings:src"' in plan
+    for obsolete_claim in (
+        'mypy_path = "typings"',
+        "Require zero missing changed arcs",
+        "fail the 100% diff gate",
+        "100% coverage of changed lines and changed branch arcs",
+        "verifies 95% coverage and 100% diff coverage",
+    ):
+        assert obsolete_claim not in plan
+
+
 def test_quality_lock_keeps_security_linter_separate() -> None:
     development = (ROOT / "requirements-dev.in").read_text(encoding="utf-8")
     security = (ROOT / "requirements-security.in").read_text(encoding="utf-8")
@@ -432,6 +461,42 @@ def test_phase_two_node_and_typescript_policy_is_exact() -> None:
         "useUnknownInCatchVariables": True,
         "verbatimModuleSyntax": True,
     }
+
+
+def test_recovery_zod_contract_is_in_every_strict_node_gate() -> None:
+    """Mutation caught: recovery schema or adversarial tests silently leave CI."""
+    package = require_json_object(
+        load_json_value((ROOT / "package.json").read_bytes()),
+        context="package.json",
+    )
+    scripts = require_json_object(package["scripts"], context="package scripts")
+    contract_path = "contracts/zod/recovery-contracts.mjs"
+    test_path = "tests/contracts/zod_recovery_contracts.test.mjs"
+    for script_name in (
+        "contracts:lint",
+        "contracts:baseline-static",
+        "lint:contracts",
+    ):
+        command = scripts[script_name]
+        assert isinstance(command, str)
+        assert contract_path in command
+        assert test_path in command
+    all_contracts = scripts["contracts:zod:all"]
+    assert isinstance(all_contracts, str)
+    assert "contracts:recovery-zod" in all_contracts
+    assert scripts["contracts:recovery-zod"] == f"node --test {test_path}"
+
+    eslint_source = (ROOT / "eslint.config.mjs").read_text(encoding="utf-8")
+    assert f'  "{contract_path}",' in eslint_source
+    assert f'  "{test_path}",' in eslint_source
+    tsconfig = require_json_object(
+        load_json_value((ROOT / "tsconfig.contracts.json").read_bytes()),
+        context="TypeScript contract config",
+    )
+    includes = tsconfig["include"]
+    assert isinstance(includes, list)
+    assert contract_path in includes
+    assert test_path in includes
 
 
 def test_markdown_policy_is_closed_and_covers_owned_markdown() -> None:
@@ -870,3 +935,15 @@ def test_pep_561_marker_is_empty_and_not_declared_as_package_data() -> None:
 
     assert (ROOT / "src/nplg_mcp/py.typed").read_bytes() == b""
     assert "[tool.setuptools.package-data]" not in pyproject
+
+
+def test_requirements_locks_are_the_only_python_resolution_authority() -> None:
+    """Reject a second generated project lock beside hash-pinned requirements."""
+    expected = {
+        ROOT / "requirements.lock",
+        ROOT / "requirements-dev.lock",
+        ROOT / "requirements-security.lock",
+    }
+
+    assert all(path.is_file() for path in expected)
+    assert not (ROOT / "uv.lock").exists()

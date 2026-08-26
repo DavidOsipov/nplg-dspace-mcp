@@ -6,11 +6,15 @@ from __future__ import annotations
 
 from .verification_envelope import (
     ControllerBinding,
+    VerificationError,
     VerificationProof,
     VerificationRequest,
     controller_policy,
     verify_request,
 )
+
+_VERIFIER = "pdf-worker-quota"
+_AUTHORITY_ERROR = "verifier authority mismatch"
 
 PROBES = (
     "image.identity",
@@ -35,9 +39,11 @@ def verify(
     binding: ControllerBinding,
 ) -> VerificationProof:
     """Validate the exact quota schedule supplied by a protected controller."""
+    if request.verifier != _VERIFIER:
+        raise VerificationError(_AUTHORITY_ERROR)
     return verify_request(
         request,
-        policy=controller_policy("pdf-worker-quota", PROBES, binding),
+        policy=controller_policy(_VERIFIER, PROBES, binding),
         executor=binding.executor,
         proof_path=binding.proof_path,
     )

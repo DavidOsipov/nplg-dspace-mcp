@@ -66,11 +66,14 @@ const taskOnePackageScriptsSchema = z.strictObject({
   "contracts:asvs-zod": z.literal(
     "node --test tests/contracts/zod_asvs_evidence_contracts.test.mjs",
   ),
+  "contracts:recovery-zod": z.literal(
+    "node --test tests/contracts/zod_recovery_contracts.test.mjs",
+  ),
   "contracts:zod:all": z.literal(
-    "npm run contracts:zod && npm run contracts:baseline-zod && npm run contracts:asvs-zod",
+    "npm run contracts:zod && npm run contracts:baseline-zod && npm run contracts:asvs-zod && npm run contracts:recovery-zod",
   ),
   "contracts:lint": z.literal(
-    "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/models.ts contracts/zod/contract.test.ts tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+    "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs contracts/zod/models.ts contracts/zod/contract.test.ts tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs",
   ),
   "contracts:typecheck": z.literal("tsc --project tsconfig.contracts.json"),
   "contracts:test": z.literal(
@@ -80,14 +83,14 @@ const taskOnePackageScriptsSchema = z.strictObject({
     "markdownlint-cli2 \"*.md\" \"docs/**/*.md\" \"deploy/**/*.md\" \"skills/**/*.md\"",
   ),
   "contracts:baseline-static": z.literal(
-    "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+    "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs",
   ),
   "test:contracts:asvs": z.literal(
     "node --test tests/contracts/zod_asvs_evidence_contracts.test.mjs",
   ),
   "typecheck:contracts": z.literal("tsc --project tsconfig.contracts.json"),
   "lint:contracts": z.literal(
-    "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+    "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs",
   ),
 });
 const packageJsonSchema = z.looseObject({
@@ -141,16 +144,18 @@ const resolvedTsconfigSchema = z.looseObject({
 
 const root = new URL("../../", import.meta.url);
 const rootPath = fileURLToPath(root);
-/** @type {readonly ["contracts/zod/baseline-contracts.mjs", "contracts/zod/asvs-evidence-contracts.mjs", "contracts/zod/capability-contracts.mjs", "contracts/zod/models.ts", "contracts/zod/contract.test.ts", "tests/contracts/zod_baseline_contracts.test.mjs", "tests/contracts/zod_asvs_evidence_contracts.test.mjs", "tests/contracts/zod_contracts.test.mjs"]} */
+/** @type {readonly ["contracts/zod/baseline-contracts.mjs", "contracts/zod/asvs-evidence-contracts.mjs", "contracts/zod/capability-contracts.mjs", "contracts/zod/recovery-contracts.mjs", "contracts/zod/models.ts", "contracts/zod/contract.test.ts", "tests/contracts/zod_baseline_contracts.test.mjs", "tests/contracts/zod_asvs_evidence_contracts.test.mjs", "tests/contracts/zod_contracts.test.mjs", "tests/contracts/zod_recovery_contracts.test.mjs"]} */
 const contractFilePaths = [
   "contracts/zod/baseline-contracts.mjs",
   "contracts/zod/asvs-evidence-contracts.mjs",
   "contracts/zod/capability-contracts.mjs",
+  "contracts/zod/recovery-contracts.mjs",
   "contracts/zod/models.ts",
   "contracts/zod/contract.test.ts",
   "tests/contracts/zod_baseline_contracts.test.mjs",
   "tests/contracts/zod_asvs_evidence_contracts.test.mjs",
   "tests/contracts/zod_contracts.test.mjs",
+  "tests/contracts/zod_recovery_contracts.test.mjs",
 ];
 /** @type {readonly ["contracts/zod/contract.test.ts", "contracts/zod/models.ts"]} */
 const contractTypeScriptFilePaths = [
@@ -978,12 +983,16 @@ void test("package scripts preserve capability and baseline Zod entrypoints", as
     "node --test tests/contracts/zod_asvs_evidence_contracts.test.mjs",
   );
   assert.equal(
+    packageJson.scripts["contracts:recovery-zod"],
+    "node --test tests/contracts/zod_recovery_contracts.test.mjs",
+  );
+  assert.equal(
     packageJson.scripts["contracts:zod:all"],
-    "npm run contracts:zod && npm run contracts:baseline-zod && npm run contracts:asvs-zod",
+    "npm run contracts:zod && npm run contracts:baseline-zod && npm run contracts:asvs-zod && npm run contracts:recovery-zod",
   );
   assert.equal(
     packageJson.scripts["contracts:lint"],
-    "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/models.ts contracts/zod/contract.test.ts tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+    "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs contracts/zod/models.ts contracts/zod/contract.test.ts tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs",
   );
   assert.equal(
     packageJson.scripts["contracts:typecheck"],
@@ -999,7 +1008,7 @@ void test("package scripts preserve capability and baseline Zod entrypoints", as
   );
   assert.equal(
     packageJson.scripts["contracts:baseline-static"],
-    "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+    "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs",
   );
   assert.equal(
     packageJson.scripts["test:contracts:asvs"],
@@ -1011,7 +1020,7 @@ void test("package scripts preserve capability and baseline Zod entrypoints", as
   );
   assert.equal(
     packageJson.scripts["lint:contracts"],
-    "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+    "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs",
   );
 });
 
@@ -1023,29 +1032,31 @@ void test("package policy model rejects missing or weakened static commands", ()
       "node --test tests/contracts/zod_baseline_contracts.test.mjs",
     "contracts:asvs-zod":
       "node --test tests/contracts/zod_asvs_evidence_contracts.test.mjs",
+    "contracts:recovery-zod":
+      "node --test tests/contracts/zod_recovery_contracts.test.mjs",
     "contracts:zod:all":
-      "npm run contracts:zod && npm run contracts:baseline-zod && npm run contracts:asvs-zod",
+      "npm run contracts:zod && npm run contracts:baseline-zod && npm run contracts:asvs-zod && npm run contracts:recovery-zod",
     "contracts:lint":
-      "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/models.ts contracts/zod/contract.test.ts tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+      "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs contracts/zod/models.ts contracts/zod/contract.test.ts tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs",
     "contracts:typecheck": "tsc --project tsconfig.contracts.json",
     "contracts:test":
       "node --test contracts/zod/contract.test.ts && npm run contracts:zod:all",
     "docs:lint":
       "markdownlint-cli2 \"*.md\" \"docs/**/*.md\" \"deploy/**/*.md\" \"skills/**/*.md\"",
     "contracts:baseline-static":
-      "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+      "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs",
     "test:contracts:asvs":
       "node --test tests/contracts/zod_asvs_evidence_contracts.test.mjs",
     "typecheck:contracts": "tsc --project tsconfig.contracts.json",
     "lint:contracts":
-      "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+      "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs",
   };
   const missingStatic = { ...exactScripts };
   delete missingStatic["contracts:baseline-static"];
   const weakenedStatic = {
     ...exactScripts,
     "contracts:baseline-static":
-      "tsc --project tsconfig.contracts.json && eslint contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+      "tsc --project tsconfig.contracts.json && eslint contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs",
   };
   const incompleteAggregate = {
     ...exactScripts,
@@ -1060,6 +1071,7 @@ void test("package policy model rejects missing or weakened static commands", ()
       "contracts:lint",
       "contracts:typecheck",
       "contracts:test",
+      "contracts:recovery-zod",
       "docs:lint",
       "test:contracts:asvs",
       "typecheck:contracts",

@@ -126,8 +126,12 @@ def test_provider_probe_is_unselected_and_fail_closed() -> None:
     assert verdict.supported is False
     assert verdict.selected_issuer is None
     assert verdict.access_token_format is None
-    assert "OAUTH_PROVIDER_CAPABILITY_UNPROVEN" in verdict.blockers
-    assert "OAUTH_END_TO_END_FLOW_UNPROVEN" in verdict.blockers
+    assert verdict.registration_modes == ("dcr",)
+    assert verdict.blockers == (
+        "OAUTH_PROVIDER_CAPABILITY_UNPROVEN",
+        "ALPIC_DCR_ISSUER_SEMANTICS_UNPROVEN",
+        "OAUTH_END_TO_END_FLOW_UNPROVEN",
+    )
 
 
 def test_provider_canonical_contract_round_trips_and_rejects_mutations() -> None:
@@ -203,6 +207,32 @@ def test_unselected_provider_preserves_its_stable_blocker() -> None:
     with pytest.raises(
         ValidationError,
         match="must preserve OAUTH_PROVIDER_CAPABILITY_UNPROVEN",
+    ):
+        _ = OAuthProviderCapabilityVerdict.model_validate_json(_redigest(raw))
+
+
+@pytest.mark.parametrize(
+    "blockers",
+    [
+        [
+            "OAUTH_PROVIDER_CAPABILITY_UNPROVEN",
+            "OAUTH_END_TO_END_FLOW_UNPROVEN",
+        ],
+        [
+            "OAUTH_PROVIDER_CAPABILITY_UNPROVEN",
+            "ALPIC_DCR_ISSUER_SEMANTICS_UNPROVEN",
+        ],
+    ],
+)
+def test_unselected_provider_preserves_every_selected_topology_blocker(
+    blockers: list[str],
+) -> None:
+    raw = _load_contract(CONTRACT)
+    raw["blockers"] = blockers
+
+    with pytest.raises(
+        ValidationError,
+        match="must preserve every selected Auth0/Alpic DCR blocker",
     ):
         _ = OAuthProviderCapabilityVerdict.model_validate_json(_redigest(raw))
 

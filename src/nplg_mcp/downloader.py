@@ -34,6 +34,7 @@ from .security import (
     validate_upstream_url,
 )
 from .storage import ContentAddressedStore, StoredArtifact
+from .storage_lifecycle import RetentionClockSample, RetentionPolicy
 
 _RUNTIME_ANNOTATION_TYPES = (
     HttpClientProtocol,
@@ -42,6 +43,8 @@ _RUNTIME_ANNOTATION_TYPES = (
     RateLimiter,
     ContentAddressedStore,
     StoredArtifact,
+    RetentionClockSample,
+    RetentionPolicy,
     Callable,
 )
 
@@ -61,6 +64,7 @@ _HTTP_SERVER_ERROR_MIN = 500
 _MAX_UPSTREAM_TIMEOUT_SECONDS = 120.0
 _MAX_CONFIGURED_REDIRECTS = 5
 _PDF_SIGNATURE_LENGTH = 8
+_DOCUMENT_PUBLICATION_INODES = 3
 _DOWNLOAD_DEADLINE_MESSAGE = (
     "The repository download did not complete within the configured deadline."
 )
@@ -155,6 +159,8 @@ class DocumentDownloader:
     require_scanner: bool = False
     guard: UpstreamGuard = field(default_factory=UpstreamGuard)
     clock: Callable[[], float] = time.monotonic
+    retention_policy: RetentionPolicy | None = None
+    retention_clock: Callable[[], RetentionClockSample] | None = None
 
     def __post_init__(self) -> None:
         """Reject invalid downloader limits before any upstream operation."""
@@ -182,6 +188,9 @@ class DocumentDownloader:
             raise ValueError(msg)
         if self.require_scanner and self.scanner is None:
             msg = "private-full downloads require a malware scanner"
+            raise ValueError(msg)
+        if (self.retention_policy is None) != (self.retention_clock is None):
+            msg = "retention policy and clock authority must be configured together"
             raise ValueError(msg)
 
     async def _ensure_dns(self) -> None:
@@ -226,18 +235,56 @@ class DocumentDownloader:
             )
         return url
 
+    def _preflight_bitstream(self, bitstream: Bitstream) -> str:
+        source_url = self._validate_bitstream(bitstream)
+        if (
+            bitstream.reported_size is not None
+            and bitstream.reported_size > self.max_bytes
+        ):
+            raise AppError(
+                ErrorCode.DOWNLOAD_TOO_LARGE,
+                "The repository file exceeds the configured download limit.",
+                http_status=413,
+                safe_details={
+                    "reported_size": bitstream.reported_size,
+                    "max_bytes": self.max_bytes,
+                },
+            )
+        return source_url
+
     async def download(self, bitstream: Bitstream) -> DownloadResult:
         """Download and publish a validated public PDF bitstream."""
+        _ = self._preflight_bitstream(bitstream)
         deadline = MonotonicDeadline.after(
             min(self.total_timeout_seconds, 59.0),
             clock=self.clock,
         )
         try:
-            async with asyncio.timeout(self.total_timeout_seconds):
-                return await self._download_within_deadline(
-                    bitstream,
-                    deadline=deadline,
+            if self.retention_policy is None or self.retention_clock is None:
+                async with asyncio.timeout(self.total_timeout_seconds):
+                    return await self._download_within_deadline(
+                        bitstream,
+                        deadline=deadline,
+                    )
+            async with self.store.reserve_publication(
+                self.retention_policy,
+                maximum_new_bytes=self.max_bytes,
+                maximum_new_objects=1,
+                # Object directory, source PDF, and lifecycle insertion record.
+                maximum_new_inodes=_DOCUMENT_PUBLICATION_INODES,
+                clock=self.retention_clock(),
+            ) as reservation:
+                async with asyncio.timeout(self.total_timeout_seconds):
+                    result = await self._download_within_deadline(
+                        bitstream,
+                        deadline=deadline,
+                    )
+                await reservation.commit(
+                    actual_bytes=result.artifact.size,
+                    actual_objects=1,
+                    actual_inodes=_DOCUMENT_PUBLICATION_INODES,
                 )
+                return result
         except UpstreamUnavailableError as exc:
             raise AppError(
                 ErrorCode.RATE_LIMITED,
@@ -437,20 +484,7 @@ class DocumentDownloader:
         *,
         deadline: MonotonicDeadline,
     ) -> DownloadResult:
-        current = self._validate_bitstream(bitstream)
-        if (
-            bitstream.reported_size is not None
-            and bitstream.reported_size > self.max_bytes
-        ):
-            raise AppError(
-                ErrorCode.DOWNLOAD_TOO_LARGE,
-                "The repository file exceeds the configured download limit.",
-                http_status=413,
-                safe_details={
-                    "reported_size": bitstream.reported_size,
-                    "max_bytes": self.max_bytes,
-                },
-            )
+        current = self._preflight_bitstream(bitstream)
         for redirect_index in range(self.max_redirects + 1):
             async with self.guard.acquire(deadline) as permit:
                 await self._admit_dependencies(permit)

@@ -18,7 +18,15 @@ from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, TypeVar, cast, override, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Protocol,
+    Self,
+    TypeVar,
+    cast,
+    override,
+    runtime_checkable,
+)
 
 from PIL import Image, UnidentifiedImageError
 
@@ -27,14 +35,19 @@ from .bounded_work import (
     BlockingWorkCapacityError,
     BoundedThreadRunner,
 )
-from .errors import AppError
+from .errors import AppError, ErrorCode
 from .pdf_executor import (
     PdfCircuitBreaker,
     PdfWorkerError,
     PdfWorkerOperationalError,
     PdfWorkerPolicy,
 )
-from .pdf_identity import render_identifier
+from .pdf_identity import (
+    RenderIdentityRequest,
+    TileGeometryRequest,
+    render_identifier,
+    tile_geometry_identifier,
+)
 from .pdf_ipc import (
     MAX_COMMAND_FRAME_BYTES,
     MAX_RESULT_FRAME_BYTES,
@@ -60,10 +73,34 @@ if TYPE_CHECKING:
     from asyncio import StreamReader, StreamWriter
     from asyncio.subprocess import Process
     from collections.abc import Callable
+    from types import TracebackType
 
     from .contracts import MonotonicDeadline
     from .pdf_worker_slot import WorkerStagingQuota
     from .storage import ContentAddressedStore
+
+
+class _RenderStagedWriter(Protocol):
+    """Narrow staged-writer capability used by render publication."""
+
+    def __enter__(self) -> Self: ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
+    def write(self, data: bytes) -> int: ...
+
+    def commit_render(self, relative_path: str) -> tuple[str, str]: ...
+
+
+class _RenderPublicationTransaction(Protocol):
+    """Issue writers carrying one exact render-transaction authority."""
+
+    def stage(self, *, suffix: str = "") -> _RenderStagedWriter: ...
 
 
 @runtime_checkable
@@ -94,7 +131,46 @@ def _peer_credentials(value: bytes) -> tuple[int, int, int]:
 
 _FRAME_PREFIX_BYTES = 4
 _WORKER_JOB_DIRECTORY = ".pdf-worker-jobs"
+_PRIVATE_DIRECTORY_MODE = 0o700
 _StorageT = TypeVar("_StorageT")
+
+
+def _ensure_private_worker_directory(
+    path: Path,
+    *,
+    allow_existing: bool,
+    normalize_existing: bool = False,
+) -> None:
+    """Create one worker directory or reject inherited ownership/mode drift."""
+    created = False
+    try:
+        path.mkdir(mode=_PRIVATE_DIRECTORY_MODE)
+        created = True
+    except FileExistsError:
+        if not allow_existing:
+            message = "PDF worker staging directory already exists"
+            raise PdfWorkerError(message) from None
+    if created or normalize_existing:
+        path.chmod(_PRIVATE_DIRECTORY_MODE, follow_symlinks=False)
+    metadata = path.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_gid != os.getegid()
+        or stat.S_IMODE(metadata.st_mode) != _PRIVATE_DIRECTORY_MODE
+    ):
+        message = "PDF worker staging directory is not private"
+        raise PdfWorkerError(message)
+
+
+def _create_private_worker_parents(root: Path, relative_parent: Path) -> Path:
+    """Create each request-relative parent with an exact private mode."""
+    current = root
+    for component in relative_parent.parts:
+        current /= component
+        _ensure_private_worker_directory(current, allow_existing=False)
+    return current
 
 
 class SubprocessPdfExecutor:
@@ -200,15 +276,13 @@ class SubprocessPdfExecutor:
         deadline: MonotonicDeadline,
     ) -> PdfResult:
         work_parent = self._store.root / _WORKER_JOB_DIRECTORY
-        work_parent.mkdir(mode=0o700, exist_ok=True)
-        work_parent_metadata = work_parent.lstat()
-        if not stat.S_ISDIR(work_parent_metadata.st_mode) or stat.S_ISLNK(
-            work_parent_metadata.st_mode
-        ):
-            message = "PDF worker job root is not a private directory"
-            raise PdfWorkerError(message)
-        work_parent.chmod(0o700)
+        _ensure_private_worker_directory(work_parent, allow_existing=True)
         job_path = Path(tempfile.mkdtemp(prefix=".nplg-pdf-worker-", dir=work_parent))
+        _ensure_private_worker_directory(
+            job_path,
+            allow_existing=True,
+            normalize_existing=True,
+        )
         process: Process | None = None
         try:
             self._require_deadline(deadline, phase="input staging")
@@ -397,21 +471,70 @@ class SubprocessPdfExecutor:
         deadline: MonotonicDeadline,
     ) -> str | None:
         cache_root = job_path / "cache"
-        cache_root.mkdir(mode=0o700)
+        _ensure_private_worker_directory(cache_root, allow_existing=False)
         if isinstance(command, (InspectCommand, RenderPagesCommand)):
-            source = self._store.resolve_asset(command.source_relative_path)
             destination = cache_root.joinpath(*Path(command.source_relative_path).parts)
-            destination.parent.mkdir(parents=True, mode=0o700)
-            return self._copy_regular_file(
-                source,
-                destination,
+            _ = _create_private_worker_parents(
+                cache_root,
+                Path(command.source_relative_path).parent,
+            )
+            with self._store.lease_asset(command.source_relative_path) as source:
+                return self._copy_regular_file(
+                    source,
+                    destination,
+                    deadline=deadline,
+                )
+        render_id = command.parameters.render_id
+        destination_root = cache_root / "renders" / render_id
+        _ = _create_private_worker_parents(
+            cache_root,
+            Path("renders") / render_id,
+        )
+        manifest_relative_path = f"renders/{render_id}/manifest.json"
+        try:
+            with self._store.lease_asset(manifest_relative_path) as manifest_path:
+                self._copy_regular_tree(
+                    manifest_path.parent,
+                    destination_root,
+                    deadline=deadline,
+                )
+        except AppError as exc:
+            if exc.code not in {ErrorCode.INVALID_INPUT, ErrorCode.NOT_FOUND}:
+                raise
+            self._diagnose_unavailable_render_tree(
+                self._store.root / "renders" / render_id,
                 deadline=deadline,
             )
-        render_id = command.parameters.render_id
-        source_root = self._store.root / "renders" / render_id
-        destination_root = cache_root / "renders" / render_id
-        self._copy_regular_tree(source_root, destination_root, deadline=deadline)
+            message = "PDF worker render input is unavailable"
+            raise PdfWorkerError(message) from exc
         return None
+
+    def _diagnose_unavailable_render_tree(
+        self,
+        source_root: Path,
+        *,
+        deadline: MonotonicDeadline,
+    ) -> None:
+        """Preserve safe corruption precedence when no completion lease exists."""
+        if source_root.is_symlink() or not source_root.is_dir():
+            return
+        try:
+            for directory, directories, files in os.walk(
+                source_root,
+                followlinks=False,
+            ):
+                self._require_deadline(deadline, phase="input staging")
+                current = Path(directory)
+                if any((current / name).is_symlink() for name in directories):
+                    message = "PDF worker render input contains a symlink"
+                    raise PdfWorkerError(message)
+                for name in files:
+                    metadata = (current / name).lstat()
+                    if not stat.S_ISREG(metadata.st_mode):
+                        message = "PDF worker input is not a regular file"
+                        raise PdfWorkerError(message)
+        except FileNotFoundError:
+            return
 
     def _copy_regular_file(
         self,
@@ -483,7 +606,7 @@ class SubprocessPdfExecutor:
         if source.is_symlink() or not source.is_dir():
             message = "PDF worker render input is unavailable"
             raise PdfWorkerError(message)
-        destination.mkdir(parents=True, mode=0o700)
+        _ensure_private_worker_directory(destination, allow_existing=True)
         for directory, directories, files in os.walk(source, followlinks=False):
             self._require_deadline(deadline, phase="input staging")
             current = Path(directory)
@@ -493,7 +616,10 @@ class SubprocessPdfExecutor:
                 if candidate.is_symlink():
                     message = "PDF worker render input contains a symlink"
                     raise PdfWorkerError(message)
-                (destination / relative / name).mkdir(mode=0o700)
+                _ensure_private_worker_directory(
+                    destination / relative / name,
+                    allow_existing=False,
+                )
             for name in files:
                 _ = self._copy_regular_file(
                     current / name,
@@ -630,11 +756,13 @@ class SubprocessPdfExecutor:
                 message = "PDF worker response source identity is unavailable"
                 raise PdfWorkerError(message)
             expected_render_id = render_identifier(
-                source_sha256=expected_source_sha256,
-                pages=command.parameters.pages,
-                mode=command.parameters.mode,
-                renderer_version=rendered.renderer_version,
-                fallback_dpi=self._processor_settings.fallback_dpi,
+                RenderIdentityRequest(
+                    source_sha256=expected_source_sha256,
+                    pages=command.parameters.pages,
+                    mode=command.parameters.mode,
+                    renderer_version=rendered.renderer_version,
+                    fallback_dpi=self._processor_settings.fallback_dpi,
+                )
             )
             if rendered.render_id != expected_render_id:
                 message = "PDF worker response render ID mismatch"
@@ -763,12 +891,14 @@ class SubprocessPdfExecutor:
                 self._publish_one(
                     job_path,
                     relative_path,
+                    transaction=transaction,
                     expected_sha256=expected_digests[relative_path],
                     deadline=deadline,
                 )
             self._publish_one(
                 job_path,
                 rendered.manifest_relative_path,
+                transaction=transaction,
                 expected_sha256=expected_digests[rendered.manifest_relative_path],
                 deadline=deadline,
             )
@@ -793,7 +923,13 @@ class SubprocessPdfExecutor:
             if parameters.overlap is not None
             else self._processor_settings.tile_overlap
         )
-        geometry = f"w{tile_width:04d}-h{tile_height:04d}-o{overlap:03d}"
+        geometry = tile_geometry_identifier(
+            TileGeometryRequest(
+                width=tile_width,
+                height=tile_height,
+                overlap=overlap,
+            )
+        )
         root = (
             f"renders/{parameters.render_id}/tiles/"
             f"page-{parameters.page_number:04d}/{geometry}"
@@ -848,12 +984,14 @@ class SubprocessPdfExecutor:
                 self._publish_one(
                     job_path,
                     relative_path,
+                    transaction=transaction,
                     expected_sha256=expected_digests[relative_path],
                     deadline=deadline,
                 )
             self._publish_one(
                 job_path,
                 rendered.manifest_relative_path,
+                transaction=transaction,
                 expected_sha256=expected_digests[rendered.manifest_relative_path],
                 deadline=deadline,
             )
@@ -1049,8 +1187,12 @@ class SubprocessPdfExecutor:
         if actual_tiles != expected_tiles:
             message = "PDF worker response tile metadata mismatch"
             raise PdfWorkerError(message)
-        geometry = (
-            f"w{expected_width:04d}-h{expected_height:04d}-o{expected_overlap:03d}"
+        geometry = tile_geometry_identifier(
+            TileGeometryRequest(
+                width=expected_width,
+                height=expected_height,
+                overlap=expected_overlap,
+            )
         )
         for tile in rendered.tiles:
             expected_tile_id = (
@@ -1177,13 +1319,14 @@ class SubprocessPdfExecutor:
         job_path: Path,
         relative_path: str,
         *,
+        transaction: _RenderPublicationTransaction,
         expected_sha256: str,
         deadline: MonotonicDeadline,
     ) -> None:
         self._require_deadline(deadline, phase="output publication")
         descriptor = self._validated_descriptor(job_path, relative_path)
         try:
-            with self._store.stage(suffix=Path(relative_path).suffix) as staged:
+            with transaction.stage(suffix=Path(relative_path).suffix) as staged:
                 self._require_deadline(deadline, phase="output publication")
                 digest = hashlib.sha256()
                 while chunk := os.read(descriptor, 1024 * 1024):

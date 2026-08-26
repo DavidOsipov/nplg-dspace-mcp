@@ -7,17 +7,24 @@ import asyncio
 import base64
 import hashlib
 import json
+import os
 import re
+import stat
 import time
 from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Annotated, Literal, Protocol, cast
 from uuid import uuid4
 
 from pydantic import Field, StringConstraints, ValidationError
 
 from .config import (
+    HARD_MAX_INLINE_RESOURCE_BYTES,
+    HARD_MAX_RENDER_PAGES,
+    HARD_MAX_TILES_PER_PAGE,
     AppConfig,
     validate_deployment_profile,
 )
@@ -53,6 +60,10 @@ from .json_types import (
     load_json_value,
     require_json_object,
 )
+from .pdf_postprocessing import (
+    MAX_RENDER_RESOURCE_INDEX_BYTES,
+    PdfPostprocessingReservationAuthority,
+)
 from .profiles import tool_names_for_profile
 from .tokens import sign_asset_token
 
@@ -76,8 +87,9 @@ if TYPE_CHECKING:
 _DOCUMENT_ID_RE = re.compile(r"^doc_[0-9a-f]{64}$")
 _RENDER_ID_RE = re.compile(r"^rnd_[0-9a-f]{32}$")
 _PDF_JOB_TIMEOUT_SECONDS = 35.0
-_MAX_RENDER_RESOURCE_INDEX_BYTES = 4096
 _MAX_RENDER_RESOURCE_SCAN_DIRECTORIES = 4096
+_PRIVATE_RESOURCE_FILE_MODE = 0o600
+_RESOURCE_READ_CHUNK_BYTES = 64 * 1024
 _METADATA_PROFILES = frozenset(
     {
         DeploymentProfile.ALPIC_METADATA,
@@ -106,6 +118,12 @@ _OPEN_WORLD_TOOLS = frozenset(
         "search_documents",
     }
 )
+_PRIVATE_PDF_PIPELINE_VERSION_FIELDS = (
+    "manifest_schema_version",
+    "render_pipeline_version",
+    "classification_algorithm_version",
+    "tile_pipeline_version",
+)
 
 
 def _tool_annotations(name: str) -> ToolAnnotations:
@@ -131,6 +149,12 @@ def _model_json(value: BaseModel, *, context: str) -> JsonObject:
         load_json_value(value.model_dump_json()),
         context=context,
     )
+
+
+def _remove_private_pdf_pipeline_versions(payload: JsonObject) -> None:
+    """Remove worker cache identities from the unchanged public tool contract."""
+    for field in _PRIVATE_PDF_PIPELINE_VERSION_FIELDS:
+        _ = payload.pop(field, None)
 
 
 def _public_model_schema(
@@ -241,6 +265,122 @@ def _validated_pdf_worker_capacity(executor: object, capacity: object) -> int:
 
 def _joined_text(*parts: str) -> str:
     return " ".join(parts)
+
+
+def _resource_file_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _inline_resource_too_large() -> AppError:
+    return AppError(
+        ErrorCode.DOWNLOAD_TOO_LARGE,
+        "The requested resource exceeds the bounded inline delivery limit.",
+        http_status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+    )
+
+
+def _resource_integrity_failure() -> AppError:
+    return AppError(
+        ErrorCode.INTERNAL_ERROR,
+        "Stored artifact integrity verification failed.",
+        http_status=HTTPStatus.INTERNAL_SERVER_ERROR,
+    )
+
+
+def _validate_inline_resource_metadata(
+    metadata: os.stat_result,
+    *,
+    expected_size: int | None,
+) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_gid != os.getegid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != _PRIVATE_RESOURCE_FILE_MODE
+    ):
+        raise _resource_integrity_failure()
+    if metadata.st_size > HARD_MAX_INLINE_RESOURCE_BYTES:
+        raise _inline_resource_too_large()
+    if metadata.st_size < 1 or (
+        expected_size is not None and metadata.st_size != expected_size
+    ):
+        raise _resource_integrity_failure()
+
+
+def _read_exact_resource_descriptor(descriptor: int, *, size: int) -> bytes:
+    content = bytearray()
+    while len(content) < size:
+        remaining = size - len(content)
+        chunk = os.read(descriptor, min(remaining, _RESOURCE_READ_CHUNK_BYTES))
+        if not chunk or len(chunk) > remaining:
+            raise _resource_integrity_failure()
+        content.extend(chunk)
+    if os.read(descriptor, 1):
+        raise _resource_integrity_failure()
+    return bytes(content)
+
+
+def _secure_resource_open_flags() -> int:
+    try:
+        required = (os.O_CLOEXEC, os.O_NOFOLLOW, os.O_NONBLOCK)
+    except AttributeError as exc:
+        raise _resource_integrity_failure() from exc
+    if any(type(flag) is not int for flag in required):
+        raise _resource_integrity_failure()
+    close_on_exec, no_follow, nonblocking = required
+    return os.O_RDONLY | close_on_exec | no_follow | nonblocking
+
+
+def read_verified_inline_resource_file(
+    path: Path,
+    *,
+    expected_size: int | None,
+) -> bytes:
+    """Read one exact private regular file through a non-following descriptor."""
+    if expected_size is not None:
+        if type(expected_size) is not int or expected_size < 1:
+            raise _resource_integrity_failure()
+        if expected_size > HARD_MAX_INLINE_RESOURCE_BYTES:
+            raise _inline_resource_too_large()
+    before = path.lstat()
+    _validate_inline_resource_metadata(before, expected_size=expected_size)
+    expected_identity = _resource_file_identity(before)
+    descriptor = os.open(path, _secure_resource_open_flags())
+    try:
+        inheritable = False
+        os.set_inheritable(descriptor, inheritable)
+        opened = os.fstat(descriptor)
+        _validate_inline_resource_metadata(opened, expected_size=expected_size)
+        if _resource_file_identity(opened) != expected_identity:
+            raise _resource_integrity_failure()
+        content = _read_exact_resource_descriptor(
+            descriptor,
+            size=opened.st_size,
+        )
+        after_read = os.fstat(descriptor)
+        after_name = path.lstat()
+        if (
+            os.get_inheritable(descriptor)
+            or _resource_file_identity(after_read) != expected_identity
+            or _resource_file_identity(after_name) != expected_identity
+        ):
+            raise _resource_integrity_failure()
+    finally:
+        os.close(descriptor)
+    return content
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,6 +523,9 @@ class ToolService:
         )
         self.downloader = downloader
         self.pdf = pdf
+        self._pdf_postprocessing_reservation = (
+            pdf if isinstance(pdf, PdfPostprocessingReservationAuthority) else None
+        )
         self.store = store
         self._pdf_jobs = asyncio.Semaphore(max_concurrent_pdf_jobs)
         definitions: tuple[RegisteredTool, ...] = (
@@ -548,6 +691,7 @@ class ToolService:
             return
         from .pdf_executor import PdfWorkerUnavailableError  # noqa: PLC0415
 
+        self.store.ensure_ready()
         try:
             self.pdf.ensure_ready()
         except PdfWorkerUnavailableError as exc:
@@ -562,7 +706,9 @@ class ToolService:
         return await self._catalog.call(name, arguments)
 
     def list_resources(self) -> list[JsonObject]:
-        """Return deterministic compatibility resource definitions."""
+        """Return resource definitions available to the active profile."""
+        if self._profile is not DeploymentProfile.PRIVATE_FULL:
+            return []
         return [
             {
                 "uri": "nplg://about",
@@ -625,6 +771,26 @@ class ToolService:
             self._resource_index_subtree(render_id, artifact_id)
         )
 
+    @staticmethod
+    def _require_bounded_resource_index(index_path: Path) -> None:
+        metadata = index_path.lstat()
+        if (
+            index_path.is_symlink()
+            or not index_path.is_file()
+            or metadata.st_size < 1
+            or metadata.st_size > MAX_RENDER_RESOURCE_INDEX_BYTES
+        ):
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact index is invalid.",
+                http_status=500,
+            )
+
+    @classmethod
+    def _read_bounded_resource_index(cls, index_path: Path) -> bytes:
+        cls._require_bounded_resource_index(index_path)
+        return index_path.read_bytes()
+
     def _load_render_resource_index(
         self,
         render_directory: Path,
@@ -642,29 +808,32 @@ class ToolService:
                 http_status=500,
             )
         index_path = render_directory / "resources" / artifact_id / "index.json"
+        index_relative_path = index_path.relative_to(self.store.root).as_posix()
         try:
-            metadata = index_path.lstat()
+            self._require_bounded_resource_index(index_path)
         except FileNotFoundError:
             return None
-        if (
-            index_path.is_symlink()
-            or not index_path.is_file()
-            or metadata.st_size < 1
-            or metadata.st_size > _MAX_RENDER_RESOURCE_INDEX_BYTES
-        ):
-            raise AppError(
-                ErrorCode.INTERNAL_ERROR,
-                "Rendered artifact index is invalid.",
-                http_status=500,
-            )
         try:
-            raw_index = index_path.read_bytes()
+            with self.store.lease_asset(index_relative_path) as leased_index:
+                raw_index = self._read_bounded_resource_index(leased_index)
             entry = _ArtifactIndexEntry.model_validate_json(
                 raw_index,
                 strict=True,
             )
         except FileNotFoundError:
             return None
+        except AppError as exc:
+            if exc.code is not ErrorCode.NOT_FOUND:
+                raise
+            try:
+                self._require_bounded_resource_index(index_path)
+            except FileNotFoundError:
+                return None
+            raise AppError(
+                ErrorCode.INTERNAL_ERROR,
+                "Rendered artifact index is invalid.",
+                http_status=500,
+            ) from exc
         except (OSError, ValidationError) as exc:
             raise AppError(
                 ErrorCode.INTERNAL_ERROR,
@@ -806,9 +975,14 @@ class ToolService:
     ) -> tuple[Path, bytes, _RegisteredArtifact] | None:
         selected: tuple[Path, bytes, _RegisteredArtifact] | None = None
         for candidate in owners:
+            if candidate.size > HARD_MAX_INLINE_RESOURCE_BYTES:
+                raise _inline_resource_too_large()
             try:
-                candidate_path = self.store.resolve_asset(candidate.relative_path)
-                candidate_content = candidate_path.read_bytes()
+                with self.store.lease_asset(candidate.relative_path) as candidate_path:
+                    candidate_content = read_verified_inline_resource_file(
+                        candidate_path,
+                        expected_size=candidate.size,
+                    )
             except (FileNotFoundError, AppError) as exc:
                 if isinstance(exc, AppError) and exc.code is not ErrorCode.NOT_FOUND:
                     raise
@@ -834,13 +1008,20 @@ class ToolService:
         content: bytes
         if registered_owners is None:
             path = self._resolve_document(artifact_id)
+            relative_path = path.relative_to(self.store.root).as_posix()
             media_type = "application/pdf"
             expected_sha256 = artifact_id.removeprefix("doc_")
             render_id = ""
             expected_size: int | None = None
             try:
-                content = path.read_bytes()
-            except FileNotFoundError as exc:
+                with self.store.lease_asset(relative_path) as path:
+                    content = read_verified_inline_resource_file(
+                        path,
+                        expected_size=None,
+                    )
+            except (FileNotFoundError, AppError) as exc:
+                if isinstance(exc, AppError) and exc.code is not ErrorCode.NOT_FOUND:
+                    raise
                 raise AppError(
                     ErrorCode.NOT_FOUND,
                     "The requested MCP resource was not found.",
@@ -907,16 +1088,16 @@ class ToolService:
         }
 
     async def read_resource(self, uri: str) -> dict[str, str]:
-        """Read one bounded compatibility resource by URI."""
-        if uri == "nplg://about":
-            return self._about_resource()
-
-        if self._profile != "private-full":
+        """Read one bounded private-full resource by URI."""
+        if self._profile is not DeploymentProfile.PRIVATE_FULL:
             raise AppError(
                 ErrorCode.NOT_FOUND,
                 "The requested MCP resource was not found.",
                 http_status=404,
             )
+
+        if uri == "nplg://about":
+            return self._about_resource()
 
         document_match = re.fullmatch(r"nplg://artifact/(doc_[0-9a-f]{64})", uri)
         if document_match:
@@ -949,8 +1130,9 @@ class ToolService:
 
     def _signed_asset_url(self, relative_path: str, media_type: str) -> str:
         now = datetime.fromtimestamp(self._utc_timestamp(), tz=UTC)
+        asset_signing_secret = self.config.require_asset_signing_secret()
         token = sign_asset_token(
-            self.config.asset_signing_secret,
+            asset_signing_secret,
             path=relative_path,
             media_type=media_type,
             expires_at=now + timedelta(seconds=self.config.asset_ttl_seconds),
@@ -966,6 +1148,7 @@ class ToolService:
 
     def _manifest_dict(self, manifest: PdfRenderPagesOutput) -> JsonObject:
         payload = _model_json(manifest, context="render manifest")
+        _remove_private_pdf_pipeline_versions(payload)
         pages_value = payload.get("pages")
         if not isinstance(pages_value, list):
             msg = "render manifest pages must be an array"
@@ -1019,19 +1202,19 @@ class ToolService:
                 "Rendered artifact provenance is invalid.",
                 http_status=500,
             )
-        path = self.store.resolve_asset(relative_path)
-        size = path.stat().st_size
-        if size < 1 or size > self.config.cache_max_bytes:
-            raise AppError(
-                ErrorCode.INTERNAL_ERROR,
-                "Rendered artifact size is invalid.",
-                http_status=500,
-            )
         digest = hashlib.sha256()
         try:
-            with path.open("rb") as stream:
-                while chunk := stream.read(1024 * 1024):
-                    digest.update(chunk)
+            with self.store.lease_asset(relative_path) as path:
+                size = path.stat().st_size
+                if size < 1 or size > self.config.cache_max_bytes:
+                    raise AppError(
+                        ErrorCode.INTERNAL_ERROR,
+                        "Rendered artifact size is invalid.",
+                        http_status=500,
+                    )
+                with path.open("rb") as stream:
+                    while chunk := stream.read(1024 * 1024):
+                        digest.update(chunk)
         except OSError as exc:
             raise AppError(
                 ErrorCode.INTERNAL_ERROR,
@@ -1091,7 +1274,7 @@ class ToolService:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        if len(payload) > _MAX_RENDER_RESOURCE_INDEX_BYTES:
+        if len(payload) > MAX_RENDER_RESOURCE_INDEX_BYTES:
             raise AppError(
                 ErrorCode.INTERNAL_ERROR,
                 "Rendered artifact index is invalid.",
@@ -1151,7 +1334,8 @@ class ToolService:
         if candidate is None:
             return True
         try:
-            path = self.store.resolve_asset(owner.relative_path)
+            with self.store.lease_asset(owner.relative_path) as path:
+                content = path.read_bytes()
         except AppError as exc:
             if exc.code is not ErrorCode.NOT_FOUND:
                 raise
@@ -1163,8 +1347,6 @@ class ToolService:
                 "Render resource index is unavailable.",
                 http_status=500,
             ) from exc
-        try:
-            content = path.read_bytes()
         except FileNotFoundError:
             return True
         except OSError as exc:
@@ -1407,6 +1589,18 @@ class ToolService:
     def _document_relative_path(artifact_id: str) -> str:
         return f"documents/{artifact_id}/source.pdf"
 
+    def _reserve_render_resource_indexes(
+        self,
+        *,
+        maximum_index_files: int,
+    ) -> AbstractAsyncContextManager[None]:
+        authority = self._pdf_postprocessing_reservation
+        if authority is None:
+            return nullcontext()
+        return authority.reserve_postprocessing_publication(
+            maximum_index_files=maximum_index_files,
+        )
+
     async def _inspect_pdf(
         self,
         values: ArtifactInput,
@@ -1447,23 +1641,28 @@ class ToolService:
         )
 
         _ = self._resolve_document(values.artifact_id)
-        result = await self._run_pdf_job(
-            RenderPagesCommand(
-                request_id=uuid4(),
-                operation="render_pages",
-                source_relative_path=self._document_relative_path(values.artifact_id),
-                parameters=RenderPagesParams(
-                    pages=tuple(values.pages),
-                    mode="native",
-                ),
+        async with self._reserve_render_resource_indexes(
+            maximum_index_files=HARD_MAX_RENDER_PAGES,
+        ):
+            result = await self._run_pdf_job(
+                RenderPagesCommand(
+                    request_id=uuid4(),
+                    operation="render_pages",
+                    source_relative_path=self._document_relative_path(
+                        values.artifact_id
+                    ),
+                    parameters=RenderPagesParams(
+                        pages=tuple(values.pages),
+                        mode="native",
+                    ),
+                )
             )
-        )
-        if not isinstance(result.payload, RenderPagesPayload):
-            message = "PDF worker returned an unexpected render payload"
-            raise PdfWorkerError(message)
-        payload = self._manifest_dict(result.payload.value)
-        payload["artifact_id"] = values.artifact_id
-        return RenderPagesOutput.model_validate(payload, strict=True)
+            if not isinstance(result.payload, RenderPagesPayload):
+                message = "PDF worker returned an unexpected render payload"
+                raise PdfWorkerError(message)
+            payload = self._manifest_dict(result.payload.value)
+            payload["artifact_id"] = values.artifact_id
+            return RenderPagesOutput.model_validate(payload, strict=True)
 
     async def _render_tiles(
         self,
@@ -1485,60 +1684,66 @@ class ToolService:
                 "Tool arguments did not match the declared schema.",
             )
 
-        result = await self._run_pdf_job(
-            RenderTilesCommand(
-                request_id=uuid4(),
-                operation="render_tiles",
-                parameters=RenderTilesParams(
+        async with self._reserve_render_resource_indexes(
+            maximum_index_files=HARD_MAX_TILES_PER_PAGE + 1,
+        ):
+            result = await self._run_pdf_job(
+                RenderTilesCommand(
+                    request_id=uuid4(),
+                    operation="render_tiles",
+                    parameters=RenderTilesParams(
+                        render_id=values.render_id,
+                        page_number=values.page_number,
+                        tile_width=values.tile_width,
+                        tile_height=values.tile_height,
+                        overlap=values.overlap,
+                    ),
+                )
+            )
+            if not isinstance(result.payload, RenderTilesPayload):
+                message = "PDF worker returned an unexpected tile payload"
+                raise PdfWorkerError(message)
+            payload = _model_json(result.payload.value, context="tile manifest")
+            _remove_private_pdf_pipeline_versions(payload)
+            tiles_value = payload.get("tiles")
+            if not isinstance(tiles_value, list):
+                msg = "tile manifest tiles must be an array"
+                raise TypeError(msg)
+            for tile_value in tiles_value:
+                tile = require_json_object(tile_value, context="rendered tile")
+                tile["asset_url"] = self._signed_asset_url(
+                    _json_string(tile.get("relative_path"), context="relative_path"),
+                    _json_string(tile.get("media_type"), context="media_type"),
+                )
+                artifact_id = self._register_render_artifact(
+                    relative_path=_json_string(
+                        tile.get("relative_path"), context="relative_path"
+                    ),
+                    sha256=_json_string(tile.get("sha256"), context="sha256"),
+                    media_type=_json_string(
+                        tile.get("media_type"), context="media_type"
+                    ),
                     render_id=values.render_id,
-                    page_number=values.page_number,
-                    tile_width=values.tile_width,
-                    tile_height=values.tile_height,
-                    overlap=values.overlap,
+                )
+                tile["resource_uri"] = f"nplg://artifact/{artifact_id}"
+            payload["manifest_asset_url"] = self._signed_asset_url(
+                _json_string(
+                    payload.get("manifest_relative_path"),
+                    context="manifest_relative_path",
                 ),
+                "application/json",
             )
-        )
-        if not isinstance(result.payload, RenderTilesPayload):
-            message = "PDF worker returned an unexpected tile payload"
-            raise PdfWorkerError(message)
-        payload = _model_json(result.payload.value, context="tile manifest")
-        tiles_value = payload.get("tiles")
-        if not isinstance(tiles_value, list):
-            msg = "tile manifest tiles must be an array"
-            raise TypeError(msg)
-        for tile_value in tiles_value:
-            tile = require_json_object(tile_value, context="rendered tile")
-            tile["asset_url"] = self._signed_asset_url(
-                _json_string(tile.get("relative_path"), context="relative_path"),
-                _json_string(tile.get("media_type"), context="media_type"),
-            )
-            artifact_id = self._register_render_artifact(
+            manifest_artifact_id = self._register_render_artifact(
                 relative_path=_json_string(
-                    tile.get("relative_path"), context="relative_path"
+                    payload.get("manifest_relative_path"),
+                    context="manifest_relative_path",
                 ),
-                sha256=_json_string(tile.get("sha256"), context="sha256"),
-                media_type=_json_string(tile.get("media_type"), context="media_type"),
+                sha256=None,
+                media_type="application/json",
                 render_id=values.render_id,
             )
-            tile["resource_uri"] = f"nplg://artifact/{artifact_id}"
-        payload["manifest_asset_url"] = self._signed_asset_url(
-            _json_string(
-                payload.get("manifest_relative_path"),
-                context="manifest_relative_path",
-            ),
-            "application/json",
-        )
-        manifest_artifact_id = self._register_render_artifact(
-            relative_path=_json_string(
-                payload.get("manifest_relative_path"),
-                context="manifest_relative_path",
-            ),
-            sha256=None,
-            media_type="application/json",
-            render_id=values.render_id,
-        )
-        payload["resource_uri"] = f"nplg://artifact/{manifest_artifact_id}"
-        return RenderTilesOutput.model_validate(payload, strict=True)
+            payload["resource_uri"] = f"nplg://artifact/{manifest_artifact_id}"
+            return RenderTilesOutput.model_validate(payload, strict=True)
 
     async def _get_render_manifest(
         self,

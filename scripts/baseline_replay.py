@@ -15,7 +15,7 @@ import math
 import re
 import stat
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Protocol, cast, runtime_checkable
 
@@ -33,8 +33,16 @@ from pydantic import (
 )
 
 from nplg_mcp.contracts import DownloadDocumentOutput, RenderPagesOutput
+from nplg_mcp.contracts.tool_models import tool_model_bindings
 from nplg_mcp.errors import AppError
 from nplg_mcp.mcp_server import create_mcp_server
+from nplg_mcp.pdf_executor import DEFAULT_FALLBACK_DPI
+from nplg_mcp.pdf_identity import (
+    RenderIdentityRequest,
+    TileGeometryRequest,
+    render_identifier,
+    tile_geometry_identifier,
+)
 from nplg_mcp.profiles import DeploymentProfile
 from nplg_mcp.sdk_parity import (
     normalize_public_error,
@@ -96,6 +104,7 @@ class _SdkJsonModel(Protocol):
 MAX_REPLAY_REQUEST_BYTES = 64 * 1024
 MAX_REPLAY_HEADERS = 8
 MAX_REPLAY_HEADER_VALUE_LENGTH = 4096
+MAX_REPLAY_ERROR_LOCATIONS = 16
 MAX_JAVASCRIPT_SAFE_INTEGER = (2**53) - 1
 BEHAVIOR_CASE_COUNT = 66
 PRIVATE_DIRECTORY_MODE = 0o700
@@ -884,9 +893,9 @@ def _request_for_case(case: _BehaviorCase) -> ReplayRequest:
 async def _apply_replay_setup(
     tools: ToolService,
     setup: EmptyReplaySetup | DocumentReplaySetup | RenderReplaySetup,
-) -> None:
+) -> str | None:
     if isinstance(setup, EmptyReplaySetup):
-        return
+        return None
     downloaded = await tools.call(
         "download_document_file",
         {"handle": setup.handle, "bitstream_id": setup.bitstream_id},
@@ -897,26 +906,72 @@ async def _apply_replay_setup(
     if downloaded.artifact_id != setup.artifact_id:
         msg = "document setup did not reproduce the exact frozen artifact ID"
         raise BaselineCaptureError(msg)
-    if isinstance(setup, RenderReplaySetup):
-        rendered = await tools.call(
-            "render_pdf_pages",
-            {
-                "artifact_id": setup.artifact_id,
-                "pages": list(setup.pages),
-                "mode": setup.mode,
-            },
+    if not isinstance(setup, RenderReplaySetup):
+        return None
+    rendered = await tools.call(
+        "render_pdf_pages",
+        {
+            "artifact_id": setup.artifact_id,
+            "pages": list(setup.pages),
+            "mode": setup.mode,
+        },
+    )
+    if not isinstance(rendered, RenderPagesOutput):
+        msg = "render setup returned the wrong strict output model"
+        raise BaselineCaptureError(msg)
+    expected_render_id = render_identifier(
+        RenderIdentityRequest(
+            source_sha256=rendered.source_sha256,
+            pages=setup.pages,
+            mode=setup.mode,
+            renderer_version=rendered.renderer_version,
+            fallback_dpi=DEFAULT_FALLBACK_DPI,
         )
-        if not isinstance(rendered, RenderPagesOutput):
-            msg = "render setup returned the wrong strict output model"
-            raise BaselineCaptureError(msg)
-        if rendered.render_id != setup.render_id:
-            msg = "render setup did not reproduce the exact frozen render ID"
-            raise BaselineCaptureError(msg)
+    )
+    if rendered.render_id != expected_render_id:
+        msg = "render setup did not reproduce the current version-bound identity"
+        raise BaselineCaptureError(msg)
+    return rendered.render_id
+
+
+def _case_for_live_render(
+    case: _BehaviorCase,
+    live_render_id: str | None,
+) -> _BehaviorCase:
+    """Substitute only the reviewed frozen render identifier for live execution."""
+    if live_render_id is None:
+        return case
+    params = cast(
+        "ReplayJsonObject",
+        json.loads(
+            json.dumps(
+                case.params,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        ),
+    )
+    arguments = params.get("arguments")
+    if isinstance(arguments, dict) and arguments.get("render_id") == FIXED_RENDER_ID:
+        arguments["render_id"] = live_render_id
+    uri = params.get("uri")
+    if isinstance(uri, str):
+        params["uri"] = uri.replace(FIXED_RENDER_ID, live_render_id)
+    name_header = (
+        case.name_header.replace(FIXED_RENDER_ID, live_render_id)
+        if case.name_header is not None
+        else None
+    )
+    return replace(case, params=params, name_header=name_header)
 
 
 def _validate_setup_allocation(
     root: Path,
     setup: EmptyReplaySetup | DocumentReplaySetup | RenderReplaySetup,
+    *,
+    live_render_id: str | None = None,
 ) -> None:
     expected = {".staging", "documents", "fixture-source.pdf", "renders"}
     if isinstance(setup, (DocumentReplaySetup, RenderReplaySetup)):
@@ -927,19 +982,25 @@ def _validate_setup_allocation(
             }
         )
     if isinstance(setup, RenderReplaySetup):
+        if live_render_id is None:
+            msg = "render setup omitted its live version-bound identity"
+            raise BaselineCaptureError(msg)
         expected.update(
             {
-                f"renders/{setup.render_id}",
-                f"renders/{setup.render_id}/manifest.json",
-                f"renders/{setup.render_id}/page-0001.jpg",
-                f"renders/{setup.render_id}/resources",
-                f"renders/{setup.render_id}/resources/{FIXED_PAGE_ARTIFACT_ID}",
+                f"renders/{live_render_id}",
+                f"renders/{live_render_id}/manifest.json",
+                f"renders/{live_render_id}/page-0001.jpg",
+                f"renders/{live_render_id}/resources",
+                f"renders/{live_render_id}/resources/{FIXED_PAGE_ARTIFACT_ID}",
                 (
-                    f"renders/{setup.render_id}/resources/"
+                    f"renders/{live_render_id}/resources/"
                     f"{FIXED_PAGE_ARTIFACT_ID}/index.json"
                 ),
             }
         )
+    elif live_render_id is not None:
+        msg = "non-render replay setup returned a render identity"
+        raise BaselineCaptureError(msg)
     actual = {path.relative_to(root).as_posix() for path in root.rglob("*")}
     if actual != expected:
         msg = "replay setup allocated an unexpected file or directory"
@@ -1117,8 +1178,13 @@ async def capture_behavior_matrix(
         elif candidate_catalog_bytes != catalog_bytes:
             msg = "tool catalog changed between fresh replay services"
             raise BaselineCaptureError(msg)
-        await _apply_replay_setup(tools, case.setup)
-        await asyncio.to_thread(_validate_setup_allocation, root, case.setup)
+        live_render_id = await _apply_replay_setup(tools, case.setup)
+        await asyncio.to_thread(
+            _validate_setup_allocation,
+            root,
+            case.setup,
+            live_render_id=live_render_id,
+        )
     return fixtures
 
 
@@ -1326,12 +1392,183 @@ def _normalize_render_collection(
         _ = item.pop("resource_uri", None)
 
 
+def _replace_json_string_token(
+    value: ReplayJsonValue,
+    *,
+    old: str,
+    new: str,
+) -> ReplayJsonValue:
+    """Replace one already validated identity token in a closed JSON value."""
+    if isinstance(value, str):
+        return value.replace(old, new)
+    if isinstance(value, list):
+        return [_replace_json_string_token(item, old=old, new=new) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _replace_json_string_token(item, old=old, new=new)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _replace_render_identifier(
+    value: ReplayJsonValue,
+    *,
+    render_id: str,
+) -> ReplayJsonValue:
+    """Map only the version-derived render identifier back to the frozen oracle."""
+    return _replace_json_string_token(
+        value,
+        old=render_id,
+        new=FIXED_RENDER_ID,
+    )
+
+
+def _normalize_tool_render_identity(
+    copied: ReplayJsonObject,
+    *,
+    name: object,
+    live: bool,
+    expected_live_render_id: str | None,
+) -> ReplayJsonObject:
+    """Validate current/frozen render IDs, then normalize only that identity."""
+    if name not in {
+        "get_render_manifest",
+        "render_pdf_page_tiles",
+        "render_pdf_pages",
+    }:
+        return copied
+    render_id = copied.get("render_id")
+    if not isinstance(render_id, str):
+        msg = "render result omitted its strict identity"
+        raise BaselineCaptureError(msg)
+    if live:
+        expected = expected_live_render_id or _render_identity_from_result(copied)
+        if render_id != expected:
+            msg = "live render result changed its version-bound identity"
+            raise BaselineCaptureError(msg)
+    elif render_id != FIXED_RENDER_ID:
+        msg = "frozen render oracle changed its reviewed identity"
+        raise BaselineCaptureError(msg)
+    normalized = _replace_render_identifier(copied, render_id=render_id)
+    if not isinstance(normalized, dict):
+        msg = "normalized render result is not an object"
+        raise BaselineCaptureError(msg)
+    return normalized
+
+
+def _render_identity_from_result(copied: ReplayJsonObject) -> str:
+    """Recompute one page-render identity from its strict public result fields."""
+    pages = copied.get("pages")
+    source_sha256 = copied.get("source_sha256")
+    mode = copied.get("mode")
+    renderer_version = copied.get("renderer_version")
+    if (
+        not isinstance(pages, list)
+        or not isinstance(source_sha256, str)
+        or mode != "native"
+        or not isinstance(renderer_version, str)
+    ):
+        msg = "live render result cannot establish its version-bound identity"
+        raise BaselineCaptureError(msg)
+    try:
+        page_numbers = _page_numbers_from_render_pages(pages)
+        return render_identifier(
+            RenderIdentityRequest(
+                source_sha256=source_sha256,
+                pages=page_numbers,
+                mode="native",
+                renderer_version=renderer_version,
+                fallback_dpi=DEFAULT_FALLBACK_DPI,
+            )
+        )
+    except (TypeError, ValidationError, ValueError) as exc:
+        msg = "live render result has an invalid identity input"
+        raise BaselineCaptureError(msg) from exc
+
+
+def _page_numbers_from_render_pages(
+    pages: list[ReplayJsonValue],
+) -> tuple[int, ...]:
+    """Extract a non-coerced page-number tuple from closed render records."""
+    page_numbers: list[int] = []
+    for page in pages:
+        if not isinstance(page, dict):
+            msg = "render page record is not an object"
+            raise TypeError(msg)
+        page_number = page.get("page_number")
+        if type(page_number) is not int:
+            msg = "render page number is not an integer"
+            raise ValueError(msg)
+        page_numbers.append(page_number)
+    return tuple(page_numbers)
+
+
+def _normalize_tile_geometry_identity(
+    copied: ReplayJsonObject,
+    *,
+    live: bool,
+) -> ReplayJsonObject:
+    """Validate the versioned tile geometry key and map it to frozen v1 form."""
+    width = copied.get("tile_width")
+    height = copied.get("tile_height")
+    overlap = copied.get("overlap")
+    if type(width) is not int or type(height) is not int or type(overlap) is not int:
+        msg = "tile result omitted its strict geometry"
+        raise BaselineCaptureError(msg)
+    current_geometry = tile_geometry_identifier(
+        TileGeometryRequest(
+            width=width,
+            height=height,
+            overlap=overlap,
+        )
+    )
+    frozen_geometry = f"w{width:04d}-h{height:04d}-o{overlap:03d}"
+    expected_geometry = current_geometry if live else frozen_geometry
+    manifest_relative_path = copied.get("manifest_relative_path")
+    tiles = copied.get("tiles")
+    if (
+        not isinstance(manifest_relative_path, str)
+        or f"/{expected_geometry}/manifest.json" not in manifest_relative_path
+        or not isinstance(tiles, list)
+        or not tiles
+    ):
+        msg = "tile result has an invalid geometry-bound manifest path"
+        raise BaselineCaptureError(msg)
+    for tile in tiles:
+        if not isinstance(tile, dict):
+            msg = "tile result contains an invalid tile record"
+            raise BaselineCaptureError(msg)
+        tile_id = tile.get("tile_id")
+        relative_path = tile.get("relative_path")
+        if (
+            not isinstance(tile_id, str)
+            or expected_geometry not in tile_id
+            or not isinstance(relative_path, str)
+            or f"/{expected_geometry}/" not in relative_path
+        ):
+            msg = "tile result has an invalid geometry-bound tile identity"
+            raise BaselineCaptureError(msg)
+    if not live:
+        return copied
+    normalized = _replace_json_string_token(
+        copied,
+        old=current_geometry,
+        new=frozen_geometry,
+    )
+    if not isinstance(normalized, dict):
+        msg = "normalized tile result is not an object"
+        raise BaselineCaptureError(msg)
+    return normalized
+
+
 def _replay_tool_result(
     case: _BehaviorCase,
     value: object,
     *,
     live: bool,
     expected_tile_manifest_uri: str | None = None,
+    expected_live_render_id: str | None = None,
 ) -> ReplayJsonObject:
     normalized = normalize_tool_result(value)
     copied_value = cast(
@@ -1374,7 +1611,15 @@ def _replay_tool_result(
             raise BaselineCaptureError(msg)
         _ = copied.pop("resource_uri", None)
     _normalize_render_collection(copied, collection_key, live=live)
-    return copied
+    normalized_render = _normalize_tool_render_identity(
+        copied,
+        name=name,
+        live=live,
+        expected_live_render_id=expected_live_render_id,
+    )
+    if name == "render_pdf_page_tiles":
+        return _normalize_tile_geometry_identity(normalized_render, live=live)
+    return normalized_render
 
 
 def _persisted_tile_manifest_uri(tools: ToolService, value: object) -> str:
@@ -1539,13 +1784,13 @@ def _matches_artifact_resource(
 def _normalized_render_pages(
     live_pages: object,
     frozen_pages: object,
-) -> tuple[list[object], list[object]] | None:
+) -> tuple[list[ReplayJsonValue], list[ReplayJsonValue]] | None:
     if not isinstance(live_pages, list) or not isinstance(frozen_pages, list):
         return None
     typed_live_pages = cast("list[object]", live_pages)
     typed_frozen_pages = cast("list[object]", frozen_pages)
-    normalized_live: list[object] = []
-    normalized_frozen: list[object] = []
+    normalized_live: list[ReplayJsonValue] = []
+    normalized_frozen: list[ReplayJsonValue] = []
     for live_page, frozen_page in zip(
         typed_live_pages,
         typed_frozen_pages,
@@ -1597,11 +1842,39 @@ def _matches_render_resource(
     )
     if not isinstance(live_manifest, dict) or not isinstance(frozen_manifest, dict):
         return False
+    live_render_id = live_manifest.get("render_id")
+    frozen_render_id = frozen_manifest.get("render_id")
+    live_pages = live_manifest.get("pages")
+    source_sha256 = live_manifest.get("source_sha256")
+    mode = live_manifest.get("mode")
+    renderer_version = live_manifest.get("renderer_version")
+    if (
+        not isinstance(live_render_id, str)
+        or frozen_render_id != FIXED_RENDER_ID
+        or not isinstance(live_pages, list)
+        or not isinstance(source_sha256, str)
+        or mode != "native"
+        or not isinstance(renderer_version, str)
+    ):
+        return False
+    try:
+        page_numbers = _page_numbers_from_render_pages(live_pages)
+        expected_live_render_id = render_identifier(
+            RenderIdentityRequest(
+                source_sha256=source_sha256,
+                pages=page_numbers,
+                mode="native",
+                renderer_version=renderer_version,
+                fallback_dpi=DEFAULT_FALLBACK_DPI,
+            )
+        )
+    except (TypeError, ValidationError, ValueError):
+        return False
     pages = _normalized_render_pages(
-        live_manifest.get("pages"),
+        live_pages,
         frozen_manifest.get("pages"),
     )
-    if pages is None:
+    if live_render_id != expected_live_render_id or pages is None:
         return False
     manifest_keys = {
         "manifest_relative_path",
@@ -1611,12 +1884,26 @@ def _matches_render_resource(
         "resource_uri",
         "source_sha256",
     }
+    normalized_live_manifest = _replace_render_identifier(
+        {key: live_manifest.get(key) for key in manifest_keys},
+        render_id=live_render_id,
+    )
+    normalized_live_pages = _replace_render_identifier(
+        pages[0],
+        render_id=live_render_id,
+    )
+    live_uri = live_content.get("uri")
+    normalized_live_uri = (
+        live_uri.replace(live_render_id, FIXED_RENDER_ID)
+        if isinstance(live_uri, str)
+        else None
+    )
     return (
-        live_content.get("uri") == frozen_content.get("uri")
+        normalized_live_uri == frozen_content.get("uri")
         and live_content.get("mimeType") == frozen_content.get("mimeType")
-        and {key: live_manifest.get(key) for key in manifest_keys}
+        and normalized_live_manifest
         == {key: frozen_manifest.get(key) for key in manifest_keys}
-        and pages[0] == pages[1]
+        and normalized_live_pages == pages[1]
     )
 
 
@@ -1683,6 +1970,142 @@ def _matches_discover(live_result: object, frozen: ReplayJsonObject) -> bool:
     )
 
 
+def _render_id_argument(case: _BehaviorCase) -> str | None:
+    """Return the already validated render-id argument of one closed case."""
+    arguments = case.params.get("arguments")
+    render_id = arguments.get("render_id") if isinstance(arguments, dict) else None
+    return render_id if isinstance(render_id, str) else None
+
+
+def _tool_error_structured_content(
+    value: object,
+    *,
+    live: bool,
+) -> ReplayJsonObject | None:
+    normalizable_value = value
+    if live:
+        envelope = _sdk_object(value, context="tool error result")
+    elif isinstance(value, dict):
+        envelope = cast("ReplayJsonObject", value)
+    else:
+        return None
+    if envelope.get("isError") is not True:
+        return None
+    try:
+        return normalize_tool_result(normalizable_value)
+    except ValueError:
+        return None
+
+
+def _public_tool_error(
+    structured: ReplayJsonObject,
+    *,
+    live: bool,
+) -> ReplayJsonObject | None:
+    """Select the sole public error object from a historical or live result."""
+    nested = structured.get("error")
+    if live or nested is not None:
+        if set(structured) != {"error"} or not isinstance(nested, dict):
+            return None
+        return nested
+    return structured
+
+
+def _normalized_tool_error(
+    value: object,
+    *,
+    live: bool,
+) -> ReplayJsonObject | None:
+    structured = _tool_error_structured_content(value, live=live)
+    if structured is None:
+        return None
+    public_error = _public_tool_error(structured, live=live)
+    if public_error is None:
+        return None
+    if not {"code", "message"}.issubset(public_error) or not set(public_error).issubset(
+        {"code", "message", "details"}
+    ):
+        return None
+    if not isinstance(public_error.get("code"), str) or not isinstance(
+        public_error.get("message"), str
+    ):
+        return None
+    details = public_error.get("details")
+    if details is not None and not isinstance(details, dict):
+        return None
+    return public_error
+
+
+def _case_tool_fields(case: _BehaviorCase) -> frozenset[str] | None:
+    name = case.params.get("name")
+    if not isinstance(name, str):
+        return None
+    for binding in tool_model_bindings():
+        if binding.name == name:
+            fields = set(binding.input_model.model_fields)
+            fields.update(
+                field.alias
+                for field in binding.input_model.model_fields.values()
+                if field.alias is not None
+            )
+            return frozenset(fields)
+    return None
+
+
+def _strict_error_projection(
+    case: _BehaviorCase,
+    public_error: ReplayJsonObject | None,
+    *,
+    live: bool,
+) -> tuple[str, str, tuple[str, ...]] | None:
+    if public_error is None:
+        return None
+    code = public_error.get("code")
+    message = public_error.get("message")
+    details = public_error.get("details")
+    known_fields = _case_tool_fields(case)
+    if (
+        not isinstance(code, str)
+        or not isinstance(message, str)
+        or not isinstance(details, dict)
+        or known_fields is None
+    ):
+        return None
+    raw_locations: object
+    safe_shape = live or "locations" in details
+    if safe_shape:
+        raw_locations = details.get("locations")
+    else:
+        validation = details.get("validation")
+        if not isinstance(validation, list):
+            return None
+        raw_locations = [
+            item.get("location") if isinstance(item, dict) else None
+            for item in validation
+        ]
+    if (
+        not isinstance(raw_locations, list)
+        or not 1 <= len(raw_locations) <= MAX_REPLAY_ERROR_LOCATIONS
+        or any(not isinstance(location, str) for location in raw_locations)
+    ):
+        return None
+    locations: list[str] = []
+    for raw_location in cast("list[str]", raw_locations):
+        top_level_location = (
+            raw_location if safe_shape else raw_location.partition(".")[0]
+        )
+        location = (
+            top_level_location
+            if top_level_location in known_fields or top_level_location == "arguments"
+            else "arguments"
+        )
+        if location not in locations:
+            locations.append(location)
+    if safe_shape and len(locations) != len(raw_locations):
+        return None
+    return code, message, tuple(locations)
+
+
 def _matches_live_sdk_case(
     case: _BehaviorCase,
     live_result: object,
@@ -1690,20 +2113,44 @@ def _matches_live_sdk_case(
     frozen_result: ReplayJsonObject,
     frozen_error: ReplayJsonObject | None,
 ) -> bool:
+    expected_live_render_id = _render_id_argument(case)
     if case.outcome == "tool-success":
         matches = live_error is None and _replay_tool_result(
             case,
             live_result,
             live=True,
+            expected_live_render_id=expected_live_render_id,
         ) == _replay_tool_result(case, frozen_result, live=False)
-    elif case.outcome == "strict-error":
-        matches = live_error is not None and normalize_public_error(live_error) == {
-            "code": -32602
-        }
-    elif case.outcome == "app-error":
-        matches = live_error is not None and normalize_public_error(live_error) == {
-            "code": JSONRPC_INTERNAL_ERROR
-        }
+    elif case.outcome in {"strict-error", "app-error"}:
+        expected_code = (
+            "INVALID_INPUT" if case.outcome == "strict-error" else "UPSTREAM_FAILURE"
+        )
+        live_public_error = _normalized_tool_error(live_result, live=True)
+        frozen_public_error = _normalized_tool_error(frozen_result, live=False)
+        if case.outcome == "strict-error":
+            live_projection = _strict_error_projection(
+                case,
+                live_public_error,
+                live=True,
+            )
+            frozen_projection = _strict_error_projection(
+                case,
+                frozen_public_error,
+                live=False,
+            )
+            matches = (
+                live_error is None
+                and live_projection is not None
+                and live_projection[0] == expected_code
+                and live_projection == frozen_projection
+            )
+        else:
+            matches = (
+                live_error is None
+                and live_public_error is not None
+                and live_public_error.get("code") == expected_code
+                and live_public_error == frozen_public_error
+            )
     elif case.outcome == "generic-error":
         matches = (
             live_error is not None
@@ -1736,6 +2183,8 @@ async def _verify_live_official_sdk_oracle(
     server: Server[None],
     frozen_oracle: ReplayJsonObject,
     tools: ToolService,
+    *,
+    live_render_id: str | None,
 ) -> None:
     """Execute one semantically equivalent official-SDK case before comparison."""
     is_error_case = case.outcome in {"generic-error", "protocol-error"}
@@ -1751,7 +2200,8 @@ async def _verify_live_official_sdk_oracle(
         )
     else:
         frozen_result = {} if is_error_case else frozen_oracle
-        live_result, client_error = await _execute_live_sdk_case(case, server)
+        live_case = _case_for_live_render(case, live_render_id)
+        live_result, client_error = await _execute_live_sdk_case(live_case, server)
         expected_tile_manifest_uri = (
             _persisted_tile_manifest_uri(tools, live_result)
             if case.outcome == "tool-success"
@@ -1765,9 +2215,10 @@ async def _verify_live_official_sdk_oracle(
                     live_result,
                     live=True,
                     expected_tile_manifest_uri=expected_tile_manifest_uri,
+                    expected_live_render_id=live_render_id,
                 )
             matches = _matches_live_sdk_case(
-                case,
+                live_case,
                 live_result,
                 client_error,
                 frozen_result,
@@ -1817,8 +2268,13 @@ async def _verify_replay_case(
     ):
         msg = "tool catalog changed between replay services"
         raise BaselineCaptureError(msg)
-    await _apply_replay_setup(tools, case.setup)
-    await asyncio.to_thread(_validate_setup_allocation, root, case.setup)
+    live_render_id = await _apply_replay_setup(tools, case.setup)
+    await asyncio.to_thread(
+        _validate_setup_allocation,
+        root,
+        case.setup,
+        live_render_id=live_render_id,
+    )
     frozen = _load_frozen_fixtures()
     frozen_record = _validated_fixture_record(
         case,
@@ -1831,7 +2287,13 @@ async def _verify_replay_case(
     )
     services = FullServiceComposition(tools=tools, store=tools.store)
     server = create_mcp_server(services, DeploymentProfile.PRIVATE_FULL)
-    await _verify_live_official_sdk_oracle(case, server, frozen_oracle, tools)
+    await _verify_live_official_sdk_oracle(
+        case,
+        server,
+        frozen_oracle,
+        tools,
+        live_render_id=live_render_id,
+    )
     _require_expected_response(case, record.expected, frozen_record.expected)
     return live_catalog_bytes
 

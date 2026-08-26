@@ -561,6 +561,117 @@ def test_live_case_matcher_executes_default_protocol_comparison() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("outcome", "code"),
+    [("strict-error", "INVALID_INPUT"), ("app-error", "UPSTREAM_FAILURE")],
+)
+def test_live_case_matcher_normalizes_actionable_tool_error_envelopes(
+    outcome: str,
+    code: str,
+) -> None:
+    case = _replay_case(outcome)
+    public_error: JsonObject = {
+        "code": code,
+        "message": "Bounded public failure.",
+    }
+    historical_error = public_error.copy()
+    if outcome == "strict-error":
+        public_error["details"] = {"locations": ["arguments"]}
+        historical_error["details"] = {
+            "validation": [
+                {
+                    "location": "unexpected",
+                    "message": "Extra inputs are not permitted",
+                    "type": "extra_forbidden",
+                }
+            ]
+        }
+    live = _SdkProjection(
+        {
+            "isError": True,
+            "structuredContent": {"error": public_error},
+        }
+    )
+    historical: JsonObject = {
+        "isError": True,
+        "structuredContent": historical_error,
+    }
+    current: JsonObject = {
+        "isError": True,
+        "structuredContent": {"error": public_error},
+    }
+
+    assert (
+        _PRIVATE_REPLAY_CALLS["_matches_live_sdk_case"](
+            case,
+            live,
+            None,
+            historical,
+            None,
+        )
+        is True
+    )
+    assert (
+        _PRIVATE_REPLAY_CALLS["_matches_live_sdk_case"](
+            case,
+            live,
+            None,
+            current,
+            None,
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "structured",
+    [
+        {"code": "INVALID_INPUT", "message": "flat-live-mutant"},
+        {"error": {"code": "OTHER", "message": "wrong-code"}},
+        {
+            "error": {"code": "INVALID_INPUT", "message": "extra-wrapper"},
+            "extra": {},
+        },
+        {"error": {"code": "INVALID_INPUT"}},
+    ],
+)
+def test_live_case_matcher_rejects_malformed_actionable_tool_errors(
+    structured: JsonObject,
+) -> None:
+    case = _replay_case("strict-error")
+    frozen_error: JsonObject = {
+        "code": "INVALID_INPUT",
+        "message": "Bounded public failure.",
+    }
+    live = _SdkProjection(
+        {
+            "isError": True,
+            "structuredContent": structured,
+        }
+    )
+
+    assert (
+        _PRIVATE_REPLAY_CALLS["_matches_live_sdk_case"](
+            case,
+            live,
+            None,
+            {"isError": True, "structuredContent": frozen_error},
+            None,
+        )
+        is False
+    )
+    assert (
+        _PRIVATE_REPLAY_CALLS["_matches_live_sdk_case"](
+            case,
+            live,
+            {"code": -32603},
+            {"isError": True, "structuredContent": frozen_error},
+            None,
+        )
+        is False
+    )
+
+
 INCLUDED_UNTRACKED_PATHS: baseline_capture_io.IncludedUntrackedPaths = (
     "contracts/zod/asvs-evidence-contracts.mjs",
     "contracts/zod/baseline-contracts.mjs",
@@ -2852,7 +2963,6 @@ def test_every_frozen_case_contains_an_executable_replay_record() -> None:
             )
 
 
-@pytest.mark.live
 def test_capture_check_mode_fails_closed_until_attestation_without_rewriting() -> None:
     before = {
         path.name: (path.stat().st_mtime_ns, path.read_bytes())
@@ -4394,7 +4504,6 @@ def test_capture_main_dispatches_explicit_write_mode(
     assert observed == [Path(capture_baseline.__file__).resolve().parents[1]]
 
 
-@pytest.mark.live
 def test_historical_capture_rejects_a_non_recovery_head_without_writes() -> None:
     repository = Path(__file__).resolve().parents[2]
     before = baseline_bytes_from(repository / "contracts" / "baseline")
@@ -4415,7 +4524,6 @@ def test_historical_capture_rejects_a_non_recovery_head_without_writes() -> None
     assert baseline_bytes_from(repository / "contracts" / "baseline") == before
 
 
-@pytest.mark.live
 def test_rejected_historical_capture_does_not_freshen_git_metadata() -> None:
     repository = Path(__file__).resolve().parents[2]
     before = git_object_metadata_inventory(repository)
@@ -4434,6 +4542,23 @@ def test_rejected_historical_capture_does_not_freshen_git_metadata() -> None:
         pass
 
     assert git_object_metadata_inventory(repository) == before
+
+
+@pytest.mark.parametrize(
+    "test_case",
+    [
+        test_capture_check_mode_fails_closed_until_attestation_without_rewriting,
+        test_historical_capture_rejects_a_non_recovery_head_without_writes,
+        test_rejected_historical_capture_does_not_freshen_git_metadata,
+    ],
+)
+def test_local_baseline_invariants_are_deterministic(
+    test_case: Callable[[], None],
+) -> None:
+    """Local Git/filesystem checks must remain in the candidate-bound suite."""
+    markers = cast("tuple[pytest.Mark, ...]", getattr(test_case, "pytestmark", ()))
+
+    assert all(marker.name != "live" for marker in markers)
 
 
 def test_check_capture_uses_a_complete_private_object_store_without_alternates(
@@ -5934,7 +6059,7 @@ EXPECTED_TASK1_SUPPRESSIONS = (
     ),
     SuppressionOccurrence(
         path="tests/contracts/test_frozen_baseline.py",
-        line=887,
+        line=998,
         rationale=(
             (
                 "# Security rationale: GIT_EXECUTABLE is absolute; fixed "
@@ -5950,7 +6075,7 @@ EXPECTED_TASK1_SUPPRESSIONS = (
     ),
     SuppressionOccurrence(
         path="tests/contracts/test_frozen_baseline.py",
-        line=4186,
+        line=4296,
         rationale=(
             (
                 "# Security rationale: sys.executable launches only the "

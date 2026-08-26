@@ -12,7 +12,8 @@ import json
 import re
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Annotated, Literal, cast
+from urllib.parse import urlsplit
 
 import httpx
 import mcp.types as mcp_types
@@ -26,7 +27,9 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    TypeAdapter,
     ValidationInfo,
+    field_validator,
     model_validator,
 )
 
@@ -64,6 +67,48 @@ _SDK_REASON = (
 _ALPIC_PROVENANCE = (
     "Alpic public documentation summary; no versioned raw detector fixture or "
     "immutable response transcript was published for this review."
+)
+_ALPIC_TASKS_PROVENANCE = (
+    "Alpic documents a separate long-running Tasks compute path with a default "
+    "TTL of up to six hours; the official Python SDK roadmap defers SEP-2663 "
+    "Tasks from mcp 2.0.0. No authorized Alpic task conformance probe exists."
+)
+_ALPIC_TASKS_BLOCKERS = (
+    "MCP_TASKS_REVISION_UNFROZEN",
+    "PYTHON_SDK_TASKS_EXTENSION_UNAVAILABLE",
+    "PYTHON_SDK_TASKS_CLIENT_UNAVAILABLE",
+    "ALPIC_TASKS_PYTHON_INTEGRATION_UNPROVEN",
+    "ALPIC_TASK_CREATION_DURABILITY_UNPROVEN",
+    "ALPIC_TASK_RESTART_RECOVERY_UNPROVEN",
+    "ALPIC_TASK_CANCELLATION_UNPROVEN",
+    "ALPIC_TASK_ISOLATION_UNPROVEN",
+    "ALPIC_TASK_RETENTION_UNPROVEN",
+    "ALPIC_TASK_ARTIFACT_DELIVERY_UNPROVEN",
+    "ALPIC_TASK_CLIENT_SUPPORT_UNPROVEN",
+)
+_TASKS_REVIEWED_DATE = "2026-08-24"
+_ALPIC_TASKS_SOURCE_EVIDENCE_DIGEST = (
+    "67dadaf3dee652e1f1f63dd26b3031043badffc64af4cf9c168090c422673a1b"
+)
+_ALPIC_TASKS_SOURCE_REQUIREMENTS = (
+    (
+        "alpic_tasks_docs",
+        "https://docs.alpic.ai/troubleshooting",
+        "tasks_compute_advertised",
+    ),
+    (
+        "python_sdk_roadmap",
+        (
+            "https://raw.githubusercontent.com/modelcontextprotocol/python-sdk/"
+            "959569ba1505897bd8d824a1bf22800672f7cf14/ROADMAP.md"
+        ),
+        "sdk_tasks_deferred",
+    ),
+    (
+        "mcp_tasks_spec",
+        "https://tasks.extensions.modelcontextprotocol.io/specification/draft/tasks",
+        "tasks_extension_draft",
+    ),
 )
 _LOCKED_MCP_ARTIFACT_SHA256S = (
     "0f440e735c13ece8bb19bc62cf0b86f4313448432fbb77d35e14034f4e050728",
@@ -122,6 +167,23 @@ HeaderValue = Annotated[
 ReviewDate = Annotated[
     str,
     StringConstraints(pattern=r"^20[0-9]{2}-[0-9]{2}-[0-9]{2}$", strict=True),
+]
+PackageVersion = Annotated[
+    str,
+    StringConstraints(
+        pattern=(
+            r"^[0-9]{1,10}\.[0-9]{1,10}\.[0-9]{1,10}"
+            r"(?:[a-z][a-z0-9.-]{0,31})?$"
+        ),
+        strict=True,
+    ),
+]
+UtcTimestamp = Annotated[
+    str,
+    StringConstraints(
+        pattern=r"^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+        strict=True,
+    ),
 ]
 
 
@@ -706,19 +768,331 @@ class OAuthProviderCapabilityVerdict(_DigestModel):
                 "or evidence"
             )
             raise ValueError(msg)
-        if (
-            not self.supported
-            and "OAUTH_PROVIDER_CAPABILITY_UNPROVEN" not in self.blockers
+        if not self.supported and self.registration_modes != ("dcr",):
+            msg = "the selected Auth0/Alpic topology requires DCR registration"
+            raise ValueError(msg)
+        if not self.supported and self.blockers != (
+            "OAUTH_PROVIDER_CAPABILITY_UNPROVEN",
+            "ALPIC_DCR_ISSUER_SEMANTICS_UNPROVEN",
+            "OAUTH_END_TO_END_FLOW_UNPROVEN",
         ):
             msg = (
-                "an unselected provider must preserve "
-                "OAUTH_PROVIDER_CAPABILITY_UNPROVEN"
+                "an unselected provider must preserve every selected Auth0/Alpic "
+                "DCR blocker; must preserve OAUTH_PROVIDER_CAPABILITY_UNPROVEN"
             )
             raise ValueError(msg)
         return self
 
 
-ModelT = TypeVar("ModelT", bound=_DigestModel)
+TaskSdkSupport = Literal["unsupported", "supported"]
+TasksRevisionState = Literal["draft", "stable"]
+TasksProviderState = Literal["not_assessed", "proven", "unsupported"]
+AlpicTasksSourceId = Literal[
+    "alpic_tasks_docs",
+    "python_sdk_roadmap",
+    "mcp_tasks_spec",
+]
+AlpicTasksSourceObservation = Literal[
+    "tasks_compute_advertised",
+    "sdk_tasks_deferred",
+    "tasks_extension_draft",
+]
+AlpicTasksBlocker = Literal[
+    "MCP_TASKS_REVISION_UNFROZEN",
+    "PYTHON_SDK_TASKS_EXTENSION_UNAVAILABLE",
+    "PYTHON_SDK_TASKS_CLIENT_UNAVAILABLE",
+    "ALPIC_TASKS_PYTHON_INTEGRATION_UNPROVEN",
+    "ALPIC_TASK_CREATION_DURABILITY_UNPROVEN",
+    "ALPIC_TASK_RESTART_RECOVERY_UNPROVEN",
+    "ALPIC_TASK_CANCELLATION_UNPROVEN",
+    "ALPIC_TASK_ISOLATION_UNPROVEN",
+    "ALPIC_TASK_RETENTION_UNPROVEN",
+    "ALPIC_TASK_ARTIFACT_DELIVERY_UNPROVEN",
+    "ALPIC_TASK_CLIENT_SUPPORT_UNPROVEN",
+]
+EvidenceIdentity = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$",
+        strict=True,
+    ),
+]
+
+
+def _canonical_negative_alpic_tasks_blockers(
+    *,
+    extension_revision_state: TasksRevisionState,
+    sdk_server_support: TaskSdkSupport,
+    sdk_client_support: TaskSdkSupport,
+    provider_states: tuple[tuple[TasksProviderState, AlpicTasksBlocker], ...],
+) -> tuple[AlpicTasksBlocker, ...]:
+    """Derive the exact ordered blockers implied by one negative state."""
+    required: set[AlpicTasksBlocker] = {
+        blocker for state, blocker in provider_states if state != "proven"
+    }
+    if extension_revision_state != "stable":
+        required.add("MCP_TASKS_REVISION_UNFROZEN")
+    if sdk_server_support != "supported":
+        required.add("PYTHON_SDK_TASKS_EXTENSION_UNAVAILABLE")
+    if sdk_client_support != "supported":
+        required.add("PYTHON_SDK_TASKS_CLIENT_UNAVAILABLE")
+    return tuple(blocker for blocker in _ALPIC_TASKS_BLOCKERS if blocker in required)
+
+
+class AlpicTasksSourceRecord(_StrictModel):
+    """A bounded digest-only capture of one allowlisted primary source."""
+
+    source_id: AlpicTasksSourceId
+    url: NonEmpty
+    final_url: NonEmpty
+    retrieved_at: UtcTimestamp
+    status_code: Literal[200]
+    media_type: Literal["text/html", "text/plain"]
+    content_length_bytes: int = Field(ge=1, le=1_048_576)
+    content_sha256: Sha256
+    observation: AlpicTasksSourceObservation
+
+    @field_validator("url", "final_url")
+    @classmethod
+    def _require_allowlisted_https_url(cls, value: str) -> str:
+        """Reject credentials, redirects, and ambiguous source locations."""
+        try:
+            parsed = urlsplit(value)
+        except ValueError as error:
+            msg = "Alpic Tasks source URL is malformed"
+            raise ValueError(msg) from error
+        if (
+            parsed.scheme != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in (None, 443)
+            or parsed.query
+            or parsed.fragment
+        ):
+            msg = "Alpic Tasks source URL must be credential-free canonical HTTPS"
+            raise ValueError(msg)
+        if parsed.hostname in {"github.com", "raw.githubusercontent.com"} and (
+            parsed.hostname != "raw.githubusercontent.com"
+            or re.fullmatch(
+                r"/modelcontextprotocol/python-sdk/[0-9a-f]{40}/ROADMAP\.md",
+                parsed.path,
+            )
+            is None
+        ):
+            msg = "the Python SDK roadmap URL must name an immutable commit"
+            raise ValueError(msg)
+        return value
+
+
+class AlpicTasksSourceEvidence(_StrictModel):
+    """Canonical source metadata, never a substitute for live provider proof."""
+
+    schema_version: Literal["1.0"]
+    sources: Annotated[
+        tuple[AlpicTasksSourceRecord, ...], Field(min_length=3, max_length=3)
+    ]
+    evidence_digest: Sha256
+
+    @model_validator(mode="after")
+    def _check_source_evidence(self) -> AlpicTasksSourceEvidence:
+        expected = _ALPIC_TASKS_SOURCE_REQUIREMENTS
+        observed = tuple(
+            (source.source_id, source.url, source.observation)
+            for source in self.sources
+        )
+        if observed != expected:
+            msg = (
+                "Alpic Tasks source evidence has an unexpected source, URL, "
+                "or observation"
+            )
+            raise ValueError(msg)
+        if any(source.final_url != source.url for source in self.sources):
+            msg = "Alpic Tasks source evidence must not follow redirects"
+            raise ValueError(msg)
+        if tuple(source.media_type for source in self.sources) != (
+            "text/html",
+            "text/plain",
+            "text/html",
+        ):
+            msg = "Alpic Tasks source evidence has an unexpected media type"
+            raise ValueError(msg)
+        expected_digest = _sha256_json(
+            cast(
+                "dict[str, object]",
+                self.model_dump(mode="json", exclude={"evidence_digest"}),
+            )
+        )
+        if self.evidence_digest != expected_digest:
+            msg = "evidence_digest does not match the canonical source evidence"
+            raise ValueError(msg)
+        return self
+
+
+class _AlpicTasksCapabilityBase(_DigestModel):
+    """Fields shared by both closed Alpic Tasks capability states."""
+
+    schema_version: Literal["1.0"]
+    provider: Literal["alpic"]
+    extension_identifier: Literal["io.modelcontextprotocol/tasks"]
+    installed_sdk_tree_sha256: Sha256
+    provider_tasks_compute: Literal["advertised"]
+    provider_ordinary_timeout_seconds: Literal[30]
+    source_evidence_digest: Sha256
+    documentation_provenance: NonEmpty
+    reviewed_date: ReviewDate
+
+
+class AlpicTasksLiveEvidenceIdentity(_StrictModel):
+    """Digest-only identities required by an authorized positive assessment."""
+
+    environment_id: EvidenceIdentity
+    deployment_id: EvidenceIdentity
+    pack_sha256: Sha256
+    sdk_wheel_sha256: Sha256
+    protocol_revision_sha256: Sha256
+    client_identities_sha256: Sha256
+    evidence_digest: Sha256
+    observed_at: UtcTimestamp
+
+
+class UnsupportedAlpicTasksCapabilityVerdict(_AlpicTasksCapabilityBase):
+    """A strict negative verdict that cannot carry live-evidence identities."""
+
+    extension_revision_state: TasksRevisionState
+    mcp_version: Literal["2.0.0"]
+    mcp_types_version: Literal["2.0.0"]
+    sdk_server_support: TaskSdkSupport
+    sdk_client_support: TaskSdkSupport
+    provider_default_task_ttl_seconds: Literal[21600]
+    provider_integration: TasksProviderState
+    task_creation_durability: TasksProviderState
+    restart_recovery: TasksProviderState
+    cancellation: TasksProviderState
+    isolation: TasksProviderState
+    retention: TasksProviderState
+    artifact_delivery: TasksProviderState
+    client_support: TasksProviderState
+    supported: Literal[False]
+    blockers: Annotated[
+        tuple[AlpicTasksBlocker, ...],
+        Field(min_length=1, max_length=len(_ALPIC_TASKS_BLOCKERS)),
+    ]
+
+    @model_validator(mode="after")
+    def _check_current_negative_state(
+        self,
+    ) -> UnsupportedAlpicTasksCapabilityVerdict:
+        if self.mcp_version != importlib.metadata.version("mcp"):
+            msg = "installed mcp version differs from Alpic Tasks capability record"
+            raise ValueError(msg)
+        if self.mcp_types_version != importlib.metadata.version("mcp-types"):
+            msg = (
+                "installed mcp-types version differs from Alpic Tasks capability record"
+            )
+            raise ValueError(msg)
+        if self.source_evidence_digest != _ALPIC_TASKS_SOURCE_EVIDENCE_DIGEST:
+            msg = "Alpic Tasks verdict is not bound to the reviewed source evidence"
+            raise ValueError(msg)
+        if self.installed_sdk_tree_sha256 != _package_tree_sha256("mcp"):
+            msg = (
+                "installed SDK package tree differs from Alpic Tasks capability record"
+            )
+            raise ValueError(msg)
+        if (
+            self.documentation_provenance != _ALPIC_TASKS_PROVENANCE
+            or self.reviewed_date != _TASKS_REVIEWED_DATE
+        ):
+            msg = "Alpic Tasks provenance differs from the reviewed assessment"
+            raise ValueError(msg)
+        provider_values = (
+            self.provider_integration,
+            self.task_creation_durability,
+            self.restart_recovery,
+            self.cancellation,
+            self.isolation,
+            self.retention,
+            self.artifact_delivery,
+            self.client_support,
+        )
+        if any(state == "proven" for state in provider_values):
+            msg = "unauthorized provider claims require live evidence identities"
+            raise ValueError(msg)
+        provider_states: tuple[tuple[TasksProviderState, AlpicTasksBlocker], ...] = (
+            (
+                self.provider_integration,
+                "ALPIC_TASKS_PYTHON_INTEGRATION_UNPROVEN",
+            ),
+            (
+                self.task_creation_durability,
+                "ALPIC_TASK_CREATION_DURABILITY_UNPROVEN",
+            ),
+            (self.restart_recovery, "ALPIC_TASK_RESTART_RECOVERY_UNPROVEN"),
+            (self.cancellation, "ALPIC_TASK_CANCELLATION_UNPROVEN"),
+            (self.isolation, "ALPIC_TASK_ISOLATION_UNPROVEN"),
+            (self.retention, "ALPIC_TASK_RETENTION_UNPROVEN"),
+            (self.artifact_delivery, "ALPIC_TASK_ARTIFACT_DELIVERY_UNPROVEN"),
+            (self.client_support, "ALPIC_TASK_CLIENT_SUPPORT_UNPROVEN"),
+        )
+        canonical_blockers = _canonical_negative_alpic_tasks_blockers(
+            extension_revision_state=self.extension_revision_state,
+            sdk_server_support=self.sdk_server_support,
+            sdk_client_support=self.sdk_client_support,
+            provider_states=provider_states,
+        )
+        if self.blockers != canonical_blockers:
+            msg = "the negative Alpic Tasks verdict must preserve every blocker"
+            raise ValueError(msg)
+        return self
+
+
+class SupportedAlpicTasksCapabilityVerdict(_AlpicTasksCapabilityBase):
+    """Structurally complete positive branch, inaccessible to operational loading."""
+
+    extension_revision_state: Literal["stable"]
+    mcp_version: PackageVersion
+    mcp_types_version: PackageVersion
+    sdk_server_support: Literal["supported"]
+    sdk_client_support: Literal["supported"]
+    provider_default_task_ttl_seconds: int = Field(strict=True, ge=1, le=21600)
+    provider_integration: Literal["proven"]
+    task_creation_durability: Literal["proven"]
+    restart_recovery: Literal["proven"]
+    cancellation: Literal["proven"]
+    isolation: Literal["proven"]
+    retention: Literal["proven"]
+    artifact_delivery: Literal["proven"]
+    client_support: Literal["proven"]
+    live_evidence: AlpicTasksLiveEvidenceIdentity
+    supported: Literal[True]
+    blockers: Annotated[tuple[AlpicTasksBlocker, ...], Field(max_length=0)]
+
+    @model_validator(mode="after")
+    def _require_protected_operational_validation(
+        self,
+        info: ValidationInfo[dict[str, object] | None],
+    ) -> SupportedAlpicTasksCapabilityVerdict:
+        if (
+            info.context is None
+            or info.context.get("allow_synthetic_tasks_supported") is not True
+        ):
+            msg = (
+                "a supported Alpic Tasks verdict requires protected operational "
+                "validation"
+            )
+            raise ValueError(msg)
+        return self
+
+
+type AlpicTasksCapabilityVerdict = Annotated[
+    UnsupportedAlpicTasksCapabilityVerdict | SupportedAlpicTasksCapabilityVerdict,
+    Field(discriminator="supported"),
+]
+
+_ALPIC_TASKS_VERDICT_ADAPTER: TypeAdapter[AlpicTasksCapabilityVerdict] = TypeAdapter(
+    AlpicTasksCapabilityVerdict
+)
 
 
 def _canonical_bytes(value: Mapping[str, object]) -> bytes:
@@ -739,10 +1113,44 @@ def _model_json(value: BaseModel) -> dict[str, object]:
     return cast("dict[str, object]", value.model_dump(mode="json"))
 
 
-def _finalize[ModelT: _DigestModel](
-    model_type: type[ModelT],
+def canonical_json_sha256(value: Mapping[str, object]) -> str:
+    """Return the SHA-256 digest of a canonical JSON-compatible mapping."""
+    return _sha256_json(value)
+
+
+def canonical_model_json(value: BaseModel) -> dict[str, object]:
+    """Return a JSON-compatible Pydantic payload with no untyped values."""
+    return _model_json(value)
+
+
+def validate_alpic_tasks_verdict_json(
+    raw: str | bytes,
+) -> AlpicTasksCapabilityVerdict:
+    """Validate an operational Alpic Tasks union record from JSON bytes."""
+    return _ALPIC_TASKS_VERDICT_ADAPTER.validate_json(raw)
+
+
+def validate_synthetic_alpic_tasks_verdict(
+    value: Mapping[str, object],
+) -> SupportedAlpicTasksCapabilityVerdict:
+    """Reach the positive schema branch without granting operational authority."""
+    verdict = _ALPIC_TASKS_VERDICT_ADAPTER.validate_json(
+        _canonical_bytes(dict(value)),
+        context=cast(
+            "dict[str, object]",
+            {"allow_synthetic_tasks_supported": True},
+        ),
+    )
+    if not isinstance(verdict, SupportedAlpicTasksCapabilityVerdict):
+        msg = "synthetic Alpic Tasks validation requires supported=true"
+        raise CapabilityContractError(msg)
+    return verdict
+
+
+def _finalize[DigestModelT: _DigestModel](
+    model_type: type[DigestModelT],
     values: Mapping[str, object],
-) -> ModelT:
+) -> DigestModelT:
     draft = model_type.model_validate(
         cast("dict[str, object]", {**values, "verdict_digest": "0" * 64}),
         context=cast("dict[str, object]", {"skip_digest": True}),
@@ -766,7 +1174,7 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object
     return result
 
 
-def _load[ModelT: _DigestModel](path: Path, model_type: type[ModelT]) -> ModelT:
+def _load[ModelT: _StrictModel](path: Path, model_type: type[ModelT]) -> ModelT:
     with path.open("rb") as stream:
         raw = stream.read(_MAX_RAW_CONTRACT_BYTES + 1)
     if len(raw) > _MAX_RAW_CONTRACT_BYTES:
@@ -785,6 +1193,45 @@ def _load[ModelT: _DigestModel](path: Path, model_type: type[ModelT]) -> ModelT:
         raise CapabilityContractError(msg)
     try:
         model = model_type.model_validate_json(raw)
+    except Exception as exc:
+        msg = f"capability contract failed validation: {path}"
+        raise CapabilityContractError(msg) from exc
+    canonical = (
+        _canonical_bytes(cast("dict[str, object]", model.model_dump(mode="json")))
+        + b"\n"
+    )
+    if raw != canonical:
+        msg = "capability contract is not canonical JSON"
+        raise CapabilityContractError(msg)
+    return model
+
+
+def _load_alpic_tasks_contract(path: Path) -> AlpicTasksCapabilityVerdict:
+    """Load the Tasks union while refusing synthetic positive authority."""
+    with path.open("rb") as stream:
+        raw = stream.read(_MAX_RAW_CONTRACT_BYTES + 1)
+    if len(raw) > _MAX_RAW_CONTRACT_BYTES:
+        msg = "capability contract exceeds the raw-byte limit"
+        raise CapabilityContractError(msg)
+    try:
+        value = cast(
+            "object",
+            json.loads(raw, object_pairs_hook=_reject_duplicate_pairs),
+        )
+    except (CapabilityContractError, json.JSONDecodeError) as exc:
+        msg = f"invalid capability JSON: {path}"
+        raise CapabilityContractError(msg) from exc
+    if type(value) is not dict:
+        msg = "capability contract must be a JSON object"
+        raise CapabilityContractError(msg)
+    contract_value = cast("dict[str, object]", value)
+    if contract_value.get("supported") is True:
+        msg = (
+            "supported Alpic Tasks capability requires protected operational validation"
+        )
+        raise CapabilityContractError(msg)
+    try:
+        model = validate_alpic_tasks_verdict_json(raw)
     except Exception as exc:
         msg = f"capability contract failed validation: {path}"
         raise CapabilityContractError(msg) from exc
@@ -1348,17 +1795,69 @@ def probe_oauth_provider() -> OAuthProviderCapabilityVerdict:
             "scopes": (),
             "token_lifetime_seconds": None,
             "revocation": "unproven",
-            "registration_modes": (),
+            "registration_modes": ("dcr",),
             "evidence_source": (
-                "not-selected; no provider discovery or witnessed flow was authorized"
+                "Auth0 plus Alpic DCR topology selected; tenant/environment and "
+                "witnessed flow unproven"
             ),
             "evidence_digest": None,
             "supported": False,
             "blockers": (
                 "OAUTH_PROVIDER_CAPABILITY_UNPROVEN",
+                "ALPIC_DCR_ISSUER_SEMANTICS_UNPROVEN",
                 "OAUTH_END_TO_END_FLOW_UNPROVEN",
             ),
-            "reviewed_date": "2026-08-15",
+            "reviewed_date": "2026-08-25",
+        },
+    )
+
+
+def _sdk_tasks_public_api_available() -> bool:
+    """Check the public types unique to the current SEP-2663 Tasks extension."""
+    return all(
+        hasattr(mcp_types, name)
+        for name in (
+            "CreateTaskResult",
+            "GetTaskRequest",
+            "CancelTaskRequest",
+            "UpdateTaskRequest",
+        )
+    )
+
+
+def probe_alpic_tasks_capability() -> UnsupportedAlpicTasksCapabilityVerdict:
+    """Return the exact fail-closed Alpic Tasks verdict for the pinned SDK."""
+    if _sdk_tasks_public_api_available():
+        msg = "the pinned SDK Tasks surface changed; re-review the capability record"
+        raise CapabilityContractError(msg)
+    return _finalize(
+        UnsupportedAlpicTasksCapabilityVerdict,
+        {
+            "schema_version": "1.0",
+            "provider": "alpic",
+            "extension_identifier": "io.modelcontextprotocol/tasks",
+            "extension_revision_state": "draft",
+            "mcp_version": importlib.metadata.version("mcp"),
+            "mcp_types_version": importlib.metadata.version("mcp-types"),
+            "installed_sdk_tree_sha256": _package_tree_sha256("mcp"),
+            "sdk_server_support": "unsupported",
+            "sdk_client_support": "unsupported",
+            "provider_tasks_compute": "advertised",
+            "provider_ordinary_timeout_seconds": 30,
+            "provider_default_task_ttl_seconds": 21600,
+            "source_evidence_digest": _ALPIC_TASKS_SOURCE_EVIDENCE_DIGEST,
+            "provider_integration": "not_assessed",
+            "task_creation_durability": "not_assessed",
+            "restart_recovery": "not_assessed",
+            "cancellation": "not_assessed",
+            "isolation": "not_assessed",
+            "retention": "not_assessed",
+            "artifact_delivery": "not_assessed",
+            "client_support": "not_assessed",
+            "documentation_provenance": _ALPIC_TASKS_PROVENANCE,
+            "supported": False,
+            "blockers": _ALPIC_TASKS_BLOCKERS,
+            "reviewed_date": _TASKS_REVIEWED_DATE,
         },
     )
 
@@ -1376,3 +1875,13 @@ def load_alpic_verdict(path: Path) -> AlpicOAuthDiscoveryCapabilityVerdict:
 def load_provider_verdict(path: Path) -> OAuthProviderCapabilityVerdict:
     """Load and validate a canonical OAuth-provider capability contract."""
     return _load(path, OAuthProviderCapabilityVerdict)
+
+
+def load_alpic_tasks_verdict(path: Path) -> AlpicTasksCapabilityVerdict:
+    """Load and validate a canonical Alpic Tasks capability contract."""
+    return _load_alpic_tasks_contract(path)
+
+
+def load_alpic_tasks_source_evidence(path: Path) -> AlpicTasksSourceEvidence:
+    """Load and validate canonical, digest-bound Alpic Tasks source metadata."""
+    return _load(path, AlpicTasksSourceEvidence)

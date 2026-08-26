@@ -1,6 +1,6 @@
 # Alpic deployment profile
 
-This repository now contains enough build metadata for Alpic to identify and install the project as **Python 3.13** instead of Node.js. Select **Streamable HTTP** when importing the repository and keep the repository root directory empty (the project lives at the repository root).
+This repository contains enough build metadata for Alpic to identify and install the project as **Python 3.13** instead of Node.js. That build compatibility is not production authorization. **Do not deploy the current candidate publicly:** the reviewed OAuth provider capability remains unsupported, and production startup deliberately fails closed before constructing network or application dependencies.
 
 ## Required project settings
 
@@ -20,15 +20,14 @@ Add these environment variables:
 ```text
 NODE_ENV=production
 DEPLOYMENT_PROFILE=alpic-metadata
-ASSET_SIGNING_SECRET=<at least 32 random bytes>
-API_PRINCIPALS_JSON=[{"principal_id":"alpic-client","api_key":"<at least 32 random bytes>"}]
+CURSOR_SIGNING_SECRET=<at least 32 random bytes>
 ALLOW_ANONYMOUS=false
 MAX_CONCURRENT_MCP_REQUESTS_PER_PRINCIPAL=4
 ```
 
-`DEPLOYMENT_PROFILE=alpic-metadata` is mandatory and exposes only `search_documents`, `get_document_metadata`, and `list_document_files`; it does not initialize the downloader, content store, scanner, or PDF runtime. Alpic supplies `ALPIC_HOST`; the server derives `PUBLIC_BASE_URL=https://<ALPIC_HOST>` automatically, but `ALPIC_HOST` never selects a deployment profile. Do not add `PUBLIC_BASE_URL` unless a custom domain is already active.
+`DEPLOYMENT_PROFILE=alpic-metadata` is mandatory and, in local test mode, exposes only `search_documents`, `get_document_metadata`, and `list_document_files`; it does not initialize the downloader, content store, scanner, or PDF runtime. Alpic supplies `ALPIC_HOST`; the server derives `PUBLIC_BASE_URL=https://<ALPIC_HOST>` automatically, but `ALPIC_HOST` never selects a deployment profile. Do not add `PUBLIC_BASE_URL` unless a custom domain is already active.
 
-Configure the Alpic client/trusted-client policy to send the credential for its stable principal in the `x-api-key` request header. The server compares that header exactly and in constant time and applies both per-principal and global admission ceilings. Give other callers separate registry entries; do **not** enable anonymous access merely because this profile is not an OAuth protected-resource implementation. Static keys are not per-user OAuth, so rotate an entry if exposed and keep Alpic's trusted-client/IP controls enabled where available. Do not treat obscurity of the generated URL as access control.
+Do not configure `API_PRINCIPALS_JSON`, `API_BEARER_TOKEN`, `API_KEY`, `NPLG_PRIVATE_STATIC_TOKEN`, or any `X-API-Key` equivalent. Static authentication is forbidden for a production profile and cannot substitute for the selected Auth0/OIDC plus Alpic DCR contract. With the checked-in negative capability record, the expected startup result is `production OAuth provider capability is unsupported`. A supported provider record would still require the separately reviewed OIDC implementation; it is not itself an activation switch.
 
 ## What this fixes
 
@@ -38,7 +37,7 @@ The failed deployment selected Node and executed `npm ci` because the tracked Gi
 
 Alpic uses a **serverless** MCP gateway. It documents a **30-second** limit for each tool invocation and reserves `/assets/*` for build-time static CDN files. This server currently generates dynamic `/assets/` URLs at runtime and relies on local filesystem artifacts across multiple calls (`download` → `inspect` → `render` → `tiles`). Therefore Alpic is **not a supported full-fidelity deployment target** for the document-download and visual-rendering pipeline in the current release.
 
-Expected compatibility on Alpic:
+Local metadata-profile compatibility already covered by offline tests:
 
 - search;
 - metadata retrieval;
@@ -53,17 +52,8 @@ Not yet production-supported on Alpic:
 
 The Docker/VPS production deployment is also metadata-only. A future full profile requires an object store, authenticated MCP-native binary resources, and a separately deployed least-privilege worker for long-running PDF work.
 
-## Post-deploy check
+## Protected staging prerequisite
 
-After Alpic reports a successful deployment, verify the public MCP endpoint with MCP Inspector or Alpic's playground. Test `tools/list`, `search_documents`, `get_document_metadata`, and `list_document_files`.
+Do not perform a public or staging deployment from this guide while the provider verdict is unsupported. A future authorized staging run must bind a named Auth0 tenant and Alpic environment, preserve the backend-self/DCR/upstream-issuer distinction, prove the access-token format and resource/audience relationship, and run through the protected controller and credential broker.
 
-For the bundled verifier, read the key silently into the environment so it is neither placed in process arguments nor copied into shell history:
-
-```bash
-read -rsp 'Alpic principal API key: ' API_KEY
-printf '\n'
-export API_KEY
-python scripts/verify_deploy.py --base-url "https://$ALPIC_HOST"
-```
-
-This public check validates the `alpic-metadata` MCP catalog and does not request health or readiness endpoints. The verifier accepts `--probe-base-url` only for a loopback HTTP origin, so omit it for an external Alpic deployment and verify private probes from the application network namespace instead.
+Until those external-authority records exist, `do_not_release` is the only supported decision. Never place a provider or MCP credential in command arguments, shell history, candidate-owned reports, or this environment file.

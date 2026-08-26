@@ -31,6 +31,12 @@ _EXPECTED_HTTP_CONCURRENCY = 128
 _EXPECTED_REQUEST_BODY_TIMEOUT_SECONDS = 10.0
 _EXPECTED_ASSET_STREAM_IDLE_TIMEOUT_SECONDS = 10.0
 _EXPECTED_ASSET_STREAM_TOTAL_TIMEOUT_SECONDS = 120.0
+_EXPECTED_RETENTION_MAX_AGE_SECONDS = 604_800
+_EXPECTED_RETENTION_MAX_OBJECTS = 100_000
+_EXPECTED_RETENTION_MIN_FREE_BYTES = 64 * 1024 * 1024
+_EXPECTED_RETENTION_MIN_FREE_INODES = 128
+_EXPECTED_RETENTION_HEALTHY_WINDOW_SECONDS = 60
+_EXPECTED_RETENTION_FORWARD_SLEW_SECONDS = 5
 _ALL_INTERFACES_HOST = str(ip_address(0))
 
 
@@ -38,6 +44,7 @@ def base_env(**overrides: str) -> dict[str, str]:
     env = {
         "NODE_ENV": "test",
         "ASSET_SIGNING_SECRET": "s" * 32,
+        "CURSOR_SIGNING_SECRET": "c" * 32,
         "PUBLIC_BASE_URL": "http://127.0.0.1:8000",
         "ALLOW_ANONYMOUS": "true",
         "CACHE_DIR": str(_TEST_CACHE_DIR),
@@ -73,6 +80,41 @@ def test_defaults_are_bounded_and_point_only_to_nplg() -> None:
         == _EXPECTED_ASSET_STREAM_TOTAL_TIMEOUT_SECONDS
     )
     assert config.deployment_profile == "private-full"
+    assert config.retention_max_age_seconds == _EXPECTED_RETENTION_MAX_AGE_SECONDS
+    assert config.retention_max_objects == _EXPECTED_RETENTION_MAX_OBJECTS
+    assert config.retention_min_free_bytes == _EXPECTED_RETENTION_MIN_FREE_BYTES
+    assert config.retention_min_free_inodes == _EXPECTED_RETENTION_MIN_FREE_INODES
+    assert (
+        config.retention_healthy_window_seconds
+        == _EXPECTED_RETENTION_HEALTHY_WINDOW_SECONDS
+    )
+    assert (
+        config.retention_max_forward_slew_seconds
+        == _EXPECTED_RETENTION_FORWARD_SLEW_SECONDS
+    )
+    assert config.retention_clock_synchronized is False
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("RETENTION_MAX_AGE_SECONDS", "59"),
+        ("RETENTION_MAX_AGE_SECONDS", "31536001"),
+        ("RETENTION_MAX_OBJECTS", "0"),
+        ("RETENTION_MAX_OBJECTS", "10000001"),
+        ("RETENTION_MIN_FREE_BYTES", "67108863"),
+        ("RETENTION_MIN_FREE_INODES", "127"),
+        ("RETENTION_HEALTHY_WINDOW_SECONDS", "3601"),
+        ("RETENTION_MAX_FORWARD_SLEW_SECONDS", "61"),
+        ("RETENTION_CLOCK_SYNCHRONIZED", "sometimes"),
+    ],
+)
+def test_retention_settings_reject_out_of_policy_values(
+    name: str,
+    value: str,
+) -> None:
+    with pytest.raises(ValueError, match=name):
+        _ = load_config(base_env(**{name: value}))
 
 
 def test_unix_pdf_worker_is_private_full_only_and_required_in_production() -> None:
@@ -100,10 +142,8 @@ def test_unix_pdf_worker_is_private_full_only_and_required_in_production() -> No
                 "NODE_ENV": "production",
                 "DEPLOYMENT_PROFILE": "private-full",
                 "ASSET_SIGNING_SECRET": "s" * 32,
+                "CURSOR_SIGNING_SECRET": "c" * 32,
                 "PUBLIC_BASE_URL": "https://mcp.example.net",
-                "API_PRINCIPALS_JSON": (
-                    '[{"principal_id":"operator","bearer_token":"' + ("t" * 32) + '"}]'
-                ),
                 "ALLOW_ANONYMOUS": "false",
                 "PDF_EXECUTOR": "serialized",
             }
@@ -152,10 +192,8 @@ def test_private_edge_tls_is_explicit_and_limited_to_private_full() -> None:
                 "DEPLOYMENT_PROFILE": "private-full",
                 "PDF_EXECUTOR": "unix-worker",
                 "ASSET_SIGNING_SECRET": "s" * 32,
+                "CURSOR_SIGNING_SECRET": "c" * 32,
                 "PUBLIC_BASE_URL": "https://mcp.example.net",
-                "API_PRINCIPALS_JSON": (
-                    '[{"principal_id":"operator","bearer_token":"' + ("t" * 32) + '"}]'
-                ),
                 "ALLOW_ANONYMOUS": "false",
             }
         )
@@ -192,8 +230,12 @@ def test_production_requires_stable_public_url_and_strong_secret() -> None:
         _ = load_config(
             {
                 "NODE_ENV": "production",
+                "DEPLOYMENT_PROFILE": "private-full",
+                "CURSOR_SIGNING_SECRET": "c" * 32,
                 "PUBLIC_BASE_URL": "https://mcp.example.net",
-                "ALLOW_ANONYMOUS": "true",
+                "ALLOW_ANONYMOUS": "false",
+                "PDF_EXECUTOR": "unix-worker",
+                "PRIVATE_EDGE_TLS": "true",
             }
         )
 
@@ -215,37 +257,29 @@ def test_public_base_url_must_be_an_origin_without_path() -> None:
 
 
 def test_production_rejects_anonymous_mode_even_when_explicit() -> None:
-    with pytest.raises(ValueError, match="API_BEARER_TOKEN"):
-        _ = load_config(
-            {
-                "NODE_ENV": "production",
-                "DEPLOYMENT_PROFILE": "alpic-metadata",
-                "ASSET_SIGNING_SECRET": "s" * 32,
-                "PUBLIC_BASE_URL": "https://mcp.example.net",
-            }
-        )
-
     with pytest.raises(ValueError, match="ALLOW_ANONYMOUS"):
         _ = load_config(
             {
                 "NODE_ENV": "production",
                 "DEPLOYMENT_PROFILE": "alpic-metadata",
-                "ASSET_SIGNING_SECRET": "s" * 32,
+                "CURSOR_SIGNING_SECRET": "c" * 32,
                 "PUBLIC_BASE_URL": "https://mcp.example.net",
                 "ALLOW_ANONYMOUS": "true",
             }
         )
 
 
-def test_production_requires_a_named_principal_registry() -> None:
-    with pytest.raises(ValueError, match="API_PRINCIPALS_JSON"):
+def test_production_rejects_a_named_static_principal_registry() -> None:
+    with pytest.raises(ValueError, match=r"static authentication.*production"):
         _ = load_config(
             {
                 "NODE_ENV": "production",
                 "DEPLOYMENT_PROFILE": "alpic-metadata",
-                "ASSET_SIGNING_SECRET": "s" * 32,
+                "CURSOR_SIGNING_SECRET": "c" * 32,
                 "PUBLIC_BASE_URL": "https://mcp.example.net",
-                "API_KEY": "k" * 32,
+                "API_PRINCIPALS_JSON": (
+                    '[{"principal_id":"researcher","api_key":"' + ("k" * 32) + '"}]'
+                ),
                 "ALLOW_ANONYMOUS": "false",
             }
         )
@@ -254,16 +288,13 @@ def test_production_requires_a_named_principal_registry() -> None:
 def test_named_principal_registry_is_strict_closed_and_secret_safe() -> None:
     token = "t" * 32
     config = load_config(
-        {
-            "NODE_ENV": "production",
-            "DEPLOYMENT_PROFILE": "alpic-metadata",
-            "ASSET_SIGNING_SECRET": "s" * 32,
-            "PUBLIC_BASE_URL": "https://mcp.example.net",
-            "API_PRINCIPALS_JSON": (
+        base_env(
+            DEPLOYMENT_PROFILE="alpic-metadata",
+            API_PRINCIPALS_JSON=(
                 '[{"principal_id":"researcher-a","bearer_token":"' + token + '"}]'
             ),
-            "ALLOW_ANONYMOUS": "false",
-        }
+            ALLOW_ANONYMOUS="false",
+        )
     )
 
     assert config.api_principals == (
@@ -379,14 +410,11 @@ def test_named_principal_registry_rejects_adversarial_json(
 ) -> None:
     with pytest.raises(ValueError, match="API_PRINCIPALS_JSON"):
         _ = load_config(
-            {
-                "NODE_ENV": "production",
-                "DEPLOYMENT_PROFILE": "alpic-metadata",
-                "ASSET_SIGNING_SECRET": "s" * 32,
-                "PUBLIC_BASE_URL": "https://mcp.example.net",
-                "API_PRINCIPALS_JSON": principals_json,
-                "ALLOW_ANONYMOUS": "false",
-            }
+            base_env(
+                DEPLOYMENT_PROFILE="alpic-metadata",
+                API_PRINCIPALS_JSON=principals_json,
+                ALLOW_ANONYMOUS="false",
+            )
         )
 
 
@@ -399,11 +427,8 @@ def test_production_principal_limit_reserves_global_capacity() -> None:
             {
                 "NODE_ENV": "production",
                 "DEPLOYMENT_PROFILE": "alpic-metadata",
-                "ASSET_SIGNING_SECRET": "s" * 32,
+                "CURSOR_SIGNING_SECRET": "c" * 32,
                 "PUBLIC_BASE_URL": "https://mcp.example.net",
-                "API_PRINCIPALS_JSON": (
-                    '[{"principal_id":"researcher","api_key":"' + ("k" * 32) + '"}]'
-                ),
                 "MAX_CONCURRENT_MCP_REQUESTS": "4",
                 "MAX_CONCURRENT_MCP_REQUESTS_PER_PRINCIPAL": "4",
                 "ALLOW_ANONYMOUS": "false",
@@ -430,9 +455,7 @@ def test_alpic_host_does_not_select_a_deployment_profile() -> None:
             "NODE_ENV": "production",
             "ALPIC_HOST": "mcp.example.net",
             "ASSET_SIGNING_SECRET": "s" * 32,
-            "API_PRINCIPALS_JSON": (
-                '[{"principal_id":"researcher","api_key":"' + ("k" * 32) + '"}]'
-            ),
+            "CURSOR_SIGNING_SECRET": "c" * 32,
             "ALLOW_ANONYMOUS": "false",
             "DEPLOYMENT_PROFILE": "private-full",
             "PDF_EXECUTOR": "unix-worker",
@@ -530,7 +553,6 @@ def test_production_requires_an_explicit_deployment_profile() -> None:
                 "NODE_ENV": "production",
                 "ASSET_SIGNING_SECRET": "s" * 32,
                 "PUBLIC_BASE_URL": "https://mcp.example.net",
-                "API_BEARER_TOKEN": "t" * 32,
                 "ALLOW_ANONYMOUS": "false",
             }
         )
@@ -549,20 +571,18 @@ def test_deployment_profile_accepts_only_closed_values(profile: str) -> None:
         _ = load_config(base_env(DEPLOYMENT_PROFILE=f"{profile}-suffix"))
 
 
-@pytest.mark.parametrize("environment", ["development", "test", "production"])
-def test_protected_mode_always_requires_a_bearer_token(environment: str) -> None:
-    public_url = (
-        "https://mcp.example.net"
-        if environment == "production"
-        else "http://testserver"
-    )
+@pytest.mark.parametrize("environment", ["development", "test"])
+def test_local_protected_mode_always_requires_a_static_credential(
+    environment: str,
+) -> None:
     with pytest.raises(ValueError, match="API_BEARER_TOKEN"):
         _ = load_config(
             {
                 "NODE_ENV": environment,
                 "DEPLOYMENT_PROFILE": "alpic-metadata",
                 "ASSET_SIGNING_SECRET": "s" * 32,
-                "PUBLIC_BASE_URL": public_url,
+                "CURSOR_SIGNING_SECRET": "c" * 32,
+                "PUBLIC_BASE_URL": "http://testserver",
                 "ALLOW_ANONYMOUS": "false",
             }
         )
@@ -677,23 +697,18 @@ def test_asset_stream_total_timeout_cannot_be_shorter_than_idle_timeout() -> Non
         )
 
 
-@pytest.mark.parametrize(
-    "field", ["ASSET_SIGNING_SECRET", "API_BEARER_TOKEN", "API_KEY"]
-)
-def test_production_rejects_documented_placeholder_secrets(field: str) -> None:
+def test_production_rejects_documented_cursor_signing_secret() -> None:
     placeholder = "replace-with-at-least-32-random-characters"
     env = {
         "NODE_ENV": "production",
         "DEPLOYMENT_PROFILE": "alpic-metadata",
-        "ASSET_SIGNING_SECRET": "s" * 32,
-        "API_BEARER_TOKEN": "t" * 32,
-        "API_KEY": "k" * 32,
+        "CURSOR_SIGNING_SECRET": "c" * 32,
         "PUBLIC_BASE_URL": "https://mcp.example.net",
         "ALLOW_ANONYMOUS": "false",
     }
-    env[field] = placeholder
+    env["CURSOR_SIGNING_SECRET"] = placeholder
 
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(ValueError, match="CURSOR_SIGNING_SECRET"):
         _ = load_config(env)
 
 
@@ -702,10 +717,7 @@ def test_alpic_host_supplies_public_origin_and_ephemeral_cache_defaults() -> Non
         {
             "NODE_ENV": "production",
             "ALPIC_HOST": "nplg-dspace-mcp-abc123.alpic.live",
-            "ASSET_SIGNING_SECRET": "s" * 32,
-            "API_PRINCIPALS_JSON": (
-                '[{"principal_id":"researcher","api_key":"' + ("k" * 32) + '"}]'
-            ),
+            "CURSOR_SIGNING_SECRET": "c" * 32,
             "ALLOW_ANONYMOUS": "false",
             "DEPLOYMENT_PROFILE": "alpic-metadata",
         }
@@ -713,7 +725,7 @@ def test_alpic_host_supplies_public_origin_and_ephemeral_cache_defaults() -> Non
 
     assert config.public_base_url == "https://nplg-dspace-mcp-abc123.alpic.live"
     assert config.cache_dir == _ALPIC_CACHE_DIR
-    assert config.api_principals[0].api_key_value() == "k" * 32
+    assert config.api_principals == ()
 
 
 @pytest.mark.parametrize(

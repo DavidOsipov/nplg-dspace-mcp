@@ -90,4 +90,5 @@ class BoundedThreadRunner:
 
 DNS_WORK = BoundedThreadRunner(capacity=1, thread_name_prefix="nplg-dns")
 PARSER_WORK = BoundedThreadRunner(capacity=1, thread_name_prefix="nplg-parser")
+READINESS_WORK = BoundedThreadRunner(capacity=1, thread_name_prefix="nplg-readiness")
 STORAGE_WORK = BoundedThreadRunner(capacity=2, thread_name_prefix="nplg-storage")

@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.machinery
+import importlib.metadata
 import json
 import os
 import re
 import stat
 import sys
+import sysconfig
 import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -37,6 +40,10 @@ from scripts.baseline_capture_io import (
     run_bounded_process,
     write_private_file,
 )
+from scripts.private_recovery_contract import (
+    PrivateRecoveryPolicy,
+    load_private_recovery_policy,
+)
 from scripts.pyright_identity import (
     PyrightIdentityError,
     PyrightPackageIdentity,
@@ -51,12 +58,14 @@ from scripts.run_quality_gate import (
     verify_exact_version,
 )
 from scripts.run_test_gate import (
+    ExternalGateRegistry,
     SystemGit,
     TestGateError,
     bind_external_snapshot,
     capture_source_snapshot,
     create_external_output,
     materialize_snapshot,
+    parse_external_gate_registry,
     registered_worktrees,
     stable_snapshot_file,
 )
@@ -68,6 +77,9 @@ _MAX_PROCESS_EXIT_CODE = 255
 _GIT_EXECUTABLE = "/usr/bin/git"
 _SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _EXACT_VERSION_PATTERN = re.compile(r"v?\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?\Z")
+_EXPECTED_PRIVATE_RECOVERY_POLICY_SHA256 = (
+    "sha256:6a9f6786479f139129f57c95d18820f55dc192a44d7d32d6ce2a385fe325bbf3"
+)
 _SUBJECT_KINDS = frozenset(
     {
         "canonical_image",
@@ -115,6 +127,431 @@ _SOURCE_SNAPSHOT_EXCLUDED_ROOTS = frozenset(
         "node_modules",
     }
 )
+_OPERATION_CONTRACT = (
+    (
+        "candidate-battery",
+        ("alpic-metadata", "private-full"),
+        "offline-candidate-execution",
+        False,
+        False,
+        ("CandidateBatteryResult.v2",),
+        (0, 64, 70, 75),
+    ),
+    (
+        "external-gate",
+        ("alpic-metadata", "private-full"),
+        "brokered-external-proof",
+        False,
+        False,
+        ("ExternalGateResult.v2",),
+        (0, 64, 70, 75),
+    ),
+    (
+        "prepare",
+        ("alpic-metadata", "private-full"),
+        "protected-ledger",
+        False,
+        False,
+        ("CandidatePreparation.v2",),
+        (0, 64, 70, 75),
+    ),
+    (
+        "staging-proof",
+        ("alpic-metadata",),
+        "provider-staging-deployment",
+        False,
+        True,
+        ("StagingProofResult.v2",),
+        (0, 20, 21, 64, 70, 75),
+    ),
+    (
+        "reconcile-staging",
+        ("alpic-metadata",),
+        "protected-ledger-reconciliation",
+        True,
+        True,
+        ("StagingReconciliationResult.v2",),
+        (0, 22, 23, 64, 70, 75),
+    ),
+    (
+        "finalize",
+        ("alpic-metadata", "private-full"),
+        "protected-ledger-publication",
+        False,
+        False,
+        ("CandidateEvidenceBundle.v2",),
+        (0, 64, 70, 75),
+    ),
+    (
+        "custody",
+        ("alpic-metadata", "private-full"),
+        "immutable-custody-upload",
+        False,
+        True,
+        (
+            "CustodyAttemptResult.v2",
+            "CandidateBundleCustodyReceipt.v2",
+            "FinalDecisionCustodyReceipt.v2",
+        ),
+        (0, 20, 21, 64, 70, 75),
+    ),
+    (
+        "reconcile-custody",
+        ("alpic-metadata", "private-full"),
+        "protected-ledger-reconciliation",
+        True,
+        True,
+        (
+            "CustodyReconciliationResult.v2",
+            "CandidateBundleCustodyReceipt.v2",
+            "FinalDecisionCustodyReceipt.v2",
+        ),
+        (0, 22, 23, 64, 70, 75),
+    ),
+    (
+        "attestation-workspace",
+        ("alpic-metadata", "private-full"),
+        "attestation-workspace-materialization",
+        False,
+        False,
+        ("AttestationWorkspaceHandoff.v2",),
+        (0, 64, 70, 75),
+    ),
+    (
+        "commit-attestation",
+        ("alpic-metadata", "private-full"),
+        "git-attestation-commit",
+        False,
+        True,
+        ("AttestationCommitResult.v2",),
+        (0, 64, 70, 75),
+    ),
+    (
+        "attest",
+        ("alpic-metadata", "private-full"),
+        "structural-attestation",
+        False,
+        False,
+        ("AttestationVerdict.v2",),
+        (0, 64, 70, 75),
+    ),
+    (
+        "eligibility",
+        ("alpic-metadata", "private-full"),
+        "public-readiness-decision",
+        False,
+        False,
+        (
+            "ReleaseEligibilityVerdict.v2",
+            "AsvsL2ConformanceVerdict.v2",
+            "EligibilityGateRecord.v2",
+        ),
+        (0, 24, 64, 70, 75),
+    ),
+    (
+        "cleanup-run",
+        ("alpic-metadata", "private-full"),
+        "scoped-destructive-cleanup",
+        False,
+        True,
+        ("CleanupResult.v2",),
+        (0, 64, 70, 75),
+    ),
+)
+_LAUNCHER_CONTRACT = (
+    (
+        "initialize-run",
+        "initialization-only",
+        "RunDescriptor.v2",
+        (0, 64, 70, 75),
+    ),
+    (
+        "run-operation",
+        "one-manifest-operation",
+        "OperationResult.v2",
+        (0, 20, 21, 22, 23, 24, 64, 70, 75),
+    ),
+    (
+        "run-through",
+        "contiguous-manifest-range",
+        "ThroughResult.v2",
+        (0, 20, 21, 22, 23, 24, 64, 70, 75),
+    ),
+    (
+        "resume-run",
+        "descriptor-selected-recovery",
+        "ResumeResult.v2",
+        (0, 20, 21, 22, 23, 24, 64, 70, 75),
+    ),
+)
+_UTILITY_CONTRACT = (
+    (
+        "validate-output-parent",
+        "--path ABSOLUTE_NEW_PATH --parent-mode 0700 --owner PROTECTED_UID",
+        "validated-output-parent.v1",
+        True,
+    ),
+    (
+        "validate-output-parents",
+        "--paths-json CLOSED_PATH_ARRAY --disjoint-from WORKTREE_SET",
+        "validated-output-parents.v1",
+        True,
+    ),
+    (
+        "capture-alpic",
+        (
+            "--tool-root PATH --cwd VERIFIED_MINIMAL_DEPLOY_PACK --stdout PATH "
+            "--stderr PATH --timeout-seconds N --max-output-bytes N -- ALPIC_ARGS"
+        ),
+        "bounded-alpic-capture.v1",
+        True,
+    ),
+)
+_EXIT_CONTRACT = (
+    (0, "named-target-durably-complete"),
+    (20, "external-delivery-unknown"),
+    (21, "proved-pre-side-effect-failure"),
+    (22, "reconciled-absent"),
+    (23, "reconciliation-ambiguous"),
+    (24, "gate-negative-chain-custodied"),
+    (64, "pre-mutation-schema-authority-or-policy-rejection"),
+    (70, "proved-pre-mutation-internal-failure"),
+    (75, "durable-incomplete-recovery-required"),
+)
+_EXTERNAL_GATE_CONTRACT = (
+    (
+        "common.nplg-live-canary",
+        "live.nplg-bound-endpoint.v2",
+        ("alpic-metadata", "private-full"),
+        "live",
+        60,
+        "nplg-live-canary.v2",
+    ),
+    (
+        "private-full.edge-http",
+        "staging.private-full-edge.v2",
+        ("private-full",),
+        "staging",
+        1800,
+        "private-edge-proof.v2",
+    ),
+    (
+        "private-full.pdf-worker-container",
+        "container.pdf-worker.v2",
+        ("private-full",),
+        "container",
+        300,
+        "container-proof.v2",
+    ),
+    (
+        "private-full.pdf-worker-write-quota",
+        "container.pdf-worker-quota.v2",
+        ("private-full",),
+        "container",
+        300,
+        "worker-quota-proof.v2",
+    ),
+    (
+        "private-full.recovery-proof",
+        "container.private-full-recovery.v2",
+        ("private-full",),
+        "container",
+        900,
+        "recovery-proof.v2",
+    ),
+    (
+        "private-full.scanner-container",
+        "container.scanner.v2",
+        ("private-full",),
+        "container",
+        300,
+        "container-proof.v2",
+    ),
+)
+_METADATA_OPERATION_IDS = tuple(item[0] for item in _OPERATION_CONTRACT)
+_PRIVATE_OPERATION_IDS = tuple(
+    item[0]
+    for item in _OPERATION_CONTRACT
+    if item[0] not in {"staging-proof", "reconcile-staging"}
+)
+_PROFILE_CONTRACT = (
+    (
+        "alpic-metadata",
+        _METADATA_OPERATION_IDS,
+        ("common.nplg-live-canary",),
+        ("alpic-deploy-pack", "python-sdist", "python-wheel"),
+        "common-live-plus-exactly-one-staging-or-reconciliation",
+        1,
+        False,
+        True,
+    ),
+    (
+        "private-full",
+        _PRIVATE_OPERATION_IDS,
+        tuple(item[0] for item in _EXTERNAL_GATE_CONTRACT),
+        (
+            "pdf-worker-image",
+            "private-app-image",
+            "private-edge-image",
+            "python-sdist",
+            "python-wheel",
+            "scanner-image",
+        ),
+        "common-live-plus-five-private-proofs",
+        0,
+        True,
+        False,
+    ),
+)
+_RECEIPT_CASE_CLASSES = ("adversarial", "fault", "negative", "property", "recovery")
+_COMMON_BINDING_FIELDS = (
+    "candidate_sha256",
+    "candidate_tree_sha256",
+    "run_id",
+    "profile",
+    "manifest_digest",
+    "controller_authority_digest",
+    "controller_revision",
+    "controller_policy_digest",
+    "controller_isolation_digest",
+    "provisioning_receipt_digest",
+)
+_COMMON_OPERATION_OPTIONS = (
+    ("--provisioning-receipt", "absolute-existing-file", None),
+    ("--run-descriptor-json", "absolute-existing-file", None),
+)
+_OPERATION_EXTRA_OPTIONS = {
+    "candidate-battery": (
+        ("--candidate-battery-result-json", "absolute-new-file", None),
+    ),
+    "external-gate": (
+        ("--external-gate-id", "identifier", None),
+        ("--external-gate-result-json", "absolute-new-file", None),
+    ),
+    "prepare": (
+        ("--candidate-battery-result-json", "absolute-existing-file", None),
+        ("--candidate-preparation-json", "absolute-new-file", None),
+    ),
+    "staging-proof": (
+        ("--candidate-preparation-json", "absolute-existing-file", None),
+        ("--staging-proof-json", "absolute-new-file", None),
+        ("--authorize-staging-deploy", "switch", None),
+    ),
+    "reconcile-staging": (
+        ("--candidate-preparation-json", "absolute-existing-file", None),
+        ("--staging-reconciliation-json", "absolute-new-file", None),
+        ("--authorize-staging-read", "switch", None),
+    ),
+    "finalize": (
+        ("--candidate-preparation-json", "absolute-existing-file", None),
+        ("--candidate-bundle-json", "absolute-new-file", None),
+    ),
+    "custody": (
+        ("--custody-attempt-json", "absolute-new-file", None),
+        ("--custody-receipt-json", "absolute-new-file", None),
+        ("--authorize-custody-upload", "switch", None),
+    ),
+    "reconcile-custody": (
+        ("--custody-reconciliation-json", "absolute-new-file", None),
+        ("--custody-receipt-json", "absolute-new-file", None),
+        ("--authorize-custody-read", "switch", None),
+    ),
+    "attestation-workspace": (
+        ("--attestation-handoff-json", "absolute-new-file", None),
+    ),
+    "commit-attestation": (
+        ("--attestation-handoff-json", "absolute-existing-file", None),
+        ("--message", "nonempty-text", None),
+        ("--authorize-commit", "switch", None),
+    ),
+    "attest": (("--attestation-verdict-json", "absolute-new-file", None),),
+    "eligibility": (
+        ("--release-eligibility-verdict-json", "absolute-new-file", None),
+        ("--asvs-l2-conformance-verdict-json", "absolute-new-file", None),
+        ("--eligibility-gate-record-json", "absolute-new-file", None),
+        ("--require-eligible", "switch", None),
+        ("--require-asvs-l2", "switch", None),
+    ),
+    "cleanup-run": (
+        ("--cleanup-journal-json", "absolute-new-file", None),
+        ("--cleanup-result-json", "absolute-new-file", None),
+        ("--authorize-cleanup", "switch", None),
+    ),
+}
+_LAUNCHER_OPTIONS = {
+    "initialize-run": (
+        ("--provisioning-receipt", "absolute-existing-file", None),
+        ("--controller-policy", "absolute-existing-file", None),
+        ("--repository-root", "absolute-directory", None),
+        ("--candidate", "git-object", None),
+        ("--profile", "release-profile", None),
+        ("--profile-inputs-json", "closed-json-object", None),
+        ("--network-broker-descriptor", "absolute-existing-file", None),
+        ("--custody-authority-descriptor", "absolute-existing-file", None),
+        ("--run-parent", "absolute-directory", None),
+        ("--initialization-journal-json", "absolute-new-file", None),
+        ("--run-descriptor-json", "absolute-new-file", None),
+        ("--authorize-run-root", "switch", None),
+    ),
+    "run-operation": (
+        ("--provisioning-receipt", "absolute-existing-file", None),
+        ("--run-descriptor-json", "absolute-existing-file", None),
+        ("--operation-request-json", "closed-json-object", None),
+    ),
+    "run-through": (
+        ("--provisioning-receipt", "absolute-existing-file", None),
+        ("--run-descriptor-json", "absolute-existing-file", None),
+        ("--range-request-json", "closed-json-object", None),
+    ),
+    "resume-run": (
+        ("--provisioning-receipt", "absolute-existing-file", None),
+        ("--run-descriptor-json", "absolute-existing-file", None),
+        ("--resume-request-json", "closed-json-object", None),
+    ),
+}
+_UTILITY_OPTIONS = {
+    "validate-output-parent": (
+        ("--path", "absolute-new-file", None),
+        ("--parent-mode", "literal", "0700"),
+        ("--owner", "identifier", None),
+    ),
+    "validate-output-parents": (
+        ("--paths-json", "closed-json-array", None),
+        ("--disjoint-from", "closed-json-array", None),
+    ),
+    "capture-alpic": (
+        ("--tool-root", "absolute-directory", None),
+        ("--cwd", "absolute-directory", None),
+        ("--stdout", "absolute-new-file", None),
+        ("--stderr", "absolute-new-file", None),
+        ("--timeout-seconds", "positive-integer", None),
+        ("--max-output-bytes", "positive-integer", None),
+        ("--alpic-args-json", "closed-alpic-argv", None),
+    ),
+}
+_OPERATION_INPUT_FIELDS = dict.fromkeys(
+    _METADATA_OPERATION_IDS,
+    (*_COMMON_BINDING_FIELDS, "operation_request"),
+)
+_LAUNCHER_INPUT_FIELDS = {
+    launcher_id: (*_COMMON_BINDING_FIELDS, "launcher_request")
+    for launcher_id, *_rest in _LAUNCHER_CONTRACT
+}
+_UTILITY_INPUT_FIELDS = {
+    utility_id: (
+        "controller_authority_digest",
+        "controller_revision",
+        "utility_request",
+    )
+    for utility_id, *_rest in _UTILITY_CONTRACT
+}
+_RESULT_FIELDS = (*_COMMON_BINDING_FIELDS, "result_payload", "result_digest")
+_UTILITY_RESULT_FIELDS = (
+    "controller_authority_digest",
+    "controller_revision",
+    "result_payload",
+    "result_digest",
+)
 
 
 class ReleaseVerificationError(RuntimeError):
@@ -129,10 +566,38 @@ def _fail_from(message: str, cause: BaseException) -> NoReturn:
     raise ReleaseVerificationError(message) from cause
 
 
+def _unsafe_command_text(value: str) -> bool:
+    return any(token in value for token in ("\x00", "\n", "\r", "$", "`", ";"))
+
+
 class _StrictModel(BaseModel):
     """Closed, immutable, non-coercing release-policy boundary."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+type ReleaseProfile = Literal["alpic-metadata", "private-full"]
+type OperationId = Literal[
+    "candidate-battery",
+    "external-gate",
+    "prepare",
+    "staging-proof",
+    "reconcile-staging",
+    "finalize",
+    "custody",
+    "reconcile-custody",
+    "attestation-workspace",
+    "commit-attestation",
+    "attest",
+    "eligibility",
+    "cleanup-run",
+]
+type LauncherId = Literal[
+    "initialize-run",
+    "run-operation",
+    "run-through",
+    "resume-run",
+]
 
 
 class _PyrightSummary(_StrictModel):
@@ -159,6 +624,83 @@ class _PyrightSuccess(_StrictModel):
         max_length=0,
     )
     summary: _PyrightSummary
+
+
+class _BanditMetric(_StrictModel):
+    """Exact non-negative metric counters emitted by Bandit 1.9.4."""
+
+    confidence_high: int = Field(alias="CONFIDENCE.HIGH", ge=0)
+    confidence_low: int = Field(alias="CONFIDENCE.LOW", ge=0)
+    confidence_medium: int = Field(alias="CONFIDENCE.MEDIUM", ge=0)
+    confidence_undefined: int = Field(alias="CONFIDENCE.UNDEFINED", ge=0)
+    severity_high: int = Field(alias="SEVERITY.HIGH", ge=0)
+    severity_low: int = Field(alias="SEVERITY.LOW", ge=0)
+    severity_medium: int = Field(alias="SEVERITY.MEDIUM", ge=0)
+    severity_undefined: int = Field(alias="SEVERITY.UNDEFINED", ge=0)
+    lines_of_code: int = Field(alias="loc", ge=0)
+    nosec: int = Field(ge=0)
+    skipped_tests: int = Field(ge=0)
+
+
+class _BanditSuccess(_StrictModel):
+    """Closed clean-result schema for Bandit 1.9.4 JSON output."""
+
+    errors: tuple[object, ...] = Field(max_length=0)
+    generated_at: str = Field(min_length=1, max_length=64)
+    metrics: dict[str, _BanditMetric] = Field(min_length=1, max_length=100_001)
+    results: tuple[object, ...] = Field(max_length=0)
+
+    @model_validator(mode="after")
+    def _requires_total_metrics(self) -> _BanditSuccess:
+        if "_totals" not in self.metrics:
+            msg = "Bandit success has no total metrics"
+            raise ValueError(msg)
+        return self
+
+
+class _PipAuditDependency(_StrictModel):
+    """One fully resolved dependency with no known vulnerabilities."""
+
+    name: str = Field(min_length=1, max_length=256)
+    version: str = Field(min_length=1, max_length=256)
+    vulns: tuple[object, ...] = Field(max_length=0)
+
+
+class _PipAuditSuccess(_StrictModel):
+    """Closed clean-result schema for pip-audit 2.10.1 JSON output."""
+
+    dependencies: tuple[_PipAuditDependency, ...] = Field(max_length=100_000)
+    fixes: tuple[object, ...] = Field(max_length=0)
+
+
+class _CycloneDxTools(_StrictModel):
+    components: tuple[dict[str, object], ...] = Field(min_length=1, max_length=1024)
+
+
+class _CycloneDxMetadata(_StrictModel):
+    timestamp: str = Field(min_length=1, max_length=64)
+    tools: _CycloneDxTools
+
+
+class _CycloneDxSuccess(_StrictModel):
+    """Closed top-level contract for CycloneDX 1.6 environment output."""
+
+    schema_uri: Literal["http://cyclonedx.org/schema/bom-1.6.schema.json"] = Field(
+        alias="$schema"
+    )
+    bom_format: Literal["CycloneDX"] = Field(alias="bomFormat")
+    components: tuple[dict[str, object], ...] = Field(
+        min_length=1,
+        max_length=100_000,
+    )
+    dependencies: tuple[dict[str, object], ...] = Field(max_length=100_000)
+    metadata: _CycloneDxMetadata
+    serial_number: str = Field(
+        alias="serialNumber",
+        pattern=r"^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    )
+    spec_version: Literal["1.6"] = Field(alias="specVersion")
+    version: Literal[1]
 
 
 class RiskWindow(_StrictModel):
@@ -329,6 +871,521 @@ class ReleaseControllerPolicy(_StrictModel):
     local_error: Literal["external_authority_required"]
 
 
+class CommandToolContract(_StrictModel):
+    """Exact interface/version/lock fields for one protected command."""
+
+    tool_id: Literal["nplg-release-controller"]
+    interface_version: Literal["2.0.0"]
+    version_probe: tuple[Literal["--version-json"]]
+    version_output_schema: Literal["ProtectedControllerVersion.v2"]
+    lock_digest_field: Literal["controller_dependency_lock_sha256"]
+    lock_source: Literal["ProtectedControllerProvisioningReceipt.v2"]
+    require_exact_lock_digest: Literal[True]
+
+
+class ArgvOptionContract(_StrictModel):
+    """One ordered, typed option in a shell-free command contract."""
+
+    flag: str = Field(pattern=r"^--[a-z][a-z0-9-]{0,63}$")
+    value_kind: Literal[
+        "absolute-directory",
+        "absolute-existing-file",
+        "absolute-new-file",
+        "closed-alpic-argv",
+        "closed-json-array",
+        "closed-json-object",
+        "git-object",
+        "identifier",
+        "literal",
+        "nonempty-text",
+        "positive-integer",
+        "release-profile",
+        "switch",
+    ]
+    literal_value: str | None
+
+    @model_validator(mode="after")
+    def _literal_shape(self) -> ArgvOptionContract:
+        if (self.value_kind == "literal") != (self.literal_value is not None):
+            msg = "argv literal option shape is inconsistent"
+            raise ValueError(msg)
+        if self.literal_value is not None and (
+            not self.literal_value or _unsafe_command_text(self.literal_value)
+        ):
+            msg = "argv literal option is unsafe"
+            raise ValueError(msg)
+        return self
+
+
+class StructuredArgvContract(_StrictModel):
+    """Closed ordered argv grammar with no shell or arbitrary passthrough."""
+
+    contract_kind: Literal["operation", "launcher", "utility"]
+    subcommand: str = Field(pattern=r"^[a-z][a-z0-9-]{0,63}$")
+    required_options: tuple[ArgvOptionContract, ...] = Field(min_length=1)
+    allow_unknown_options: Literal[False]
+    allow_passthrough: Literal[False]
+    allow_shell: Literal[False]
+
+    @model_validator(mode="after")
+    def _closed_options(self) -> StructuredArgvContract:
+        flags = tuple(option.flag for option in self.required_options)
+        if len(flags) != len(set(flags)):
+            msg = "argv contract contains a duplicate option"
+            raise ValueError(msg)
+        return self
+
+
+class InputPayloadContract(_StrictModel):
+    """Closed input-payload expectation for one protected command."""
+
+    contract_kind: Literal["input"]
+    schema_id: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9.-]{0,127}$")
+    schema_version: Literal["1.0", "2.0"]
+    required_fields: tuple[str, ...] = Field(min_length=1)
+    allow_unknown_fields: Literal[False]
+
+    @model_validator(mode="after")
+    def _unique_fields(self) -> InputPayloadContract:
+        if len(self.required_fields) != len(set(self.required_fields)):
+            msg = "input contract fields must be unique"
+            raise ValueError(msg)
+        return self
+
+
+class OutputPayloadContract(_StrictModel):
+    """Closed complete-result expectation; digests alone never satisfy it."""
+
+    contract_kind: Literal["output"]
+    schema_ids: tuple[str, ...] = Field(min_length=1)
+    schema_version: Literal["1.0", "2.0"]
+    required_fields: tuple[str, ...] = Field(min_length=1)
+    allow_unknown_fields: Literal[False]
+    allow_digest_only: Literal[False]
+
+    @model_validator(mode="after")
+    def _unique_output_shape(self) -> OutputPayloadContract:
+        if (
+            len(self.schema_ids) != len(set(self.schema_ids))
+            or len(self.required_fields) != len(set(self.required_fields))
+            or any(
+                re.fullmatch(r"[A-Za-z][A-Za-z0-9.-]{0,127}", schema_id) is None
+                for schema_id in self.schema_ids
+            )
+        ):
+            msg = "output contract schemas and fields must be unique and valid"
+            raise ValueError(msg)
+        return self
+
+
+class ReleaseOperationSpec(_StrictModel):
+    """One expected protected operation interface, never its implementation."""
+
+    operation_id: OperationId
+    profiles: tuple[ReleaseProfile, ...]
+    effect: Literal[
+        "offline-candidate-execution",
+        "brokered-external-proof",
+        "protected-ledger",
+        "provider-staging-deployment",
+        "protected-ledger-reconciliation",
+        "protected-ledger-publication",
+        "immutable-custody-upload",
+        "attestation-workspace-materialization",
+        "git-attestation-commit",
+        "structural-attestation",
+        "public-readiness-decision",
+        "scoped-destructive-cleanup",
+    ]
+    recovery_only: bool
+    requires_explicit_authorization: bool
+    result_schemas: tuple[str, ...]
+    exit_codes: tuple[int, ...]
+    tool: CommandToolContract
+    argv: StructuredArgvContract
+    input_contract: InputPayloadContract
+    output_contract: OutputPayloadContract
+
+
+class LauncherCommandSpec(_StrictModel):
+    """One stateful top-level protected launcher command contract."""
+
+    command_id: LauncherId
+    dispatch: Literal[
+        "initialization-only",
+        "one-manifest-operation",
+        "contiguous-manifest-range",
+        "descriptor-selected-recovery",
+    ]
+    result_schema: str
+    exit_codes: tuple[int, ...]
+    tool: CommandToolContract
+    argv: StructuredArgvContract
+    input_contract: InputPayloadContract
+    output_contract: OutputPayloadContract
+
+
+class ReadOnlyUtilitySpec(_StrictModel):
+    """One non-stateful helper/preflight utility contract."""
+
+    command_id: Literal[
+        "validate-output-parent",
+        "validate-output-parents",
+        "capture-alpic",
+    ]
+    argv_schema: str
+    output_schema: str
+    read_only: Literal[True]
+    tool: CommandToolContract
+    argv: StructuredArgvContract
+    input_contract: InputPayloadContract
+    output_contract: OutputPayloadContract
+
+
+class LauncherExitSpec(_StrictModel):
+    """One non-conflatable launcher exit meaning."""
+
+    code: Literal[0, 20, 21, 22, 23, 24, 64, 70, 75]
+    meaning: str
+
+
+class ExternalGateSpec(_StrictModel):
+    """One registry-owned protected operational discriminator."""
+
+    gate_id: Literal[
+        "common.nplg-live-canary",
+        "private-full.edge-http",
+        "private-full.pdf-worker-container",
+        "private-full.pdf-worker-write-quota",
+        "private-full.recovery-proof",
+        "private-full.scanner-container",
+    ]
+    command_id: str
+    profiles: tuple[ReleaseProfile, ...]
+    kind: Literal["live", "staging", "container"]
+    timeout_seconds: int = Field(gt=0)
+    result_schema: str
+
+
+class ReleaseProfileSpec(_StrictModel):
+    """Exact operation, subject, and operational-proof selection for a profile."""
+
+    profile_id: ReleaseProfile
+    operation_ids: tuple[OperationId, ...]
+    external_gate_ids: tuple[str, ...]
+    subject_roles: tuple[str, ...]
+    finalize_inputs: Literal[
+        "common-live-plus-exactly-one-staging-or-reconciliation",
+        "common-live-plus-five-private-proofs",
+    ]
+    task21_staging_imports: Literal[0, 1]
+    container_runtime_required: bool
+    private_nonconstruction_required: bool
+
+
+class ContractSensitivityPolicy(_StrictModel):
+    """Minimum candidate-side expectation for protected-controller TDD receipts."""
+
+    candidate_battery_environment: Literal["offline-no-secret"]
+    required_case_classes: tuple[
+        Literal["adversarial", "fault", "negative", "property", "recovery"], ...
+    ]
+    replaced_suite_must_fail: Literal[True]
+    empty_suite_must_fail: Literal[True]
+    always_pass_suite_must_fail: Literal[True]
+    source_mutation_must_fail: Literal[True]
+    minimum_changed_line_coverage_percent: Literal[95]
+    minimum_changed_branch_coverage_percent: Literal[95]
+    surviving_mutants_allowed: Literal[0]
+    conditional_skips_allowed: Literal[0]
+    evidence_inside_candidate_allowed: Literal[False]
+
+    @model_validator(mode="after")
+    def _closed_case_classes(self) -> ContractSensitivityPolicy:
+        if self.required_case_classes != _RECEIPT_CASE_CLASSES:
+            msg = "release command manifest case classes are not closed"
+            raise ValueError(msg)
+        return self
+
+
+class ReleaseCommandManifest(_StrictModel):
+    """Candidate-side expected contract for an independently protected controller."""
+
+    schema_version: Literal[1]
+    contract_id: Literal["nplg.release-command-manifest.v1"]
+    controller_authority: Literal["separately-protected-external"]
+    candidate_implements_controller: Literal[False]
+    operations: tuple[ReleaseOperationSpec, ...]
+    launcher_commands: tuple[LauncherCommandSpec, ...]
+    utilities: tuple[ReadOnlyUtilitySpec, ...]
+    exit_semantics: tuple[LauncherExitSpec, ...]
+    external_gates: tuple[ExternalGateSpec, ...]
+    profiles: tuple[ReleaseProfileSpec, ...]
+    sensitivity_policy: ContractSensitivityPolicy
+    missing_authority_status: Literal["PROTECTED_RELEASE_CONTROLLER_UNAVAILABLE"]
+    terminal_verdict: Literal["do_not_release"]
+
+    @model_validator(mode="after")
+    def _closed_contract(self) -> ReleaseCommandManifest:
+        operations = tuple(
+            (
+                item.operation_id,
+                item.profiles,
+                item.effect,
+                item.recovery_only,
+                item.requires_explicit_authorization,
+                item.result_schemas,
+                item.exit_codes,
+            )
+            for item in self.operations
+        )
+        launchers = tuple(
+            (item.command_id, item.dispatch, item.result_schema, item.exit_codes)
+            for item in self.launcher_commands
+        )
+        utilities = tuple(
+            (item.command_id, item.argv_schema, item.output_schema, item.read_only)
+            for item in self.utilities
+        )
+        exits = tuple((item.code, item.meaning) for item in self.exit_semantics)
+        external_gates = tuple(
+            (
+                item.gate_id,
+                item.command_id,
+                item.profiles,
+                item.kind,
+                item.timeout_seconds,
+                item.result_schema,
+            )
+            for item in self.external_gates
+        )
+        profiles = tuple(
+            (
+                item.profile_id,
+                item.operation_ids,
+                item.external_gate_ids,
+                item.subject_roles,
+                item.finalize_inputs,
+                item.task21_staging_imports,
+                item.container_runtime_required,
+                item.private_nonconstruction_required,
+            )
+            for item in self.profiles
+        )
+        operation_shapes = tuple(
+            (
+                item.operation_id,
+                item.argv.contract_kind,
+                item.argv.subcommand,
+                tuple(
+                    (option.flag, option.value_kind, option.literal_value)
+                    for option in item.argv.required_options
+                ),
+                item.input_contract.schema_id,
+                item.input_contract.schema_version,
+                item.input_contract.required_fields,
+                item.output_contract.schema_ids,
+                item.output_contract.schema_version,
+                item.output_contract.required_fields,
+            )
+            for item in self.operations
+        )
+        expected_operation_shapes = tuple(
+            (
+                operation_id,
+                "operation",
+                "run-operation",
+                (
+                    *_COMMON_OPERATION_OPTIONS,
+                    ("--operation", "literal", operation_id),
+                    *_OPERATION_EXTRA_OPTIONS[operation_id],
+                ),
+                f"{operation_id}.input.v2",
+                "2.0",
+                _OPERATION_INPUT_FIELDS[operation_id],
+                result_schemas,
+                "2.0",
+                _RESULT_FIELDS,
+            )
+            for (
+                operation_id,
+                *_middle,
+                result_schemas,
+                _exit_codes,
+            ) in _OPERATION_CONTRACT
+        )
+        launcher_shapes = tuple(
+            (
+                item.command_id,
+                item.argv.contract_kind,
+                item.argv.subcommand,
+                tuple(
+                    (option.flag, option.value_kind, option.literal_value)
+                    for option in item.argv.required_options
+                ),
+                item.input_contract.schema_id,
+                item.input_contract.schema_version,
+                item.input_contract.required_fields,
+                item.output_contract.schema_ids,
+                item.output_contract.schema_version,
+                item.output_contract.required_fields,
+            )
+            for item in self.launcher_commands
+        )
+        expected_launcher_shapes = tuple(
+            (
+                launcher_id,
+                "launcher",
+                launcher_id,
+                _LAUNCHER_OPTIONS[launcher_id],
+                f"{launcher_id}.input.v2",
+                "2.0",
+                _LAUNCHER_INPUT_FIELDS[launcher_id],
+                (result_schema,),
+                "2.0",
+                _RESULT_FIELDS,
+            )
+            for launcher_id, _dispatch, result_schema, _exit_codes in _LAUNCHER_CONTRACT
+        )
+        utility_shapes = tuple(
+            (
+                item.command_id,
+                item.argv.contract_kind,
+                item.argv.subcommand,
+                tuple(
+                    (option.flag, option.value_kind, option.literal_value)
+                    for option in item.argv.required_options
+                ),
+                item.input_contract.schema_id,
+                item.input_contract.schema_version,
+                item.input_contract.required_fields,
+                item.output_contract.schema_ids,
+                item.output_contract.schema_version,
+                item.output_contract.required_fields,
+            )
+            for item in self.utilities
+        )
+        expected_utility_shapes = tuple(
+            (
+                utility_id,
+                "utility",
+                utility_id,
+                _UTILITY_OPTIONS[utility_id],
+                f"{utility_id}.input.v1",
+                "1.0",
+                _UTILITY_INPUT_FIELDS[utility_id],
+                (output_schema,),
+                "1.0",
+                _UTILITY_RESULT_FIELDS,
+            )
+            for utility_id, _argv_schema, output_schema, _read_only in _UTILITY_CONTRACT
+        )
+        if (
+            operations != _OPERATION_CONTRACT
+            or launchers != _LAUNCHER_CONTRACT
+            or utilities != _UTILITY_CONTRACT
+            or exits != _EXIT_CONTRACT
+            or external_gates != _EXTERNAL_GATE_CONTRACT
+            or profiles != _PROFILE_CONTRACT
+            or operation_shapes != expected_operation_shapes
+            or launcher_shapes != expected_launcher_shapes
+            or utility_shapes != expected_utility_shapes
+        ):
+            msg = "release command manifest differs from the closed expected contract"
+            raise ValueError(msg)
+        return self
+
+
+class FakeTddReceipt(_StrictModel):
+    """Candidate-side fake of one externally signed TDD receipt summary."""
+
+    target_kind: Literal["operation", "launcher"]
+    target_id: str
+    red_exit: Literal[1]
+    green_exit: Literal[0]
+    refactor_exit: Literal[0]
+    collected_tests: tuple[str, ...] = Field(min_length=1)
+    case_classes: tuple[
+        Literal["adversarial", "fault", "negative", "property", "recovery"], ...
+    ]
+    mutations_total: int = Field(ge=1)
+    mutations_killed: int = Field(ge=0)
+    source_diff_sha256: str
+    integration_exit: Literal[0]
+    protected_controller_signed: Literal[True]
+    candidate_generated: Literal[False]
+    completed_at: datetime
+    expires_at: datetime
+
+    @model_validator(mode="after")
+    def _complete_sensitive_receipt(self) -> FakeTddReceipt:
+        if (
+            not self.target_id
+            or len(self.collected_tests) != len(set(self.collected_tests))
+            or self.case_classes != _RECEIPT_CASE_CLASSES
+            or self.mutations_killed != self.mutations_total
+            or _SHA256_PATTERN.fullmatch(self.source_diff_sha256) is None
+            or self.completed_at.utcoffset() != timedelta(0)
+            or self.expires_at.utcoffset() != timedelta(0)
+            or self.expires_at <= self.completed_at
+        ):
+            msg = "TDD receipt is incomplete, insensitive, or stale"
+            raise ValueError(msg)
+        return self
+
+
+class FakeCriticalSuiteResult(_StrictModel):
+    """Candidate-side fake proving failure sensitivity of the critical battery."""
+
+    collected_tests: tuple[str, ...] = Field(min_length=1)
+    replaced_suite_detected: Literal[True]
+    empty_suite_detected: Literal[True]
+    always_pass_suite_detected: Literal[True]
+    source_mutation_detected: Literal[True]
+    changed_line_coverage_percent: int = Field(ge=95, le=100)
+    changed_branch_coverage_percent: int = Field(ge=95, le=100)
+    surviving_mutants: Literal[0]
+    conditional_skips: Literal[0]
+    evidence_location: Literal["external-protected-custody"]
+
+    @model_validator(mode="after")
+    def _unique_tests(self) -> FakeCriticalSuiteResult:
+        if len(self.collected_tests) != len(set(self.collected_tests)):
+            msg = "critical suite collection is not unique"
+            raise ValueError(msg)
+        return self
+
+
+class CandidateContractTranscript(_StrictModel):
+    """Strict candidate fake; it never substitutes for signed controller evidence."""
+
+    schema_version: Literal[1]
+    profile: ReleaseProfile
+    manifest_digest: str
+    operation_receipts: tuple[FakeTddReceipt, ...]
+    launcher_receipts: tuple[FakeTddReceipt, ...]
+    external_gate_ids: tuple[str, ...]
+    critical_suite: FakeCriticalSuiteResult
+
+    @model_validator(mode="after")
+    def _valid_digest(self) -> CandidateContractTranscript:
+        if _SHA256_PATTERN.fullmatch(self.manifest_digest) is None:
+            msg = "candidate contract transcript manifest digest is invalid"
+            raise ValueError(msg)
+        return self
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateReleaseStatus:
+    """Non-authoritative status emitted while protected authority is absent."""
+
+    profile: ReleaseProfile
+    local_status: Literal["PROTECTED_RELEASE_CONTROLLER_UNAVAILABLE"]
+    terminal_verdict: Literal["do_not_release"]
+    release_ready: Literal[False]
+    release_authorized: Literal[False]
+
+
 class TrivyDatabaseReceipt(_StrictModel):
     """Signed, fresh, independently acquired Trivy database receipt."""
 
@@ -479,11 +1536,14 @@ class DependencyEvidence(_StrictModel):
 
 @dataclass(frozen=True, slots=True)
 class ReleasePolicies:
-    """The three independently parsed Task 8 candidate-side policies."""
+    """Independently parsed candidate-side policies and controller contract."""
 
     dependency_risk: DependencyRiskPolicy
     trusted_sources: TrustedPackageSourcesPolicy
     controller: ReleaseControllerPolicy
+    recovery: PrivateRecoveryPolicy
+    external_gate_registry: ExternalGateRegistry
+    commands: ReleaseCommandManifest
 
 
 def _duplicate_json_name(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -501,18 +1561,8 @@ def _reject_json_number(value: str) -> NoReturn:
     raise ReleaseVerificationError(msg)
 
 
-def _freeze_json_arrays(value: object) -> object:
-    if type(value) is list:
-        return tuple(_freeze_json_arrays(item) for item in cast("list[object]", value))
-    if type(value) is dict:
-        return {
-            name: _freeze_json_arrays(item)
-            for name, item in cast("dict[str, object]", value).items()
-        }
-    return value
-
-
-def _load_json_object(path: Path) -> dict[str, object]:
+def _load_json_object(path: Path) -> bytes:
+    """Preparse a JSON object for duplicate names before strict model parsing."""
     try:
         raw = read_regular_bytes(path)
         parsed = cast(
@@ -535,15 +1585,12 @@ def _load_json_object(path: Path) -> dict[str, object]:
     if type(parsed) is not dict:
         msg = f"release policy must be an object: {path.name}"
         raise ReleaseVerificationError(msg)
-    return cast(
-        "dict[str, object]",
-        _freeze_json_arrays(cast("dict[str, object]", parsed)),
-    )
+    return raw
 
 
 def _load_model[ModelT: BaseModel](path: Path, model: type[ModelT]) -> ModelT:
     try:
-        return model.model_validate(_load_json_object(path), strict=True)
+        return model.model_validate_json(_load_json_object(path), strict=True)
     except ValidationError as exc:
         msg = f"release policy schema rejected: {path.name}"
         raise ReleaseVerificationError(msg) from exc
@@ -562,6 +1609,128 @@ def load_trusted_package_sources_policy(path: Path) -> TrustedPackageSourcesPoli
 def load_release_controller_policy(path: Path) -> ReleaseControllerPolicy:
     """Load one strict external-controller expectation descriptor."""
     return _load_model(path, ReleaseControllerPolicy)
+
+
+def load_release_command_manifest(path: Path) -> ReleaseCommandManifest:
+    """Load the exact candidate-side expectation for the protected controller."""
+    try:
+        return _load_model(path, ReleaseCommandManifest)
+    except ReleaseVerificationError as exc:
+        _fail_from("release command manifest rejected", exc)
+
+
+def validate_external_gate_manifest_join(
+    registry: ExternalGateRegistry,
+    manifest: ReleaseCommandManifest,
+) -> None:
+    """Require independent gate policies to describe one identical inventory."""
+    registry_contract = tuple(
+        (
+            gate.gate_id,
+            gate.command_id,
+            gate.profiles,
+            gate.kind,
+            gate.timeout_seconds,
+            gate.result_schema,
+        )
+        for gate in registry.gates
+    )
+    manifest_contract = tuple(
+        (
+            gate.gate_id,
+            gate.command_id,
+            gate.profiles,
+            gate.kind,
+            gate.timeout_seconds,
+            gate.result_schema,
+        )
+        for gate in manifest.external_gates
+    )
+    registry_profiles = tuple(
+        (
+            profile.profile_id,
+            tuple(
+                gate.gate_id
+                for gate in registry.gates
+                if profile.profile_id in gate.profiles
+            ),
+        )
+        for profile in manifest.profiles
+    )
+    manifest_profiles = tuple(
+        (profile.profile_id, profile.external_gate_ids) for profile in manifest.profiles
+    )
+    if registry_contract != manifest_contract or registry_profiles != manifest_profiles:
+        _fail("external gate registry differs from release command manifest")
+
+
+def release_command_manifest_digest(manifest: ReleaseCommandManifest) -> str:
+    """Digest the canonical expected contract for external equality checks."""
+    value = load_json_value(manifest.model_dump_json())
+    return "sha256:" + hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def validate_candidate_contract_transcript(
+    payload: bytes,
+    *,
+    manifest: ReleaseCommandManifest,
+    now: datetime,
+) -> CandidateContractTranscript:
+    """Validate a failure-sensitive fake without granting release authority."""
+    try:
+        transcript = CandidateContractTranscript.model_validate_json(
+            payload,
+            strict=True,
+        )
+        if now.utcoffset() != timedelta(0):
+            _fail("candidate contract transcript clock is not UTC")
+        operation_ids = tuple(
+            receipt.target_id for receipt in transcript.operation_receipts
+        )
+        launcher_ids = tuple(
+            receipt.target_id for receipt in transcript.launcher_receipts
+        )
+        if (
+            operation_ids != _METADATA_OPERATION_IDS
+            or launcher_ids != tuple(item[0] for item in _LAUNCHER_CONTRACT)
+            or any(
+                receipt.target_kind != "operation"
+                for receipt in transcript.operation_receipts
+            )
+            or any(
+                receipt.target_kind != "launcher"
+                for receipt in transcript.launcher_receipts
+            )
+            or transcript.manifest_digest != release_command_manifest_digest(manifest)
+        ):
+            _fail("candidate contract transcript receipt inventory is incomplete")
+        profile = next(
+            item for item in manifest.profiles if item.profile_id == transcript.profile
+        )
+        if transcript.external_gate_ids != profile.external_gate_ids:
+            _fail("candidate contract transcript external gates do not match profile")
+        receipts = (*transcript.operation_receipts, *transcript.launcher_receipts)
+        if any(
+            receipt.completed_at > now or receipt.expires_at <= now
+            for receipt in receipts
+        ):
+            _fail("candidate contract transcript contains stale evidence")
+    except (StopIteration, ValidationError, ReleaseVerificationError) as exc:
+        _fail_from("candidate contract transcript rejected", exc)
+    return transcript
+
+
+def candidate_release_status(profile: ReleaseProfile) -> CandidateReleaseStatus:
+    """Return the only candidate-local status while authority is unavailable."""
+    if profile not in {"alpic-metadata", "private-full"}:
+        _fail("release profile is outside the closed manifest")
+    return CandidateReleaseStatus(
+        profile=profile,
+        local_status="PROTECTED_RELEASE_CONTROLLER_UNAVAILABLE",
+        terminal_verdict="do_not_release",
+        release_ready=False,
+        release_authorized=False,
+    )
 
 
 def _utc_timestamp(value: str) -> datetime:
@@ -901,6 +2070,201 @@ class _GateCommandContext:
     subject_digest: str
 
 
+type _TrustedReleaseToolMode = Literal["module", "console"]
+
+
+@dataclass(frozen=True, slots=True)
+class _TrustedReleaseTool:
+    """Pinned Python tool identity and its reviewed invocation boundary."""
+
+    name: str
+    module: str
+    distribution: str
+    version: str
+    mode: _TrustedReleaseToolMode
+    entry_name: str | None = None
+    entry_value: str | None = None
+
+
+_TRUSTED_RELEASE_TOOLS = (
+    _TrustedReleaseTool("ruff", "ruff", "ruff", "0.16.3", "module"),
+    _TrustedReleaseTool(
+        "mypy",
+        "mypy",
+        "mypy",
+        "2.3.1",
+        "console",
+        "mypy",
+        "mypy.__main__:console_entry",
+    ),
+    _TrustedReleaseTool(
+        "bandit",
+        "bandit",
+        "bandit",
+        "1.9.4",
+        "console",
+        "bandit",
+        "bandit.cli.main:main",
+    ),
+    _TrustedReleaseTool(
+        "pip-audit",
+        "pip_audit",
+        "pip-audit",
+        "2.10.1",
+        "console",
+        "pip-audit",
+        "pip_audit._cli:audit",
+    ),
+    _TrustedReleaseTool(
+        "cyclonedx",
+        "cyclonedx_py",
+        "cyclonedx-bom",
+        "7.3.1",
+        "console",
+        "cyclonedx-py",
+        "cyclonedx_py._internal.cli:run",
+    ),
+)
+_TRUSTED_RELEASE_TOOL_DRIVER = r"""
+import importlib
+from importlib import metadata
+import json
+from pathlib import Path
+import runpy
+import sys
+
+proof = json.loads(sys.argv[1])
+if type(proof) is not list or len(proof) != 8:
+    raise SystemExit(97)
+(
+    mode,
+    module_name,
+    distribution_name,
+    expected_version,
+    raw_origin,
+    raw_purelib,
+    entry_name,
+    entry_value,
+) = proof
+if (
+    mode not in ("module", "console")
+    or not all(
+        type(value) is str
+        for value in (
+            module_name,
+            distribution_name,
+            expected_version,
+            raw_origin,
+            raw_purelib,
+        )
+    )
+    or (entry_name is not None and type(entry_name) is not str)
+    or (entry_value is not None and type(entry_value) is not str)
+):
+    raise SystemExit(97)
+if mode == "module" and (entry_name is not None or entry_value is not None):
+    raise SystemExit(97)
+if mode == "console" and (entry_name is None or entry_value is None):
+    raise SystemExit(97)
+
+site_packages = Path(raw_purelib).resolve(strict=True)
+expected_origin = Path(raw_origin).resolve(strict=True)
+candidate_root = Path.cwd().resolve(strict=True)
+if site_packages not in expected_origin.parents:
+    raise SystemExit(97)
+
+def is_unreviewed_candidate_path(path):
+    inside_candidate = path == candidate_root or candidate_root in path.parents
+    inside_reviewed_purelib = path == site_packages or site_packages in path.parents
+    return inside_candidate and not inside_reviewed_purelib
+
+for item in sys.path:
+    if item == "":
+        raise SystemExit(97)
+    resolved = Path(item).resolve(strict=False)
+    if is_unreviewed_candidate_path(resolved):
+        raise SystemExit(97)
+sys.path.insert(0, site_packages.as_posix())
+
+def reviewed_distribution():
+    matches = tuple(
+        metadata.distributions(
+            name=distribution_name,
+            path=[site_packages.as_posix()],
+        )
+    )
+    if len(matches) != 1 or matches[0].version != expected_version:
+        raise SystemExit(97)
+    return matches[0]
+
+distribution = reviewed_distribution()
+tool = importlib.import_module(module_name)
+expected_package_root = expected_origin.parent
+
+def verify_loaded_tool():
+    if sys.modules.get(module_name) is not tool:
+        raise SystemExit(97)
+    raw_file = getattr(tool, "__file__", None)
+    specification = getattr(tool, "__spec__", None)
+    specification_origin = getattr(specification, "origin", None)
+    if type(raw_file) is not str or type(specification_origin) is not str:
+        raise SystemExit(97)
+    if (
+        Path(raw_file).resolve(strict=True) != expected_origin
+        or Path(specification_origin).resolve(strict=True) != expected_origin
+    ):
+        raise SystemExit(97)
+    reviewed_distribution()
+    for loaded_name, loaded_module in tuple(sys.modules.items()):
+        if not loaded_name.startswith(module_name + "."):
+            continue
+        loaded_file = getattr(loaded_module, "__file__", None)
+        if type(loaded_file) is not str:
+            raise SystemExit(97)
+        loaded_origin = Path(loaded_file).resolve(strict=True)
+        if expected_package_root not in loaded_origin.parents:
+            raise SystemExit(97)
+
+verify_loaded_tool()
+baseline_modules = frozenset(sys.modules)
+arguments = sys.argv[2:]
+returncode = None
+try:
+    if mode == "module":
+        sys.argv = [module_name, *arguments]
+        runpy.run_module(module_name, run_name="__main__", alter_sys=True)
+    else:
+        entries = tuple(
+            item
+            for item in distribution.entry_points
+            if item.group == "console_scripts" and item.name == entry_name
+        )
+        if len(entries) != 1 or entries[0].value != entry_value:
+            raise SystemExit(97)
+        entry = entries[0].load()
+        if not callable(entry):
+            raise SystemExit(97)
+        sys.argv = [entry_name, *arguments]
+        returncode = entry()
+except SystemExit as exc:
+    returncode = exc.code
+
+verify_loaded_tool()
+for loaded_name in frozenset(sys.modules).difference(baseline_modules):
+    loaded_file = getattr(sys.modules[loaded_name], "__file__", None)
+    if type(loaded_file) is not str:
+        continue
+    loaded_origin = Path(loaded_file).resolve(strict=True)
+    if is_unreviewed_candidate_path(loaded_origin):
+        raise SystemExit(97)
+if returncode is None:
+    returncode = 0
+if type(returncode) is not int:
+    raise SystemExit(97)
+raise SystemExit(returncode)
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class _PyrightRuntimeIdentity:
     """Reviewed Node and package evidence used for one Pyright execution."""
@@ -911,6 +2275,75 @@ class _PyrightRuntimeIdentity:
     @property
     def offline_evidence(self) -> tuple[str, ...]:
         return (self.node_sha256, *self.package.offline_evidence)
+
+
+type _TrustedReleaseToolProof = tuple[
+    _TrustedReleaseToolMode,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str | None,
+    str | None,
+]
+
+
+def _trusted_release_tool_proof(
+    tool: _TrustedReleaseTool,
+) -> _TrustedReleaseToolProof:
+    """Resolve one pinned tool only from this interpreter's reviewed purelib."""
+    try:
+        raw_purelib = cast("object", sysconfig.get_path("purelib"))
+        if not isinstance(raw_purelib, str):
+            _fail("trusted release tool root is unavailable")
+        site_packages = Path(raw_purelib).resolve(strict=True)
+        distributions = tuple(
+            importlib.metadata.distributions(
+                name=tool.distribution,
+                path=[site_packages.as_posix()],
+            )
+        )
+        specification = importlib.machinery.PathFinder.find_spec(
+            tool.module,
+            [site_packages.as_posix()],
+        )
+    except (ImportError, OSError, TypeError) as exc:
+        _fail_from("trusted release tool identity is unavailable", exc)
+    if (
+        len(distributions) != 1
+        or distributions[0].version != tool.version
+        or specification is None
+        or specification.origin is None
+    ):
+        _fail("trusted release tool version or import origin is invalid")
+    try:
+        origin = Path(specification.origin).resolve(strict=True)
+        origin_metadata = origin.lstat()
+    except OSError as exc:
+        _fail_from("trusted release tool import origin is unavailable", exc)
+    if not stat.S_ISREG(origin_metadata.st_mode) or site_packages not in origin.parents:
+        _fail("trusted release tool import origin is not a regular purelib file")
+    entries = tuple(
+        item
+        for item in distributions[0].entry_points
+        if item.group == "console_scripts" and item.name == tool.entry_name
+    )
+    if tool.mode == "console":
+        if len(entries) != 1 or entries[0].value != tool.entry_value:
+            _fail("trusted release tool entry point is invalid")
+    elif entries or tool.entry_name is not None or tool.entry_value is not None:
+        _fail("trusted release module invocation is invalid")
+    return (
+        tool.mode,
+        tool.module,
+        tool.distribution,
+        tool.version,
+        origin.as_posix(),
+        site_packages.as_posix(),
+        tool.entry_name,
+        tool.entry_value,
+    )
 
 
 def _gate_command(
@@ -940,6 +2373,43 @@ def _gate_command(
     )
 
 
+def _trusted_python_gate_command(
+    tool: _TrustedReleaseTool,
+    *,
+    arguments: tuple[str, ...],
+    context: _GateCommandContext,
+) -> GateCommand:
+    """Bind one Python gate to an isolated, origin-proving child driver."""
+    proof = _trusted_release_tool_proof(tool)
+    encoded_proof = json.dumps(
+        proof,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode()
+    proof_sha256 = f"sha256:{hashlib.sha256(encoded_proof).hexdigest()}"
+    python = Path(sys.executable)
+    command = _gate_command(
+        name=tool.name,
+        executable=python,
+        version=tool.version,
+        argv=(
+            python.as_posix(),
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            _TRUSTED_RELEASE_TOOL_DRIVER,
+            encoded_proof.decode("ascii"),
+            *arguments,
+        ),
+        context=context,
+    )
+    return replace(
+        command,
+        offline_evidence=(context.subject_digest, proof_sha256),
+    )
+
+
 def local_gate_commands(
     request: LocalGatesRequest,
     subject_digest: str,
@@ -952,15 +2422,11 @@ def local_gate_commands(
     root = request.worktree.resolve(strict=True)
     node = request.node_executable
     context = _GateCommandContext(cwd=root, subject_digest=subject_digest)
+    trusted_tools = {tool.name: tool for tool in _TRUSTED_RELEASE_TOOLS}
     return (
-        _gate_command(
-            name="ruff",
-            executable=python,
-            version="0.16.3",
-            argv=(
-                python.as_posix(),
-                "-m",
-                "ruff",
+        _trusted_python_gate_command(
+            trusted_tools["ruff"],
+            arguments=(
                 "check",
                 "--output-format=json",
                 "src",
@@ -968,11 +2434,9 @@ def local_gate_commands(
             ),
             context=context,
         ),
-        _gate_command(
-            name="mypy",
-            executable=python,
-            version="2.3.1",
-            argv=(python.as_posix(), "-m", "mypy", "-O", "json", "src", "scripts"),
+        _trusted_python_gate_command(
+            trusted_tools["mypy"],
+            arguments=("-O", "json", "src", "scripts"),
             context=context,
         ),
         replace(
@@ -1006,14 +2470,9 @@ def local_gate_commands(
             ),
             context=context,
         ),
-        _gate_command(
-            name="bandit",
-            executable=python,
-            version="1.9.4",
-            argv=(
-                python.as_posix(),
-                "-m",
-                "bandit",
+        _trusted_python_gate_command(
+            trusted_tools["bandit"],
+            arguments=(
                 "-ll",
                 "-r",
                 "src",
@@ -1023,14 +2482,9 @@ def local_gate_commands(
             ),
             context=context,
         ),
-        _gate_command(
-            name="pip-audit",
-            executable=python,
-            version="2.10.1",
-            argv=(
-                python.as_posix(),
-                "-m",
-                "pip_audit",
+        _trusted_python_gate_command(
+            trusted_tools["pip-audit"],
+            arguments=(
                 "-r",
                 "requirements-dev.lock",
                 "--require-hashes",
@@ -1041,14 +2495,9 @@ def local_gate_commands(
             ),
             context=context,
         ),
-        _gate_command(
-            name="cyclonedx",
-            executable=python,
-            version="7.3.1",
-            argv=(
-                python.as_posix(),
-                "-m",
-                "cyclonedx_py",
+        _trusted_python_gate_command(
+            trusted_tools["cyclonedx"],
+            arguments=(
                 "environment",
                 "--output-format",
                 "JSON",
@@ -1237,6 +2686,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "materialize-source":
         materialize_source(worktree, cast("Path", values["output"]))
         return 0
+    _ = load_release_policies(worktree / "security")
     report = run_local_gates(
         LocalGatesRequest(
             worktree=worktree,
@@ -1266,7 +2716,15 @@ def cli(argv: Sequence[str] | None = None) -> int:
 
 
 def load_release_policies(root: Path) -> ReleasePolicies:
-    """Load the three closed candidate-side Task 8 policy descriptors."""
+    """Load the closed candidate-side policy and expected-controller descriptors."""
+    external_gate_registry = parse_external_gate_registry(
+        (root / "external-test-gates.json").read_bytes()
+    )
+    commands = load_release_command_manifest(root / "release-command-manifests.json")
+    validate_external_gate_manifest_join(external_gate_registry, commands)
+    recovery = load_private_recovery_policy(root / "private-recovery-policy.json")
+    if recovery.policy_digest != _EXPECTED_PRIVATE_RECOVERY_POLICY_SHA256:
+        _fail("private recovery policy differs from the closed release binding")
     return ReleasePolicies(
         dependency_risk=load_dependency_risk_policy(
             root / "dependency-risk-policy.json"
@@ -1277,6 +2735,9 @@ def load_release_policies(root: Path) -> ReleasePolicies:
         controller=load_release_controller_policy(
             root / "release-controller-policy.json"
         ),
+        recovery=recovery,
+        external_gate_registry=external_gate_registry,
+        commands=commands,
     )
 
 
@@ -1433,9 +2894,34 @@ class SystemCommandRunner:
         )
 
 
+def _valid_closed_python_tool_success(
+    command: GateCommand,
+    completed: ChildResult,
+) -> bool:
+    """Validate one pinned Python tool's exact zero-exit output contract."""
+    try:
+        if command.name == "ruff":
+            parsed = load_json_value(completed.stdout)
+            return parsed == [] and completed.stderr == b""
+        if command.name == "bandit":
+            _ = _BanditSuccess.model_validate_json(completed.stdout, strict=True)
+            return True
+        if command.name == "pip-audit":
+            _ = _PipAuditSuccess.model_validate_json(completed.stdout, strict=True)
+            return True
+        if command.name == "cyclonedx":
+            _ = _CycloneDxSuccess.model_validate_json(completed.stdout, strict=True)
+            return completed.stderr == b""
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError, ValidationError):
+        return False
+    return False
+
+
 def _valid_success_evidence(command: GateCommand, completed: ChildResult) -> bool:
     """Validate a zero-exit tool result against its exact success contract."""
-    if command.name == "mypy":
+    if command.name in {"bandit", "cyclonedx", "pip-audit", "ruff"}:
+        valid = _valid_closed_python_tool_success(command, completed)
+    elif command.name == "mypy":
         valid = completed.stdout in (b"", b"\n") and completed.stderr == b""
     elif command.name == "pyright":
         valid = False

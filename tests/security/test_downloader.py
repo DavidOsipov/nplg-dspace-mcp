@@ -30,7 +30,15 @@ from nplg_mcp.resilience import (
     UpstreamGuardPolicy,
 )
 from nplg_mcp.security import DnsTransientError
-from nplg_mcp.storage import ContentAddressedStore
+from nplg_mcp.storage import ContentAddressedStore, StoreLifecycleConfiguration
+from nplg_mcp.storage_lifecycle import (
+    ClockHighWater,
+    PublicationBlocker,
+    PublicationReservationError,
+    RetentionClockSample,
+    RetentionPolicy,
+    StorageCapacity,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Generator
@@ -149,6 +157,164 @@ async def test_valid_public_pdf_is_streamed_to_content_addressed_storage(
     assert result.artifact.media_type == "application/pdf"
     assert result.source_bitstream_id == "bit_test"
     assert result.bytes_downloaded == len(body)
+
+
+@pytest.mark.asyncio
+async def test_download_reserves_unknown_length_before_network_or_staging(
+    tmp_path: Path,
+) -> None:
+    network_calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal network_calls
+        network_calls += 1
+        return httpx.Response(
+            200,
+            content=b"%PDF-1.7\nbody",
+            headers={"content-type": "application/pdf"},
+        )
+
+    policy = RetentionPolicy(
+        maximum_age_seconds=3600,
+        maximum_bytes=10,
+        maximum_objects=2,
+        minimum_free_bytes=64 * 1024 * 1024,
+        minimum_free_inodes=128,
+    )
+    now = datetime.now(UTC)
+    first = RetentionClockSample(
+        utc_now=now,
+        monotonic_now=0.0,
+        boot_id="test-boot",
+        synchronized=True,
+    )
+    current = RetentionClockSample(
+        utc_now=now,
+        monotonic_now=1.0,
+        boot_id="test-boot",
+        synchronized=True,
+    )
+    clock_guard = ClockHighWater(
+        tmp_path / ".retention-clock.json",
+        healthy_window_seconds=0,
+        maximum_forward_slew_seconds=5,
+    )
+    _ = clock_guard.observe(first)
+    assert clock_guard.observe(first).trusted is True
+    capacity = StorageCapacity(
+        total_bytes=128 * 1024 * 1024,
+        available_bytes=128 * 1024 * 1024,
+        total_inodes=1000,
+        available_inodes=1000,
+    )
+    store = ContentAddressedStore(
+        tmp_path,
+        max_bytes=10,
+        lifecycle=StoreLifecycleConfiguration(
+            policy=policy,
+            capacity_sampler=lambda: capacity,
+            clock_high_water=clock_guard,
+            clock_sampler=lambda: current,
+        ),
+    )
+    _ = store.put_bytes(
+        b"123456",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        downloader = DocumentDownloader(
+            client=client,
+            store=store,
+            max_bytes=6,
+            validate_dns=False,
+            retention_policy=policy,
+            retention_clock=lambda: current,
+        )
+        with pytest.raises(PublicationReservationError) as raised:
+            _ = await downloader.download(bitstream())
+
+    assert raised.value.blocker is PublicationBlocker.BYTE_BUDGET
+    assert network_calls == 0
+    assert tuple(store.staging_dir.iterdir()) == ()
+
+
+@pytest.mark.asyncio
+async def test_download_reserves_lifecycle_metadata_inode_before_network(
+    tmp_path: Path,
+) -> None:
+    network_calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal network_calls
+        network_calls += 1
+        return httpx.Response(
+            200,
+            content=b"%PDF-1.7\nbody",
+            headers={"content-type": "application/pdf"},
+        )
+
+    policy = RetentionPolicy(
+        maximum_age_seconds=3600,
+        maximum_bytes=1024,
+        maximum_objects=2,
+        minimum_free_bytes=64 * 1024 * 1024,
+        minimum_free_inodes=128,
+    )
+    now = datetime.now(UTC)
+    initial = RetentionClockSample(
+        utc_now=now,
+        monotonic_now=0.0,
+        boot_id="test-boot",
+        synchronized=True,
+    )
+    current = RetentionClockSample(
+        utc_now=now,
+        monotonic_now=1.0,
+        boot_id="test-boot",
+        synchronized=True,
+    )
+    clock_guard = ClockHighWater(
+        tmp_path / ".retention-clock.json",
+        healthy_window_seconds=0,
+        maximum_forward_slew_seconds=5,
+    )
+    _ = clock_guard.observe(initial)
+    assert clock_guard.observe(initial).trusted is True
+    capacity = StorageCapacity(
+        total_bytes=128 * 1024 * 1024,
+        available_bytes=128 * 1024 * 1024,
+        total_inodes=1000,
+        available_inodes=130,
+    )
+    store = ContentAddressedStore(
+        tmp_path,
+        max_bytes=1024,
+        lifecycle=StoreLifecycleConfiguration(
+            policy=policy,
+            capacity_sampler=lambda: capacity,
+            clock_high_water=clock_guard,
+            clock_sampler=lambda: current,
+        ),
+    )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        downloader = DocumentDownloader(
+            client=client,
+            store=store,
+            max_bytes=128,
+            validate_dns=False,
+            retention_policy=policy,
+            retention_clock=lambda: current,
+        )
+        with pytest.raises(PublicationReservationError) as raised:
+            _ = await downloader.download(bitstream())
+
+    assert raised.value.blocker is PublicationBlocker.INODE_HEADROOM
+    assert network_calls == 0
+    assert tuple(store.staging_dir.iterdir()) == ()
 
 
 @pytest.mark.asyncio

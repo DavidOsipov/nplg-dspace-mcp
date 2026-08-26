@@ -36,8 +36,6 @@ from scripts.run_test_gate import (
     CommandResult,
     CoveragePolicy,
     CoverageReportResult,
-    ExternalGate,
-    ExternalGateRegistry,
     InstalledFileRecord,
     SystemClock,
     SystemExecutor,
@@ -75,6 +73,7 @@ if TYPE_CHECKING:
 
 _CI_MAX_EXAMPLES = 200
 _FULL_PERCENT = 100.0
+_FULL_BRANCH_FLOOR = 100
 _MIN_MARKER_ARGUMENTS = 2
 _TRUSTED_PROOF_FIELDS = 4
 _PRIVATE_DIRECTORY_MODE = 0o700
@@ -85,9 +84,15 @@ _TRUSTED_DRIVER_ROOTS_INDEX = 6
 _TRUSTED_DRIVER_PROOF_INDEX = 7
 _TRUSTED_DRIVER_PACKAGE_ROOT_INDEX = 8
 _TRUSTED_DRIVER_REJECTION = 97
+_COLLECTION_OUTPUT_LIMIT_BYTES = 32 * 1024 * 1024
 _CLI_FAILURE = 1
 _SECOND_CALL = 2
 _THIRD_CALL = 3
+_DETERMINISTIC_NODE = "tests/test_ok.py::test_ok"
+_LIVE_CANARY_NODE = (
+    "tests/integration/test_repository.py::"
+    "test_live_nplg_canary_uses_bound_public_endpoint"
+)
 _MATCH_BRANCH_SOURCE = """if anchor:
     pass
 match value:
@@ -102,6 +107,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     pass
 """
+
+
+class _NodeCollector(Protocol):
+    def __call__(self, payload: bytes, *, allow_empty: bool) -> tuple[str, ...]: ...
+
 
 _SHARED_AUTHORITY_NAMES = (
     "RepositoryEvidence",
@@ -528,15 +538,19 @@ class _CoverageExecutor:
                     "changed during gate\n", encoding="utf-8"
                 )
                 self._source_mutated = True
-            selected = marker is not None and marker == self._external_marker
+            nodes: tuple[str, ...]
+            if marker is None:
+                nodes = (_DETERMINISTIC_NODE, _LIVE_CANARY_NODE)
+            elif marker == "live":
+                nodes = (_LIVE_CANARY_NODE,)
+            else:
+                nodes = ()
+            if marker is not None and marker == self._external_marker:
+                nodes = (_DETERMINISTIC_NODE, *nodes)
             return CommandResult(
                 argv=argv,
-                returncode=0 if marker is None or selected else 5,
-                stdout=(
-                    b"tests/test_ok.py::test_ok\n\n1 test collected in 0.01s\n"
-                    if marker is None or selected
-                    else b""
-                ),
+                returncode=0 if nodes else 5,
+                stdout=("\n".join((*nodes, "")).encode() if nodes else b""),
                 stderr=b"",
             )
         if "run" in argv and (
@@ -1150,9 +1164,15 @@ def _policy() -> CoveragePolicy:
             "src/nplg_mcp/json_preflight.py",
             "src/nplg_mcp/network.py",
             "src/nplg_mcp/resilience.py",
+            "src/nplg_mcp/resource_admission.py",
             "src/nplg_mcp/pdf_executor.py",
             "src/nplg_mcp/pdf_ipc.py",
+            "src/nplg_mcp/malware.py",
+            "src/nplg_mcp/pdf_worker_client.py",
+            "src/nplg_mcp/storage.py",
+            "src/nplg_mcp/storage_lifecycle.py",
             "src/nplg_mcp/rate_limit.py",
+            "src/nplg_mcp/mcp_server.py",
             "src/nplg_mcp/sdk_boundary.py",
             "src/nplg_mcp/security.py",
             "src/nplg_mcp/tokens.py",
@@ -1162,6 +1182,9 @@ def _policy() -> CoveragePolicy:
             "scripts/run_quality_gate.py",
             "scripts/run_test_gate.py",
             "scripts/run_mutation_gate.py",
+            "scripts/verify_scanner_container.py",
+            "scripts/verify_pdf_worker_quota.py",
+            "scripts/verify_private_recovery.py",
             "scripts/verify_release.py",
             "scripts/bootstrap_external_tools.py",
             "scripts/pyright_identity.py",
@@ -1169,17 +1192,62 @@ def _policy() -> CoveragePolicy:
     )
 
 
-def test_branchless_mcp_server_is_not_registered_as_a_decision_module() -> None:
-    """Decision inventory contains only modules with measurable branch exits."""
+def test_mcp_server_profile_branch_is_registered_as_a_decision_module() -> None:
+    """Profile-dependent SDK registration is held to 100% branch coverage."""
     relative = "src/nplg_mcp/mcp_server.py"
     parser = PythonParser(filename=relative, exclude=join_regex(DEFAULT_EXCLUDE))
     parser.parse_source()
     branch_exits = sum(
         exits - 1 for exits in parser.exit_counts().values() if exits > 1
     )
+    root = Path(__file__).resolve().parents[2]
+    policy = parse_coverage_policy(
+        (root / "security" / "coverage-policy.json").read_bytes(),
+        root=root,
+    )
 
-    assert branch_exits == 0
-    assert relative not in _policy().decision_modules
+    assert branch_exits == 1
+    assert policy.decision_module_branch_floor == _FULL_BRANCH_FLOOR
+    assert relative in policy.decision_modules
+
+
+def test_inline_resource_admission_is_registered_as_a_decision_module() -> None:
+    """Byte-denominated overload/accounting decisions require full branches."""
+    relative = "src/nplg_mcp/resource_admission.py"
+    parser = PythonParser(filename=relative, exclude=join_regex(DEFAULT_EXCLUDE))
+    parser.parse_source()
+    branch_exits = sum(
+        exits - 1 for exits in parser.exit_counts().values() if exits > 1
+    )
+    root = Path(__file__).resolve().parents[2]
+    policy = parse_coverage_policy(
+        (root / "security" / "coverage-policy.json").read_bytes(),
+        root=root,
+    )
+
+    assert branch_exits > 0
+    assert policy.decision_module_branch_floor == _FULL_BRANCH_FLOOR
+    assert relative in policy.decision_modules
+
+
+def test_task_sixteen_a_decision_modules_are_registered_at_full_branch_floor() -> None:
+    """Every Task 16A decision surface remains in the closed 100% inventory."""
+    root = Path(__file__).resolve().parents[2]
+    policy = parse_coverage_policy(
+        (root / "security" / "coverage-policy.json").read_bytes(),
+        root=root,
+    )
+
+    assert policy.decision_module_branch_floor == _FULL_BRANCH_FLOOR
+    assert {
+        "src/nplg_mcp/malware.py",
+        "src/nplg_mcp/pdf_worker_client.py",
+        "src/nplg_mcp/storage.py",
+        "src/nplg_mcp/storage_lifecycle.py",
+        "scripts/verify_scanner_container.py",
+        "scripts/verify_pdf_worker_quota.py",
+        "scripts/verify_private_recovery.py",
+    }.issubset(policy.decision_modules)
 
 
 def _policy_document() -> dict[str, object]:
@@ -1225,6 +1293,21 @@ def test_gate_records_are_immutable(tmp_path: Path) -> None:
         request.__setattr__("compare_branch", "HEAD^")
 
 
+def test_collection_parser_ignores_non_node_diagnostic_lines() -> None:
+    """Pytest banners and summaries cannot be mistaken for collected node IDs."""
+    payload = f"diagnostic banner\n{_DETERMINISTIC_NODE}\n1 test collected\n".encode()
+    namespace = cast(
+        "dict[str, object]",
+        cast("object", test_gate_module.__dict__),
+    )
+    collect_nodes = cast(
+        "_NodeCollector",
+        namespace["_collected_nodes"],
+    )
+
+    assert collect_nodes(payload, allow_empty=False) == (_DETERMINISTIC_NODE,)
+
+
 def test_coverage_policy_parser_reaches_behavioral_red(tmp_path: Path) -> None:
     _materialize_policy_modules(tmp_path)
     policy_path = tmp_path / "coverage-policy.json"
@@ -1239,14 +1322,22 @@ def test_coverage_policy_parser_reaches_behavioral_red(tmp_path: Path) -> None:
                 b'"src/nplg_mcp/errors.py","src/nplg_mcp/http_security.py",',
                 b'"src/nplg_mcp/json_preflight.py","src/nplg_mcp/network.py",',
                 b'"src/nplg_mcp/resilience.py",',
+                b'"src/nplg_mcp/resource_admission.py",',
                 b'"src/nplg_mcp/pdf_executor.py","src/nplg_mcp/pdf_ipc.py",',
+                b'"src/nplg_mcp/malware.py",',
+                b'"src/nplg_mcp/pdf_worker_client.py","src/nplg_mcp/storage.py",',
+                b'"src/nplg_mcp/storage_lifecycle.py",',
                 b'"src/nplg_mcp/rate_limit.py",',
+                b'"src/nplg_mcp/mcp_server.py",',
                 b'"src/nplg_mcp/sdk_boundary.py",',
                 b'"src/nplg_mcp/security.py","src/nplg_mcp/tokens.py",',
                 b'"scripts/delete_render.py","scripts/run_live_nplg_canary.py",',
                 b'"scripts/smoke_live.py",',
                 b'"scripts/run_quality_gate.py","scripts/run_test_gate.py",',
-                b'"scripts/run_mutation_gate.py","scripts/verify_release.py",',
+                b'"scripts/run_mutation_gate.py",',
+                b'"scripts/verify_scanner_container.py",',
+                b'"scripts/verify_pdf_worker_quota.py",',
+                b'"scripts/verify_private_recovery.py","scripts/verify_release.py",',
                 b'"scripts/bootstrap_external_tools.py",',
                 b'"scripts/pyright_identity.py"]}\n',
             )
@@ -1293,10 +1384,10 @@ def test_coverage_policy_rejects_nonexistent_or_unmeasured_modules(
         _ = parse_coverage_policy(payload, root=tmp_path)
 
 
-def test_empty_external_registry_parser_reaches_behavioral_red() -> None:
-    registry = parse_external_gate_registry(b'{"version":1,"gates":[]}\n')
-
-    assert registry == ExternalGateRegistry(version=1, gates=())
+def test_external_registry_rejects_a_missing_protected_gate_inventory() -> None:
+    """A Task 7-era empty registry is no longer a valid release policy."""
+    with pytest.raises(GateError, match="reviewed protected-gate inventory"):
+        _ = parse_external_gate_registry(b'{"version":1,"gates":[]}\n')
 
 
 def test_repository_policy_files_match_the_closed_phase3_contract() -> None:
@@ -1309,65 +1400,114 @@ def test_repository_policy_files_match_the_closed_phase3_contract() -> None:
         )
         == _policy()
     )
-    assert parse_external_gate_registry(
+    registry = parse_external_gate_registry(
         (root / "security" / "external-test-gates.json").read_bytes()
-    ) == ExternalGateRegistry(
-        version=1,
-        gates=(
-            ExternalGate(
-                kind="live",
-                node_id=(
-                    "tests/contracts/test_frozen_baseline.py::"
-                    "test_capture_check_mode_fails_closed_until_attestation_without_rewriting"
-                ),
-            ),
-            ExternalGate(
-                kind="live",
-                node_id=(
-                    "tests/contracts/test_frozen_baseline.py::"
-                    "test_historical_capture_rejects_a_non_recovery_head_without_writes"
-                ),
-            ),
-            ExternalGate(
-                kind="live",
-                node_id=(
-                    "tests/contracts/test_frozen_baseline.py::"
-                    "test_rejected_historical_capture_does_not_freshen_git_metadata"
-                ),
-            ),
-            ExternalGate(
-                kind="live",
-                node_id=(
-                    "tests/integration/test_repository.py::"
-                    "test_live_nplg_canary_uses_bound_public_endpoint"
-                ),
-                gate_id="common.nplg-live-canary",
-                command_id="live.nplg-bound-endpoint.v2",
-                profiles=("alpic-metadata", "private-full"),
-                mode="preexecuted-operational",
-                protected_command=(
-                    "nplg-release-controller",
-                    "external-gate",
-                    "--gate-id",
-                    "common.nplg-live-canary",
-                    "--candidate-battery-json",
-                    "BATTERY",
-                    "--controller-policy",
-                    "EXPECTED_POLICY",
-                    "--network-broker-descriptor",
-                    "BROKER",
-                    "--result-json",
-                    "RESULT_JSON",
-                ),
-                protected_cwd="protected-controller-root",
-                broker_kind="one-operation-exact-nplg-origin",
-                authority="protected-controller-network-broker",
-                timeout_seconds=60,
-                result_schema="nplg-live-canary.v2",
-                signed_proof_schema="nplg-live-canary.v2",
-            ),
+    )
+    assert registry.version == 1
+    assert tuple(gate.gate_id for gate in registry.gates) == (
+        "common.nplg-live-canary",
+        "private-full.edge-http",
+        "private-full.pdf-worker-container",
+        "private-full.pdf-worker-write-quota",
+        "private-full.recovery-proof",
+        "private-full.scanner-container",
+    )
+    assert tuple(gate.command_id for gate in registry.gates) == (
+        "live.nplg-bound-endpoint.v2",
+        "staging.private-full-edge.v2",
+        "container.pdf-worker.v2",
+        "container.pdf-worker-quota.v2",
+        "container.private-full-recovery.v2",
+        "container.scanner.v2",
+    )
+    assert tuple(gate.kind for gate in registry.gates) == (
+        "live",
+        "staging",
+        "container",
+        "container",
+        "container",
+        "container",
+    )
+    assert tuple(gate.node_id for gate in registry.gates) == (
+        (
+            "tests/integration/test_repository.py::"
+            "test_live_nplg_canary_uses_bound_public_endpoint"
+        ),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    assert tuple(gate.timeout_seconds for gate in registry.gates) == (
+        60,
+        1800,
+        300,
+        300,
+        900,
+        300,
+    )
+    assert tuple(gate.result_schema for gate in registry.gates) == (
+        "nplg-live-canary.v2",
+        "private-edge-proof.v2",
+        "container-proof.v2",
+        "worker-quota-proof.v2",
+        "recovery-proof.v2",
+        "container-proof.v2",
+    )
+
+
+def test_external_registry_contains_only_controller_bound_gates() -> None:
+    """Every excluded test has a complete protected operational contract."""
+    root = Path(__file__).resolve().parents[2]
+    registry = parse_external_gate_registry(
+        (root / "security" / "external-test-gates.json").read_bytes()
+    )
+
+    for gate in registry.gates:
+        assert gate.gate_id is not None
+        assert gate.command_id is not None
+        assert gate.profiles
+        assert gate.mode == "preexecuted-operational"
+        assert gate.protected_command
+        assert gate.protected_cwd == "protected-controller-root"
+        assert gate.broker_kind is not None
+        assert gate.authority is not None
+        assert gate.timeout_seconds is not None
+        assert gate.result_schema is not None
+        assert gate.signed_proof_schema is not None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "extra", "command-drift", "invented-private-node"],
+)
+def test_external_registry_rejects_missing_extra_or_drifted_gates(
+    mutation: str,
+) -> None:
+    """The checked-in registry is one closed policy, not an extensible hint."""
+    root = Path(__file__).resolve().parents[2]
+    value = cast(
+        "dict[str, object]",
+        cast(
+            "object",
+            json.loads((root / "security" / "external-test-gates.json").read_bytes()),
         ),
     )
+    gates = cast("list[dict[str, object]]", value["gates"])
+    if mutation == "missing":
+        _ = gates.pop()
+    elif mutation == "extra":
+        gates.append(copy.deepcopy(gates[-1]))
+    elif mutation == "command-drift":
+        gates[-1]["command_id"] = "container.scanner.v3"
+    else:
+        gates[-1]["node_id"] = "tests/security/test_forged.py::test_forged"
+
+    with pytest.raises(GateError, match="reviewed protected-gate inventory"):
+        _ = parse_external_gate_registry(
+            json.dumps(value, separators=(",", ":")).encode()
+        )
 
 
 def test_coverage_pytest_and_hypothesis_configuration_is_closed() -> None:
@@ -2774,14 +2914,40 @@ def _initialize_gate_repository(
         json.dumps(policy_document, separators=(",", ":")),
         encoding="utf-8",
     )
-    _ = (security / "external-test-gates.json").write_text(
-        '{"version":1,"gates":[]}\n',
-        encoding="utf-8",
+    _ = (security / "external-test-gates.json").write_bytes(
+        Path(__file__)
+        .resolve()
+        .parents[2]
+        .joinpath("security/external-test-gates.json")
+        .read_bytes()
     )
     tests = repository / "tests"
     tests.mkdir()
     _ = (tests / "test_ok.py").write_text(
         "def test_ok() -> None:\n    assert True\n",
+        encoding="utf-8",
+    )
+    integration = tests / "integration"
+    integration.mkdir()
+    _ = integration.joinpath("test_repository.py").write_text(
+        """
+import pytest
+
+
+@pytest.mark.live
+def test_live_nplg_canary_uses_bound_public_endpoint() -> None:
+    assert True
+""".lstrip(),
+        encoding="utf-8",
+    )
+    _ = repository.joinpath("pytest.ini").write_text(
+        """
+[pytest]
+markers =
+    live: protected live authority
+    staging: protected staging authority
+    container: protected container authority
+""".lstrip(),
         encoding="utf-8",
     )
     for relative, payload in (extra_files or {}).items():
@@ -2847,66 +3013,27 @@ settings.register_profile(
 """.lstrip(),
         encoding="utf-8",
     )
-    false_modules = [
-        "admission",
-        "http_security",
-        "json_preflight",
-        "network",
-        "resilience",
-        "pdf_executor",
-        "pdf_ipc",
-        "rate_limit",
-        "sdk_boundary",
-        "security",
-        "tokens",
-        "delete_render",
-        "run_live_nplg_canary",
-        "smoke_live",
-        "run_quality_gate",
-        "run_test_gate",
-        "run_mutation_gate",
-        "verify_release",
-        "bootstrap_external_tools",
-        "pyright_identity",
-    ]
-    if cover_every_branch:
-        false_modules.insert(1, "errors")
-    false_assertions = [
-        f"    assert {name}.decide(False) == 0" for name in false_modules
-    ]
+    module_names = tuple(
+        (relative.removeprefix("src/").removesuffix(".py").replace("/", "."))
+        for relative in _policy().decision_modules
+    )
+    false_module_names = tuple(
+        name for name in module_names if cover_every_branch or name != "nplg_mcp.errors"
+    )
     test_source = "\n".join(
         (
-            (
-                "from nplg_mcp import (admission, errors, http_security, "
-                "json_preflight, network, resilience, pdf_executor, pdf_ipc, "
-                "rate_limit, sdk_boundary, security, tokens)"
-            ),
-            "from scripts import (",
-            "    bootstrap_external_tools,",
-            "    delete_render,",
-            "    run_live_nplg_canary,",
-            "    run_mutation_gate,",
-            "    run_quality_gate,",
-            "    run_test_gate,",
-            "    smoke_live,",
-            "    pyright_identity,",
-            "    verify_release,",
-            ")",
+            "import importlib",
             "",
-            "MODULES = (",
-            "    admission, errors, http_security, json_preflight, network,",
-            "    resilience,",
-            "    pdf_executor, pdf_ipc, rate_limit, sdk_boundary,",
-            "    security, tokens,",
-            "    delete_render, run_live_nplg_canary, smoke_live, run_quality_gate,",
-            "    run_test_gate, run_mutation_gate, verify_release,",
-            "    bootstrap_external_tools, pyright_identity,",
-            ")",
+            f"MODULE_NAMES = {module_names!r}",
+            f"FALSE_MODULE_NAMES = {false_module_names!r}",
             "",
             "def test_all_decisions() -> None:",
-            "    for module in MODULES:",
+            "    for name in MODULE_NAMES:",
+            "        module = importlib.import_module(name)",
             "        assert module.decide(True) == 1",
-            *false_assertions,
+            "    for name in FALSE_MODULE_NAMES:",
+            "        module = importlib.import_module(name)",
+            "        assert module.decide(False) == 0",
             "",
         )
     )
@@ -3010,6 +3137,14 @@ def test_run_test_gate_reaches_behavioral_red(tmp_path: Path) -> None:
         == _EXPECTED_COMMAND_RECORDS
     )
     assert executor.requests
+    collection_requests = tuple(
+        child for child in executor.requests if "--collect-only" in child.argv
+    )
+    assert collection_requests
+    assert all(
+        child.stdout_limit_bytes == _COLLECTION_OUTPUT_LIMIT_BYTES
+        for child in collection_requests
+    )
 
 
 def test_coverage_report_commands_prebind_materialized_package(

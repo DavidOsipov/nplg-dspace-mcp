@@ -8,7 +8,7 @@ Upstream-read-only Streamable HTTP MCP server for the National Parliamentary Lib
 - NPLG-specific DSpace 5.5 XMLUI/Manakin and OAI-PMH adapter; this is intentionally not a generic DSpace scraper.
 - Exact-origin, canonical-handle, DNS/IP, redirect, MIME, signature, streaming-size, and path controls.
 - Rich Dublin Core metadata with OAI-DIM preference and bounded XMLUI fallback.
-- Content-addressed public PDF storage, signed expiring asset URLs, and standard MCP `resource_link` content blocks for PDFs, manifests, page JPEGs, and tiles.
+- Content-addressed public PDF storage, signed expiring asset URLs, and canonical MCP resource reads for authorized PDFs, manifests, page JPEGs, and tiles in the private profile.
 - Conservative PDFium-based page classification:
   - byte-identical extraction for eligible single embedded JPEG pages;
   - native embedded-scan pixel-grid rendering where defensible;
@@ -16,7 +16,7 @@ Upstream-read-only Streamable HTTP MCP server for the National Parliamentary Lib
 - JPEG pages with no post-render resize.
 - Default 2048×2048 crop-only tiles with 128-pixel overlap.
 - Shared upstream request pacing plus fail-fast MCP, asset-stream, server-wide, and PDF-job concurrency bounds.
-- Bearer authentication by default in production.
+- Production activation fails closed until the governed Auth0/OIDC and Alpic DCR capability evidence supports an implemented verifier; static bearer/API-key fallback is forbidden.
 - Docker Compose + Caddy deployment assets and post-deploy verification scripts.
 
 No OCR is performed. The companion skill tells agents to verify Georgian text visually and preserve page/tile provenance. No MCP tool mutates the upstream NPLG archive and render deletion remains operator-only. The three tools that populate the local download/render cache are accurately marked as cache-writing in their MCP annotations.
@@ -33,6 +33,26 @@ No OCR is performed. The companion skill tells agents to verify Georgian text vi
 | `render_pdf_pages` | Create full-page JPEGs on the native scan grid or labelled fallback grid. |
 | `render_pdf_page_tiles` | Create overlapping crop-only tiles without resize. |
 | `get_render_manifest` | Refresh structured render metadata and signed links. |
+
+## MCP resources
+
+The `private-full` profile advertises one fixed resource and two canonical
+templates:
+
+- `nplg://about` describes the server's read-only scope and provenance rules.
+- `nplg://artifact/{artifact_id}` reads an authorized content-addressed PDF,
+  rendered JPEG, or tile manifest. A concrete artifact identifier is `doc_`
+  followed by exactly 64 lowercase hexadecimal SHA-256 characters.
+- `nplg://render/{render_id}/manifest` reads an authorized bounded render
+  manifest. A concrete render identifier is `rnd_` followed by exactly 32
+  lowercase hexadecimal characters.
+
+Clients resolve those canonical URIs through `resources/read`. Successful tool
+calls put their strictly validated Pydantic result in `structuredContent`; the
+SDK `content` array is intentionally empty. Tool result `resource_uri` fields
+identify resources that may be read through the protocol after the same
+authorization and expiry checks. The `alpic-metadata` profile does not register
+resource routes or advertise local storage.
 
 ## Local development
 
@@ -97,6 +117,7 @@ set -euo pipefail
 
 export NODE_ENV=development
 export DEPLOYMENT_PROFILE=private-full
+export CURSOR_SIGNING_SECRET="$(.venv/bin/python -c 'import secrets; print(secrets.token_hex(32))')"
 export ASSET_SIGNING_SECRET="$(.venv/bin/python -c 'import secrets; print(secrets.token_hex(32))')"
 export ALLOW_ANONYMOUS=true
 export PUBLIC_BASE_URL=http://127.0.0.1:8000
@@ -120,11 +141,14 @@ Offline tests use pinned HTML/OAI fixtures and a synthetic PDF corpus. Live NPLG
 
 The phase 0–1 capability records under `contracts/` are negative evidence,
 not OAuth support: dynamic operation-scope 403, exact Alpic detector replay,
-route compatibility, and provider selection remain explicit blockers.
+route compatibility, provider selection, DCR issuer semantics, and the witnessed
+end-to-end flow remain explicit blockers. Production startup consumes that
+negative provider verdict before dependency construction and refuses all static
+bearer/API-key fallback.
 
 ## Production deployment
 
-Use the reviewed Docker Compose + Caddy procedure in [`deploy/README.md`](deploy/README.md) for the complete download and PDF-rendering pipeline. Alpic users must read [`deploy/ALPIC.md`](deploy/ALPIC.md): the platform can host the search/metadata surface, but its serverless runtime, 30-second tool limit, and static `/assets/` handling do not provide a full-fidelity target for the current multi-call rendering workflow.
+The current candidate is `do_not_release`: production startup is intentionally blocked until the selected OAuth provider/DCR contract and verifier are implemented and evidenced. The Docker Compose + Caddy material in [`deploy/README.md`](deploy/README.md) is configuration scaffolding, not authorization to expose the service. Alpic users must read [`deploy/ALPIC.md`](deploy/ALPIC.md): even after the authentication blocker is closed, the platform's serverless runtime, 30-second tool limit, and static `/assets/` handling do not provide a full-fidelity target for the current multi-call rendering workflow.
 
 The minimum Docker/VPS operational sequence is:
 

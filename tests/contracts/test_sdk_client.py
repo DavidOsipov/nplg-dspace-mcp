@@ -14,6 +14,7 @@ import pytest
 from mcp import Client, types
 from mcp.shared.exceptions import MCPError
 
+from nplg_mcp.errors import ErrorCode
 from nplg_mcp.json_types import JsonObject, require_json_object
 from nplg_mcp.mcp_server import create_mcp_server
 from nplg_mcp.profiles import DeploymentProfile
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
 
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
+METHOD_NOT_FOUND = -32601
 
 
 async def _render_first_page_resource(
@@ -83,6 +85,28 @@ async def test_official_client_lists_strict_metadata_tools(
 
 
 @pytest.mark.asyncio
+async def test_metadata_profile_advertises_no_private_resource_surfaces(
+    app_services: MetadataServices,
+) -> None:
+    """Metadata-only deployments cannot disclose private artifact capabilities."""
+    handlers = SdkHandlers(app_services, DeploymentProfile.ALPIC_METADATA)
+
+    resources = await handlers.on_list_resources(
+        cast("ServerRequestContext[None]", None),
+        None,
+    )
+    templates = await handlers.on_list_resource_templates(
+        cast("ServerRequestContext[None]", None),
+        None,
+    )
+
+    assert resources.resources == []
+    assert templates.resource_templates == []
+    assert resources.ttl_ms == templates.ttl_ms == 0
+    assert resources.cache_scope == templates.cache_scope == "private"
+
+
+@pytest.mark.asyncio
 async def test_default_official_client_records_a_discovery_result(
     app_services: MetadataServices,
 ) -> None:
@@ -113,7 +137,9 @@ async def test_official_client_returns_revalidated_structured_output(
         result = await client.call_tool("search_documents", {"query": "fixture"})
 
     assert result.is_error is False
-    assert result.content == []
+    assert len(result.content) == 1
+    assert isinstance(result.content[0], types.TextContent)
+    assert result.content[0].text == "Tool completed successfully."
     assert result.structured_content == {
         "items": [
             {
@@ -133,44 +159,65 @@ async def test_official_client_returns_revalidated_structured_output(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("name", "arguments"),
+    ("arguments", "expected_location"),
     [
-        ("search_documents", {"query": "fixture", "unexpected": True}),
-        ("search_documents", {"query": 1}),
-        ("search_documents", {"query": "fixture", "page_size": True}),
-        ("unknown_tool", {}),
+        ({"query": "fixture", "unexpected": True}, "arguments"),
+        ({"query": 1}, "query"),
+        ({"query": "fixture", "page_size": True}, "page_size"),
     ],
 )
 async def test_official_client_rejects_invalid_raw_tool_arguments(
     app_services: MetadataServices,
-    name: str,
     arguments: dict[str, object],
+    expected_location: str,
 ) -> None:
-    """Bad raw arguments fail at the adapter with the standard invalid-params code."""
+    """Known-tool argument errors remain in the actionable tool-result channel."""
+    server = create_mcp_server(app_services, DeploymentProfile.ALPIC_METADATA)
+
+    async with Client(server, mode="2026-07-28") as client:
+        result = await client.call_tool("search_documents", arguments)
+
+    assert result.is_error is True
+    assert result.structured_content == {
+        "error": {
+            "code": ErrorCode.INVALID_INPUT.value,
+            "message": "Tool arguments did not match the declared schema.",
+            "details": {"locations": [expected_location]},
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_official_client_receives_exact_unknown_tool_protocol_error(
+    app_services: MetadataServices,
+) -> None:
+    """Unknown tool identity stays a sanitized Invalid Params protocol error."""
     server = create_mcp_server(app_services, DeploymentProfile.ALPIC_METADATA)
 
     async with Client(server, mode="2026-07-28") as client:
         with pytest.raises(MCPError) as captured:
-            _ = await client.call_tool(name, arguments)
+            _ = await client.call_tool("attacker-controlled-unknown-tool", {})
 
     assert captured.value.error.code == INVALID_PARAMS
-    assert "fixture" not in captured.value.error.message
+    assert captured.value.error.message == "Unknown tool."
+    assert captured.value.error.data == {"code": "UNKNOWN_TOOL"}
+    assert "attacker-controlled" not in str(
+        captured.value.error.model_dump(mode="json")
+    )
 
 
 @pytest.mark.asyncio
-async def test_metadata_profile_registers_no_local_resource_templates(
+async def test_metadata_profile_does_not_register_resource_routes(
     app_services: MetadataServices,
 ) -> None:
-    """Metadata-only deployment cannot advertise local artifact or render state."""
+    """Metadata-only deployment has no resource route to advertise local state."""
     server = create_mcp_server(app_services, DeploymentProfile.ALPIC_METADATA)
 
     async with Client(server, mode="2026-07-28") as client:
-        result = await client.list_resource_templates()
+        with pytest.raises(MCPError) as captured:
+            _ = await client.list_resource_templates()
 
-    assert result.resource_templates == []
-    wire = result.model_dump(mode="json", by_alias=True)
-    assert wire["ttlMs"] == 0
-    assert wire["cacheScope"] == "private"
+    assert captured.value.error.code == METHOD_NOT_FOUND
 
 
 @pytest.mark.asyncio
@@ -200,10 +247,12 @@ async def test_private_profile_registers_only_canonical_local_templates(
 
 @pytest.mark.asyncio
 async def test_valid_absent_resource_has_exact_bounded_invalid_params_error(
-    app_services: MetadataServices,
+    tmp_path: Path,
 ) -> None:
     """A canonical but absent resource is never an empty successful read."""
-    server = create_mcp_server(app_services, DeploymentProfile.ALPIC_METADATA)
+    tools = make_tool_service(tmp_path)
+    services = FullServiceComposition(tools=tools, store=tools.store)
+    server = create_mcp_server(services, DeploymentProfile.PRIVATE_FULL)
 
     async with Client(server, mode="2026-07-28") as client:
         with pytest.raises(MCPError) as captured:
@@ -226,11 +275,13 @@ async def test_valid_absent_resource_has_exact_bounded_invalid_params_error(
     ],
 )
 async def test_malformed_resource_uri_is_invalid_before_service_entry(
-    app_services: MetadataServices,
+    tmp_path: Path,
     uri: str,
 ) -> None:
     """Malformed and removed URI forms fail at the SDK adapter before lookup."""
-    server = create_mcp_server(app_services, DeploymentProfile.ALPIC_METADATA)
+    tools = make_tool_service(tmp_path)
+    services = FullServiceComposition(tools=tools, store=tools.store)
+    server = create_mcp_server(services, DeploymentProfile.PRIVATE_FULL)
 
     async with Client(server, mode="2026-07-28") as client:
         with pytest.raises(MCPError) as captured:
@@ -637,4 +688,4 @@ async def test_mutant_legacy_page_uri_is_killed_at_live_sdk_output_boundary(
         )
 
     assert captured.value.error.code == INTERNAL_ERROR
-    assert captured.value.error.message == "Internal server error"
+    assert captured.value.error.message == "Internal tool error."

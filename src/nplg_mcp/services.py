@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from contextlib import AbstractContextManager
     from pathlib import Path
 
+    from .config import DeploymentProfile
     from .contracts import StrictOutput
     from .http_types import HttpClientProtocol
     from .json_types import JsonObject
@@ -38,8 +39,19 @@ class ToolSurface(Protocol):
 class AssetStore(Protocol):
     """Narrow asset/readiness store surface required by the HTTP application."""
 
+    def ensure_ready(self) -> None:
+        """Validate storage readiness without changing persistent state."""
+        ...
+
     def resolve_asset(self, relative_path: str) -> Path:
         """Resolve one validated relative asset path."""
+        ...
+
+    def lease_asset(
+        self,
+        relative_path: str,
+    ) -> AbstractContextManager[Path]:
+        """Hold one resolved object against pruning for a complete read."""
         ...
 
     def stage(
@@ -47,7 +59,7 @@ class AssetStore(Protocol):
         *,
         suffix: str = ".tmp",
     ) -> AbstractContextManager[object, bool | None]:
-        """Create one bounded readiness staging file."""
+        """Create one bounded artifact staging file."""
         ...
 
 
@@ -94,3 +106,16 @@ class FullServiceComposition:
 
 
 type AppServices = MetadataServiceComposition | FullServiceComposition
+
+
+def validate_service_composition(
+    profile: DeploymentProfile,
+    services: AppServices,
+) -> None:
+    """Reject a service graph that does not exactly match its profile."""
+    matches = (
+        profile == "alpic-metadata" and isinstance(services, MetadataServiceComposition)
+    ) or (profile == "private-full" and isinstance(services, FullServiceComposition))
+    if not matches:
+        msg = "deployment profile does not match service composition"
+        raise ValueError(msg)

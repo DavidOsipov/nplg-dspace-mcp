@@ -14,6 +14,9 @@ const REVIEWED_DATE = "2026-08-15";
 const SDK_UPSTREAM_COMMIT_UNAVAILABLE_REASON = "The official PyPI wheel metadata does not publish a verified VCS commit.";
 const SDK_REASON = "SDK v2.0.0 applies static route scopes before MCP parsing, omits the RFC minimum-scope parameter, and accepts duplicate Authorization headers.";
 const ALPIC_PROVENANCE = "Alpic public documentation summary; no versioned raw detector fixture or immutable response transcript was published for this review.";
+const ALPIC_TASKS_PROVENANCE = "Alpic documents a separate long-running Tasks compute path with a default TTL of up to six hours; the official Python SDK roadmap defers SEP-2663 Tasks from mcp 2.0.0. No authorized Alpic task conformance probe exists.";
+const ALPIC_TASKS_REVIEWED_DATE = "2026-08-24";
+const ALPIC_TASKS_SOURCE_EVIDENCE_DIGEST = "67dadaf3dee652e1f1f63dd26b3031043badffc64af4cf9c168090c422673a1b";
 const RESOURCE_METADATA_URL = "https://mcp.example.test/.well-known/oauth-protected-resource";
 const INVALID_TOKEN_CHALLENGE = `Bearer error="invalid_token", error_description="Authentication required", resource_metadata="${RESOURCE_METADATA_URL}"`;
 const INSUFFICIENT_SCOPE_CHALLENGE = `Bearer error="insufficient_scope", error_description="Required scope: nplg:search", resource_metadata="${RESOURCE_METADATA_URL}"`;
@@ -39,6 +42,9 @@ const verifierToken = z.string().min(1).max(256).refine(
   "verifier token contains whitespace or control characters",
 );
 const reviewDate = z.string().regex(/^20[0-9]{2}-[0-9]{2}-[0-9]{2}$/);
+const packageVersion = z.string().regex(
+  /^[0-9]{1,10}\.[0-9]{1,10}\.[0-9]{1,10}(?:[a-z][a-z0-9.-]{0,31})?$/,
+);
 const header = z.strictObject({
   name: z.string().min(1).max(128).regex(/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/),
   value: z.string().min(1).max(4096).regex(/^[^\r\n]+$/),
@@ -762,6 +768,161 @@ export const alpicOAuthDiscoveryCapabilitySchema = z.strictObject({
   }
 });
 
+const alpicTasksBlockers = z.tuple([
+  z.literal("MCP_TASKS_REVISION_UNFROZEN"),
+  z.literal("PYTHON_SDK_TASKS_EXTENSION_UNAVAILABLE"),
+  z.literal("PYTHON_SDK_TASKS_CLIENT_UNAVAILABLE"),
+  z.literal("ALPIC_TASKS_PYTHON_INTEGRATION_UNPROVEN"),
+  z.literal("ALPIC_TASK_CREATION_DURABILITY_UNPROVEN"),
+  z.literal("ALPIC_TASK_RESTART_RECOVERY_UNPROVEN"),
+  z.literal("ALPIC_TASK_CANCELLATION_UNPROVEN"),
+  z.literal("ALPIC_TASK_ISOLATION_UNPROVEN"),
+  z.literal("ALPIC_TASK_RETENTION_UNPROVEN"),
+  z.literal("ALPIC_TASK_ARTIFACT_DELIVERY_UNPROVEN"),
+  z.literal("ALPIC_TASK_CLIENT_SUPPORT_UNPROVEN"),
+]);
+
+/**
+ * @param {string} sourceId
+ * @param {string} url
+ * @param {string} observation
+ * @param {string} mediaType
+ * @returns {z.ZodType}
+ */
+function alpicTasksSourceRecord(sourceId, url, observation, mediaType) {
+  return z.strictObject({
+    source_id: z.literal(sourceId),
+    url: z.literal(url),
+    final_url: z.literal(url),
+    retrieved_at: z.string().regex(/^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/),
+    status_code: z.literal(200),
+    media_type: z.literal(mediaType),
+    content_length_bytes: z.number().int().min(1).max(1_048_576),
+    content_sha256: sha256,
+    observation: z.literal(observation),
+  });
+}
+
+const alpicTasksSources = z.tuple([
+  alpicTasksSourceRecord(
+    "alpic_tasks_docs",
+    "https://docs.alpic.ai/troubleshooting",
+    "tasks_compute_advertised",
+    "text/html",
+  ),
+  alpicTasksSourceRecord(
+    "python_sdk_roadmap",
+    "https://raw.githubusercontent.com/modelcontextprotocol/python-sdk/959569ba1505897bd8d824a1bf22800672f7cf14/ROADMAP.md",
+    "sdk_tasks_deferred",
+    "text/plain",
+  ),
+  alpicTasksSourceRecord(
+    "mcp_tasks_spec",
+    "https://tasks.extensions.modelcontextprotocol.io/specification/draft/tasks",
+    "tasks_extension_draft",
+    "text/html",
+  ),
+]);
+
+/** Canonical digest-only evidence from three allowlisted primary sources. */
+export const alpicTasksSourceEvidenceSchema = z.strictObject({
+  schema_version: z.literal("1.0"),
+  sources: alpicTasksSources,
+  evidence_digest: sha256,
+}).superRefine((value, context) => {
+  if (value.evidence_digest !== digestJson({
+    schema_version: value.schema_version,
+    sources: value.sources,
+  })) {
+    context.addIssue({ code: "custom", path: ["evidence_digest"], message: "source evidence digest mismatch" });
+  }
+});
+
+const alpicTasksCommonShape = {
+  schema_version: z.literal("1.0"),
+  provider: z.literal("alpic"),
+  extension_identifier: z.literal("io.modelcontextprotocol/tasks"),
+  provider_tasks_compute: z.literal("advertised"),
+  provider_ordinary_timeout_seconds: z.literal(30),
+  provider_default_task_ttl_seconds: z.number().int().min(1).max(21_600),
+};
+
+const unsupportedAlpicTasksCapabilitySchema = z.strictObject({
+  ...alpicTasksCommonShape,
+  extension_revision_state: z.literal("draft"),
+  mcp_version: z.literal("2.0.0"),
+  mcp_types_version: z.literal("2.0.0"),
+  installed_sdk_tree_sha256: z.literal(INSTALLED_MCP_TREE_SHA256),
+  sdk_server_support: z.literal("unsupported"),
+  sdk_client_support: z.literal("unsupported"),
+  provider_default_task_ttl_seconds: z.literal(21_600),
+  source_evidence_digest: z.literal(ALPIC_TASKS_SOURCE_EVIDENCE_DIGEST),
+  provider_integration: z.literal("not_assessed"),
+  task_creation_durability: z.literal("not_assessed"),
+  restart_recovery: z.literal("not_assessed"),
+  cancellation: z.literal("not_assessed"),
+  isolation: z.literal("not_assessed"),
+  retention: z.literal("not_assessed"),
+  artifact_delivery: z.literal("not_assessed"),
+  client_support: z.literal("not_assessed"),
+  documentation_provenance: z.literal(ALPIC_TASKS_PROVENANCE),
+  supported: z.literal(false),
+  blockers: alpicTasksBlockers,
+  reviewed_date: z.literal(ALPIC_TASKS_REVIEWED_DATE),
+  verdict_digest: sha256,
+});
+
+const alpicTasksEvidenceIdentity = z.string()
+  .min(1)
+  .max(256)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/);
+
+const alpicTasksLiveEvidenceIdentitySchema = z.strictObject({
+  environment_id: alpicTasksEvidenceIdentity,
+  deployment_id: alpicTasksEvidenceIdentity,
+  pack_sha256: sha256,
+  sdk_wheel_sha256: sha256,
+  protocol_revision_sha256: sha256,
+  client_identities_sha256: sha256,
+  evidence_digest: sha256,
+  observed_at: z.string().regex(/^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/),
+});
+
+const supportedAlpicTasksCapabilitySchema = z.strictObject({
+  ...alpicTasksCommonShape,
+  extension_revision_state: z.literal("stable"),
+  mcp_version: packageVersion,
+  mcp_types_version: packageVersion,
+  installed_sdk_tree_sha256: sha256,
+  sdk_server_support: z.literal("supported"),
+  sdk_client_support: z.literal("supported"),
+  source_evidence_digest: sha256,
+  provider_integration: z.literal("proven"),
+  task_creation_durability: z.literal("proven"),
+  restart_recovery: z.literal("proven"),
+  cancellation: z.literal("proven"),
+  isolation: z.literal("proven"),
+  retention: z.literal("proven"),
+  artifact_delivery: z.literal("proven"),
+  client_support: z.literal("proven"),
+  documentation_provenance: nonEmpty,
+  live_evidence: alpicTasksLiveEvidenceIdentitySchema,
+  supported: z.literal(true),
+  blockers: z.tuple([]),
+  reviewed_date: reviewDate,
+  verdict_digest: sha256,
+});
+
+/** Independent false/true oracle; true fixtures never grant runtime authority. */
+export const alpicTasksCapabilitySchema = z.discriminatedUnion("supported", [
+  unsupportedAlpicTasksCapabilitySchema,
+  supportedAlpicTasksCapabilitySchema,
+]).superRefine((value, context) => {
+  if (!verdictDigestMatches(value)) {
+    context.addIssue({ code: "custom", path: ["verdict_digest"], message: "verdict digest mismatch" });
+  }
+});
+
 export const oauthProviderCapabilitySchema = z.strictObject({
   schema_version: z.literal("1.0"),
   selected_issuer: nonEmpty.nullable(),
@@ -798,6 +959,22 @@ export const oauthProviderCapabilitySchema = z.strictObject({
   if (!value.supported && !value.blockers.includes("OAUTH_PROVIDER_CAPABILITY_UNPROVEN")) {
     context.addIssue({ code: "custom", path: ["blockers"], message: "unselected provider must preserve its blocker" });
   }
+  const expectedUnprovenBlockers = [
+    "OAUTH_PROVIDER_CAPABILITY_UNPROVEN",
+    "ALPIC_DCR_ISSUER_SEMANTICS_UNPROVEN",
+    "OAUTH_END_TO_END_FLOW_UNPROVEN",
+  ];
+  if (!value.supported && (
+    value.registration_modes.length !== 1 || value.registration_modes[0] !== "dcr"
+  )) {
+    context.addIssue({ code: "custom", path: ["registration_modes"], message: "selected Auth0/Alpic topology requires DCR" });
+  }
+  if (!value.supported && (
+    value.blockers.length !== expectedUnprovenBlockers.length ||
+    value.blockers.some((blocker, index) => blocker !== expectedUnprovenBlockers[index])
+  )) {
+    context.addIssue({ code: "custom", path: ["blockers"], message: "selected Auth0/Alpic DCR blockers are incomplete" });
+  }
   if (!verdictDigestMatches(value)) {
     context.addIssue({ code: "custom", path: ["verdict_digest"], message: "verdict digest mismatch" });
   }
@@ -806,5 +983,7 @@ export const oauthProviderCapabilitySchema = z.strictObject({
 export const capabilitySchemas = {
   sdk: sdkAuthorizationCapabilitySchema,
   alpic: alpicOAuthDiscoveryCapabilitySchema,
+  alpicTasks: alpicTasksCapabilitySchema,
+  alpicTasksSources: alpicTasksSourceEvidenceSchema,
   provider: oauthProviderCapabilitySchema,
 };

@@ -1,20 +1,44 @@
 # Copyright (c) 2026 David Osipov
 """Tests for token validation and constant-time comparisons."""
 
+from __future__ import annotations
+
 import base64
 import hashlib
 import hmac
 import json
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
+from typing import TYPE_CHECKING, cast
 
 import pytest
+from pydantic import ValidationError
 
+from nplg_mcp import tokens as token_module
 from nplg_mcp.errors import AppError, ErrorCode
-from nplg_mcp.tokens import AssetGrant, sign_asset_token, verify_asset_token
+from nplg_mcp.tokens import (
+    CURSOR_KEY_ID,
+    HARD_MAX_CURSOR_TTL_SECONDS,
+    AssetGrant,
+    CursorV1,
+    cursor_query_hash,
+    derive_cursor_signing_key,
+    sign_asset_token,
+    sign_cursor,
+    verify_asset_token,
+    verify_cursor,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from nplg_mcp.json_types import JsonObject
 
 SECRET = b"s" * 32
 NOW = datetime(2026, 8, 14, 18, 0, tzinfo=UTC)
+_CURSOR_QUERY = "strict cursor query"
+_CURSOR_SCOPE = "1234/560449"
+_CURSOR_PAIRS_HOOK = "_reject_duplicate_cursor_keys"
 
 
 def _signed_raw_payload(payload: bytes) -> str:
@@ -26,6 +50,121 @@ def _signed_raw_payload(payload: bytes) -> str:
     ).digest()
     encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
     return f"{encoded_payload}.{encoded_signature}"
+
+
+def _cursor(**updates: object) -> CursorV1:
+    payload: dict[str, object] = {
+        "version": 1,
+        "key_id": CURSOR_KEY_ID,
+        "query_hash": cursor_query_hash(_CURSOR_QUERY),
+        "scope_handle": _CURSOR_SCOPE,
+        "offset": 50,
+        "page_size": 25,
+        "issued_at": NOW,
+        "expires_at": NOW + timedelta(minutes=15),
+    }
+    payload.update(updates)
+    return CursorV1.model_validate(payload, strict=True)
+
+
+def _signed_cursor_payload(payload: bytes) -> str:
+    encoded_payload = base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+    signature = hmac.new(
+        derive_cursor_signing_key(SECRET),
+        encoded_payload.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+    return f"{encoded_payload}.{encoded_signature}"
+
+
+def test_cursor_round_trip_binds_every_search_context_field() -> None:
+    cursor = _cursor()
+    token = sign_cursor(SECRET, cursor)
+
+    assert (
+        verify_cursor(
+            SECRET,
+            token,
+            normalized_query=_CURSOR_QUERY,
+            scope_handle=_CURSOR_SCOPE,
+            page_size=25,
+            now=NOW,
+        )
+        == cursor
+    )
+
+
+@pytest.mark.parametrize(
+    "expires_at",
+    [
+        NOW,
+        NOW + timedelta(seconds=HARD_MAX_CURSOR_TTL_SECONDS + 1),
+    ],
+)
+def test_cursor_model_rejects_nonpositive_and_overlong_lifetimes(
+    expires_at: datetime,
+) -> None:
+    with pytest.raises(ValidationError, match="cursor lifetime is invalid"):
+        _ = _cursor(expires_at=expires_at)
+
+
+@pytest.mark.parametrize("secret", [b"short", "s" * 32])
+def test_cursor_key_derivation_rejects_short_or_nonbyte_secrets(secret: object) -> None:
+    with pytest.raises(ValueError, match="at least 32 bytes"):
+        _ = derive_cursor_signing_key(cast("bytes", secret))
+
+
+@pytest.mark.parametrize("query", ["", b"not-text"])
+def test_cursor_query_hash_rejects_empty_or_nontext_input(query: object) -> None:
+    with pytest.raises(ValueError, match="must be nonempty"):
+        _ = cursor_query_hash(cast("str", query))
+
+
+def test_cursor_json_hook_rejects_duplicate_and_nonjson_claims() -> None:
+    duplicated = _signed_cursor_payload(
+        b'{"version":1,"version":1,"key_id":"cursor-v1"}'
+    )
+    with pytest.raises(AppError, match="malformed"):
+        _ = verify_cursor(
+            SECRET,
+            duplicated,
+            normalized_query=_CURSOR_QUERY,
+            scope_handle=_CURSOR_SCOPE,
+            page_size=25,
+            now=NOW,
+        )
+
+    reject_pairs = cast(
+        "Callable[[list[tuple[str, object]]], JsonObject]",
+        getattr(token_module, _CURSOR_PAIRS_HOOK),
+    )
+    with pytest.raises(TypeError, match="not a JSON value"):
+        _ = reject_pairs([("claim", object())])
+
+
+def test_cursor_rejects_bad_signature_and_unsupported_key_id() -> None:
+    token = sign_cursor(SECRET, _cursor())
+    with pytest.raises(AppError, match="malformed"):
+        _ = verify_cursor(
+            b"x" * 32,
+            token,
+            normalized_query=_CURSOR_QUERY,
+            scope_handle=_CURSOR_SCOPE,
+            page_size=25,
+            now=NOW,
+        )
+
+    unsupported = sign_cursor(SECRET, _cursor(key_id="cursor-v2"))
+    with pytest.raises(AppError, match="unsupported"):
+        _ = verify_cursor(
+            SECRET,
+            unsupported,
+            normalized_query=_CURSOR_QUERY,
+            scope_handle=_CURSOR_SCOPE,
+            page_size=25,
+            now=NOW,
+        )
 
 
 def test_asset_token_round_trips_and_is_bound_to_path_and_media_type() -> None:

@@ -31,8 +31,15 @@ HARD_MAX_RENDER_PAGES = 8
 HARD_MAX_PAGE_PIXELS = 120_000_000
 HARD_MAX_RENDER_PIXELS = 480_000_000
 HARD_MAX_REQUEST_BODY_BYTES = 1_048_576
+HARD_MAX_INLINE_RESOURCE_BYTES = 4 * 1024 * 1024
 DEFAULT_CACHE_MAX_BYTES = 20 * 1024 * 1024 * 1024
 HARD_MAX_CACHE_BYTES = 1024 * 1024 * 1024 * 1024
+DEFAULT_RETENTION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_RETENTION_MAX_OBJECTS = 100_000
+DEFAULT_RETENTION_MIN_FREE_BYTES = 64 * 1024 * 1024
+DEFAULT_RETENTION_MIN_FREE_INODES = 128
+DEFAULT_RETENTION_HEALTHY_WINDOW_SECONDS = 60
+DEFAULT_RETENTION_MAX_FORWARD_SLEW_SECONDS = 5
 HARD_MAX_TILE_DIMENSION = 4096
 HARD_MAX_TILE_OVERLAP = 512
 HARD_MAX_TILES_PER_PAGE = 100
@@ -113,6 +120,16 @@ class ApiPrincipalCredential(BaseModel):
 
 _API_PRINCIPALS_ADAPTER = TypeAdapter(list[ApiPrincipalCredential])
 _RESERVED_PRINCIPAL_IDS = frozenset({"anonymous", "legacy-api-key", "legacy-bearer"})
+_PRODUCTION_STATIC_AUTH_KEYS = frozenset(
+    {
+        "API_BEARER_TOKEN",
+        "API_KEY",
+        "API_PRINCIPALS_JSON",
+        "NPLG_PRIVATE_STATIC_TOKEN",
+        "X_API_KEY",
+        "X-API-Key",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,7 +140,7 @@ class AppConfig:
     nplg_base_url: str
     cache_dir: Path
     public_base_url: str
-    asset_signing_secret: bytes
+    asset_signing_secret: bytes | None
     api_bearer_token: str | None
     api_key: str | None
     allow_anonymous: bool
@@ -139,6 +156,7 @@ class AppConfig:
     upstream_timeout_seconds: float
     upstream_rate_per_second: float
     max_redirects: int
+    cursor_signing_secret: bytes
     pdf_executor: PdfExecutor = "serialized"
     pdf_worker_socket_path: Path = PDF_WORKER_SOCKET_PATH
     pdf_worker_slot_root: Path = PDF_WORKER_SLOT_ROOT
@@ -150,6 +168,13 @@ class AppConfig:
     max_concurrent_asset_streams: int = 8
     max_concurrent_http_requests: int = 128
     cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES
+    retention_max_age_seconds: int = DEFAULT_RETENTION_MAX_AGE_SECONDS
+    retention_max_objects: int = DEFAULT_RETENTION_MAX_OBJECTS
+    retention_min_free_bytes: int = DEFAULT_RETENTION_MIN_FREE_BYTES
+    retention_min_free_inodes: int = DEFAULT_RETENTION_MIN_FREE_INODES
+    retention_healthy_window_seconds: int = DEFAULT_RETENTION_HEALTHY_WINDOW_SECONDS
+    retention_max_forward_slew_seconds: int = DEFAULT_RETENTION_MAX_FORWARD_SLEW_SECONDS
+    retention_clock_synchronized: bool = False
     request_body_timeout_seconds: float = 10.0
     asset_stream_idle_timeout_seconds: float = 10.0
     asset_stream_total_timeout_seconds: float = 120.0
@@ -164,6 +189,14 @@ class AppConfig:
     def mcp_max_body_bytes(self) -> int:
         """Expose the single project body ceiling at the SDK transport seam."""
         return self.max_request_body_bytes
+
+    def require_asset_signing_secret(self) -> bytes:
+        """Return the private-full asset-token root or reject the absent capability."""
+        secret = self.asset_signing_secret
+        if secret is None:
+            msg = "asset signing is unavailable in the metadata-only profile"
+            raise ValueError(msg)
+        return secret
 
 
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -477,14 +510,19 @@ def validate_deployment_profile(value: object) -> DeploymentProfile:
     raise ValueError(msg)
 
 
-def _signing_secret(env: Mapping[str, str], *, production: bool) -> bytes:
-    secret = env.get("ASSET_SIGNING_SECRET", "")
+def _signing_secret(
+    env: Mapping[str, str],
+    *,
+    name: str,
+    production: bool,
+) -> bytes:
+    secret = env.get(name, "")
     secret_bytes = secret.encode("utf-8")
     if len(secret_bytes) < _MIN_CREDENTIAL_BYTES:
-        msg = "ASSET_SIGNING_SECRET must be at least 32 bytes"
+        msg = f"{name} must be at least 32 bytes"
         raise ValueError(msg)
     if production and secret == _DOCUMENTED_PLACEHOLDER:
-        msg = "ASSET_SIGNING_SECRET must be replaced before production deployment"
+        msg = f"{name} must be replaced before production deployment"
         raise ValueError(msg)
     return secret_bytes
 
@@ -499,6 +537,12 @@ def _authorization(
     bool,
     tuple[ApiPrincipalCredential, ...],
 ]:
+    if production and not _PRODUCTION_STATIC_AUTH_KEYS.isdisjoint(env):
+        msg = (
+            "static authentication configuration is forbidden in production; "
+            "the selected OAuth capability must activate successfully"
+        )
+        raise ValueError(msg)
     allow_anonymous = _bool(
         env,
         "ALLOW_ANONYMOUS",
@@ -507,6 +551,8 @@ def _authorization(
     if production and allow_anonymous:
         msg = "ALLOW_ANONYMOUS must be false in production"
         raise ValueError(msg)
+    if production:
+        return None, None, False, ()
     api_bearer_token = env.get("API_BEARER_TOKEN") or None
     if (
         api_bearer_token is not None
@@ -514,25 +560,13 @@ def _authorization(
     ):
         msg = "API_BEARER_TOKEN must be at least 32 bytes"
         raise ValueError(msg)
-    if production and api_bearer_token == _DOCUMENTED_PLACEHOLDER:
-        msg = "API_BEARER_TOKEN must be replaced before production deployment"
-        raise ValueError(msg)
     api_key = env.get("API_KEY") or None
     if api_key is not None and len(api_key.encode("utf-8")) < _MIN_CREDENTIAL_BYTES:
         msg = "API_KEY must be at least 32 bytes"
         raise ValueError(msg)
-    if production and api_key == _DOCUMENTED_PLACEHOLDER:
-        msg = "API_KEY must be replaced before production deployment"
-        raise ValueError(msg)
     api_principals = _api_principal_registry(env)
     if api_principals and (api_bearer_token is not None or api_key is not None):
         msg = "API_PRINCIPALS_JSON cannot be combined with API_BEARER_TOKEN or API_KEY"
-        raise ValueError(msg)
-    if production and not api_principals:
-        msg = (
-            "API_PRINCIPALS_JSON is required in production; legacy "
-            "API_BEARER_TOKEN and API_KEY are development-only"
-        )
         raise ValueError(msg)
     if (
         not allow_anonymous
@@ -614,6 +648,7 @@ def _validate_anonymous_scope(
 def _validate_credential_separation(
     secret: bytes,
     *,
+    label: str,
     api_bearer_token: str | None,
     api_key: str | None,
     api_principals: tuple[ApiPrincipalCredential, ...],
@@ -634,7 +669,7 @@ def _validate_credential_separation(
             secret,
             credential.encode("utf-8"),
         ):
-            msg = f"ASSET_SIGNING_SECRET and {name} must differ"
+            msg = f"{label} and {name} must differ"
             raise ValueError(msg)
 
 
@@ -724,8 +759,6 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
     if nplg_base_url != NPLG_BASE_URL:
         msg = f"NPLG_BASE_URL must be exactly {NPLG_BASE_URL}"
         raise ValueError(msg)
-    secret = _signing_secret(env, production=production)
-
     configured_public_base_url = env.get("PUBLIC_BASE_URL")
     alpic_host = env.get("ALPIC_HOST", "").strip()
     if alpic_host and not production:
@@ -753,12 +786,6 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
         env,
         public_base_url=public_base_url,
         allow_anonymous=allow_anonymous,
-    )
-    _validate_credential_separation(
-        secret,
-        api_bearer_token=api_bearer_token,
-        api_key=api_key,
-        api_principals=api_principals,
     )
     tile_width, tile_height, tile_overlap = _tile_geometry(env)
     pdf_executor, max_concurrent_pdf_jobs = _pdf_settings(
@@ -819,6 +846,35 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
             "MAX_CONCURRENT_MCP_REQUESTS in production"
         )
         raise ValueError(msg)
+    cursor_signing_secret = _signing_secret(
+        env,
+        name="CURSOR_SIGNING_SECRET",
+        production=production,
+    )
+    asset_signing_secret = (
+        None
+        if deployment_profile == "alpic-metadata"
+        else _signing_secret(
+            env,
+            name="ASSET_SIGNING_SECRET",
+            production=production,
+        )
+    )
+    _validate_credential_separation(
+        cursor_signing_secret,
+        label="CURSOR_SIGNING_SECRET",
+        api_bearer_token=api_bearer_token,
+        api_key=api_key,
+        api_principals=api_principals,
+    )
+    if asset_signing_secret is not None:
+        _validate_credential_separation(
+            asset_signing_secret,
+            label="ASSET_SIGNING_SECRET",
+            api_bearer_token=api_bearer_token,
+            api_key=api_key,
+            api_principals=api_principals,
+        )
 
     return AppConfig(
         environment=environment,
@@ -832,7 +888,7 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
             )
         ),
         public_base_url=public_base_url,
-        asset_signing_secret=secret,
+        asset_signing_secret=asset_signing_secret,
         api_bearer_token=api_bearer_token,
         api_key=api_key,
         allow_anonymous=allow_anonymous,
@@ -893,6 +949,7 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
             maximum=5.0,
         ),
         max_redirects=_int(env, "MAX_REDIRECTS", 3, minimum=0, maximum=5),
+        cursor_signing_secret=cursor_signing_secret,
         pdf_executor=pdf_executor,
         pdf_worker_socket_path=pdf_worker_socket_path,
         scanner_socket_path=scanner_socket_path,
@@ -922,6 +979,53 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
             DEFAULT_CACHE_MAX_BYTES,
             minimum=1,
             maximum=HARD_MAX_CACHE_BYTES,
+        ),
+        retention_max_age_seconds=_int(
+            env,
+            "RETENTION_MAX_AGE_SECONDS",
+            DEFAULT_RETENTION_MAX_AGE_SECONDS,
+            minimum=60,
+            maximum=31_536_000,
+        ),
+        retention_max_objects=_int(
+            env,
+            "RETENTION_MAX_OBJECTS",
+            DEFAULT_RETENTION_MAX_OBJECTS,
+            minimum=1,
+            maximum=10_000_000,
+        ),
+        retention_min_free_bytes=_int(
+            env,
+            "RETENTION_MIN_FREE_BYTES",
+            DEFAULT_RETENTION_MIN_FREE_BYTES,
+            minimum=DEFAULT_RETENTION_MIN_FREE_BYTES,
+            maximum=HARD_MAX_CACHE_BYTES,
+        ),
+        retention_min_free_inodes=_int(
+            env,
+            "RETENTION_MIN_FREE_INODES",
+            DEFAULT_RETENTION_MIN_FREE_INODES,
+            minimum=DEFAULT_RETENTION_MIN_FREE_INODES,
+            maximum=10_000_000,
+        ),
+        retention_healthy_window_seconds=_int(
+            env,
+            "RETENTION_HEALTHY_WINDOW_SECONDS",
+            DEFAULT_RETENTION_HEALTHY_WINDOW_SECONDS,
+            minimum=0,
+            maximum=3600,
+        ),
+        retention_max_forward_slew_seconds=_int(
+            env,
+            "RETENTION_MAX_FORWARD_SLEW_SECONDS",
+            DEFAULT_RETENTION_MAX_FORWARD_SLEW_SECONDS,
+            minimum=0,
+            maximum=60,
+        ),
+        retention_clock_synchronized=_bool(
+            env,
+            "RETENTION_CLOCK_SYNCHRONIZED",
+            default=False,
         ),
         request_body_timeout_seconds=_float(
             env,

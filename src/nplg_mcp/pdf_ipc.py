@@ -25,6 +25,10 @@ from .config import (
     HARD_MAX_TILES_PER_PAGE,
 )
 from .errors import ErrorCode  # noqa: TC001 - Pydantic resolves the enum at runtime.
+from .pdf_identity import (
+    PDF_PIPELINE_VERSIONS,
+    SemanticVersion,
+)
 
 MAX_COMMAND_FRAME_BYTES = 65_536
 MAX_RESULT_FRAME_BYTES = 4_194_304
@@ -92,6 +96,29 @@ class StrictModel(BaseModel):
     """Closed and immutable worker boundary model."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+
+class PdfPipelineVersionOutput(StrictModel):
+    """Required semantic identities for persisted PDF derivatives."""
+
+    manifest_schema_version: SemanticVersion
+    render_pipeline_version: SemanticVersion
+    classification_algorithm_version: SemanticVersion
+    tile_pipeline_version: SemanticVersion
+
+    @override
+    def model_post_init(self, _context: object) -> None:
+        """Fail closed when a worker advertises non-current derivative semantics."""
+        expected = PDF_PIPELINE_VERSIONS
+        if (
+            self.manifest_schema_version != expected.manifest_schema_version
+            or self.render_pipeline_version != expected.render_pipeline_version
+            or self.classification_algorithm_version
+            != expected.classification_algorithm_version
+            or self.tile_pipeline_version != expected.tile_pipeline_version
+        ):
+            message = "PDF worker pipeline version drift"
+            raise ValueError(message)
 
 
 class InspectParams(StrictModel):
@@ -248,7 +275,7 @@ class RenderedPageOutput(StrictModel):
     lossy_conversion: bool
 
 
-class RenderPagesOutput(StrictModel):
+class RenderPagesOutput(PdfPipelineVersionOutput):
     """Strict wire form of a page-render manifest."""
 
     render_id: RenderId
@@ -285,7 +312,7 @@ class RenderedTileOutput(StrictModel):
     lossy_conversion: Literal[True]
 
 
-class RenderTilesOutput(StrictModel):
+class RenderTilesOutput(PdfPipelineVersionOutput):
     """Strict wire form of a tile manifest."""
 
     render_id: RenderId

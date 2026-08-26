@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, Self, cast
 
 import pypdfium2 as pdfium
 from PIL import Image, ImageChops, ImageStat, UnidentifiedImageError
@@ -27,12 +27,39 @@ from .json_types import (
     load_json_value,
     require_json_object,
 )
-from .pdf_identity import render_identifier
+from .pdf_identity import (
+    PDF_PIPELINE_VERSIONS,
+    RenderIdentityRequest,
+    TileGeometryRequest,
+    render_identifier,
+    tile_geometry_identifier,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
+    from types import TracebackType
 
     from .storage import ContentAddressedStore
+
+
+class _RenderStagedWriter(Protocol):
+    def __enter__(self) -> Self: ...
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
+    def write(self, data: bytes) -> int: ...
+
+    def commit_render(self, relative_path: str) -> tuple[str, str]: ...
+
+
+class _RenderPublicationTransaction(Protocol):
+    def stage(self, *, suffix: str = "") -> _RenderStagedWriter: ...
+
 
 _RENDER_ID_RE = re.compile(r"^rnd_[0-9a-f]{32}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -132,6 +159,12 @@ class RenderManifest:
     mode: str
     pages: tuple[RenderedPage, ...]
     manifest_relative_path: str
+    manifest_schema_version: str = PDF_PIPELINE_VERSIONS.manifest_schema_version
+    render_pipeline_version: str = PDF_PIPELINE_VERSIONS.render_pipeline_version
+    classification_algorithm_version: str = (
+        PDF_PIPELINE_VERSIONS.classification_algorithm_version
+    )
+    tile_pipeline_version: str = PDF_PIPELINE_VERSIONS.tile_pipeline_version
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +202,12 @@ class TileManifest:
     overlap: int
     tiles: tuple[RenderedTile, ...]
     manifest_relative_path: str
+    manifest_schema_version: str = PDF_PIPELINE_VERSIONS.manifest_schema_version
+    render_pipeline_version: str = PDF_PIPELINE_VERSIONS.render_pipeline_version
+    classification_algorithm_version: str = (
+        PDF_PIPELINE_VERSIONS.classification_algorithm_version
+    )
+    tile_pipeline_version: str = PDF_PIPELINE_VERSIONS.tile_pipeline_version
 
 
 @dataclass(frozen=True, slots=True)
@@ -1109,11 +1148,14 @@ class PdfProcessor:
         if mode != "native":
             raise AppError(ErrorCode.INVALID_INPUT, "Render mode is invalid.")
         return render_identifier(
-            source_sha256=source_sha256,
-            pages=pages,
-            mode="native",
-            renderer_version=_RENDERER_VERSION,
-            fallback_dpi=self.fallback_dpi,
+            RenderIdentityRequest(
+                source_sha256=source_sha256,
+                pages=pages,
+                mode="native",
+                renderer_version=_RENDERER_VERSION,
+                fallback_dpi=self.fallback_dpi,
+                pipeline_versions=PDF_PIPELINE_VERSIONS,
+            )
         )
 
     @staticmethod
@@ -1123,7 +1165,11 @@ class PdfProcessor:
         return render_id
 
     def _write_render_asset(
-        self, render_id: str, relative_name: str, data: bytes
+        self,
+        transaction: _RenderPublicationTransaction,
+        render_id: str,
+        relative_name: str,
+        data: bytes,
     ) -> tuple[str, str]:
         _ = self._validate_render_id(render_id)
         pure = PurePosixPath(relative_name)
@@ -1143,10 +1189,30 @@ class PdfProcessor:
                 "Render asset path escapes its render directory.",
             ) from exc
         relative_path = destination.relative_to(self.store.root).as_posix()
-        return self.store.put_render_bytes(relative_path, data)
+        with transaction.stage(suffix=destination.suffix) as staged:
+            _ = staged.write(data)
+            return staged.commit_render(relative_path)
 
     def _manifest_from_dict(self, payload: JsonObject) -> RenderManifest:
         try:
+            payload = _closed_object(
+                payload,
+                context="render manifest",
+                fields=frozenset(
+                    {
+                        "render_id",
+                        "source_sha256",
+                        "renderer_version",
+                        "mode",
+                        "pages",
+                        "manifest_relative_path",
+                        "manifest_schema_version",
+                        "render_pipeline_version",
+                        "classification_algorithm_version",
+                        "tile_pipeline_version",
+                    }
+                ),
+            )
             page_values = _list_field(payload, "pages")
             pages = tuple(_rendered_page_from_json(item) for item in page_values)
             return RenderManifest(
@@ -1156,6 +1222,16 @@ class PdfProcessor:
                 mode=_string_field(payload, "mode"),
                 pages=pages,
                 manifest_relative_path=_string_field(payload, "manifest_relative_path"),
+                manifest_schema_version=_string_field(
+                    payload, "manifest_schema_version"
+                ),
+                render_pipeline_version=_string_field(
+                    payload, "render_pipeline_version"
+                ),
+                classification_algorithm_version=_string_field(
+                    payload, "classification_algorithm_version"
+                ),
+                tile_pipeline_version=_string_field(payload, "tile_pipeline_version"),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise AppError(
@@ -1170,6 +1246,14 @@ class PdfProcessor:
             or manifest.renderer_version != _RENDERER_VERSION
             or manifest.mode != "native"
             or not manifest.pages
+            or manifest.manifest_schema_version
+            != PDF_PIPELINE_VERSIONS.manifest_schema_version
+            or manifest.render_pipeline_version
+            != PDF_PIPELINE_VERSIONS.render_pipeline_version
+            or manifest.classification_algorithm_version
+            != PDF_PIPELINE_VERSIONS.classification_algorithm_version
+            or manifest.tile_pipeline_version
+            != PDF_PIPELINE_VERSIONS.tile_pipeline_version
         ):
             raise AppError(
                 ErrorCode.INTERNAL_ERROR,
@@ -1231,6 +1315,26 @@ class PdfProcessor:
                 load_json_value(path.read_text(encoding="utf-8")),
                 context="tile manifest root",
             )
+            payload = _closed_object(
+                payload,
+                context="tile manifest",
+                fields=frozenset(
+                    {
+                        "render_id",
+                        "page_number",
+                        "page_sha256",
+                        "tile_width",
+                        "tile_height",
+                        "overlap",
+                        "tiles",
+                        "manifest_relative_path",
+                        "manifest_schema_version",
+                        "render_pipeline_version",
+                        "classification_algorithm_version",
+                        "tile_pipeline_version",
+                    }
+                ),
+            )
             tile_values = _list_field(payload, "tiles")
             manifest = TileManifest(
                 render_id=_string_field(payload, "render_id"),
@@ -1241,6 +1345,16 @@ class PdfProcessor:
                 overlap=_integer_field(payload, "overlap"),
                 tiles=tuple(_rendered_tile_from_json(item) for item in tile_values),
                 manifest_relative_path=_string_field(payload, "manifest_relative_path"),
+                manifest_schema_version=_string_field(
+                    payload, "manifest_schema_version"
+                ),
+                render_pipeline_version=_string_field(
+                    payload, "render_pipeline_version"
+                ),
+                classification_algorithm_version=_string_field(
+                    payload, "classification_algorithm_version"
+                ),
+                tile_pipeline_version=_string_field(payload, "tile_pipeline_version"),
             )
         except (
             OSError,
@@ -1264,6 +1378,14 @@ class PdfProcessor:
             or manifest.manifest_relative_path != relative_path
             or manifest.page_sha256 != page.sha256
             or len(manifest.tiles) != len(boxes)
+            or manifest.manifest_schema_version
+            != PDF_PIPELINE_VERSIONS.manifest_schema_version
+            or manifest.render_pipeline_version
+            != PDF_PIPELINE_VERSIONS.render_pipeline_version
+            or manifest.classification_algorithm_version
+            != PDF_PIPELINE_VERSIONS.classification_algorithm_version
+            or manifest.tile_pipeline_version
+            != PDF_PIPELINE_VERSIONS.tile_pipeline_version
         ):
             raise AppError(
                 ErrorCode.INTERNAL_ERROR,
@@ -1274,9 +1396,16 @@ class PdfProcessor:
             for _index, (tile, box) in enumerate(
                 zip(manifest.tiles, boxes, strict=True), start=1
             ):
+                geometry_key = tile_geometry_identifier(
+                    TileGeometryRequest(
+                        width=tile_width,
+                        height=tile_height,
+                        overlap=overlap,
+                        pipeline_versions=PDF_PIPELINE_VERSIONS,
+                    )
+                )
                 expected_id = (
-                    f"p{page_number:04d}_w{tile_width:04d}-h{tile_height:04d}"
-                    f"-o{overlap:03d}_x{box.x:06d}_y{box.y:06d}"
+                    f"p{page_number:04d}_{geometry_key}_x{box.x:06d}_y{box.y:06d}"
                 )
                 expected_path = f"renders/{render_id}/{tile_root}/{expected_id}.jpg"
                 if (
@@ -1426,6 +1555,7 @@ class PdfProcessor:
 
     def _render_page(
         self,
+        transaction: _RenderPublicationTransaction,
         document: pdfium.PdfDocument,
         request: _PageRenderRequest,
     ) -> RenderedPage:
@@ -1436,6 +1566,7 @@ class PdfProcessor:
             _ = page.close()
         width, height, dpi_x, dpi_y, resolution_source = request.grid
         relative_path, output_sha = self._write_render_asset(
+            transaction,
             request.render_id,
             f"page-{request.page_number:04d}.jpg",
             encoded.data,
@@ -1462,6 +1593,7 @@ class PdfProcessor:
 
     def _write_render_manifest(
         self,
+        transaction: _RenderPublicationTransaction,
         request: _RenderRequest,
         pages: tuple[RenderedPage, ...],
     ) -> RenderManifest:
@@ -1473,6 +1605,12 @@ class PdfProcessor:
             mode=request.mode,
             pages=pages,
             manifest_relative_path=manifest_relative_path,
+            manifest_schema_version=PDF_PIPELINE_VERSIONS.manifest_schema_version,
+            render_pipeline_version=PDF_PIPELINE_VERSIONS.render_pipeline_version,
+            classification_algorithm_version=(
+                PDF_PIPELINE_VERSIONS.classification_algorithm_version
+            ),
+            tile_pipeline_version=PDF_PIPELINE_VERSIONS.tile_pipeline_version,
         )
         payload = json.dumps(
             dataclass_to_json(manifest, context="render manifest"),
@@ -1482,7 +1620,10 @@ class PdfProcessor:
             separators=(",", ":"),
         ).encode("utf-8")
         written_path, _ = self._write_render_asset(
-            request.render_id, "manifest.json", payload
+            transaction,
+            request.render_id,
+            "manifest.json",
+            payload,
         )
         if written_path != manifest_relative_path:
             raise AppError(
@@ -1494,13 +1635,18 @@ class PdfProcessor:
 
     def _render_tile(
         self,
+        transaction: _RenderPublicationTransaction,
         request: _TileManifestRequest,
         source: Image.Image,
         box: TileBox,
     ) -> RenderedTile:
-        geometry_key = (
-            f"w{request.tile_width:04d}-h{request.tile_height:04d}"
-            f"-o{request.overlap:03d}"
+        geometry_key = tile_geometry_identifier(
+            TileGeometryRequest(
+                width=request.tile_width,
+                height=request.tile_height,
+                overlap=request.overlap,
+                pipeline_versions=PDF_PIPELINE_VERSIONS,
+            )
         )
         tile_id = f"p{request.page_number:04d}_{geometry_key}_x{box.x:06d}_y{box.y:06d}"
         with _validated_tile_crop(source, box) as cropped:
@@ -1510,6 +1656,7 @@ class PdfProcessor:
                 dpi_y=request.page.effective_dpi_y,
             )
         relative_path, sha256 = self._write_render_asset(
+            transaction,
             request.render_id,
             f"{request.tile_root}/{tile_id}.jpg",
             data,
@@ -1531,6 +1678,7 @@ class PdfProcessor:
 
     def _crop_tiles(
         self,
+        transaction: _RenderPublicationTransaction,
         request: _TileManifestRequest,
     ) -> tuple[RenderedTile, ...]:
         source_path = self.store.resolve_asset(request.page.relative_path)
@@ -1538,11 +1686,13 @@ class PdfProcessor:
             _ = source.load()
             _validated_tile_source(source, request.page)
             return tuple(
-                self._render_tile(request, source, box) for box in request.boxes
+                self._render_tile(transaction, request, source, box)
+                for box in request.boxes
             )
 
     def _write_tile_manifest(
         self,
+        transaction: _RenderPublicationTransaction,
         request: _TileManifestRequest,
         tiles: tuple[RenderedTile, ...],
     ) -> TileManifest:
@@ -1555,6 +1705,12 @@ class PdfProcessor:
             overlap=request.overlap,
             tiles=tiles,
             manifest_relative_path=request.relative_path,
+            manifest_schema_version=PDF_PIPELINE_VERSIONS.manifest_schema_version,
+            render_pipeline_version=PDF_PIPELINE_VERSIONS.render_pipeline_version,
+            classification_algorithm_version=(
+                PDF_PIPELINE_VERSIONS.classification_algorithm_version
+            ),
+            tile_pipeline_version=PDF_PIPELINE_VERSIONS.tile_pipeline_version,
         )
         payload = json.dumps(
             dataclass_to_json(result, context="tile manifest"),
@@ -1564,6 +1720,7 @@ class PdfProcessor:
             separators=(",", ":"),
         ).encode("utf-8")
         written_path, _ = self._write_render_asset(
+            transaction,
             request.render_id,
             f"{request.tile_root}/manifest.json",
             payload,
@@ -1619,6 +1776,7 @@ class PdfProcessor:
 
             rendered_pages = tuple(
                 self._render_page(
+                    transaction,
                     document,
                     _PageRenderRequest(
                         render_id=render_id,
@@ -1630,7 +1788,11 @@ class PdfProcessor:
                 for page_number in selected
             )
 
-            manifest = self._write_render_manifest(request, rendered_pages)
+            manifest = self._write_render_manifest(
+                transaction,
+                request,
+                rendered_pages,
+            )
             transaction.commit()
         except AppError:
             raise
@@ -1696,7 +1858,14 @@ class PdfProcessor:
             tile_height=height,
             overlap=applied_overlap,
         )
-        geometry_key = f"w{width:04d}-h{height:04d}-o{applied_overlap:03d}"
+        geometry_key = tile_geometry_identifier(
+            TileGeometryRequest(
+                width=width,
+                height=height,
+                overlap=applied_overlap,
+                pipeline_versions=PDF_PIPELINE_VERSIONS,
+            )
+        )
         tile_root = f"tiles/page-{page_number:04d}/{geometry_key}"
         tile_manifest_path = f"renders/{render_id}/{tile_root}/manifest.json"
         request = _TileManifestRequest(
@@ -1724,14 +1893,14 @@ class PdfProcessor:
                     transaction.commit()
                     return cached
             try:
-                tiles = self._crop_tiles(request)
+                tiles = self._crop_tiles(transaction, request)
             except (UnidentifiedImageError, OSError, ValueError) as exc:
                 raise AppError(
                     ErrorCode.PDF_PROCESSING_FAILED,
                     "The rendered page could not be tiled.",
                     http_status=422,
                 ) from exc
-            result = self._write_tile_manifest(request, tiles)
+            result = self._write_tile_manifest(transaction, request, tiles)
             transaction.commit()
             return result
         finally:

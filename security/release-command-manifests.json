@@ -1,0 +1,2257 @@
+{
+  "schema_version": 1,
+  "contract_id": "nplg.release-command-manifest.v1",
+  "controller_authority": "separately-protected-external",
+  "candidate_implements_controller": false,
+  "operations": [
+    {
+      "operation_id": "candidate-battery",
+      "profiles": [
+        "alpic-metadata",
+        "private-full"
+      ],
+      "effect": "offline-candidate-execution",
+      "recovery_only": false,
+      "requires_explicit_authorization": false,
+      "result_schemas": [
+        "CandidateBatteryResult.v2"
+      ],
+      "exit_codes": [
+        0,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "operation",
+        "subcommand": "run-operation",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--operation",
+            "value_kind": "literal",
+            "literal_value": "candidate-battery"
+          },
+          {
+            "flag": "--candidate-battery-result-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "candidate-battery.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "operation_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "CandidateBatteryResult.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "operation_id": "external-gate",
+      "profiles": [
+        "alpic-metadata",
+        "private-full"
+      ],
+      "effect": "brokered-external-proof",
+      "recovery_only": false,
+      "requires_explicit_authorization": false,
+      "result_schemas": [
+        "ExternalGateResult.v2"
+      ],
+      "exit_codes": [
+        0,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "operation",
+        "subcommand": "run-operation",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--operation",
+            "value_kind": "literal",
+            "literal_value": "external-gate"
+          },
+          {
+            "flag": "--external-gate-id",
+            "value_kind": "identifier",
+            "literal_value": null
+          },
+          {
+            "flag": "--external-gate-result-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "external-gate.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "operation_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "ExternalGateResult.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "operation_id": "prepare",
+      "profiles": [
+        "alpic-metadata",
+        "private-full"
+      ],
+      "effect": "protected-ledger",
+      "recovery_only": false,
+      "requires_explicit_authorization": false,
+      "result_schemas": [
+        "CandidatePreparation.v2"
+      ],
+      "exit_codes": [
+        0,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "operation",
+        "subcommand": "run-operation",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--operation",
+            "value_kind": "literal",
+            "literal_value": "prepare"
+          },
+          {
+            "flag": "--candidate-battery-result-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--candidate-preparation-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "prepare.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "operation_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "CandidatePreparation.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "operation_id": "staging-proof",
+      "profiles": [
+        "alpic-metadata"
+      ],
+      "effect": "provider-staging-deployment",
+      "recovery_only": false,
+      "requires_explicit_authorization": true,
+      "result_schemas": [
+        "StagingProofResult.v2"
+      ],
+      "exit_codes": [
+        0,
+        20,
+        21,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "operation",
+        "subcommand": "run-operation",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--operation",
+            "value_kind": "literal",
+            "literal_value": "staging-proof"
+          },
+          {
+            "flag": "--candidate-preparation-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--staging-proof-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--authorize-staging-deploy",
+            "value_kind": "switch",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "staging-proof.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "operation_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "StagingProofResult.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "operation_id": "reconcile-staging",
+      "profiles": [
+        "alpic-metadata"
+      ],
+      "effect": "protected-ledger-reconciliation",
+      "recovery_only": true,
+      "requires_explicit_authorization": true,
+      "result_schemas": [
+        "StagingReconciliationResult.v2"
+      ],
+      "exit_codes": [
+        0,
+        22,
+        23,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "operation",
+        "subcommand": "run-operation",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--operation",
+            "value_kind": "literal",
+            "literal_value": "reconcile-staging"
+          },
+          {
+            "flag": "--candidate-preparation-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--staging-reconciliation-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--authorize-staging-read",
+            "value_kind": "switch",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "reconcile-staging.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "operation_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "StagingReconciliationResult.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "operation_id": "finalize",
+      "profiles": [
+        "alpic-metadata",
+        "private-full"
+      ],
+      "effect": "protected-ledger-publication",
+      "recovery_only": false,
+      "requires_explicit_authorization": false,
+      "result_schemas": [
+        "CandidateEvidenceBundle.v2"
+      ],
+      "exit_codes": [
+        0,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "operation",
+        "subcommand": "run-operation",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--operation",
+            "value_kind": "literal",
+            "literal_value": "finalize"
+          },
+          {
+            "flag": "--candidate-preparation-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--candidate-bundle-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "finalize.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "operation_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "CandidateEvidenceBundle.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "operation_id": "custody",
+      "profiles": [
+        "alpic-metadata",
+        "private-full"
+      ],
+      "effect": "immutable-custody-upload",
+      "recovery_only": false,
+      "requires_explicit_authorization": true,
+      "result_schemas": [
+        "CustodyAttemptResult.v2",
+        "CandidateBundleCustodyReceipt.v2",
+        "FinalDecisionCustodyReceipt.v2"
+      ],
+      "exit_codes": [
+        0,
+        20,
+        21,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "operation",
+        "subcommand": "run-operation",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--operation",
+            "value_kind": "literal",
+            "literal_value": "custody"
+          },
+          {
+            "flag": "--custody-attempt-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--custody-receipt-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--authorize-custody-upload",
+            "value_kind": "switch",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "custody.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "operation_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "CustodyAttemptResult.v2",
+          "CandidateBundleCustodyReceipt.v2",
+          "FinalDecisionCustodyReceipt.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "operation_id": "reconcile-custody",
+      "profiles": [
+        "alpic-metadata",
+        "private-full"
+      ],
+      "effect": "protected-ledger-reconciliation",
+      "recovery_only": true,
+      "requires_explicit_authorization": true,
+      "result_schemas": [
+        "CustodyReconciliationResult.v2",
+        "CandidateBundleCustodyReceipt.v2",
+        "FinalDecisionCustodyReceipt.v2"
+      ],
+      "exit_codes": [
+        0,
+        22,
+        23,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "operation",
+        "subcommand": "run-operation",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--operation",
+            "value_kind": "literal",
+            "literal_value": "reconcile-custody"
+          },
+          {
+            "flag": "--custody-reconciliation-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--custody-receipt-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--authorize-custody-read",
+            "value_kind": "switch",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "reconcile-custody.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "operation_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "CustodyReconciliationResult.v2",
+          "CandidateBundleCustodyReceipt.v2",
+          "FinalDecisionCustodyReceipt.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "operation_id": "attestation-workspace",
+      "profiles": [
+        "alpic-metadata",
+        "private-full"
+      ],
+      "effect": "attestation-workspace-materialization",
+      "recovery_only": false,
+      "requires_explicit_authorization": false,
+      "result_schemas": [
+        "AttestationWorkspaceHandoff.v2"
+      ],
+      "exit_codes": [
+        0,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "operation",
+        "subcommand": "run-operation",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--operation",
+            "value_kind": "literal",
+            "literal_value": "attestation-workspace"
+          },
+          {
+            "flag": "--attestation-handoff-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "attestation-workspace.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "operation_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "AttestationWorkspaceHandoff.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "operation_id": "commit-attestation",
+      "profiles": [
+        "alpic-metadata",
+        "private-full"
+      ],
+      "effect": "git-attestation-commit",
+      "recovery_only": false,
+      "requires_explicit_authorization": true,
+      "result_schemas": [
+        "AttestationCommitResult.v2"
+      ],
+      "exit_codes": [
+        0,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "operation",
+        "subcommand": "run-operation",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--operation",
+            "value_kind": "literal",
+            "literal_value": "commit-attestation"
+          },
+          {
+            "flag": "--attestation-handoff-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--message",
+            "value_kind": "nonempty-text",
+            "literal_value": null
+          },
+          {
+            "flag": "--authorize-commit",
+            "value_kind": "switch",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "commit-attestation.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "operation_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "AttestationCommitResult.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "operation_id": "attest",
+      "profiles": [
+        "alpic-metadata",
+        "private-full"
+      ],
+      "effect": "structural-attestation",
+      "recovery_only": false,
+      "requires_explicit_authorization": false,
+      "result_schemas": [
+        "AttestationVerdict.v2"
+      ],
+      "exit_codes": [
+        0,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "operation",
+        "subcommand": "run-operation",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--operation",
+            "value_kind": "literal",
+            "literal_value": "attest"
+          },
+          {
+            "flag": "--attestation-verdict-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "attest.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "operation_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "AttestationVerdict.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "operation_id": "eligibility",
+      "profiles": [
+        "alpic-metadata",
+        "private-full"
+      ],
+      "effect": "public-readiness-decision",
+      "recovery_only": false,
+      "requires_explicit_authorization": false,
+      "result_schemas": [
+        "ReleaseEligibilityVerdict.v2",
+        "AsvsL2ConformanceVerdict.v2",
+        "EligibilityGateRecord.v2"
+      ],
+      "exit_codes": [
+        0,
+        24,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "operation",
+        "subcommand": "run-operation",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--operation",
+            "value_kind": "literal",
+            "literal_value": "eligibility"
+          },
+          {
+            "flag": "--release-eligibility-verdict-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--asvs-l2-conformance-verdict-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--eligibility-gate-record-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--require-eligible",
+            "value_kind": "switch",
+            "literal_value": null
+          },
+          {
+            "flag": "--require-asvs-l2",
+            "value_kind": "switch",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "eligibility.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "operation_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "ReleaseEligibilityVerdict.v2",
+          "AsvsL2ConformanceVerdict.v2",
+          "EligibilityGateRecord.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "operation_id": "cleanup-run",
+      "profiles": [
+        "alpic-metadata",
+        "private-full"
+      ],
+      "effect": "scoped-destructive-cleanup",
+      "recovery_only": false,
+      "requires_explicit_authorization": true,
+      "result_schemas": [
+        "CleanupResult.v2"
+      ],
+      "exit_codes": [
+        0,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "operation",
+        "subcommand": "run-operation",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--operation",
+            "value_kind": "literal",
+            "literal_value": "cleanup-run"
+          },
+          {
+            "flag": "--cleanup-journal-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--cleanup-result-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--authorize-cleanup",
+            "value_kind": "switch",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "cleanup-run.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "operation_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "CleanupResult.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    }
+  ],
+  "launcher_commands": [
+    {
+      "command_id": "initialize-run",
+      "dispatch": "initialization-only",
+      "result_schema": "RunDescriptor.v2",
+      "exit_codes": [
+        0,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "launcher",
+        "subcommand": "initialize-run",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--controller-policy",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--repository-root",
+            "value_kind": "absolute-directory",
+            "literal_value": null
+          },
+          {
+            "flag": "--candidate",
+            "value_kind": "git-object",
+            "literal_value": null
+          },
+          {
+            "flag": "--profile",
+            "value_kind": "release-profile",
+            "literal_value": null
+          },
+          {
+            "flag": "--profile-inputs-json",
+            "value_kind": "closed-json-object",
+            "literal_value": null
+          },
+          {
+            "flag": "--network-broker-descriptor",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--custody-authority-descriptor",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-parent",
+            "value_kind": "absolute-directory",
+            "literal_value": null
+          },
+          {
+            "flag": "--initialization-journal-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--authorize-run-root",
+            "value_kind": "switch",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "initialize-run.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "launcher_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "RunDescriptor.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "command_id": "run-operation",
+      "dispatch": "one-manifest-operation",
+      "result_schema": "OperationResult.v2",
+      "exit_codes": [
+        0,
+        20,
+        21,
+        22,
+        23,
+        24,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "launcher",
+        "subcommand": "run-operation",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--operation-request-json",
+            "value_kind": "closed-json-object",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "run-operation.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "launcher_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "OperationResult.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "command_id": "run-through",
+      "dispatch": "contiguous-manifest-range",
+      "result_schema": "ThroughResult.v2",
+      "exit_codes": [
+        0,
+        20,
+        21,
+        22,
+        23,
+        24,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "launcher",
+        "subcommand": "run-through",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--range-request-json",
+            "value_kind": "closed-json-object",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "run-through.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "launcher_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "ThroughResult.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "command_id": "resume-run",
+      "dispatch": "descriptor-selected-recovery",
+      "result_schema": "ResumeResult.v2",
+      "exit_codes": [
+        0,
+        20,
+        21,
+        22,
+        23,
+        24,
+        64,
+        70,
+        75
+      ],
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "launcher",
+        "subcommand": "resume-run",
+        "required_options": [
+          {
+            "flag": "--provisioning-receipt",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--run-descriptor-json",
+            "value_kind": "absolute-existing-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--resume-request-json",
+            "value_kind": "closed-json-object",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "resume-run.input.v2",
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "launcher_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "ResumeResult.v2"
+        ],
+        "schema_version": "2.0",
+        "required_fields": [
+          "candidate_sha256",
+          "candidate_tree_sha256",
+          "run_id",
+          "profile",
+          "manifest_digest",
+          "controller_authority_digest",
+          "controller_revision",
+          "controller_policy_digest",
+          "controller_isolation_digest",
+          "provisioning_receipt_digest",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    }
+  ],
+  "utilities": [
+    {
+      "command_id": "validate-output-parent",
+      "argv_schema": "--path ABSOLUTE_NEW_PATH --parent-mode 0700 --owner PROTECTED_UID",
+      "output_schema": "validated-output-parent.v1",
+      "read_only": true,
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "utility",
+        "subcommand": "validate-output-parent",
+        "required_options": [
+          {
+            "flag": "--path",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--parent-mode",
+            "value_kind": "literal",
+            "literal_value": "0700"
+          },
+          {
+            "flag": "--owner",
+            "value_kind": "identifier",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "validate-output-parent.input.v1",
+        "schema_version": "1.0",
+        "required_fields": [
+          "controller_authority_digest",
+          "controller_revision",
+          "utility_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "validated-output-parent.v1"
+        ],
+        "schema_version": "1.0",
+        "required_fields": [
+          "controller_authority_digest",
+          "controller_revision",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "command_id": "validate-output-parents",
+      "argv_schema": "--paths-json CLOSED_PATH_ARRAY --disjoint-from WORKTREE_SET",
+      "output_schema": "validated-output-parents.v1",
+      "read_only": true,
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "utility",
+        "subcommand": "validate-output-parents",
+        "required_options": [
+          {
+            "flag": "--paths-json",
+            "value_kind": "closed-json-array",
+            "literal_value": null
+          },
+          {
+            "flag": "--disjoint-from",
+            "value_kind": "closed-json-array",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "validate-output-parents.input.v1",
+        "schema_version": "1.0",
+        "required_fields": [
+          "controller_authority_digest",
+          "controller_revision",
+          "utility_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "validated-output-parents.v1"
+        ],
+        "schema_version": "1.0",
+        "required_fields": [
+          "controller_authority_digest",
+          "controller_revision",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    },
+    {
+      "command_id": "capture-alpic",
+      "argv_schema": "--tool-root PATH --cwd VERIFIED_MINIMAL_DEPLOY_PACK --stdout PATH --stderr PATH --timeout-seconds N --max-output-bytes N -- ALPIC_ARGS",
+      "output_schema": "bounded-alpic-capture.v1",
+      "read_only": true,
+      "tool": {
+        "tool_id": "nplg-release-controller",
+        "interface_version": "2.0.0",
+        "version_probe": [
+          "--version-json"
+        ],
+        "version_output_schema": "ProtectedControllerVersion.v2",
+        "lock_digest_field": "controller_dependency_lock_sha256",
+        "lock_source": "ProtectedControllerProvisioningReceipt.v2",
+        "require_exact_lock_digest": true
+      },
+      "argv": {
+        "contract_kind": "utility",
+        "subcommand": "capture-alpic",
+        "required_options": [
+          {
+            "flag": "--tool-root",
+            "value_kind": "absolute-directory",
+            "literal_value": null
+          },
+          {
+            "flag": "--cwd",
+            "value_kind": "absolute-directory",
+            "literal_value": null
+          },
+          {
+            "flag": "--stdout",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--stderr",
+            "value_kind": "absolute-new-file",
+            "literal_value": null
+          },
+          {
+            "flag": "--timeout-seconds",
+            "value_kind": "positive-integer",
+            "literal_value": null
+          },
+          {
+            "flag": "--max-output-bytes",
+            "value_kind": "positive-integer",
+            "literal_value": null
+          },
+          {
+            "flag": "--alpic-args-json",
+            "value_kind": "closed-alpic-argv",
+            "literal_value": null
+          }
+        ],
+        "allow_unknown_options": false,
+        "allow_passthrough": false,
+        "allow_shell": false
+      },
+      "input_contract": {
+        "contract_kind": "input",
+        "schema_id": "capture-alpic.input.v1",
+        "schema_version": "1.0",
+        "required_fields": [
+          "controller_authority_digest",
+          "controller_revision",
+          "utility_request"
+        ],
+        "allow_unknown_fields": false
+      },
+      "output_contract": {
+        "contract_kind": "output",
+        "schema_ids": [
+          "bounded-alpic-capture.v1"
+        ],
+        "schema_version": "1.0",
+        "required_fields": [
+          "controller_authority_digest",
+          "controller_revision",
+          "result_payload",
+          "result_digest"
+        ],
+        "allow_unknown_fields": false,
+        "allow_digest_only": false
+      }
+    }
+  ],
+  "exit_semantics": [
+    {
+      "code": 0,
+      "meaning": "named-target-durably-complete"
+    },
+    {
+      "code": 20,
+      "meaning": "external-delivery-unknown"
+    },
+    {
+      "code": 21,
+      "meaning": "proved-pre-side-effect-failure"
+    },
+    {
+      "code": 22,
+      "meaning": "reconciled-absent"
+    },
+    {
+      "code": 23,
+      "meaning": "reconciliation-ambiguous"
+    },
+    {
+      "code": 24,
+      "meaning": "gate-negative-chain-custodied"
+    },
+    {
+      "code": 64,
+      "meaning": "pre-mutation-schema-authority-or-policy-rejection"
+    },
+    {
+      "code": 70,
+      "meaning": "proved-pre-mutation-internal-failure"
+    },
+    {
+      "code": 75,
+      "meaning": "durable-incomplete-recovery-required"
+    }
+  ],
+  "external_gates": [
+    {
+      "gate_id": "common.nplg-live-canary",
+      "command_id": "live.nplg-bound-endpoint.v2",
+      "profiles": [
+        "alpic-metadata",
+        "private-full"
+      ],
+      "kind": "live",
+      "timeout_seconds": 60,
+      "result_schema": "nplg-live-canary.v2"
+    },
+    {
+      "gate_id": "private-full.edge-http",
+      "command_id": "staging.private-full-edge.v2",
+      "profiles": [
+        "private-full"
+      ],
+      "kind": "staging",
+      "timeout_seconds": 1800,
+      "result_schema": "private-edge-proof.v2"
+    },
+    {
+      "gate_id": "private-full.pdf-worker-container",
+      "command_id": "container.pdf-worker.v2",
+      "profiles": [
+        "private-full"
+      ],
+      "kind": "container",
+      "timeout_seconds": 300,
+      "result_schema": "container-proof.v2"
+    },
+    {
+      "gate_id": "private-full.pdf-worker-write-quota",
+      "command_id": "container.pdf-worker-quota.v2",
+      "profiles": [
+        "private-full"
+      ],
+      "kind": "container",
+      "timeout_seconds": 300,
+      "result_schema": "worker-quota-proof.v2"
+    },
+    {
+      "gate_id": "private-full.recovery-proof",
+      "command_id": "container.private-full-recovery.v2",
+      "profiles": [
+        "private-full"
+      ],
+      "kind": "container",
+      "timeout_seconds": 900,
+      "result_schema": "recovery-proof.v2"
+    },
+    {
+      "gate_id": "private-full.scanner-container",
+      "command_id": "container.scanner.v2",
+      "profiles": [
+        "private-full"
+      ],
+      "kind": "container",
+      "timeout_seconds": 300,
+      "result_schema": "container-proof.v2"
+    }
+  ],
+  "profiles": [
+    {
+      "profile_id": "alpic-metadata",
+      "operation_ids": [
+        "candidate-battery",
+        "external-gate",
+        "prepare",
+        "staging-proof",
+        "reconcile-staging",
+        "finalize",
+        "custody",
+        "reconcile-custody",
+        "attestation-workspace",
+        "commit-attestation",
+        "attest",
+        "eligibility",
+        "cleanup-run"
+      ],
+      "external_gate_ids": [
+        "common.nplg-live-canary"
+      ],
+      "subject_roles": [
+        "alpic-deploy-pack",
+        "python-sdist",
+        "python-wheel"
+      ],
+      "finalize_inputs": "common-live-plus-exactly-one-staging-or-reconciliation",
+      "task21_staging_imports": 1,
+      "container_runtime_required": false,
+      "private_nonconstruction_required": true
+    },
+    {
+      "profile_id": "private-full",
+      "operation_ids": [
+        "candidate-battery",
+        "external-gate",
+        "prepare",
+        "finalize",
+        "custody",
+        "reconcile-custody",
+        "attestation-workspace",
+        "commit-attestation",
+        "attest",
+        "eligibility",
+        "cleanup-run"
+      ],
+      "external_gate_ids": [
+        "common.nplg-live-canary",
+        "private-full.edge-http",
+        "private-full.pdf-worker-container",
+        "private-full.pdf-worker-write-quota",
+        "private-full.recovery-proof",
+        "private-full.scanner-container"
+      ],
+      "subject_roles": [
+        "pdf-worker-image",
+        "private-app-image",
+        "private-edge-image",
+        "python-sdist",
+        "python-wheel",
+        "scanner-image"
+      ],
+      "finalize_inputs": "common-live-plus-five-private-proofs",
+      "task21_staging_imports": 0,
+      "container_runtime_required": true,
+      "private_nonconstruction_required": false
+    }
+  ],
+  "sensitivity_policy": {
+    "candidate_battery_environment": "offline-no-secret",
+    "required_case_classes": [
+      "adversarial",
+      "fault",
+      "negative",
+      "property",
+      "recovery"
+    ],
+    "replaced_suite_must_fail": true,
+    "empty_suite_must_fail": true,
+    "always_pass_suite_must_fail": true,
+    "source_mutation_must_fail": true,
+    "minimum_changed_line_coverage_percent": 95,
+    "minimum_changed_branch_coverage_percent": 95,
+    "surviving_mutants_allowed": 0,
+    "conditional_skips_allowed": 0,
+    "evidence_inside_candidate_allowed": false
+  },
+  "missing_authority_status": "PROTECTED_RELEASE_CONTROLLER_UNAVAILABLE",
+  "terminal_verdict": "do_not_release"
+}

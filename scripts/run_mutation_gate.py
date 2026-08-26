@@ -134,6 +134,17 @@ _TASK_THIRTEEN_TARGETS = (
     "src/nplg_mcp/app.py",
     "src/nplg_mcp/__main__.py",
 )
+_TASK_SIXTEEN_A_TARGETS = (
+    "src/nplg_mcp/malware.py",
+    "src/nplg_mcp/downloader.py",
+    "src/nplg_mcp/storage.py",
+    "src/nplg_mcp/storage_lifecycle.py",
+    "src/nplg_mcp/tools.py",
+    "src/nplg_mcp/pdf_worker_client.py",
+    "scripts/verify_scanner_container.py",
+    "scripts/verify_pdf_worker_quota.py",
+    "scripts/verify_private_recovery.py",
+)
 _TASK_SEVENTEEN_TARGETS = (
     "src/nplg_mcp/app.py",
     "src/nplg_mcp/http_types.py",
@@ -148,11 +159,15 @@ _TASK_EIGHTEEN_TARGETS = (
     "src/nplg_mcp/repository.py",
     "src/nplg_mcp/tokens.py",
 )
+_TASK_NINETEEN_TARGETS = ("src/nplg_mcp/profiles.py",)
+_TASK_TWENTY_ONE_A_TARGETS = ("src/nplg_mcp/capabilities.py",)
+_TASK_TWENTY_TWO_TARGETS = ("scripts/verify_release.py",)
 _TARGET_MODULES = {
     "src/nplg_mcp/security.py": "nplg_mcp.security",
     "src/nplg_mcp/tokens.py": "nplg_mcp.tokens",
     "src/nplg_mcp/downloader.py": "nplg_mcp.downloader",
     "src/nplg_mcp/storage.py": "nplg_mcp.storage",
+    "src/nplg_mcp/storage_lifecycle.py": "nplg_mcp.storage_lifecycle",
     "src/nplg_mcp/errors.py": "nplg_mcp.errors",
     "scripts/delete_render.py": "scripts.delete_render",
     "scripts/smoke_live.py": "scripts.smoke_live",
@@ -177,6 +192,14 @@ _TARGET_MODULES = {
     "scripts/run_live_nplg_canary.py": "scripts.run_live_nplg_canary",
     "src/nplg_mcp/parsers.py": "nplg_mcp.parsers",
     "src/nplg_mcp/repository.py": "nplg_mcp.repository",
+    "src/nplg_mcp/profiles.py": "nplg_mcp.profiles",
+    "src/nplg_mcp/capabilities.py": "nplg_mcp.capabilities",
+    "scripts/verify_release.py": "scripts.verify_release",
+    "src/nplg_mcp/malware.py": "nplg_mcp.malware",
+    "src/nplg_mcp/pdf_worker_client.py": "nplg_mcp.pdf_worker_client",
+    "scripts/verify_scanner_container.py": "scripts.verify_scanner_container",
+    "scripts/verify_pdf_worker_quota.py": "scripts.verify_pdf_worker_quota",
+    "scripts/verify_private_recovery.py": "scripts.verify_private_recovery",
 }
 _REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
     "src/nplg_mcp/security.py": (
@@ -580,9 +603,12 @@ _REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
         "x__json_response",
         "x__metrics_response",
         "x__origin",
+        "x__reject_distributed_full",
+        "x__reject_unavailable_production_oauth",
         "x__request_authority",
         "x__require_public_host",
         "x__runtime_services",
+        "x__validate_production_auth_activation",
         "x__validate_startup_config",
         "x_create_app",
         "xǁ_DisconnectAwareFileResponseǁ__init__",
@@ -591,6 +617,226 @@ _REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
     "src/nplg_mcp/__main__.py": (
         "x__http_concurrency_limit",
         "x_main",
+    ),
+}
+
+_TASK_SIXTEEN_A_REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
+    "src/nplg_mcp/malware.py": (
+        "x__peer_credentials",
+        "x__sha256_path",
+        "x_validate_clean_scan_result",
+    ),
+    "src/nplg_mcp/downloader.py": tuple(
+        sorted(
+            frozenset(_REQUIRED_LOCAL_FUNCTIONS["src/nplg_mcp/downloader.py"])
+            | {
+                "x__record_dns_app_error",
+                "x__record_transport_error",
+                "x__run_storage_commit",
+                "x__run_storage_write",
+                "x__system_scan_now",
+            }
+        )
+    ),
+    "src/nplg_mcp/storage.py": tuple(
+        sorted(
+            frozenset(_REQUIRED_LOCAL_FUNCTIONS["src/nplg_mcp/storage.py"])
+            | {
+                "x__delete_orphan_staging_inventory",
+                "x__current_async_task",
+                "x__directory_identity",
+                "x__inventory_orphan_staging",
+                "x__open_verified_directory",
+                "x__open_verified_regular_file",
+                "x__regular_file_identity",
+                "x__same_staging_entry",
+                "x__validate_staging_entry_name",
+                "xǁContentAddressedStoreǁ_asset_object_key",
+                "xǁContentAddressedStoreǁ_activate_publication_reservation_locked",
+                "xǁContentAddressedStoreǁ_close_admission",
+                "xǁContentAddressedStoreǁ_commit_publication_reservation_locked",
+                "xǁContentAddressedStoreǁ_consume_existing_document_locked",
+                "xǁContentAddressedStoreǁ_emit_lifecycle_alert",
+                "xǁContentAddressedStoreǁ_ensure_insertion_sequence",
+                "xǁContentAddressedStoreǁ_finish_prune_locked",
+                "xǁContentAddressedStoreǁ_invoke_render_transaction_guard",
+                "xǁContentAddressedStoreǁ_object_roots",
+                "xǁContentAddressedStoreǁ_prune_pressure",
+                "xǁContentAddressedStoreǁ_prune_unleased",
+                "xǁContentAddressedStoreǁ_publication_denial",
+                "xǁContentAddressedStoreǁ_publish_new_document_locked",
+                "xǁContentAddressedStoreǁ_reconcile_staged_size_locked",
+                "xǁContentAddressedStoreǁ_register_render_transaction_locked",
+                "xǁContentAddressedStoreǁ_record_unsatisfied_prune",
+                "xǁContentAddressedStoreǁ_release_publication_reservation_locked",
+                "xǁContentAddressedStoreǁ_release_staged_reservation_locked",
+                "xǁContentAddressedStoreǁ_replace_staged_render",
+                "xǁContentAddressedStoreǁ_require_lifecycle_policy",
+                "xǁContentAddressedStoreǁ_require_render_mutation_authority_locked",
+                "xǁContentAddressedStoreǁ_require_render_transaction_destination",
+                "xǁContentAddressedStoreǁ_sample_capacity",
+                "xǁContentAddressedStoreǁ_stage_render_transaction",
+                "xǁContentAddressedStoreǁ_stored_objects",
+                "xǁContentAddressedStoreǁ_tree_stats",
+                "xǁContentAddressedStoreǁ_validate_actual_publication",
+                "xǁContentAddressedStoreǁ_validate_publication_maximum",
+                "xǁContentAddressedStoreǁ_validate_published_identity",
+                "xǁContentAddressedStoreǁ_validated_render_destination",
+                "xǁContentAddressedStoreǁ_verify_store_root_identity",
+                "xǁContentAddressedStoreǁabort_publication_reservation",
+                "xǁContentAddressedStoreǁacquire_asset_lease",
+                "xǁContentAddressedStoreǁbegin_publication_reservation",
+                "xǁContentAddressedStoreǁcommit_publication_reservation",
+                "xǁContentAddressedStoreǁlease_asset",
+                "xǁContentAddressedStoreǁprune",
+                "xǁContentAddressedStoreǁreconcile_lifecycle",
+                "xǁContentAddressedStoreǁrelease_asset_lease",
+                "xǁContentAddressedStoreǁreplace_render_bytes_if_matches",
+                "xǁContentAddressedStoreǁreserve_publication",
+                "xǁ_AssetLeaseǁ__enter__",
+                "xǁ_AssetLeaseǁ__exit__",
+                "xǁ_AssetLeaseǁ__init__",
+                "xǁ_PublicationReservationContextǁ__aexit__",
+                "xǁ_PublicationReservationContextǁ__init__",
+                "xǁ_PublicationReservationǁ__init__",
+                "xǁ_PublicationReservationǁabort",
+                "xǁ_PublicationReservationǁactivate",
+                "xǁ_PublicationReservationǁbegin",
+                "xǁ_PublicationReservationǁclose",
+                "xǁ_PublicationReservationǁcommit",
+                "xǁ_RenderTransactionǁ_require_active_owner_context",
+                "xǁ_RenderTransactionǁ_require_owner_context",
+                "xǁ_RenderTransactionǁstage",
+                "xǁ_StagedWriterǁprepare_for_scan",
+                "xǁ_StagedWriterǁreplace_render",
+            }
+        )
+    ),
+    "src/nplg_mcp/storage_lifecycle.py": (
+        "x__has_private_state_metadata",
+        "x__prepare_private_state_descriptor",
+        "x__system_utc_now",
+        "x__read_boot_identity_unchecked",
+        "x__read_boot_identity",
+        "xǁSystemRetentionClockǁ__init__",
+        "xǁSystemRetentionClockǁ__call__",
+        "xǁInsertionSequenceRecordǁbuild",
+        "xǁInsertionHighWaterRecordǁbuild",
+        "xǁPublicationReservationErrorǁ__init__",
+        "x_validate_retention_capacity",
+        "x_filesystem_capacity",
+        "x__canonical_json_bytes",
+        "x__json_digest",
+        "x__clock_record",
+        "x__reject_duplicate_keys",
+        "xǁClockHighWaterǁ__init__",
+        "xǁClockHighWaterǁ_read",
+        "xǁClockHighWaterǁ_write",
+        "xǁClockHighWaterǁ_assessment",
+        "xǁClockHighWaterǁ_baseline",
+        "xǁClockHighWaterǁobserve",
+        "x__read_private_record",
+        "x__write_private_record",
+        "x__insertion_object_key",
+        "xǁPersistentInsertionOrderǁ__init__",
+        "xǁPersistentInsertionOrderǁ_validated_object_path",
+        "xǁPersistentInsertionOrderǁ_write_high_water",
+        "xǁPersistentInsertionOrderǁ_allocate",
+        "xǁPersistentInsertionOrderǁ_load_object_sequence",
+        "xǁPersistentInsertionOrderǁinitialize",
+        "xǁPersistentInsertionOrderǁensure",
+        "xǁPersistentInsertionOrderǁsequence_for",
+        "xǁPersistentInsertionOrderǁremove",
+    ),
+    "src/nplg_mcp/tools.py": tuple(
+        sorted(
+            (
+                frozenset(_REQUIRED_LOCAL_FUNCTIONS["src/nplg_mcp/tools.py"])
+                - {"x__json_integer", "x__validated_serialized_pdf_capacity"}
+            )
+            | {
+                "x__remove_private_pdf_pipeline_versions",
+                "x__validated_pdf_worker_capacity",
+                "xǁToolServiceǁ_about_resource",
+                "xǁToolServiceǁ_discover_render_artifact",
+                "xǁToolServiceǁ_load_render_resource_index",
+                "xǁToolServiceǁ_matching_render_owner",
+                "xǁToolServiceǁ_persist_render_resource_index",
+                "xǁToolServiceǁ_prune_resource_index",
+                "xǁToolServiceǁ_read_artifact_resource",
+                "xǁToolServiceǁ_read_bounded_resource_index",
+                "xǁToolServiceǁ_read_registered_owner_group",
+                "xǁToolServiceǁ_register_render_artifact",
+                "xǁToolServiceǁ_registered_artifact",
+                "xǁToolServiceǁ_render_artifact_content_identity",
+                "xǁToolServiceǁ_render_resource_index_payload",
+                "xǁToolServiceǁ_replace_render_resource_index",
+                "xǁToolServiceǁ_representative_is_missing",
+                "xǁToolServiceǁ_require_bounded_resource_index",
+                "xǁToolServiceǁ_resource_index_relative_path",
+                "xǁToolServiceǁ_utc_timestamp",
+                "xǁToolServiceǁ_validate_registered_artifact",
+                "xǁToolServiceǁ_validated_representative_candidate",
+            }
+        )
+    ),
+    "src/nplg_mcp/pdf_worker_client.py": (
+        "x__peer_credentials",
+        "xǁSubprocessPdfExecutorǁ__init__",
+        "xǁSubprocessPdfExecutorǁ_run_storage",
+        "xǁSubprocessPdfExecutorǁexecute",
+        "xǁSubprocessPdfExecutorǁ_execute_with_permit",
+        "xǁSubprocessPdfExecutorǁ_cleanup_worker",
+        "xǁSubprocessPdfExecutorǁ_remove_job_tree",
+        "xǁSubprocessPdfExecutorǁ_restore_job_tree_permissions",
+        "xǁSubprocessPdfExecutorǁ_wait_for_cleanup",
+        "xǁSubprocessPdfExecutorǁ_validate_and_publish",
+        "xǁSubprocessPdfExecutorǁ_worker_environment",
+        "xǁSubprocessPdfExecutorǁ_require_deadline",
+        "xǁSubprocessPdfExecutorǁ_stage_inputs",
+        "xǁSubprocessPdfExecutorǁ_diagnose_unavailable_render_tree",
+        "xǁSubprocessPdfExecutorǁ_copy_regular_file",
+        "xǁSubprocessPdfExecutorǁ_copy_regular_tree",
+        "xǁSubprocessPdfExecutorǁ_exchange",
+        "xǁSubprocessPdfExecutorǁ_write_request",
+        "xǁSubprocessPdfExecutorǁ_read_result_body",
+        "xǁSubprocessPdfExecutorǁ_read_stderr",
+        "xǁSubprocessPdfExecutorǁ_terminate_process_group",
+        "xǁSubprocessPdfExecutorǁ_wait_for_process_group_exit",
+        "xǁSubprocessPdfExecutorǁ_validate_result_binding",
+        "xǁSubprocessPdfExecutorǁ_validate_result_pixel_budget",
+        "xǁSubprocessPdfExecutorǁ_validate_render_pixel_budget",
+        "xǁSubprocessPdfExecutorǁ_publish_outputs",
+        "xǁSubprocessPdfExecutorǁ_publish_page_render",
+        "xǁSubprocessPdfExecutorǁ_publish_tile_render",
+        "xǁSubprocessPdfExecutorǁ_validated_descriptor",
+        "xǁSubprocessPdfExecutorǁ_validate_output_file",
+        "xǁSubprocessPdfExecutorǁ_validate_image_dimensions",
+        "xǁSubprocessPdfExecutorǁ_load_staged_render_manifest",
+        "xǁSubprocessPdfExecutorǁ_validate_tile_result_binding",
+        "xǁSubprocessPdfExecutorǁ_validate_manifest_file",
+        "xǁSubprocessPdfExecutorǁ_require_exact_output_set",
+        "xǁSubprocessPdfExecutorǁ_authoritative_matches",
+        "xǁSubprocessPdfExecutorǁ_sha256_path",
+        "xǁSubprocessPdfExecutorǁ_publish_one",
+        "xǁUnixSocketPdfExecutorǁ__init__",
+        "xǁUnixSocketPdfExecutorǁ_prepare_work_parent",
+        "xǁUnixSocketPdfExecutorǁ_execute_in_work_root",
+        "xǁUnixSocketPdfExecutorǁ_verify_socket_path",
+        "xǁUnixSocketPdfExecutorǁ_exchange_unix",
+    ),
+    "scripts/verify_scanner_container.py": ("x_verify",),
+    "scripts/verify_pdf_worker_quota.py": ("x_verify",),
+    "scripts/verify_private_recovery.py": (
+        "x__reject_duplicate_names",
+        "x__reject_noninteger_number",
+        "x__bounded_json_integer",
+        "x__require_canonical_receipt",
+        "x__require_receipt_digest",
+        "x__parse_recovery_receipt",
+        "x__validated_policy",
+        "x__bind_receipt",
+        "x_verify",
     ),
 }
 
@@ -609,6 +855,110 @@ _TASK_EIGHTEEN_REQUIRED_LOCAL_FUNCTIONS = {
         else _REQUIRED_LOCAL_FUNCTIONS[target]
     )
     for target in _TASK_EIGHTEEN_TARGETS
+}
+_TASK_NINETEEN_REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
+    "src/nplg_mcp/profiles.py": ("x_tool_names_for_profile",),
+}
+_TASK_TWENTY_ONE_A_REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
+    "src/nplg_mcp/capabilities.py": (
+        "x__body_evidence",
+        "x__canonical_bytes",
+        "x__canonical_negative_alpic_tasks_blockers",
+        "x__decode_base64",
+        "x__expected_dispatch_response",
+        "x__expected_error_response",
+        "x__expected_initialize_request",
+        "x__expected_tool_request",
+        "x__finalize",
+        "x__header_values",
+        "x__headers",
+        "x__initialize_body",
+        "x__load",
+        "x__load_alpic_tasks_contract",
+        "x__model_json",
+        "x__observe_alpic_local_sdk",
+        "x__observe_http_case",
+        "x__observe_sdk_matrix",
+        "x__package_file_sha256",
+        "x__package_tree_sha256",
+        "x__parse_bearer_challenge",
+        "x__raw_request",
+        "x__reject_duplicate_pairs",
+        "x__sdk_probe_app",
+        "x__sdk_tasks_public_api_available",
+        "x__sha256_json",
+        "x__tool_call_body",
+        "x__tool_headers",
+        "x_canonical_json_sha256",
+        "x_canonical_model_json",
+        "x_load_alpic_tasks_source_evidence",
+        "x_load_alpic_tasks_verdict",
+        "x_load_alpic_verdict",
+        "x_load_provider_verdict",
+        "x_load_sdk_verdict",
+        "x_probe_alpic_oauth_discovery",
+        "x_probe_alpic_tasks_capability",
+        "x_probe_oauth_provider",
+        "x_probe_sdk_authorization",
+        "x_validate_alpic_tasks_verdict_json",
+        "x_validate_synthetic_alpic_tasks_verdict",
+        "xǁSdkAuthorizationCapabilityVerdictǁ_check_http_semantics",
+        "xǁSdkAuthorizationCapabilityVerdictǁ_check_installed_identity",
+        "xǁSdkAuthorizationCapabilityVerdictǁ_check_matrix_digests",
+        "xǁSdkAuthorizationCapabilityVerdictǁ_check_matrix_identity",
+        "xǁSdkAuthorizationCapabilityVerdictǁ_check_support_decision",
+        "xǁ_FixtureDispatchCounterǁ__init__",
+        "xǁ_FixtureDispatchCounterǁcall_tool",
+        "xǁ_FixtureProbeStateǁ__init__",
+        "xǁ_FixtureTokenVerifierǁ__init__",
+        "xǁ_FixtureTokenVerifierǁverify_token",
+    ),
+}
+_TASK_TWENTY_TWO_REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
+    "scripts/verify_release.py": (
+        "x__dependency_window",
+        "x__duplicate_json_name",
+        "x__external_requirements",
+        "x__fail",
+        "x__fail_from",
+        "x__gate_command",
+        "x__load_json_object",
+        "x__load_model",
+        "x__parser",
+        "x__reject_json_number",
+        "x__source_entry",
+        "x__trusted_python_gate_command",
+        "x__trusted_release_tool_proof",
+        "x__unsafe_command_text",
+        "x__utc_timestamp",
+        "x__valid_closed_python_tool_success",
+        "x__valid_success_evidence",
+        "x__validate_dependency_evidence_identity",
+        "x__validate_dependency_exception",
+        "x__validate_dependency_finding",
+        "x__validate_pyright_runtime_identity",
+        "x_assert_source_snapshot",
+        "x_candidate_release_status",
+        "x_capture_source_descriptor_snapshot",
+        "x_cli",
+        "x_load_dependency_evidence",
+        "x_load_dependency_risk_policy",
+        "x_load_release_command_manifest",
+        "x_load_release_controller_policy",
+        "x_load_release_policies",
+        "x_load_trivy_database_receipt",
+        "x_load_trusted_package_sources_policy",
+        "x_local_gate_commands",
+        "x_main",
+        "x_materialize_source",
+        "x_release_command_manifest_digest",
+        "x_run_gate_battery",
+        "x_run_local_gates",
+        "x_validate_candidate_contract_transcript",
+        "x_validate_external_gate_manifest_join",
+        "x_write_source_snapshot",
+        "xǁSystemCommandRunnerǁ__call__",
+    ),
 }
 
 
@@ -748,12 +1098,37 @@ def _mutation_policy(
 
 
 def _later_task_mutation_policy(targets: tuple[str, ...]) -> MutationPolicy:
+    if targets == _TASK_SIXTEEN_A_TARGETS:
+        return _mutation_policy(
+            targets,
+            test_paths=(
+                "tests/unit/test_scanner_container_verifier.py",
+                "tests/unit/test_pdf_worker_quota_verifier.py",
+                "tests/unit/test_private_recovery_verifier.py",
+                "tests/security/test_malware.py",
+                "tests/security/test_downloader.py",
+                "tests/security/test_pdf_worker.py",
+                "tests/security/test_pdf_adversarial_corpus_worker.py",
+                "tests/unit/test_pdf_worker_client_edges.py",
+                "tests/unit/test_storage.py",
+                "tests/unit/test_storage_internals.py",
+                "tests/unit/test_storage_transaction_atomicity.py",
+                "tests/property/test_storage_properties.py",
+                "tests/unit/test_storage_lifecycle.py",
+                "tests/unit/test_pdf_publication_reservation.py",
+                "tests/unit/test_tools.py",
+                "tests/integration/test_pdf.py",
+                "tests/static/test_deployment.py",
+            ),
+            required_local_functions=_TASK_SIXTEEN_A_REQUIRED_LOCAL_FUNCTIONS,
+        )
     if targets == _TASK_THIRTEEN_TARGETS:
         return _mutation_policy(
             targets,
             test_paths=(
                 "tests/conformance/test_mcp_http.py",
                 "tests/contracts/test_sdk_parity.py",
+                "tests/security/test_auth_activation.py",
                 "tests/unit/test_app_lifespan.py",
                 "tests/unit/test_json_preflight.py",
                 "tests/property/test_json_preflight_properties.py",
@@ -770,22 +1145,57 @@ def _later_task_mutation_policy(targets: tuple[str, ...]) -> MutationPolicy:
             ),
             required_local_functions=_TASK_EIGHTEEN_REQUIRED_LOCAL_FUNCTIONS,
         )
-    return _mutation_policy(
-        targets,
-        test_paths=(
+    if targets == _TASK_NINETEEN_TARGETS:
+        return _mutation_policy(
+            targets,
+            test_paths=(
+                "tests/integration/test_profiles.py",
+                "tests/contracts/test_sdk_client.py",
+                "tests/unit/test_config.py",
+            ),
+            required_local_functions=_TASK_NINETEEN_REQUIRED_LOCAL_FUNCTIONS,
+        )
+    if targets == _TASK_TWENTY_ONE_A_TARGETS:
+        return _mutation_policy(
+            targets,
+            test_paths=(
+                "tests/contracts/test_sdk_auth_feasibility.py",
+                "tests/contracts/test_alpic_oauth_discovery.py",
+                "tests/contracts/test_oauth_provider_capability.py",
+                "tests/contracts/test_alpic_tasks_capability.py",
+                "tests/unit/test_probe_alpic_tasks_capability.py",
+                "tests/integration/test_profiles.py",
+            ),
+            required_local_functions=_TASK_TWENTY_ONE_A_REQUIRED_LOCAL_FUNCTIONS,
+        )
+    test_paths: tuple[str, ...]
+    deselected_tests: tuple[str, ...]
+    required_local_functions: dict[str, tuple[str, ...]] | None
+    if targets == _TASK_TWENTY_TWO_TARGETS:
+        test_paths = ("tests/static/test_release_gate.py",)
+        deselected_tests = ()
+        required_local_functions = _TASK_TWENTY_TWO_REQUIRED_LOCAL_FUNCTIONS
+    else:
+        test_paths = (
             "tests/security/test_ssrf_binding.py",
             "tests/unit/test_upstream_resilience.py",
             "tests/unit/test_live_nplg_canary.py",
             "tests/security/test_downloader.py",
             "tests/integration/test_repository.py",
             "tests/conformance/test_mcp_http.py",
-        ),
-        deselected_tests=(
+        )
+        deselected_tests = (
             (
                 "tests/integration/test_repository.py::"
                 "test_live_nplg_canary_uses_bound_public_endpoint"
             ),
-        ),
+        )
+        required_local_functions = None
+    return _mutation_policy(
+        targets,
+        test_paths=test_paths,
+        deselected_tests=deselected_tests,
+        required_local_functions=required_local_functions,
     )
 
 
@@ -853,8 +1263,12 @@ def mutation_policy_for_targets(targets: tuple[str, ...]) -> MutationPolicy:
         )
     if targets in {
         _TASK_THIRTEEN_TARGETS,
+        _TASK_SIXTEEN_A_TARGETS,
         _TASK_SEVENTEEN_TARGETS,
         _TASK_EIGHTEEN_TARGETS,
+        _TASK_NINETEEN_TARGETS,
+        _TASK_TWENTY_ONE_A_TARGETS,
+        _TASK_TWENTY_TWO_TARGETS,
     }:
         return _later_task_mutation_policy(targets)
     _fail("mutation request does not match the closed initial policy")

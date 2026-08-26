@@ -27,6 +27,12 @@ from nplg_mcp.security import (
 _UNEXPECTED_UNIX = "Unix delegate must not be reached"
 
 
+class _HostnameSubclass(str):
+    """Represent a value-equivalent hostname with a distinct runtime type."""
+
+    __slots__ = ()
+
+
 class _Stream(httpcore.AsyncNetworkStream):
     def __init__(self, peer: tuple[str, int]) -> None:
         super().__init__()
@@ -152,6 +158,43 @@ async def test_tcp_rejects_every_non_exact_or_unbounded_timeout_before_socket_wo
             NPLG_HOST,
             443,
             timeout=cast("float | None", raw_timeout),
+        )
+
+    assert resolver_calls == 0
+    assert delegate.calls == []
+
+
+@pytest.mark.parametrize(
+    ("host", "port"),
+    [
+        ("DSPACE.NPLG.GOV.GE", 443),
+        (_HostnameSubclass(NPLG_HOST), 443),
+        (NPLG_HOST, 443.0),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tcp_rejects_noncanonical_host_or_port_before_resolution(
+    host: object,
+    port: object,
+) -> None:
+    """Mutation caught: accepting a coercive endpoint before DNS/socket binding."""
+    delegate = _Backend()
+    resolver_calls = 0
+
+    async def resolver(requested_host: str) -> ResolvedEndpoint:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return await _public(requested_host)
+
+    backend = BoundAsyncNetworkBackend(
+        delegate=delegate, resolver=resolver, clock=lambda: 10.0
+    )
+
+    with pytest.raises(httpcore.ConnectError, match="target is not approved"):
+        _ = await backend.connect_tcp(
+            cast("str", host),
+            cast("int", port),
+            timeout=5.0,
         )
 
     assert resolver_calls == 0

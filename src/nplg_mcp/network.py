@@ -637,7 +637,12 @@ class BoundAsyncNetworkBackend(httpcore.AsyncNetworkBackend):
         socket_options: Iterable[SOCKET_OPTION] | None = None,
     ) -> httpcore.AsyncNetworkStream:
         request_deadline = self._deadline(timeout)
-        if host.lower() != NPLG_HOST or port != _HTTPS_PORT:
+        if (
+            type(host) is not str
+            or host != NPLG_HOST
+            or type(port) is not int
+            or port != _HTTPS_PORT
+        ):
             raise _HttpcoreTransportPolicyError(_TARGET_REJECTED)
         endpoint = await self._resolver(host)
         if type(endpoint) is not ResolvedEndpoint:

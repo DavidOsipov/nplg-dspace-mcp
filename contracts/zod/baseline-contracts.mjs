@@ -1109,7 +1109,7 @@ export const committedBaselineManifestSchema = z.strictObject({
  * @param {string} source
  * @returns {JsonValue}
  */
-function parseJsonRejectingDuplicateKeys(source) {
+export function parseJsonRejectingDuplicateKeys(source) {
   let offset = 0;
 
   /**

@@ -37,4 +37,7 @@ def tool_names_for_profile(profile: DeploymentProfile) -> tuple[ToolName, ...]:
     """Return the immutable exact tool inventory for one validated profile."""
     if profile is DeploymentProfile.ALPIC_METADATA:
         return METADATA_TOOL_NAMES
-    return FULL_TOOL_NAMES
+    if profile is DeploymentProfile.PRIVATE_FULL:
+        return FULL_TOOL_NAMES
+    message = "distributed-full is not implemented and must remain disabled"
+    raise ValueError(message)

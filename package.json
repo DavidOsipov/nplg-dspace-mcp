@@ -8,18 +8,19 @@
     "node": ">=24.0.0 <25.0.0"
   },
   "scripts": {
-    "contracts:lint": "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/models.ts contracts/zod/contract.test.ts tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+    "contracts:lint": "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs contracts/zod/models.ts contracts/zod/contract.test.ts tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs",
     "contracts:typecheck": "tsc --project tsconfig.contracts.json",
     "contracts:test": "node --test contracts/zod/contract.test.ts && npm run contracts:zod:all",
     "docs:lint": "markdownlint-cli2 \"*.md\" \"docs/**/*.md\" \"deploy/**/*.md\" \"skills/**/*.md\"",
     "contracts:zod": "node --test tests/contracts/zod_contracts.test.mjs",
     "contracts:baseline-zod": "node --test tests/contracts/zod_baseline_contracts.test.mjs",
     "contracts:asvs-zod": "node --test tests/contracts/zod_asvs_evidence_contracts.test.mjs",
-    "contracts:zod:all": "npm run contracts:zod && npm run contracts:baseline-zod && npm run contracts:asvs-zod",
-    "contracts:baseline-static": "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs",
+    "contracts:recovery-zod": "node --test tests/contracts/zod_recovery_contracts.test.mjs",
+    "contracts:zod:all": "npm run contracts:zod && npm run contracts:baseline-zod && npm run contracts:asvs-zod && npm run contracts:recovery-zod",
+    "contracts:baseline-static": "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs",
     "test:contracts:asvs": "node --test tests/contracts/zod_asvs_evidence_contracts.test.mjs",
     "typecheck:contracts": "tsc --project tsconfig.contracts.json",
-    "lint:contracts": "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs"
+    "lint:contracts": "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

@@ -6,6 +6,8 @@ import { z } from "zod";
 import * as capabilityContracts from "../../contracts/zod/capability-contracts.mjs";
 
 const {
+  alpicTasksCapabilitySchema,
+  alpicTasksSourceEvidenceSchema,
   alpicOAuthDiscoveryCapabilitySchema,
   oauthProviderCapabilitySchema,
   sdkAuthorizationCapabilitySchema,
@@ -65,14 +67,39 @@ const mutableAlpicSchema = z.looseObject({
   reviewed_date: z.string(),
 });
 const mutableProviderSchema = z.looseObject({
+  blockers: z.array(z.string()),
   scopes: z.array(z.string()),
   verdict_digest: z.string(),
+});
+const mutableAlpicTasksSchema = z.looseObject({
+  blockers: z.array(z.string()),
+  extension_revision_state: z.string(),
+  provider_integration: z.string(),
+  provider_tasks_compute: z.string(),
+  restart_recovery: z.string(),
+  reviewed_date: z.string(),
+  source_evidence_digest: z.string(),
+  supported: z.boolean(),
+  verdict_digest: z.string(),
+  live_evidence: z.looseObject({ environment_id: z.string() }).optional(),
+});
+const mutableAlpicTasksSourceRecordSchema = z.looseObject({
+  content_sha256: z.string(),
+  final_url: z.string(),
+  media_type: z.string(),
+  url: z.string(),
+});
+const mutableAlpicTasksSourceEvidenceSchema = z.looseObject({
+  evidence_digest: z.string(),
+  schema_version: z.string(),
+  sources: z.array(mutableAlpicTasksSourceRecordSchema),
 });
 
 /** @typedef {z.infer<typeof mutableHttpSchema>} MutableHttp */
 /** @typedef {z.infer<typeof mutableObservationSchema>} MutableObservation */
 /** @typedef {z.infer<typeof mutableSdkSchema>} MutableSdk */
 /** @typedef {z.infer<typeof mutableAlpicSchema>} MutableAlpic */
+/** @typedef {z.infer<typeof mutableAlpicTasksSchema>} MutableAlpicTasks */
 
 /**
  * @param {string} name
@@ -99,6 +126,18 @@ async function loadAlpic() {
 /** @returns {Promise<z.infer<typeof mutableProviderSchema>>} */
 async function loadProvider() {
   return mutableProviderSchema.parse(await loadUnknown("oauth-provider-capability.json"));
+}
+
+/** @returns {Promise<MutableAlpicTasks>} */
+async function loadAlpicTasks() {
+  return mutableAlpicTasksSchema.parse(await loadUnknown("alpic-tasks-capability.json"));
+}
+
+/** @returns {Promise<z.infer<typeof mutableAlpicTasksSourceEvidenceSchema>>} */
+async function loadAlpicTasksSourceEvidence() {
+  return mutableAlpicTasksSourceEvidenceSchema.parse(
+    await loadUnknown("alpic-tasks-source-evidence.json"),
+  );
 }
 
 /**
@@ -205,6 +244,24 @@ function redigestAlpic(value) {
 }
 
 /**
+ * @param {z.infer<typeof mutableProviderSchema>} value
+ * @returns {z.infer<typeof mutableProviderSchema>}
+ */
+function redigestProvider(value) {
+  value.verdict_digest = digestJson(withoutVerdictDigest(value));
+  return value;
+}
+
+/**
+ * @param {MutableAlpicTasks} value
+ * @returns {MutableAlpicTasks}
+ */
+function redigestAlpicTasks(value) {
+  value.verdict_digest = digestJson(withoutVerdictDigest(value));
+  return value;
+}
+
+/**
  * @template T
  * @param {unknown} raw
  * @param {import("zod").ZodType<T>} schema
@@ -227,9 +284,18 @@ void test("Zod independently accepts the strict capability records", async () =>
   const sdk = parseRawContract(await loadRaw("sdk-authorization-capability.json"), sdkAuthorizationCapabilitySchema);
   const alpic = parseRawContract(await loadRaw("alpic-oauth-discovery-capability.json"), alpicOAuthDiscoveryCapabilitySchema);
   const provider = parseRawContract(await loadRaw("oauth-provider-capability.json"), oauthProviderCapabilitySchema);
+  assert.equal(typeof alpicTasksCapabilitySchema.parse, "function");
+  assert.equal(typeof alpicTasksSourceEvidenceSchema.parse, "function");
+  const alpicTasksSources = parseRawContract(
+    await loadRaw("alpic-tasks-source-evidence.json"),
+    alpicTasksSourceEvidenceSchema,
+  );
+  const alpicTasks = parseRawContract(await loadRaw("alpic-tasks-capability.json"), alpicTasksCapabilitySchema);
   assert.equal(sdk.supported, false);
   assert.equal(alpic.exact_detector_fixture_supported, false);
   assert.equal(provider.supported, false);
+  assert.equal(alpicTasks.supported, false);
+  assert.equal(alpicTasks.source_evidence_digest, alpicTasksSources.evidence_digest);
 });
 
 void test("Zod rejects unknown fields independently of Pydantic", async () => {
@@ -287,6 +353,24 @@ void test("Zod raw loader rejects duplicate keys and noncanonical bytes", async 
   assert.throws(
     () => parseRawContract(" ".repeat(2_097_153), sdkAuthorizationCapabilitySchema),
     RangeError,
+  );
+
+  const alpicTasksRaw = await loadRaw("alpic-tasks-capability.json");
+  const alpicTasksDuplicate = alpicTasksRaw.replace(
+    '{"artifact_delivery":',
+    '{"provider":"alpic","artifact_delivery":',
+  );
+  assert.throws(() => parseRawContract(alpicTasksDuplicate, alpicTasksCapabilitySchema));
+  const alpicTasksPretty = `${JSON.stringify(JSON.parse(alpicTasksRaw), null, 2)}\n`;
+  assert.throws(() => parseRawContract(alpicTasksPretty, alpicTasksCapabilitySchema));
+
+  const alpicTasksSourcesRaw = await loadRaw("alpic-tasks-source-evidence.json");
+  const alpicTasksSourcesDuplicate = alpicTasksSourcesRaw.replace(
+    '{"evidence_digest":',
+    '{"schema_version":"1.0","evidence_digest":',
+  );
+  assert.throws(
+    () => parseRawContract(alpicTasksSourcesDuplicate, alpicTasksSourceEvidenceSchema),
   );
 });
 
@@ -375,6 +459,143 @@ void test("Zod rejects redigested Alpic route, rewrite, challenge, and support f
   assert.throws(() => alpicOAuthDiscoveryCapabilitySchema.parse(sdkIdentity));
 });
 
+void test("Zod rejects redigested Alpic Tasks support and deployment forgeries", async () => {
+  const supported = await loadAlpicTasks();
+  supported.supported = true;
+  redigestAlpicTasks(supported);
+  assert.throws(() => alpicTasksCapabilitySchema.parse(supported));
+
+  const integration = await loadAlpicTasks();
+  integration.provider_integration = "proven";
+  redigestAlpicTasks(integration);
+  assert.throws(() => alpicTasksCapabilitySchema.parse(integration));
+
+  const compute = await loadAlpicTasks();
+  compute.provider_tasks_compute = "proven";
+  redigestAlpicTasks(compute);
+  assert.throws(() => alpicTasksCapabilitySchema.parse(compute));
+
+  const extension = await loadAlpicTasks();
+  extension.extension_revision_state = "stable";
+  redigestAlpicTasks(extension);
+  assert.throws(() => alpicTasksCapabilitySchema.parse(extension));
+
+  const blockers = await loadAlpicTasks();
+  blockers.blockers.reverse();
+  redigestAlpicTasks(blockers);
+  assert.throws(() => alpicTasksCapabilitySchema.parse(blockers));
+
+  const unknown = await loadAlpicTasks();
+  unknown["future_approval"] = true;
+  assert.throws(() => alpicTasksCapabilitySchema.parse(unknown));
+});
+
+void test("Zod reaches only a complete synthetic supported Alpic Tasks branch", async () => {
+  const synthetic = await loadAlpicTasks();
+  Object.assign(synthetic, {
+    extension_revision_state: "stable",
+    mcp_version: "2.1.0",
+    mcp_types_version: "2.1.0",
+    installed_sdk_tree_sha256: "1".repeat(64),
+    sdk_server_support: "supported",
+    sdk_client_support: "supported",
+    source_evidence_digest: "2".repeat(64),
+    provider_integration: "proven",
+    task_creation_durability: "proven",
+    restart_recovery: "proven",
+    cancellation: "proven",
+    isolation: "proven",
+    retention: "proven",
+    artifact_delivery: "proven",
+    client_support: "proven",
+    documentation_provenance: "Synthetic schema-reachability fixture; not operational evidence.",
+    supported: true,
+    blockers: [],
+    reviewed_date: "2026-08-25",
+    live_evidence: {
+      environment_id: "synthetic-environment",
+      deployment_id: "synthetic-deployment",
+      pack_sha256: "3".repeat(64),
+      sdk_wheel_sha256: "4".repeat(64),
+      protocol_revision_sha256: "5".repeat(64),
+      client_identities_sha256: "6".repeat(64),
+      evidence_digest: "7".repeat(64),
+      observed_at: "2026-08-25T00:00:00Z",
+    },
+  });
+  redigestAlpicTasks(synthetic);
+
+  const parsed = alpicTasksCapabilitySchema.parse(synthetic);
+
+  assert.equal(parsed.supported, true);
+  assert.equal(parsed.live_evidence.environment_id, "synthetic-environment");
+  const missingIdentity = structuredClone(synthetic);
+  delete missingIdentity.live_evidence;
+  redigestAlpicTasks(missingIdentity);
+  assert.throws(() => alpicTasksCapabilitySchema.parse(missingIdentity));
+  const unproven = structuredClone(synthetic);
+  unproven.restart_recovery = "not_assessed";
+  redigestAlpicTasks(unproven);
+  assert.throws(() => alpicTasksCapabilitySchema.parse(unproven));
+  const invalidVersion = structuredClone(synthetic);
+  invalidVersion["mcp_version"] = "not-a-version";
+  redigestAlpicTasks(invalidVersion);
+  assert.throws(() => alpicTasksCapabilitySchema.parse(invalidVersion));
+  assert.equal((await loadAlpicTasks()).supported, false);
+});
+
+void test("Zod rejects Alpic Tasks source swaps and source-verdict splices", async () => {
+  const redirected = await loadAlpicTasksSourceEvidence();
+  const redirectedSource = redirected.sources[0];
+  assert.ok(redirectedSource !== undefined);
+  redirectedSource.final_url = "https://attacker.example/tasks";
+  redirected.evidence_digest = digestJson({
+    schema_version: redirected.schema_version,
+    sources: redirected.sources,
+  });
+  assert.throws(() => alpicTasksSourceEvidenceSchema.parse(redirected));
+
+  const refreshed = await loadAlpicTasksSourceEvidence();
+  const refreshedSource = refreshed.sources[0];
+  assert.ok(refreshedSource !== undefined);
+  refreshedSource.content_sha256 = "0".repeat(64);
+  refreshed.evidence_digest = digestJson({
+    schema_version: refreshed.schema_version,
+    sources: refreshed.sources,
+  });
+  assert.doesNotThrow(() => alpicTasksSourceEvidenceSchema.parse(refreshed));
+
+  const verdict = await loadAlpicTasks();
+  verdict.source_evidence_digest = refreshed.evidence_digest;
+  verdict.verdict_digest = digestJson(withoutVerdictDigest(verdict));
+  assert.throws(() => alpicTasksCapabilitySchema.parse(verdict));
+});
+
+void test("Zod requires immutable commit-pinned SDK roadmap provenance", async () => {
+  const evidence = await loadAlpicTasksSourceEvidence();
+  const roadmap = evidence.sources[1];
+  assert.ok(roadmap !== undefined);
+  roadmap.url = "https://raw.githubusercontent.com/modelcontextprotocol/python-sdk/959569ba1505897bd8d824a1bf22800672f7cf14/ROADMAP.md";
+  roadmap.final_url = roadmap.url;
+  roadmap.media_type = "text/plain";
+  evidence.evidence_digest = digestJson({
+    schema_version: evidence.schema_version,
+    sources: evidence.sources,
+  });
+  assert.doesNotThrow(() => alpicTasksSourceEvidenceSchema.parse(evidence));
+
+  const mutable = await loadAlpicTasksSourceEvidence();
+  const mutableRoadmap = mutable.sources[1];
+  assert.ok(mutableRoadmap !== undefined);
+  mutableRoadmap.url = "https://github.com/modelcontextprotocol/python-sdk/blob/main/ROADMAP.md";
+  mutableRoadmap.final_url = mutableRoadmap.url;
+  mutable.evidence_digest = digestJson({
+    schema_version: mutable.schema_version,
+    sources: mutable.sources,
+  });
+  assert.throws(() => alpicTasksSourceEvidenceSchema.parse(mutable));
+});
+
 void test("Zod bounds persisted strings and tuples", async () => {
   const sdk = await loadSdk();
   sdk.reason = "x".repeat(4097);
@@ -417,4 +638,20 @@ void test("Zod rejects redigested capability provenance drift", async () => {
     redigestAlpic(alpic);
     assert.throws(() => alpicOAuthDiscoveryCapabilitySchema.parse(alpic));
   }
+});
+
+void test("Zod preserves every selected Auth0 and Alpic DCR blocker", async () => {
+  const missingDcr = await loadProvider();
+  missingDcr.blockers = [
+    "OAUTH_PROVIDER_CAPABILITY_UNPROVEN",
+    "OAUTH_END_TO_END_FLOW_UNPROVEN",
+  ];
+  assert.throws(() => oauthProviderCapabilitySchema.parse(redigestProvider(missingDcr)));
+
+  const missingFlow = await loadProvider();
+  missingFlow.blockers = [
+    "OAUTH_PROVIDER_CAPABILITY_UNPROVEN",
+    "ALPIC_DCR_ISSUER_SEMANTICS_UNPROVEN",
+  ];
+  assert.throws(() => oauthProviderCapabilitySchema.parse(redigestProvider(missingFlow)));
 });

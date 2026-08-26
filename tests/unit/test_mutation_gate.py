@@ -63,6 +63,17 @@ _TASK_SEVENTEEN_TARGETS = (
     "src/nplg_mcp/downloader.py",
     "scripts/run_live_nplg_canary.py",
 )
+_TASK_SIXTEEN_A_TARGETS = (
+    "src/nplg_mcp/malware.py",
+    "src/nplg_mcp/downloader.py",
+    "src/nplg_mcp/storage.py",
+    "src/nplg_mcp/storage_lifecycle.py",
+    "src/nplg_mcp/tools.py",
+    "src/nplg_mcp/pdf_worker_client.py",
+    "scripts/verify_scanner_container.py",
+    "scripts/verify_pdf_worker_quota.py",
+    "scripts/verify_private_recovery.py",
+)
 _EXPECTED_MODULES: dict[str, str] = {
     "src/nplg_mcp/security.py": "nplg_mcp.security",
     "src/nplg_mcp/tokens.py": "nplg_mcp.tokens",
@@ -886,11 +897,18 @@ def test_phase_three_mutation_policies_are_closed_and_test_selected() -> None:
     assert task_thirteen.test_paths == (
         "tests/conformance/test_mcp_http.py",
         "tests/contracts/test_sdk_parity.py",
+        "tests/security/test_auth_activation.py",
         "tests/unit/test_app_lifespan.py",
         "tests/unit/test_json_preflight.py",
         "tests/property/test_json_preflight_properties.py",
         "tests/unit/test_config.py",
     )
+    task_thirteen_functions = dict(task_thirteen.required_functions)
+    assert {
+        "nplg_mcp.app.x__reject_distributed_full",
+        "nplg_mcp.app.x__reject_unavailable_production_oauth",
+        "nplg_mcp.app.x__validate_production_auth_activation",
+    }.issubset(task_thirteen_functions["src/nplg_mcp/app.py"])
     with pytest.raises(MutationGateError, match="closed initial policy"):
         _ = mutation_policy_for_targets(tuple(reversed(task_thirteen_targets)))
 
@@ -914,6 +932,121 @@ def test_task_seventeen_mutation_policy_selects_exact_security_suite() -> None:
             "test_live_nplg_canary_uses_bound_public_endpoint"
         ),
     )
+
+
+def test_task_sixteen_a_mutation_policy_is_exact_closed_and_recovery_selected() -> None:
+    """Task 16A's documented command must select its complete adversarial suite."""
+    policy = mutation_policy_for_targets(_TASK_SIXTEEN_A_TARGETS)
+
+    assert policy.targets == _TASK_SIXTEEN_A_TARGETS
+    assert policy.test_paths == (
+        "tests/unit/test_scanner_container_verifier.py",
+        "tests/unit/test_pdf_worker_quota_verifier.py",
+        "tests/unit/test_private_recovery_verifier.py",
+        "tests/security/test_malware.py",
+        "tests/security/test_downloader.py",
+        "tests/security/test_pdf_worker.py",
+        "tests/security/test_pdf_adversarial_corpus_worker.py",
+        "tests/unit/test_pdf_worker_client_edges.py",
+        "tests/unit/test_storage.py",
+        "tests/unit/test_storage_internals.py",
+        "tests/unit/test_storage_transaction_atomicity.py",
+        "tests/property/test_storage_properties.py",
+        "tests/unit/test_storage_lifecycle.py",
+        "tests/unit/test_pdf_publication_reservation.py",
+        "tests/unit/test_tools.py",
+        "tests/integration/test_pdf.py",
+        "tests/static/test_deployment.py",
+    )
+    assert policy.deselected_tests == ()
+    required = dict(policy.required_functions)
+    storage_required = set(required["src/nplg_mcp/storage.py"])
+    assert {
+        (
+            "nplg_mcp.storage."
+            "xǁContentAddressedStoreǁ_activate_publication_reservation_locked"
+        ),
+        (
+            "nplg_mcp.storage."
+            "xǁContentAddressedStoreǁ_commit_publication_reservation_locked"
+        ),
+        "nplg_mcp.storage.xǁContentAddressedStoreǁ_finish_prune_locked",
+        (
+            "nplg_mcp.storage."
+            "xǁContentAddressedStoreǁ_register_render_transaction_locked"
+        ),
+        "nplg_mcp.storage.x__current_async_task",
+        ("nplg_mcp.storage.xǁContentAddressedStoreǁ_invoke_render_transaction_guard"),
+        (
+            "nplg_mcp.storage."
+            "xǁContentAddressedStoreǁ_require_render_mutation_authority_locked"
+        ),
+        (
+            "nplg_mcp.storage."
+            "xǁContentAddressedStoreǁ_require_render_transaction_destination"
+        ),
+        "nplg_mcp.storage.xǁContentAddressedStoreǁ_stage_render_transaction",
+        ("nplg_mcp.storage.xǁ_RenderTransactionǁ_require_active_owner_context"),
+        "nplg_mcp.storage.xǁ_RenderTransactionǁ_require_owner_context",
+        "nplg_mcp.storage.xǁ_RenderTransactionǁstage",
+    } <= storage_required
+    assert required["scripts/verify_private_recovery.py"] == (
+        "scripts.verify_private_recovery.x__reject_duplicate_names",
+        "scripts.verify_private_recovery.x__reject_noninteger_number",
+        "scripts.verify_private_recovery.x__bounded_json_integer",
+        "scripts.verify_private_recovery.x__require_canonical_receipt",
+        "scripts.verify_private_recovery.x__require_receipt_digest",
+        "scripts.verify_private_recovery.x__parse_recovery_receipt",
+        "scripts.verify_private_recovery.x__validated_policy",
+        "scripts.verify_private_recovery.x__bind_receipt",
+        "scripts.verify_private_recovery.x_verify",
+    )
+    lifecycle_prefix = "nplg_mcp.storage_lifecycle."
+    assert tuple(
+        function.removeprefix(lifecycle_prefix)
+        for function in required["src/nplg_mcp/storage_lifecycle.py"]
+    ) == (
+        "x__has_private_state_metadata",
+        "x__prepare_private_state_descriptor",
+        "x__system_utc_now",
+        "x__read_boot_identity_unchecked",
+        "x__read_boot_identity",
+        "xǁSystemRetentionClockǁ__init__",
+        "xǁSystemRetentionClockǁ__call__",
+        "xǁInsertionSequenceRecordǁbuild",
+        "xǁInsertionHighWaterRecordǁbuild",
+        "xǁPublicationReservationErrorǁ__init__",
+        "x_validate_retention_capacity",
+        "x_filesystem_capacity",
+        "x__canonical_json_bytes",
+        "x__json_digest",
+        "x__clock_record",
+        "x__reject_duplicate_keys",
+        "xǁClockHighWaterǁ__init__",
+        "xǁClockHighWaterǁ_read",
+        "xǁClockHighWaterǁ_write",
+        "xǁClockHighWaterǁ_assessment",
+        "xǁClockHighWaterǁ_baseline",
+        "xǁClockHighWaterǁobserve",
+        "x__read_private_record",
+        "x__write_private_record",
+        "x__insertion_object_key",
+        "xǁPersistentInsertionOrderǁ__init__",
+        "xǁPersistentInsertionOrderǁ_validated_object_path",
+        "xǁPersistentInsertionOrderǁ_write_high_water",
+        "xǁPersistentInsertionOrderǁ_allocate",
+        "xǁPersistentInsertionOrderǁ_load_object_sequence",
+        "xǁPersistentInsertionOrderǁinitialize",
+        "xǁPersistentInsertionOrderǁensure",
+        "xǁPersistentInsertionOrderǁsequence_for",
+        "xǁPersistentInsertionOrderǁremove",
+    )
+    assert all(required[target] for target in _TASK_SIXTEEN_A_TARGETS)
+    with pytest.raises(MutationGateError, match="closed initial policy"):
+        _ = mutation_policy_for_targets(tuple(reversed(_TASK_SIXTEEN_A_TARGETS)))
+    partial_targets = cast("tuple[str, ...]", _TASK_SIXTEEN_A_TARGETS[:-1])
+    with pytest.raises(MutationGateError, match="closed initial policy"):
+        _ = mutation_policy_for_targets(partial_targets)
 
 
 def test_task_eighteen_mutation_policy_selects_exact_parser_suite() -> None:
@@ -1034,6 +1167,187 @@ def test_task_eighteen_mutation_policy_selects_exact_parser_suite() -> None:
     }
     with pytest.raises(MutationGateError, match="closed initial policy"):
         _ = mutation_policy_for_targets(tuple(reversed(targets)))
+
+
+def test_task_nineteen_profile_mutation_policy_is_exact_and_closed() -> None:
+    """Mutation caught: profile mutation falls through to a broader test policy."""
+    target = "src/nplg_mcp/profiles.py"
+
+    policy = mutation_policy_for_targets((target,))
+
+    assert policy.targets == (target,)
+    assert policy.test_paths == (
+        "tests/integration/test_profiles.py",
+        "tests/contracts/test_sdk_client.py",
+        "tests/unit/test_config.py",
+    )
+    assert policy.deselected_tests == ()
+    assert policy.required_functions == (
+        (target, ("nplg_mcp.profiles.x_tool_names_for_profile",)),
+    )
+    with pytest.raises(MutationGateError, match="closed initial policy"):
+        _ = mutation_policy_for_targets((target, "src/nplg_mcp/capabilities.py"))
+
+
+def test_task_twenty_one_a_capability_mutation_policy_is_exact_and_closed() -> None:
+    """Mutation caught: capability mutants or their selected suites drift."""
+    target = "src/nplg_mcp/capabilities.py"
+    local_functions = (
+        "x__body_evidence",
+        "x__canonical_bytes",
+        "x__canonical_negative_alpic_tasks_blockers",
+        "x__decode_base64",
+        "x__expected_dispatch_response",
+        "x__expected_error_response",
+        "x__expected_initialize_request",
+        "x__expected_tool_request",
+        "x__finalize",
+        "x__header_values",
+        "x__headers",
+        "x__initialize_body",
+        "x__load",
+        "x__load_alpic_tasks_contract",
+        "x__model_json",
+        "x__observe_alpic_local_sdk",
+        "x__observe_http_case",
+        "x__observe_sdk_matrix",
+        "x__package_file_sha256",
+        "x__package_tree_sha256",
+        "x__parse_bearer_challenge",
+        "x__raw_request",
+        "x__reject_duplicate_pairs",
+        "x__sdk_probe_app",
+        "x__sdk_tasks_public_api_available",
+        "x__sha256_json",
+        "x__tool_call_body",
+        "x__tool_headers",
+        "x_canonical_json_sha256",
+        "x_canonical_model_json",
+        "x_load_alpic_tasks_source_evidence",
+        "x_load_alpic_tasks_verdict",
+        "x_load_alpic_verdict",
+        "x_load_provider_verdict",
+        "x_load_sdk_verdict",
+        "x_probe_alpic_oauth_discovery",
+        "x_probe_alpic_tasks_capability",
+        "x_probe_oauth_provider",
+        "x_probe_sdk_authorization",
+        "x_validate_alpic_tasks_verdict_json",
+        "x_validate_synthetic_alpic_tasks_verdict",
+        "xǁSdkAuthorizationCapabilityVerdictǁ_check_http_semantics",
+        "xǁSdkAuthorizationCapabilityVerdictǁ_check_installed_identity",
+        "xǁSdkAuthorizationCapabilityVerdictǁ_check_matrix_digests",
+        "xǁSdkAuthorizationCapabilityVerdictǁ_check_matrix_identity",
+        "xǁSdkAuthorizationCapabilityVerdictǁ_check_support_decision",
+        "xǁ_FixtureDispatchCounterǁ__init__",
+        "xǁ_FixtureDispatchCounterǁcall_tool",
+        "xǁ_FixtureProbeStateǁ__init__",
+        "xǁ_FixtureTokenVerifierǁ__init__",
+        "xǁ_FixtureTokenVerifierǁverify_token",
+    )
+
+    policy = mutation_policy_for_targets((target,))
+
+    assert policy.targets == (target,)
+    assert policy.test_paths == (
+        "tests/contracts/test_sdk_auth_feasibility.py",
+        "tests/contracts/test_alpic_oauth_discovery.py",
+        "tests/contracts/test_oauth_provider_capability.py",
+        "tests/contracts/test_alpic_tasks_capability.py",
+        "tests/unit/test_probe_alpic_tasks_capability.py",
+        "tests/integration/test_profiles.py",
+    )
+    assert policy.deselected_tests == ()
+    assert policy.required_functions == (
+        (
+            target,
+            tuple(f"nplg_mcp.capabilities.{function}" for function in local_functions),
+        ),
+    )
+    with pytest.raises(MutationGateError, match="closed initial policy"):
+        _ = mutation_policy_for_targets((target, "src/nplg_mcp/profiles.py"))
+
+
+def test_task_twenty_two_mutation_policy_selects_exact_release_loader_suites() -> None:
+    """Mutation caught: Task 22 accepts an arbitrary or untested target."""
+    targets = ("scripts/verify_release.py",)
+
+    policy = mutation_policy_for_targets(targets)
+
+    assert policy.targets == targets
+    assert policy.test_paths == ("tests/static/test_release_gate.py",)
+    assert policy.deselected_tests == ()
+    with pytest.raises(MutationGateError, match="closed initial policy"):
+        _ = mutation_policy_for_targets((*targets, "scripts/run_mutation_gate.py"))
+
+
+def test_task_twenty_two_mutation_metadata_requires_exact_observed_inventory() -> None:
+    """Mutation caught: Task 22 silently accepts stale or incomplete metadata."""
+    target = "scripts/verify_release.py"
+    module = "scripts.verify_release"
+    local_functions: tuple[str, ...] = (
+        "x__dependency_window",
+        "x__duplicate_json_name",
+        "x__external_requirements",
+        "x__fail",
+        "x__fail_from",
+        "x__gate_command",
+        "x__load_json_object",
+        "x__load_model",
+        "x__parser",
+        "x__reject_json_number",
+        "x__source_entry",
+        "x__trusted_python_gate_command",
+        "x__trusted_release_tool_proof",
+        "x__unsafe_command_text",
+        "x__utc_timestamp",
+        "x__valid_closed_python_tool_success",
+        "x__valid_success_evidence",
+        "x__validate_dependency_evidence_identity",
+        "x__validate_dependency_exception",
+        "x__validate_dependency_finding",
+        "x__validate_pyright_runtime_identity",
+        "x_assert_source_snapshot",
+        "x_candidate_release_status",
+        "x_capture_source_descriptor_snapshot",
+        "x_cli",
+        "x_load_dependency_evidence",
+        "x_load_dependency_risk_policy",
+        "x_load_release_command_manifest",
+        "x_load_release_controller_policy",
+        "x_load_release_policies",
+        "x_load_trivy_database_receipt",
+        "x_load_trusted_package_sources_policy",
+        "x_local_gate_commands",
+        "x_main",
+        "x_materialize_source",
+        "x_release_command_manifest_digest",
+        "x_run_gate_battery",
+        "x_run_local_gates",
+        "x_validate_candidate_contract_transcript",
+        "x_validate_external_gate_manifest_join",
+        "x_write_source_snapshot",
+        "x\u01c1SystemCommandRunner\u01c1__call__",
+    )
+    policy = mutation_policy_for_targets((target,))
+    expected_functions = tuple(f"{module}.{function}" for function in local_functions)
+
+    assert policy.required_functions == ((target, expected_functions),)
+
+    def payload_for(functions: tuple[str, ...]) -> tuple[tuple[str, bytes], ...]:
+        statuses = {f"{module}.{function}__mutmut_1": 1 for function in functions}
+        return ((target, _meta(json.dumps(statuses).encode())),)
+
+    summary = parse_mutation_results(payload_for(local_functions))
+    assert summary.total == len(local_functions)
+    assert summary.killed == len(local_functions)
+
+    with pytest.raises(MutationGateError, match="unexpected generated functions"):
+        _ = parse_mutation_results(payload_for(local_functions[1:]))
+    with pytest.raises(MutationGateError, match="unexpected generated functions"):
+        _ = parse_mutation_results(
+            payload_for((*local_functions, "x_unexpected_generated_function"))
+        )
 
 
 def test_phase_three_mutation_metadata_accepts_only_exact_generated_functions() -> None:

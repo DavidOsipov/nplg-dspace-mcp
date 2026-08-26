@@ -49,6 +49,14 @@ continues to enforce the same Pydantic models at runtime. The ledger is local
 implementation evidence, not release approval, and the custom adapter is
 removed in Task 14.
 
+Task 14 deliberately changes three `private-full` resource semantics and binds
+each side to the accepted-difference ledger: canonical artifact resources now
+return their immutable binary content instead of a JSON signed-URL locator;
+render resources use the current pipeline-version-bound identity; and the
+official SDK advertises the two canonical private resource templates that the
+custom protocol did not expose. Frozen list/about behavior remains equal. These
+records are local compatibility dispositions, not protected release approval.
+
 ## Rejected alternatives
 
 - Continuing the custom protocol as the long-term transport implementation.

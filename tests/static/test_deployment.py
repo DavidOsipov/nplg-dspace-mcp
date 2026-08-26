@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import re
 import tomllib
 from pathlib import Path
 from stat import S_IMODE
@@ -12,6 +13,8 @@ from typing import TYPE_CHECKING, cast
 import pytest
 import yaml
 
+from nplg_mcp.app import create_app
+from nplg_mcp.config import load_config
 from nplg_mcp.json_types import (
     JsonObject,
     JsonValue,
@@ -121,7 +124,7 @@ def test_environment_example_matches_strict_runtime_configuration() -> None:
         "PORT=8000",
         "ALLOW_ANONYMOUS=false",
         "DEPLOYMENT_PROFILE=alpic-metadata",
-        'API_PRINCIPALS_JSON=[{"principal_id":"primary","bearer_token":',
+        "CURSOR_SIGNING_SECRET=replace-with-at-least-32-random-characters",
         "UPSTREAM_RATE_PER_SECOND=1.0",
         "MAX_REQUEST_BODY_BYTES=1048576",
         "REQUEST_BODY_TIMEOUT_SECONDS=10",
@@ -135,6 +138,13 @@ def test_environment_example_matches_strict_runtime_configuration() -> None:
         "ASSET_STREAM_TOTAL_TIMEOUT_SECONDS=120",
         "MAX_CONCURRENT_HTTP_REQUESTS=128",
         "CACHE_MAX_BYTES=21474836480",
+        "RETENTION_MAX_AGE_SECONDS=604800",
+        "RETENTION_MAX_OBJECTS=100000",
+        "RETENTION_MIN_FREE_BYTES=67108864",
+        "RETENTION_MIN_FREE_INODES=128",
+        "RETENTION_HEALTHY_WINDOW_SECONDS=60",
+        "RETENTION_MAX_FORWARD_SLEW_SECONDS=5",
+        "RETENTION_CLOCK_SYNCHRONIZED=false",
         "TILE_WIDTH=2048",
         "TILE_HEIGHT=2048",
         "TILE_OVERLAP=128",
@@ -142,6 +152,32 @@ def test_environment_example_matches_strict_runtime_configuration() -> None:
         assert line in text
     assert "OPTIONAL_BEARER_TOKEN" not in text
     assert "SANDBOX_MODE" not in text
+    for forbidden in (
+        "API_BEARER_TOKEN=",
+        "API_KEY=",
+        "API_PRINCIPALS_JSON=",
+        "NPLG_PRIVATE_STATIC_TOKEN=",
+        "X_API_KEY=",
+        "X-API-Key=",
+    ):
+        assert forbidden not in text
+
+
+def test_production_operator_docs_never_configure_static_authentication() -> None:
+    """Keep candidate scaffolding from becoming a shared-secret deployment recipe."""
+    for relative in ("deploy/README.md", "deploy/ALPIC.md"):
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        for forbidden in (
+            "API_BEARER_TOKEN=",
+            "API_KEY=",
+            "API_PRINCIPALS_JSON=",
+            "NPLG_PRIVATE_STATIC_TOKEN=",
+            "X_API_KEY=",
+            "X-API-Key=",
+            "export API_BEARER_TOKEN",
+            "export API_KEY",
+        ):
+            assert forbidden not in text
 
 
 def test_dockerfile_is_pinned_non_root_and_health_checked() -> None:
@@ -785,17 +821,78 @@ def test_alpic_operator_guide_states_platform_limits_without_overclaiming() -> N
         "serverless",
         "not a supported full-fidelity deployment target",
         "allow_anonymous=false",
-        "x-api-key",
+        "do not deploy",
+        "production oauth provider capability is unsupported",
+        "do_not_release",
     ):
         assert phrase in guide
-    assert "read -rsp" in guide
-    assert "export api_key='<" not in guide
+    for forbidden in ("api_principals_json=[", "read -rsp", "export api_key"):
+        assert forbidden not in guide
+
+
+def test_alpic_documented_environment_parses_then_fails_oauth_activation() -> None:
+    guide = (ROOT / "deploy" / "ALPIC.md").read_text(encoding="utf-8")
+    match = re.search(
+        r"Add these environment variables:\n\n```text\n(?P<block>.*?)\n```",
+        guide,
+        flags=re.DOTALL,
+    )
+    assert match is not None, "the documented metadata environment block is absent"
+    block = cast("str", match.group("block"))
+
+    env: dict[str, str] = {}
+    for line in block.splitlines():
+        name, separator, value = line.partition("=")
+        assert separator == "=", f"invalid environment line: {line!r}"
+        assert name, f"environment name is absent: {line!r}"
+        assert value, f"environment value is absent: {line!r}"
+        assert name not in env, f"duplicate documented environment variable: {name}"
+        env[name] = value
+    for secret_name in ("CURSOR_SIGNING_SECRET", "ASSET_SIGNING_SECRET"):
+        if secret_name in env:
+            env[secret_name] = "c" * 32
+    env["ALPIC_HOST"] = "nplg-dspace-mcp.example.alpic.live"
+
+    config = load_config(env)
+
+    assert config.environment == "production"
+    assert config.deployment_profile == "alpic-metadata"
+    assert config.cursor_signing_secret == b"c" * 32
+    assert config.asset_signing_secret is None
+    assert config.api_principals == ()
+    with pytest.raises(ValueError, match="OAuth provider capability is unsupported"):
+        _ = create_app(config)
 
 
 def test_readme_routes_alpic_users_to_the_limited_profile() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "deploy/ALPIC.md" in readme
     assert "Alpic" in readme
+
+
+def test_readme_describes_the_canonical_private_resource_protocol() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    heading, separator, remainder = readme.partition("## MCP resources\n")
+    _ = heading
+    assert separator, "README has no MCP resources section"
+    section = remainder.partition("\n## ")[0]
+
+    documented_templates = set(
+        cast("list[str]", re.findall(r"`(nplg://[^`]*\{[^`]+)`", section))
+    )
+    assert documented_templates == {
+        "nplg://artifact/{artifact_id}",
+        "nplg://render/{render_id}/manifest",
+    }
+    for claim in (
+        "`nplg://about`",
+        "`resources/read`",
+        "`structuredContent`",
+        "`content`",
+        "`private-full`",
+    ):
+        assert claim in section
+    assert "resource_link" not in readme.lower()
 
 
 def test_compose_validation_examples_do_not_print_rendered_secrets() -> None:

@@ -5,10 +5,21 @@ from __future__ import annotations
 
 import math
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Literal,
+    Protocol,
+    Self,
+    overload,
+)
+
+from pydantic import Field, TypeAdapter, model_validator
 
 from .config import (
+    HARD_MAX_CACHE_BYTES,
     HARD_MAX_PAGE_PIXELS,
     HARD_MAX_RENDER_PAGES,
     HARD_MAX_RENDER_PIXELS,
@@ -16,17 +27,262 @@ from .config import (
     HARD_MAX_TILE_OVERLAP,
     HARD_MAX_TILES_PER_PAGE,
 )
+from .contracts.base import StrictModel
+from .pdf_ipc import (
+    PdfCommand,
+    PdfResult,
+    RenderPagesCommand,
+    RenderTilesCommand,
+)
+from .pdf_postprocessing import MAX_RENDER_RESOURCE_INDEX_BYTES
+from .pdf_worker_slot import PdfWorkerSlotPolicy
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncGenerator, Callable
 
     from .contracts import MonotonicDeadline
-    from .pdf_ipc import PdfCommand, PdfResult
+    from .storage import ContentAddressedStore, StoreLifecycleConfiguration
 
 _MAX_TERMINATION_GRACE_SECONDS = 5.0
 _MAX_CIRCUIT_FAILURE_THRESHOLD = 100
 _MAX_CIRCUIT_OPEN_SECONDS = 3_600.0
 DEFAULT_FALLBACK_DPI = 400
+_MAX_PDF_PUBLICATION_FILES = HARD_MAX_TILES_PER_PAGE + 1
+_MAX_PDF_PUBLICATION_DIRECTORIES = 3
+_MAX_PDF_PUBLICATION_TEMPORARY_FILES = 1
+_MAX_PDF_PUBLICATION_INODES = 10_000_000
+_PDF_COMMAND_ADAPTER: TypeAdapter[PdfCommand] = TypeAdapter(PdfCommand)
+
+
+class PdfPublicationPlan(StrictModel):
+    """Closed worst-case accounting for one authoritative render tree."""
+
+    operation: Literal["render_pages", "render_tiles"]
+    maximum_output_files: Annotated[
+        int,
+        Field(strict=True, ge=2, le=_MAX_PDF_PUBLICATION_FILES),
+    ]
+    maximum_output_directories: Annotated[
+        int,
+        Field(strict=True, ge=1, le=_MAX_PDF_PUBLICATION_DIRECTORIES),
+    ]
+    maximum_temporary_files: Annotated[
+        int,
+        Field(strict=True, ge=1, le=_MAX_PDF_PUBLICATION_TEMPORARY_FILES),
+    ]
+    maximum_new_bytes: Annotated[
+        int,
+        Field(strict=True, ge=1, le=HARD_MAX_CACHE_BYTES),
+    ]
+    maximum_new_objects: Annotated[
+        int,
+        Field(strict=True, ge=1, le=1),
+    ]
+    maximum_new_inodes: Annotated[
+        int,
+        Field(strict=True, ge=1, le=_MAX_PDF_PUBLICATION_INODES),
+    ]
+
+    @model_validator(mode="after")
+    def _require_complete_tree_capacity(self) -> Self:
+        minimum_inodes = (
+            self.maximum_output_files
+            + self.maximum_output_directories
+            + self.maximum_temporary_files
+        )
+        if self.maximum_new_bytes < self.maximum_output_files:
+            message = "PDF publication bytes do not cover every bounded output"
+            raise ValueError(message)
+        if self.maximum_new_inodes < minimum_inodes:
+            message = "PDF publication inodes do not cover the complete tree"
+            raise ValueError(message)
+        return self
+
+
+class PdfPostprocessingPublicationPlan(StrictModel):
+    """Closed capacity plan for resource indexes emitted after rendering."""
+
+    maximum_index_files: Annotated[
+        int,
+        Field(strict=True, ge=1, le=HARD_MAX_TILES_PER_PAGE + 1),
+    ]
+
+    @property
+    def maximum_new_bytes(self) -> int:
+        """Return the bounded aggregate serialized index size."""
+        return self.maximum_index_files * MAX_RENDER_RESOURCE_INDEX_BYTES
+
+    @property
+    def maximum_new_objects(self) -> int:
+        """Reserve the render object root before the worker can create it."""
+        return 1
+
+    @property
+    def maximum_new_inodes(self) -> int:
+        """Cover one resources directory, index trees, and one staged file."""
+        return 2 * self.maximum_index_files + 2
+
+
+def _validated_pdf_command(command: PdfCommand) -> PdfCommand:
+    """Revalidate even model-constructed commands at the reservation boundary."""
+    return _PDF_COMMAND_ADAPTER.validate_json(
+        command.model_dump_json(),
+        strict=True,
+    )
+
+
+def _validated_slot_policy(policy: PdfWorkerSlotPolicy) -> PdfWorkerSlotPolicy:
+    """Reject forged slot policies before deriving accounting authority."""
+    return PdfWorkerSlotPolicy.model_validate_json(
+        policy.model_dump_json(),
+        strict=True,
+    )
+
+
+def _derive_validated_publication_plan(
+    command: PdfCommand,
+    slot_policy: PdfWorkerSlotPolicy,
+) -> PdfPublicationPlan | None:
+    if isinstance(command, RenderPagesCommand):
+        maximum_output_files = len(command.parameters.pages) + 1
+        maximum_output_directories = 1
+    elif isinstance(command, RenderTilesCommand):
+        # Page dimensions are worker-validated after dispatch, so reserve the
+        # protocol maximum rather than trusting an unavailable tile estimate.
+        maximum_output_files = HARD_MAX_TILES_PER_PAGE + 1
+        # A new tiles/page/geometry subtree can accompany the manifest.
+        maximum_output_directories = 3
+    else:
+        return None
+    maximum_temporary_files = 1
+    minimum_topology_inodes = (
+        maximum_output_files + maximum_output_directories + maximum_temporary_files
+    )
+    return PdfPublicationPlan(
+        operation=command.operation,
+        maximum_output_files=maximum_output_files,
+        maximum_output_directories=maximum_output_directories,
+        maximum_temporary_files=maximum_temporary_files,
+        # The authoritative copy cannot exceed the verified aggregate worker
+        # slot.  The maxima also cover at least one byte/inode per topology
+        # entry if a malformed deployment policy understates its capacity.
+        maximum_new_bytes=max(
+            slot_policy.maximum_total_bytes,
+            maximum_output_files,
+        ),
+        maximum_new_objects=1,
+        maximum_new_inodes=max(
+            slot_policy.maximum_total_inodes,
+            minimum_topology_inodes,
+        ),
+    )
+
+
+@overload
+def derive_pdf_publication_plan(
+    command: RenderPagesCommand | RenderTilesCommand,
+    slot_policy: PdfWorkerSlotPolicy,
+) -> PdfPublicationPlan: ...
+
+
+@overload
+def derive_pdf_publication_plan(
+    command: PdfCommand,
+    slot_policy: PdfWorkerSlotPolicy,
+) -> PdfPublicationPlan | None: ...
+
+
+def derive_pdf_publication_plan(
+    command: PdfCommand,
+    slot_policy: PdfWorkerSlotPolicy,
+) -> PdfPublicationPlan | None:
+    """Derive one full-slot page/tile reservation from strict inputs."""
+    validated_command = _validated_pdf_command(command)
+    validated_policy = _validated_slot_policy(slot_policy)
+    return _derive_validated_publication_plan(validated_command, validated_policy)
+
+
+class PublicationReservingPdfExecutor:
+    """Reserve a complete render tree before either PDF backend is invoked."""
+
+    __slots__ = ("_inner", "_lifecycle", "_slot_policy", "_store")
+
+    def __init__(
+        self,
+        *,
+        inner: PdfExecutor,
+        store: ContentAddressedStore,
+        lifecycle: StoreLifecycleConfiguration,
+        slot_policy: PdfWorkerSlotPolicy,
+    ) -> None:
+        """Bind one store authority and immutable verified slot policy."""
+        super().__init__()
+        self._inner = inner
+        self._store = store
+        self._lifecycle = lifecycle
+        self._slot_policy = _validated_slot_policy(slot_policy)
+
+    async def execute(
+        self,
+        command: PdfCommand,
+        *,
+        deadline: MonotonicDeadline,
+    ) -> PdfResult:
+        """Reserve before dispatch and release once on every exit path."""
+        validated_command = _validated_pdf_command(command)
+        plan = _derive_validated_publication_plan(
+            validated_command,
+            self._slot_policy,
+        )
+        if plan is None:
+            return await self._inner.execute(validated_command, deadline=deadline)
+        async with self._store.reserve_publication(
+            self._lifecycle.policy,
+            maximum_new_bytes=plan.maximum_new_bytes,
+            maximum_new_objects=plan.maximum_new_objects,
+            maximum_new_inodes=plan.maximum_new_inodes,
+            clock=self._lifecycle.clock_sampler(),
+        ) as reservation:
+            result = await self._inner.execute(validated_command, deadline=deadline)
+            # PDF publication has already passed through ContentAddressedStore,
+            # whose under-lock commit recheck observes the persisted deltas. No
+            # unaccounted bytes, objects, or inodes remain to be converted.
+            await reservation.commit(
+                actual_bytes=0,
+                actual_objects=0,
+                actual_inodes=0,
+            )
+            return result
+
+    @asynccontextmanager
+    async def reserve_postprocessing_publication(
+        self,
+        *,
+        maximum_index_files: int,
+    ) -> AsyncGenerator[None, None]:
+        """Hold bounded index capacity across worker dispatch and validation."""
+        plan = PdfPostprocessingPublicationPlan(
+            maximum_index_files=maximum_index_files,
+        )
+        async with self._store.reserve_publication(
+            self._lifecycle.policy,
+            maximum_new_bytes=plan.maximum_new_bytes,
+            maximum_new_objects=plan.maximum_new_objects,
+            maximum_new_inodes=plan.maximum_new_inodes,
+            clock=self._lifecycle.clock_sampler(),
+        ) as reservation:
+            yield
+            # Index files are already persisted through ContentAddressedStore,
+            # so its commit recheck observes the authoritative deltas.
+            await reservation.commit(
+                actual_bytes=0,
+                actual_objects=0,
+                actual_inodes=0,
+            )
+
+    def ensure_ready(self) -> None:
+        """Delegate readiness without consuming publication capacity."""
+        self._inner.ensure_ready()
 
 
 @dataclass(frozen=True, slots=True)

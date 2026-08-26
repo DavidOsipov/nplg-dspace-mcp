@@ -9,7 +9,7 @@ import hashlib
 import hmac
 import json
 import os
-import threading
+import sys
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
@@ -22,12 +22,11 @@ import pytest
 
 import nplg_mcp.network as network_module
 from nplg_mcp import repository as repository_module
-from nplg_mcp.bounded_work import PARSER_WORK
 from nplg_mcp.contracts import MonotonicDeadline
 from nplg_mcp.errors import AppError, ErrorCode
 from nplg_mcp.http_types import HttpClientProtocol, HttpResponseProtocol
 from nplg_mcp.network import create_bound_http_transport
-from nplg_mcp.parsers import SearchPage, parse_search_results
+from nplg_mcp.parser_executor import SubprocessParserExecutor
 from nplg_mcp.repository import NplgRepository, decode_cursor, encode_cursor
 from nplg_mcp.resilience import (
     AttemptPermit,
@@ -41,7 +40,7 @@ from nplg_mcp.tokens import derive_cursor_signing_key
 from scripts.run_live_nplg_canary import execute_canary_probe
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable
+    from collections.abc import AsyncIterator
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
 _EXPECTED_PAGE_SIZE = 2
@@ -69,13 +68,6 @@ class _ReadOnlyPropertyDescriptor(Protocol):
 
     @property
     def fset(self) -> None: ...
-
-
-def _runner_became_idle() -> bool:
-    deadline = time.monotonic() + 1.0
-    while PARSER_WORK.active != 0 and time.monotonic() < deadline:
-        time.sleep(0.001)
-    return PARSER_WORK.active == 0
 
 
 def _read_only_property_getter(member: object) -> Callable[[object], object]:
@@ -849,26 +841,8 @@ async def test_repository_rejects_an_upstream_page_larger_than_requested() -> No
 
 @pytest.mark.asyncio
 async def test_repository_total_deadline_includes_response_parsing(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    finished = threading.Event()
-
-    def slow_parser(
-        html: str,
-        *,
-        source_url: str,
-        page_size: int = 50,
-    ) -> SearchPage:
-        try:
-            time.sleep(0.05)
-            return parse_search_results(
-                html,
-                source_url=source_url,
-                page_size=page_size,
-            )
-        finally:
-            finished.set()
-
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -876,67 +850,46 @@ async def test_repository_total_deadline_includes_response_parsing(
             headers={"content-type": "text/html"},
         )
 
-    monkeypatch.setattr("nplg_mcp.repository.parse_search_results", slow_parser)
+    parser_executor = SubprocessParserExecutor(
+        worker_argv=(
+            sys.executable,
+            str(FIXTURES / "parser_worker_hang.py"),
+            str(tmp_path / "deadline-parser.txt"),
+        )
+    )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         repository = NplgRepository(
             client=client,
             validate_dns=False,
-            total_timeout_seconds=0.01,
+            total_timeout_seconds=0.25,
+            parser_executor=parser_executor,
         )
         with pytest.raises(AppError, match="deadline") as captured:
             _ = await repository.search("ივერია", page_size=2)
 
     assert captured.value.code is ErrorCode.UPSTREAM_FAILURE
-    assert await asyncio.to_thread(finished.wait, 1.0)
-    assert await asyncio.to_thread(_runner_became_idle)
+    assert parser_executor.active == 0
 
 
 @pytest.mark.asyncio
-async def test_timed_out_parser_retains_parser_capacity_until_worker_exits() -> None:
-    started = threading.Event()
-    release = threading.Event()
-    finished = threading.Event()
-
-    def blocked_parser() -> str:
-        started.set()
-        try:
-            assert release.wait(timeout=2.0)
-            return "late"
-        finally:
-            finished.set()
-
-    async with httpx.AsyncClient() as client:
-        repository = NplgRepository(client=client, validate_dns=False)
-        first = asyncio.create_task(
-            repository._parse_within_deadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-                blocked_parser,
-                deadline=asyncio.get_running_loop().time() + 0.01,
-            )
+async def test_timed_out_parser_releases_capacity_after_process_cleanup(
+    tmp_path: Path,
+) -> None:
+    executor = SubprocessParserExecutor(
+        worker_argv=(
+            sys.executable,
+            str(FIXTURES / "parser_worker_hang.py"),
+            str(tmp_path / "capacity-parser.txt"),
         )
-        try:
-            assert await asyncio.to_thread(started.wait, 1.0)
-            with pytest.raises(AppError, match="deadline"):
-                _ = await first
-            parse_call = cast(
-                "Awaitable[str]",
-                repository._parse_within_deadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-                    lambda: "must-not-run",
-                    deadline=asyncio.get_running_loop().time() + 0.25,
-                ),
-            )
-            with pytest.raises(AppError, match="parser capacity") as saturated:
-                _ = await parse_call
-            assert saturated.value.code is ErrorCode.RATE_LIMITED
-        finally:
-            release.set()
-            assert await asyncio.to_thread(finished.wait, 1.0)
-            assert await asyncio.to_thread(_runner_became_idle)
+    )
 
-        result = await repository._parse_within_deadline(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            lambda: "recovered",
-            deadline=asyncio.get_running_loop().time() + 0.25,
-        )
-        assert result == "recovered"
+    for _ in range(2):
+        with pytest.raises(TimeoutError):
+            _ = await executor.parse_metadata_formats(
+                "<OAI-PMH/>",
+                deadline=asyncio.get_running_loop().time() + 0.2,
+            )
+        assert executor.active == 0
 
 
 @pytest.mark.asyncio

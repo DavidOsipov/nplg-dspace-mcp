@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated, Literal, Protocol, cast
 
@@ -19,6 +20,9 @@ if TYPE_CHECKING:
     from typing import Self
 
 _MAX_OUTPUT_BYTES = 4096
+_MAX_CONFIGURED_OUTPUT_BYTES = 64 * 1024
+_MIN_PROOF_PATH_PARTS = 3
+_PRIVATE_PROOF_MODE = 0o600
 _CANARY = b"NPLG_SECRET_CANARY"
 _ERR_POLICY = "trusted verifier policy is invalid"
 _ERR_AUTHORITY = "verification authority does not match the request"
@@ -195,7 +199,12 @@ def _validate_request(request: VerificationRequest, policy: VerifierPolicy) -> N
         raise VerificationError(_ERR_PROBES)
 
 
-def _validate_outcome(outcome: object, expected_argv: tuple[str, ...]) -> None:
+def _validate_outcome(
+    outcome: object,
+    expected_argv: tuple[str, ...],
+    *,
+    max_output_bytes: int,
+) -> None:
     if type(outcome) is not CommandOutcome:
         raise VerificationError(_ERR_EXECUTOR)
     result = outcome
@@ -206,8 +215,8 @@ def _validate_outcome(outcome: object, expected_argv: tuple[str, ...]) -> None:
         or type(result.stderr) is not bytes
         or result.timed_out is not False
         or result.returncode != 0
-        or len(result.stdout) > _MAX_OUTPUT_BYTES
-        or len(result.stderr) > _MAX_OUTPUT_BYTES
+        or len(result.stdout) > max_output_bytes
+        or len(result.stderr) > max_output_bytes
         or _CANARY in result.stdout
         or _CANARY in result.stderr
     ):
@@ -245,35 +254,150 @@ def controller_policy(
     )
 
 
-def _exclusive_write(path: Path, proof: VerificationProof) -> None:
-    if not path.is_absolute() or path.name != "proof.json":
+def _require_directory_descriptor(descriptor: int) -> None:
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        raise VerificationError(_ERR_PROOF_DIRECTORY_TYPE)
+
+
+def _require_private_regular_file(descriptor: int) -> None:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != _PRIVATE_PROOF_MODE
+        or metadata.st_nlink != 1
+    ):
+        raise VerificationError(_ERR_PROOF_WRITE)
+
+
+def _write_all(descriptor: int, encoded: bytes) -> None:
+    offset = 0
+    while offset < len(encoded):
+        written = os.write(descriptor, encoded[offset:])
+        if written <= 0:
+            raise VerificationError(_ERR_PROOF_WRITE)
+        offset += written
+
+
+def _require_nofollow_flag(*, error: str) -> int:
+    """Require the platform no-follow primitive before opening proof material."""
+    no_follow = cast("object", getattr(os, "O_NOFOLLOW", None))
+    if type(no_follow) is not int:
+        raise VerificationError(error)
+    return no_follow
+
+
+def _open_proof_parent(path: Path) -> int:
+    """Open every absolute parent component without following a symlink."""
+    if (
+        not path.is_absolute()
+        or path.name != "proof.json"
+        or len(path.parts) < _MIN_PROOF_PATH_PARTS
+        or any(part in {"", ".", ".."} for part in path.parts[1:])
+    ):
         raise VerificationError(_ERR_PROOF_PATH)
-    parents = (path.parent, *path.parent.parents)
-    for directory in parents:
-        try:
-            metadata = directory.lstat()
-        except OSError as exc:
-            raise VerificationError(_ERR_PROOF_DIRECTORY) from exc
-        if directory.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
-            raise VerificationError(_ERR_PROOF_DIRECTORY_TYPE)
-    proof_payload = cast("dict[str, object]", proof.model_dump(mode="json"))
-    proof_json = json.dumps(proof_payload, sort_keys=True) + "\n"
-    encoded = proof_json.encode("utf-8")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_CLOEXEC
+        | os.O_DIRECTORY
+        | _require_nofollow_flag(error=_ERR_PROOF_DIRECTORY)
+    )
     try:
-        descriptor = os.open(path, flags, 0o600)
+        descriptor = os.open(path.anchor, directory_flags)
     except OSError as exc:
-        raise VerificationError(_ERR_PROOF_WRITE) from exc
+        raise VerificationError(_ERR_PROOF_DIRECTORY) from exc
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            _ = stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
-    except BaseException:
-        path.unlink(missing_ok=True)
+        for component in path.parent.parts[1:]:
+            child = os.open(component, directory_flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        _require_directory_descriptor(descriptor)
+    except VerificationError:
+        os.close(descriptor)
         raise
+    except OSError as exc:
+        os.close(descriptor)
+        raise VerificationError(_ERR_PROOF_DIRECTORY) from exc
+    return descriptor
+
+
+def write_verification_result(path: Path, result: StrictModel) -> None:
+    """Publish one canonical result through an anchored exclusive mode-0600 file."""
+    no_follow = _require_nofollow_flag(error=_ERR_PROOF_WRITE)
+    parent_descriptor = _open_proof_parent(path)
+    result_payload = cast("dict[str, object]", result.model_dump(mode="json"))
+    encoded = (
+        json.dumps(
+            result_payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | no_follow
+    descriptor: int | None = None
+    created = False
+    try:
+        try:
+            descriptor = os.open(
+                path.name,
+                flags,
+                _PRIVATE_PROOF_MODE,
+                dir_fd=parent_descriptor,
+            )
+            created = True
+        except OSError as exc:
+            raise VerificationError(_ERR_PROOF_WRITE) from exc
+        os.fchmod(descriptor, _PRIVATE_PROOF_MODE)
+        _require_private_regular_file(descriptor)
+        _write_all(descriptor, encoded)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.fsync(parent_descriptor)
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created:
+            with suppress(OSError):
+                os.unlink(path.name, dir_fd=parent_descriptor)
+        raise
+    finally:
+        os.close(parent_descriptor)
+
+
+def run_verified_probes(
+    request: VerificationRequest,
+    *,
+    policy: VerifierPolicy,
+    executor: ArgvExecutor,
+    max_output_bytes: int = _MAX_OUTPUT_BYTES,
+) -> tuple[CommandOutcome, ...]:
+    """Run an exact diagnostic-only schedule and return bounded typed outcomes."""
+    if (
+        type(max_output_bytes) is not int
+        or not 1 <= max_output_bytes <= _MAX_CONFIGURED_OUTPUT_BYTES
+    ):
+        raise VerificationError(_ERR_POLICY)
+    _validate_policy(policy)
+    _validate_request(request, policy)
+    forbidden_tokens = {"build", "create", "pull"}
+    if any(forbidden_tokens.intersection(probe.argv) for probe in request.probes):
+        raise VerificationError(_ERR_COMMAND)
+    outcomes: list[CommandOutcome] = []
+    for probe in request.probes:
+        try:
+            outcome = executor(probe.argv)
+        except Exception as exc:
+            raise VerificationError(_ERR_EXECUTION) from exc
+        _validate_outcome(
+            outcome,
+            probe.argv,
+            max_output_bytes=max_output_bytes,
+        )
+        outcomes.append(outcome)
+    return tuple(outcomes)
 
 
 def verify_request(
@@ -284,17 +408,11 @@ def verify_request(
     proof_path: Path,
 ) -> VerificationProof:
     """Run only pre-authorized probes and publish a non-overwritable proof."""
-    _validate_policy(policy)
-    _validate_request(request, policy)
-    for probe in request.probes:
-        forbidden = {"build", "pull"}.intersection(probe.argv)
-        if forbidden:
-            raise VerificationError(_ERR_COMMAND)
-        try:
-            outcome = executor(probe.argv)
-        except Exception as exc:
-            raise VerificationError(_ERR_EXECUTION) from exc
-        _validate_outcome(outcome, probe.argv)
+    _ = run_verified_probes(
+        request,
+        policy=policy,
+        executor=executor,
+    )
     proof = VerificationProof(
         version=1,
         verifier=request.verifier,
@@ -303,5 +421,5 @@ def verify_request(
         image_subjects=request.image_subjects,
         probe_ids=tuple(item.probe_id for item in request.probes),
     )
-    _exclusive_write(proof_path, proof)
+    write_verification_result(proof_path, proof)
     return proof

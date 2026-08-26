@@ -403,9 +403,15 @@ _DECISION_MODULES = (
     "src/nplg_mcp/json_preflight.py",
     "src/nplg_mcp/network.py",
     "src/nplg_mcp/resilience.py",
+    "src/nplg_mcp/resource_admission.py",
     "src/nplg_mcp/pdf_executor.py",
     "src/nplg_mcp/pdf_ipc.py",
+    "src/nplg_mcp/malware.py",
+    "src/nplg_mcp/pdf_worker_client.py",
+    "src/nplg_mcp/storage.py",
+    "src/nplg_mcp/storage_lifecycle.py",
     "src/nplg_mcp/rate_limit.py",
+    "src/nplg_mcp/mcp_server.py",
     "src/nplg_mcp/sdk_boundary.py",
     "src/nplg_mcp/security.py",
     "src/nplg_mcp/tokens.py",
@@ -415,6 +421,9 @@ _DECISION_MODULES = (
     "scripts/run_quality_gate.py",
     "scripts/run_test_gate.py",
     "scripts/run_mutation_gate.py",
+    "scripts/verify_scanner_container.py",
+    "scripts/verify_pdf_worker_quota.py",
+    "scripts/verify_private_recovery.py",
     "scripts/verify_release.py",
     "scripts/bootstrap_external_tools.py",
     "scripts/pyright_identity.py",
@@ -678,10 +687,10 @@ class CoveragePolicy:
 
 @dataclass(frozen=True, slots=True)
 class ExternalGate:
-    """One exact pytest node delegated to a named external class."""
+    """One exact protected gate and its optional pytest classification node."""
 
     kind: Literal["live", "staging", "container"]
-    node_id: str
+    node_id: str | None = None
     gate_id: str | None = None
     command_id: str | None = None
     profiles: tuple[str, ...] = ()
@@ -959,7 +968,7 @@ def parse_coverage_policy(payload: bytes, *, root: Path) -> CoveragePolicy:
 
 
 def parse_external_gate_registry(payload: bytes) -> ExternalGateRegistry:
-    """Parse the exact empty or Phase 1 provenance registry."""
+    """Parse the exact reviewed protected-gate inventory."""
     value = _require_object(
         _load_closed_json(payload),
         context="external gate registry",
@@ -968,27 +977,6 @@ def parse_external_gate_registry(payload: bytes) -> ExternalGateRegistry:
         _fail("external gate registry fields do not match version 1")
     version = _require_exact_integer(value["version"], expected=1, field="version")
     expected = [
-        {
-            "kind": "live",
-            "node_id": (
-                "tests/contracts/test_frozen_baseline.py::"
-                "test_capture_check_mode_fails_closed_until_attestation_without_rewriting"
-            ),
-        },
-        {
-            "kind": "live",
-            "node_id": (
-                "tests/contracts/test_frozen_baseline.py::"
-                "test_historical_capture_rejects_a_non_recovery_head_without_writes"
-            ),
-        },
-        {
-            "kind": "live",
-            "node_id": (
-                "tests/contracts/test_frozen_baseline.py::"
-                "test_rejected_historical_capture_does_not_freshen_git_metadata"
-            ),
-        },
         {
             "kind": "live",
             "node_id": (
@@ -1020,19 +1008,158 @@ def parse_external_gate_registry(payload: bytes) -> ExternalGateRegistry:
             "result_schema": "nplg-live-canary.v2",
             "signed_proof_schema": "nplg-live-canary.v2",
         },
+        {
+            "kind": "staging",
+            "gate_id": "private-full.edge-http",
+            "command_id": "staging.private-full-edge.v2",
+            "profiles": ["private-full"],
+            "mode": "preexecuted-operational",
+            "protected_command": [
+                "nplg-release-controller",
+                "external-gate",
+                "--gate-id",
+                "private-full.edge-http",
+                "--candidate-battery-json",
+                "BATTERY",
+                "--controller-policy",
+                "EXPECTED_POLICY",
+                "--network-broker-descriptor",
+                "BROKER",
+                "--target-descriptor",
+                "TARGET",
+                "--result-json",
+                "RESULT_JSON",
+            ],
+            "protected_cwd": "protected-controller-root",
+            "broker_kind": "one-operation-private-staging-edge",
+            "authority": "protected-controller-network-broker",
+            "timeout_seconds": 1800,
+            "result_schema": "private-edge-proof.v2",
+            "signed_proof_schema": "private-edge-proof.v2",
+        },
+        {
+            "kind": "container",
+            "gate_id": "private-full.pdf-worker-container",
+            "command_id": "container.pdf-worker.v2",
+            "profiles": ["private-full"],
+            "mode": "preexecuted-operational",
+            "protected_command": [
+                "nplg-release-controller",
+                "external-gate",
+                "--gate-id",
+                "private-full.pdf-worker-container",
+                "--candidate-battery-json",
+                "BATTERY",
+                "--controller-policy",
+                "EXPECTED_POLICY",
+                "--runtime-broker-descriptor",
+                "BROKER",
+                "--result-json",
+                "RESULT_JSON",
+            ],
+            "protected_cwd": "protected-controller-root",
+            "broker_kind": "one-operation-disposable-rootless-runtime",
+            "authority": "protected-controller-runtime-broker",
+            "timeout_seconds": 300,
+            "result_schema": "container-proof.v2",
+            "signed_proof_schema": "container-proof.v2",
+        },
+        {
+            "kind": "container",
+            "gate_id": "private-full.pdf-worker-write-quota",
+            "command_id": "container.pdf-worker-quota.v2",
+            "profiles": ["private-full"],
+            "mode": "preexecuted-operational",
+            "protected_command": [
+                "nplg-release-controller",
+                "external-gate",
+                "--gate-id",
+                "private-full.pdf-worker-write-quota",
+                "--candidate-battery-json",
+                "BATTERY",
+                "--controller-policy",
+                "EXPECTED_POLICY",
+                "--runtime-broker-descriptor",
+                "BROKER",
+                "--slot-descriptor",
+                "SLOT",
+                "--result-json",
+                "RESULT_JSON",
+            ],
+            "protected_cwd": "protected-controller-root",
+            "broker_kind": "one-operation-runtime-with-bounded-slot",
+            "authority": "protected-controller-runtime-and-slot-broker",
+            "timeout_seconds": 300,
+            "result_schema": "worker-quota-proof.v2",
+            "signed_proof_schema": "worker-quota-proof.v2",
+        },
+        {
+            "kind": "container",
+            "gate_id": "private-full.recovery-proof",
+            "command_id": "container.private-full-recovery.v2",
+            "profiles": ["private-full"],
+            "mode": "preexecuted-operational",
+            "protected_command": [
+                "nplg-release-controller",
+                "external-gate",
+                "--gate-id",
+                "private-full.recovery-proof",
+                "--candidate-battery-json",
+                "BATTERY",
+                "--controller-policy",
+                "EXPECTED_POLICY",
+                "--runtime-broker-descriptor",
+                "BROKER",
+                "--slot-descriptor",
+                "SLOT",
+                "--result-json",
+                "RESULT_JSON",
+            ],
+            "protected_cwd": "protected-controller-root",
+            "broker_kind": "one-operation-runtime-with-bounded-slot",
+            "authority": "protected-controller-runtime-and-slot-broker",
+            "timeout_seconds": 900,
+            "result_schema": "recovery-proof.v2",
+            "signed_proof_schema": "recovery-proof.v2",
+        },
+        {
+            "kind": "container",
+            "gate_id": "private-full.scanner-container",
+            "command_id": "container.scanner.v2",
+            "profiles": ["private-full"],
+            "mode": "preexecuted-operational",
+            "protected_command": [
+                "nplg-release-controller",
+                "external-gate",
+                "--gate-id",
+                "private-full.scanner-container",
+                "--candidate-battery-json",
+                "BATTERY",
+                "--controller-policy",
+                "EXPECTED_POLICY",
+                "--runtime-broker-descriptor",
+                "BROKER",
+                "--result-json",
+                "RESULT_JSON",
+            ],
+            "protected_cwd": "protected-controller-root",
+            "broker_kind": "one-operation-disposable-rootless-runtime",
+            "authority": "protected-controller-runtime-broker",
+            "timeout_seconds": 300,
+            "result_schema": "container-proof.v2",
+            "signed_proof_schema": "container-proof.v2",
+        },
     ]
     gates = value["gates"]
-    if gates == []:
-        return ExternalGateRegistry(version=version, gates=())
     if gates != expected:
-        _fail("external gate registry does not match the reviewed Phase 1 nodes")
+        _fail("external gate registry does not match reviewed protected-gate inventory")
     parsed: list[ExternalGate] = []
     for raw_gate in expected:
-        gate = cast("dict[str, object]", raw_gate)
+        gate = raw_gate
         parsed.append(
             ExternalGate(
                 kind=cast("Literal['live', 'staging', 'container']", gate["kind"]),
-                node_id=cast("str", gate["node_id"]),
+                node_id=cast("str | None", gate.get("node_id")),
                 gate_id=cast("str | None", gate.get("gate_id")),
                 command_id=cast("str | None", gate.get("command_id")),
                 profiles=tuple(cast("list[str]", gate.get("profiles", []))),
@@ -3435,7 +3562,12 @@ def _collect_deterministic_nodes(
     complete_result, record = _run_command(
         runtime.executor,
         runtime.clock,
-        CommandRequest(argv=common, cwd=snapshot, environment=runtime.environment),
+        CommandRequest(
+            argv=common,
+            cwd=snapshot,
+            environment=runtime.environment,
+            stdout_limit_bytes=_MAX_GIT_OUTPUT_BYTES,
+        ),
     )
     runtime.evidence.append(record)
     complete = _collected_nodes(complete_result.stdout, allow_empty=False)
@@ -3454,6 +3586,7 @@ def _collect_deterministic_nodes(
                 ),
                 cwd=snapshot,
                 environment=runtime.environment,
+                stdout_limit_bytes=_MAX_GIT_OUTPUT_BYTES,
             ),
             accepted_returncodes=frozenset({0, _PYTEST_NO_TESTS_COLLECTED}),
         )
@@ -3465,7 +3598,9 @@ def _collect_deterministic_nodes(
             _fail("external pytest node classification is inconsistent")
         external.update(nodes)
         classified.update((marker, node) for node in nodes)
-    expected = {(gate.kind, gate.node_id) for gate in registry.gates}
+    expected = {
+        (gate.kind, gate.node_id) for gate in registry.gates if gate.node_id is not None
+    }
     if classified != expected:
         _fail("external pytest nodes do not match the reviewed registry")
     return tuple(node for node in complete if node not in external)

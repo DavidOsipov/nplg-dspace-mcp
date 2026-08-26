@@ -20,6 +20,7 @@ from nplg_mcp.parsers import (
     parse_oai_record,
     parse_search_results,
 )
+from nplg_mcp.security import NPLG_HOST
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
 _EXPECTED_SEARCH_TOTAL = 42
@@ -58,6 +59,7 @@ _EXCESSIVE_METADATA_FIELDS = 2_049
 _EXCESSIVE_BITSTREAMS = 257
 _EXCESSIVE_METADATA_FORMATS = 65
 _EXCESSIVE_TEXT_CODE_POINTS = 1_048_577
+_EXCESSIVE_FIELD_CODE_POINTS = 65_537
 _EXCESSIVE_TREE_DEPTH = 65
 _EXCESSIVE_HTML_ELEMENTS = 50_001
 _EXCESSIVE_XML_ELEMENTS = 50_001
@@ -427,9 +429,11 @@ def test_parser_rejects_preflight_and_dom_count_disagreement(
         nodes=0,
         total_attributes=0,
         total_text_code_points=0,
+        semantic_total_text_code_points=0,
         metadata_fields=0,
         records=0,
         max_field_code_points=0,
+        semantic_max_field_code_points=0,
     )
 
     def mismatched_counts(*_args: object, **_kwargs: object) -> SimpleNamespace:
@@ -552,6 +556,23 @@ def test_item_parser_rejects_duplicate_contract_markers() -> None:
         )
 
 
+def test_item_parser_rejects_footer_handle_from_another_record() -> None:
+    """Mutation caught: accepting an expected handle outside the item container."""
+    document = f"<footer><code>{_ITEM_HANDLE}</code></footer>" + _item_document(
+        identity="<code>777/42</code>",
+        rows="<tr><td>Title:</td><td>Other record</td></tr>",
+    )
+
+    with pytest.raises(AppError, match="did not match the requested handle") as raised:
+        _ = parse_item_page(
+            document,
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
 def test_item_parser_rejects_ambiguous_restricted_and_public_markers() -> None:
     document = _item_document(
         extra=(
@@ -577,13 +598,17 @@ def test_oai_parsers_reject_duplicate_contract_markers() -> None:
         _ = parse_metadata_formats(f"<OAI-PMH>{formats}{formats}</OAI-PMH>")
 
     record = (
-        "<record><header><identifier>oai:dspace:1234/499564</identifier></header>"
+        "<record><header><identifier>"
+        f"oai:{NPLG_HOST}:{_ITEM_HANDLE}</identifier></header>"
         '<metadata><field mdschema="dc" element="title">Title</field></metadata>'
         "</record>"
     )
     with pytest.raises(AppError, match="contract marker"):
         _ = parse_oai_record(
-            f"<OAI-PMH><GetRecord>{record}{record}</GetRecord></OAI-PMH>",
+            (
+                '<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">'
+                f"<GetRecord>{record}{record}</GetRecord></OAI-PMH>"
+            ),
             expected_handle=_ITEM_HANDLE,
             metadata_prefix="dim",
         )
@@ -692,6 +717,51 @@ def _item_document(
         '<div id="aspect_artifactbrowser_ItemViewer_div_item-view">'
         f'{identity}<table class="itemDisplayTable">{rows}</table>{extra}</div>'
     )
+
+
+def test_item_parser_preserves_nested_metadata_row_order_without_duplicates() -> None:
+    document = (
+        '<div id="aspect_artifactbrowser_ItemViewer_div_item-view">'
+        f"<code>{_ITEM_HANDLE}</code>"
+        '<table class="outer itemDisplayTable">'
+        "<tr><td>dc.description</td><td>Outer"
+        '<table class="itemDisplayTable nested">'
+        "<tr><td>dc.title</td><td>Nested title</td><td>-</td></tr>"
+        "</table></td><td>-</td></tr></table>"
+        '<table class="itemDisplayTable sibling">'
+        "<tr><td>dc.subject</td><td>Sibling subject</td><td>-</td></tr>"
+        "</table>Show full metadata record</div>"
+    )
+
+    item = parse_item_page(
+        document,
+        expected_handle=_ITEM_HANDLE,
+        source_url=_ITEM_SOURCE,
+    )
+
+    assert tuple(field.key for field in item.raw_fields) == (
+        "dc.description",
+        "dc.title",
+        "dc.subject",
+    )
+    assert item.title == "Nested title"
+    assert item.subjects == ("Sibling subject",)
+
+
+def test_item_parser_ignores_empty_or_absent_hrefs_during_bitstream_walk() -> None:
+    extra = (
+        '<a href="">empty</a><a>absent</a>'
+        f'<a href="/bitstream/{_ITEM_HANDLE}/1/file.pdf">file.pdf</a>'
+    )
+
+    item = parse_item_page(
+        _item_document(extra=extra),
+        expected_handle=_ITEM_HANDLE,
+        source_url=_ITEM_SOURCE,
+    )
+
+    assert len(item.bitstreams) == 1
+    assert item.bitstreams[0].filename == "file.pdf"
 
 
 def _oai_document(*, identifier: str, metadata: str) -> str:
@@ -1263,6 +1333,52 @@ def test_oai_record_rejects_missing_or_mismatched_identifier(xml: str) -> None:
     assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
 
 
+def test_oai_record_rejects_arbitrary_namespace_contract_markers() -> None:
+    """Mutation caught: matching the OAI required hierarchy by local name alone."""
+    xml = _document(
+        '<evil:OAI-PMH xmlns:evil="urn:attacker" ',
+        'xmlns:dim="http://www.dspace.org/xmlns/dspace/dim">',
+        "<evil:GetRecord><evil:record><evil:header><evil:identifier>",
+        f"oai:dspace.nplg.gov.ge:{_ITEM_HANDLE}",
+        "</evil:identifier></evil:header><evil:metadata>",
+        '<dim:dim><dim:field mdschema="dc" element="title">',
+        "Title</dim:field></dim:dim>",
+        "</evil:metadata></evil:record></evil:GetRecord></evil:OAI-PMH>",
+    )
+
+    with pytest.raises(AppError, match="invalid root element") as raised:
+        _ = parse_oai_record(
+            xml,
+            expected_handle=_ITEM_HANDLE,
+            metadata_prefix="dim",
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_oai_record_rejects_untrusted_identifier_namespace() -> None:
+    """Mutation caught: accepting an attacker-controlled identifier prefix."""
+    xml = _document(
+        '<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/" ',
+        'xmlns:dim="http://www.dspace.org/xmlns/dspace/dim">',
+        "<GetRecord><record><header><identifier>",
+        f"oai:untrusted.example:{_ITEM_HANDLE}",
+        "</identifier></header><metadata>",
+        '<dim:dim><dim:field mdschema="dc" element="title">',
+        "Title</dim:field></dim:dim>",
+        "</metadata></record></GetRecord></OAI-PMH>",
+    )
+
+    with pytest.raises(AppError, match="did not match the requested handle") as raised:
+        _ = parse_oai_record(
+            xml,
+            expected_handle=_ITEM_HANDLE,
+            metadata_prefix="dim",
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
 @pytest.mark.parametrize("metadata_prefix", ["dim", "oai_dc"])
 def test_oai_record_rejects_identifier_and_metadata_injected_outside_record(
     metadata_prefix: str,
@@ -1485,7 +1601,7 @@ def test_oai_record_accepts_only_approved_direct_metadata_hierarchy(
 ) -> None:
     record = parse_oai_record(
         _oai_document(
-            identifier=f"oai:dspace:{_ITEM_HANDLE}",
+            identifier=f"oai:dspace.nplg.gov.ge:{_ITEM_HANDLE}",
             metadata=metadata,
         ),
         expected_handle=_ITEM_HANDLE,
@@ -1538,7 +1654,7 @@ def test_oai_dc_record_preserves_language_and_ignores_empty_fields() -> None:
         "<terms:subject></terms:subject></dc></metadata>"
     )
     xml = _oai_document(
-        identifier=f"oai:dspace:{_ITEM_HANDLE}",
+        identifier=f"oai:dspace.nplg.gov.ge:{_ITEM_HANDLE}",
         metadata=metadata,
     )
 
@@ -1570,7 +1686,7 @@ def test_oai_record_rejects_missing_dc_metadata_or_unsupported_prefix(
     expected_code: ErrorCode,
 ) -> None:
     xml = _oai_document(
-        identifier=f"oai:dspace:{_ITEM_HANDLE}",
+        identifier=f"oai:{NPLG_HOST}:{_ITEM_HANDLE}",
         metadata=metadata,
     )
 
@@ -1671,6 +1787,54 @@ def test_item_parser_rejects_excessive_aggregate_text() -> None:
         )
 
     assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_item_parser_counts_all_whitespace_toward_the_aggregate_text_limit() -> None:
+    """Mutation caught: collapsing a whitespace run before enforcing its budget."""
+    document = _item_document(extra=f"<p>{' ' * _EXCESSIVE_TEXT_CODE_POINTS}</p>")
+
+    with pytest.raises(AppError, match="aggregate text limit") as raised:
+        _ = parse_item_page(
+            document,
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_item_parser_counts_whitespace_only_field_toward_field_limit() -> None:
+    """Mutation caught: treating a whitespace-only metadata field as one character."""
+    rows = (
+        "<tr><td>Title:</td><td>Title</td></tr>"
+        f"<tr><td>Subject:</td><td>{' ' * _EXCESSIVE_FIELD_CODE_POINTS}</td></tr>"
+    )
+
+    with pytest.raises(AppError, match="field code-point limit") as raised:
+        _ = parse_item_page(
+            _item_document(rows=rows),
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_item_parser_accepts_indented_markup_within_raw_text_limit() -> None:
+    """Regression: normal DOM whitespace normalization is not parser drift."""
+    document = _item_document(
+        identity=f"\n  <code>{_ITEM_HANDLE}</code>\n",
+        rows=("\n    <tr>\n      <td>Title:</td>\n      <td>Title</td>\n    </tr>\n"),
+        extra="\n  <p>Formatting whitespace is valid.</p>\n",
+    )
+
+    item = parse_item_page(
+        document,
+        expected_handle=_ITEM_HANDLE,
+        source_url=_ITEM_SOURCE,
+    )
+
+    assert item.title == "Title"
 
 
 def test_item_parser_rejects_excessive_tree_depth() -> None:

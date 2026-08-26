@@ -9,8 +9,9 @@ import ipaddress
 import ssl
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, Protocol, cast, override
 
 import dns.message
 import dns.name
@@ -46,7 +47,7 @@ from nplg_mcp.security import NPLG_HOST
 from tests.helpers.app_factory import base_environment
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
 
     from nplg_mcp.tools import ToolService
 
@@ -57,6 +58,29 @@ _FIRST_CONNECT_FAILED = "first connection failed"
 _CNAME_TTL = 2.0
 _EXPECTED_TTL = 5.0
 _FORGED_BOOLEAN: object = True
+_NETWORK_NAMESPACE = cast(
+    "dict[str, object]",
+    cast("object", network_module.__dict__),
+)
+_DNS_REJECTION = cast(
+    "type[Exception]",
+    _NETWORK_NAMESPACE["_DnsPolicyRejectionError"],
+)
+
+
+class _CnameChainParser(Protocol):
+    def __call__(
+        self,
+        answer: dns.resolver.Answer,
+        *,
+        host: str,
+    ) -> tuple[str, ...]: ...
+
+
+_CNAME_CHAIN = cast(
+    "_CnameChainParser",
+    _NETWORK_NAMESPACE["_canonical_cname_chain"],
+)
 
 
 def _dns_runner_became_idle() -> bool:
@@ -216,6 +240,169 @@ def _cname_chain_dns_answer(
         dns.rdataclass.IN,
         response,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _ForgedRecord:
+    value: str
+
+    def to_text(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class _ForgedChainingResult:
+    canonical_name: dns.name.Name
+    minimum_ttl: int
+
+
+@dataclass(slots=True)
+class _ForgedResponse:
+    answer: list[dns.rrset.RRset]
+
+
+@dataclass(slots=True)
+class _ForgedAnswer:
+    response: _ForgedResponse
+    chaining_result: _ForgedChainingResult
+    rrset: tuple[_ForgedRecord, ...]
+
+
+def _forged_dns_answer(
+    *,
+    answer_rrsets: tuple[dns.rrset.RRset, ...] = (),
+    canonical_name: str,
+    records: tuple[str, ...] = (),
+) -> dns.resolver.Answer:
+    """Build only the resolver surface needed for adversarial parser tests."""
+    value = _ForgedAnswer(
+        response=_ForgedResponse(answer=list(answer_rrsets)),
+        chaining_result=_ForgedChainingResult(
+            canonical_name=dns.name.from_text(canonical_name),
+            minimum_ttl=30,
+        ),
+        rrset=tuple(_ForgedRecord(value=record) for record in records),
+    )
+    return cast("dns.resolver.Answer", cast("object", value))
+
+
+class _ForgedCnameRrset:
+    """Minimal deliberately invalid multi-record CNAME RRset."""
+
+    rdtype = dns.rdatatype.CNAME
+
+    def __init__(self, owner: str, targets: tuple[str, ...]) -> None:
+        super().__init__()
+        self.name = dns.name.from_text(owner)
+        self._targets = targets
+
+    def __iter__(self) -> Iterator[_ForgedRecord]:
+        return iter(tuple(_ForgedRecord(value=target) for target in self._targets))
+
+
+def test_dns_cname_parser_rejects_ambiguous_duplicate_cyclic_and_unrelated_data() -> (
+    None
+):
+    """Malformed resolver answers must fail closed before address authorization."""
+    host = f"{NPLG_HOST}."
+    edge = "edge.example."
+    other = "other.example."
+    ambiguous = cast(
+        "dns.rrset.RRset",
+        _ForgedCnameRrset(host, (edge, other)),
+    )
+    with pytest.raises(
+        _DNS_REJECTION,
+        match="ambiguous",
+    ):
+        _ = _CNAME_CHAIN(
+            _forged_dns_answer(
+                answer_rrsets=(ambiguous,),
+                canonical_name=edge,
+            ),
+            host=NPLG_HOST,
+        )
+
+    duplicate_owner = (
+        dns.rrset.from_text(host, 20, "IN", "CNAME", edge),
+        dns.rrset.from_text(host, 20, "IN", "CNAME", other),
+    )
+    with pytest.raises(
+        _DNS_REJECTION,
+        match="duplicate owners",
+    ):
+        _ = _CNAME_CHAIN(
+            _forged_dns_answer(
+                answer_rrsets=duplicate_owner,
+                canonical_name=edge,
+            ),
+            host=NPLG_HOST,
+        )
+
+    cycle = (
+        dns.rrset.from_text(host, 20, "IN", "CNAME", edge),
+        dns.rrset.from_text(edge, 20, "IN", "CNAME", host),
+    )
+    with pytest.raises(
+        _DNS_REJECTION,
+        match="cycle",
+    ):
+        _ = _CNAME_CHAIN(
+            _forged_dns_answer(answer_rrsets=cycle, canonical_name=host),
+            host=NPLG_HOST,
+        )
+
+    unrelated = (
+        dns.rrset.from_text(host, 20, "IN", "CNAME", edge),
+        dns.rrset.from_text(other, 20, "IN", "CNAME", "elsewhere.example."),
+    )
+    with pytest.raises(
+        _DNS_REJECTION,
+        match="unrelated chain",
+    ):
+        _ = _CNAME_CHAIN(
+            _forged_dns_answer(answer_rrsets=unrelated, canonical_name=edge),
+            host=NPLG_HOST,
+        )
+
+    changed = (dns.rrset.from_text(host, 20, "IN", "CNAME", edge),)
+    with pytest.raises(
+        _DNS_REJECTION,
+        match="changed during resolution",
+    ):
+        _ = _CNAME_CHAIN(
+            _forged_dns_answer(answer_rrsets=changed, canonical_name=other),
+            host=NPLG_HOST,
+        )
+
+
+def test_dns_resolution_deduplicates_hostile_repeated_record_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated resolver records cannot inflate the authorized address set."""
+
+    def resolve(
+        _resolver: dns.resolver.Resolver,
+        qname: dns.name.Name | str,
+        rdtype: dns.rdatatype.RdataType | str = dns.rdatatype.A,
+        **_options: object,
+    ) -> dns.resolver.Answer:
+        del rdtype
+        host = str(qname).removesuffix(".")
+        return _forged_dns_answer(
+            canonical_name=f"{host}.",
+            records=("1.1.1.1", "1.1.1.1"),
+        )
+
+    monkeypatch.setattr(dns.resolver.Resolver, "resolve", resolve)
+
+    assert resolve_addresses_with_ttl(NPLG_HOST) == (("1.1.1.1",), 30.0)
+
+
+def test_transport_classifier_rejects_unknown_exception_types() -> None:
+    """Only the explicitly reviewed transport classes enter circuit accounting."""
+    with pytest.raises(TypeError, match="outside the reviewed classifier"):
+        _ = network_module.classify_transport_failure(RuntimeError("unexpected"))
 
 
 @pytest.mark.asyncio

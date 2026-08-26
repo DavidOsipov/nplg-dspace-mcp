@@ -1,0 +1,102 @@
+{
+  "schema_version": "1.0",
+  "corpus_id": "nplg-pdf-adversarial-synthetic",
+  "max_fixture_bytes": 65536,
+  "license": {
+    "spdx_identifier": "CC0-1.0",
+    "document_path": "LICENSE.txt",
+    "sha256": "4e08c069c125eee27018782db824db057ab9e337ed4e237db18edb5eef9e1e86",
+    "size_bytes": 384
+  },
+  "generator": {
+    "name": "nplg-pdf-adversarial-corpus",
+    "implementation_path": "tests/helpers/pdf_adversarial_corpus.py",
+    "callable": "build_fixture_bytes",
+    "version": "1",
+    "deterministic": true,
+    "contains_third_party_documents": false,
+    "source_statement": "Repository-authored synthetic bytes; no third-party documents or payloads."
+  },
+  "entries": [
+    {
+      "case_id": "concurrency-reuse",
+      "category": "concurrency_reuse",
+      "relative_path": "cases/concurrency-reuse.pdf",
+      "media_type": "application/pdf",
+      "sha256": "014a19e016541453a3a7ac60238e1bf7036958149c9b404c8bb29fa1fb1cca72",
+      "size_bytes": 640,
+      "expected_behavior": "reuse_without_mutation",
+      "description": "Valid minimal document reserved for deterministic concurrent-read and repeated-use tests."
+    },
+    {
+      "case_id": "crash-marker",
+      "category": "crash_marker",
+      "relative_path": "cases/crash-marker.pdf",
+      "media_type": "application/pdf",
+      "sha256": "0f3de20bd775d7b7abd96dd9c8f4c4ceffac08fac8a5d465b012246fe2059203",
+      "size_bytes": 642,
+      "expected_behavior": "inert_test_marker",
+      "description": "Valid minimal document with an inert crash label for controlled test-double selection only."
+    },
+    {
+      "case_id": "declared-huge-page",
+      "category": "declared_huge_page",
+      "relative_path": "cases/declared-huge-page.pdf",
+      "media_type": "application/pdf",
+      "sha256": "973b37b93b97c06844374b3da2910c4576b399f45806eadeb75e7c4ce9eebd88",
+      "size_bytes": 652,
+      "expected_behavior": "accept_bounded_metadata",
+      "description": "Tiny document declaring a one-million-point page without embedding a large allocation."
+    },
+    {
+      "case_id": "encrypted",
+      "category": "encrypted",
+      "relative_path": "cases/encrypted.pdf",
+      "media_type": "application/pdf",
+      "sha256": "548ac1e96bb380c53d2cfc99e53f847f4ea1a4fc6009474471a9191b4b9ddbbf",
+      "size_bytes": 835,
+      "expected_behavior": "reject_invalid_document",
+      "description": "Synthetic standard-security-handler document with no real secret or third-party content."
+    },
+    {
+      "case_id": "malformed",
+      "category": "malformed",
+      "relative_path": "cases/malformed.pdf",
+      "media_type": "application/pdf",
+      "sha256": "1f8aefb318b9632cde1f417fdb20d193d746ff9493975a0288cd6f946b943b0d",
+      "size_bytes": 89,
+      "expected_behavior": "reject_invalid_document",
+      "description": "Malformed catalog and nonnumeric startxref fixture intended for fail-closed parsing."
+    },
+    {
+      "case_id": "nested-high-object",
+      "category": "nested_high_object",
+      "relative_path": "cases/nested-high-object.pdf",
+      "media_type": "application/pdf",
+      "sha256": "0acfb95bf94faf8147785d84cb15189c10c4572eeb264344254da481c0b8c8ab",
+      "size_bytes": 6140,
+      "expected_behavior": "accept_bounded_metadata",
+      "description": "Bounded chain of sixty nested dictionaries across sixty-four objects for parser-depth coverage."
+    },
+    {
+      "case_id": "timeout-marker",
+      "category": "timeout_marker",
+      "relative_path": "cases/timeout-marker.pdf",
+      "media_type": "application/pdf",
+      "sha256": "c7a12aeaad0b9216dc306c942760131c8c4518afb957acd7ad7ff51289920dff",
+      "size_bytes": 646,
+      "expected_behavior": "inert_test_marker",
+      "description": "Valid minimal document with an inert timeout label for controlled test-double selection only."
+    },
+    {
+      "case_id": "truncated",
+      "category": "truncated",
+      "relative_path": "cases/truncated.pdf",
+      "media_type": "application/pdf",
+      "sha256": "23c7de044b08cdd9add38741441f0b7040284c18bde8bf96726d3161a0896002",
+      "size_bytes": 160,
+      "expected_behavior": "reject_invalid_document",
+      "description": "Deterministically cut valid-document prefix with no complete object graph, xref, or trailer."
+    }
+  ]
+}

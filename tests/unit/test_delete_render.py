@@ -28,6 +28,7 @@ ARGUMENT_ERROR_EXIT = 2
 CANCELLED_EXIT = 130
 INTERNAL_MARKER = "private-delete-detail"
 OUTPUT_FAILURE = "output unavailable"
+PRIVATE_DIRECTORY_MODE = 0o700
 
 
 class InteractiveInput(io.StringIO):
@@ -133,7 +134,7 @@ def _harness(
     stdout: io.StringIO | None = None,
     stderr: io.StringIO | None = None,
 ) -> DeleteHarness:
-    (tmp_path / "renders").mkdir(exist_ok=True)
+    (tmp_path / "renders").mkdir(mode=PRIVATE_DIRECTORY_MODE, exist_ok=True)
     output = stdout or io.StringIO()
     errors = stderr or io.StringIO()
     factory = FakeProcessorFactory(FakeDeleter(outcome))
@@ -305,7 +306,7 @@ def test_process_entrypoint_uses_real_default_dependencies(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    (tmp_path / "renders").mkdir()
+    (tmp_path / "renders").mkdir(mode=PRIVATE_DIRECTORY_MODE)
     monkeypatch.setattr(
         sys,
         "argv",

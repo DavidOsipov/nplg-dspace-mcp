@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import tokenize
 from dataclasses import replace
@@ -21,6 +22,8 @@ from scripts.build_asvs_matrix import (
     GIT_CLOSED_ENV,
     ApplicableEvidenceRow,
     AsvsRequirement,
+    ClaimPolicyRecord,
+    CustodiedEvidenceReference,
     GitCommandRequest,
     GitCommandResult,
     LocalEvidenceReference,
@@ -65,6 +68,7 @@ STATIC_DIRECTIVE_PATTERN = re.compile(
     """,
     flags=re.IGNORECASE | re.VERBOSE,
 )
+_DEFAULT_REFERENCE_EXPIRY = datetime(2027, 1, 1, tzinfo=UTC)
 
 
 class _InjectedGitRunner:
@@ -147,6 +151,179 @@ def _applicable_row_data() -> dict[str, object]:
     }
 
 
+def _claim_policy(
+    *,
+    pass_required_kinds: tuple[str, ...] | None = None,
+    na_absence_required: bool = False,
+) -> ClaimPolicyRecord:
+    payload: dict[str, object] = {
+        "requirement_id": "v5.0.0-V1.1.1",
+        "profile": "alpic-metadata",
+        "pass_required_kinds": pass_required_kinds,
+        "na_absence_required": na_absence_required,
+        "risk_acceptance_authority_id": None,
+    }
+    return ClaimPolicyRecord.model_validate(payload)
+
+
+def _local_reference(
+    *,
+    evidence_id: str = "ev.fixture",
+    kind: str = "test",
+    expires_at: datetime = _DEFAULT_REFERENCE_EXPIRY,
+) -> LocalEvidenceReference:
+    payload: dict[str, object] = {
+        "artifact_path": "evidence/fixture.json",
+        "asserted_invariant": "The claim remains unassessed.",
+        "candidate_tree_sha256": "1" * 64,
+        "collected_at": datetime(2026, 8, 16, tzinfo=UTC),
+        "covered_surface": "src/nplg_mcp",
+        "deployment_id": None,
+        "evidence_id": evidence_id,
+        "evidence_revision": "da5cc20e4f8bf3e1cacf74c49d5391487cb11cb0",
+        "expires_at": expires_at,
+        "image_digest": None,
+        "kind": kind,
+        "profiles": ("alpic-metadata",),
+        "requirement_ids": ("v5.0.0-V1.1.1",),
+        "result": "pass",
+        "reviewer": "reviewer-subject",
+        "selectors": ("tests/unit/test_fixture.py::test_claim",),
+        "sha256": "2" * 64,
+        "storage": "local",
+        "verifier": "test-report-v1",
+    }
+    return LocalEvidenceReference.model_validate(payload)
+
+
+def _applicable_release_blockers(
+    row: ApplicableEvidenceRow,
+    claim: ClaimPolicyRecord,
+    references: tuple[LocalEvidenceReference | CustodiedEvidenceReference, ...],
+    *,
+    as_of: datetime,
+) -> tuple[str, ...]:
+    blockers: list[str] = []
+    if row.verdict == "Risk accepted":
+        reason = (
+            "expired-risk-acceptance"
+            if row.risk_expiry is not None and as_of.date() >= row.risk_expiry
+            else "risk-accepted-publicly-ineligible"
+        )
+        blockers.append(reason)
+    else:
+        verdict_reason = {
+            "Not assessed": "not-assessed",
+            "Fail": "failed",
+            "Partial": "partial",
+        }.get(row.verdict)
+        if verdict_reason is not None:
+            blockers.append(verdict_reason)
+        elif (
+            claim.pass_required_kinds is None
+            or row.required_evidence_kinds != claim.pass_required_kinds
+        ):
+            blockers.append("pass-policy-not-closed")
+        else:
+            matching = tuple(
+                reference
+                for reference in references
+                if reference.evidence_id in row.evidence_ids
+                and row.requirement_id in reference.requirement_ids
+                and row.profile in reference.profiles
+                and row.evidence_revision == reference.evidence_revision
+                and row.invariant == reference.asserted_invariant
+            )
+            if any(reference.expires_at <= as_of for reference in matching):
+                blockers.append("expired-evidence")
+            elif any(
+                not any(reference.kind == kind for reference in matching)
+                for kind in claim.pass_required_kinds
+            ):
+                blockers.append("missing-required-evidence")
+    return tuple(blockers)
+
+
+def _not_applicable_release_blockers(
+    row: NotApplicableEvidenceRow,
+    claim: ClaimPolicyRecord,
+    references: tuple[LocalEvidenceReference | CustodiedEvidenceReference, ...],
+    *,
+    as_of: datetime,
+) -> tuple[str, ...]:
+    blockers: list[str] = []
+    matching_absence = tuple(
+        reference
+        for reference in references
+        if reference.evidence_id in row.absence_evidence_ids
+        and row.requirement_id in reference.requirement_ids
+        and row.profile in reference.profiles
+        and row.evidence_revision == reference.evidence_revision
+        and row.invariant == reference.asserted_invariant
+    )
+    if row.applicability_review_due <= as_of.date():
+        blockers.append("expired-na-review")
+    elif not claim.na_absence_required:
+        blockers.append("unjustified-na")
+    elif any(reference.expires_at <= as_of for reference in matching_absence):
+        blockers.append("expired-absence-evidence")
+    elif not matching_absence:
+        blockers.append("missing-absence-evidence")
+    return tuple(blockers)
+
+
+def _row_release_blockers(
+    row: ApplicableEvidenceRow | NotApplicableEvidenceRow,
+    claim: ClaimPolicyRecord,
+    references: tuple[LocalEvidenceReference | CustodiedEvidenceReference, ...],
+    *,
+    as_of: datetime,
+) -> tuple[str, ...]:
+    if row.evidence_revision != "da5cc20e4f8bf3e1cacf74c49d5391487cb11cb0":
+        return ("evidence-revision-mismatch",)
+    if isinstance(row, ApplicableEvidenceRow):
+        return _applicable_release_blockers(
+            row,
+            claim,
+            references,
+            as_of=as_of,
+        )
+    return _not_applicable_release_blockers(
+        row,
+        claim,
+        references,
+        as_of=as_of,
+    )
+
+
+def _profile_release_blockers(
+    profile: str,
+    *,
+    as_of: datetime,
+) -> tuple[str, ...]:
+    rows = tuple(row for row in load_evidence_matrix() if row.profile == profile)
+    manifest = load_evidence_manifest()
+    policy = load_independent_evidence_policy()
+    claims = tuple(claim for claim in policy.claims if claim.profile == profile)
+    row_ids = tuple(row.requirement_id for row in rows)
+    claim_ids = tuple(claim.requirement_id for claim in claims)
+    if row_ids != claim_ids or len(rows) != L1_L2_COUNT:
+        return ("profile:incomplete-product",)
+    by_requirement = {claim.requirement_id: claim for claim in claims}
+    blockers: list[str] = []
+    for row in rows:
+        blockers.extend(
+            f"{row.requirement_id}:{reason}"
+            for reason in _row_release_blockers(
+                row,
+                by_requirement[row.requirement_id],
+                manifest,
+                as_of=as_of,
+            )
+        )
+    return tuple(blockers)
+
+
 def test_task2_subprocess_suppression_has_exact_closed_inventory() -> None:
     source = TASK2_SOURCE.read_text(encoding="utf-8")
 
@@ -227,6 +404,148 @@ def test_evidence_discriminator_rejects_illegal_conditional_states() -> None:
         _ = ApplicableEvidenceRow.model_validate(applicable)
     with pytest.raises(ValidationError):
         _ = NotApplicableEvidenceRow.model_validate(not_applicable)
+
+
+@pytest.mark.parametrize(
+    ("verdict", "expected"),
+    [
+        ("Not assessed", "not-assessed"),
+        ("Fail", "failed"),
+        ("Partial", "partial"),
+    ],
+)
+def test_public_release_readiness_rejects_every_incomplete_applicable_verdict(
+    verdict: str,
+    expected: str,
+) -> None:
+    payload = _applicable_row_data()
+    payload["verdict"] = verdict
+    row = ApplicableEvidenceRow.model_validate(payload)
+
+    assert _row_release_blockers(
+        row,
+        _claim_policy(),
+        (),
+        as_of=datetime(2026, 8, 23, tzinfo=UTC),
+    ) == (expected,)
+
+
+@pytest.mark.parametrize(
+    ("risk_expiry", "expected"),
+    [
+        (date(2026, 8, 24), "risk-accepted-publicly-ineligible"),
+        (date(2026, 8, 22), "expired-risk-acceptance"),
+    ],
+)
+def test_public_release_readiness_never_accepts_risk_acceptance(
+    risk_expiry: date,
+    expected: str,
+) -> None:
+    payload = _applicable_row_data() | {
+        "compensating_controls": ("control.fixture",),
+        "release_approval_evidence_id": "approval.fixture",
+        "residual_risk": "A named residual risk remains.",
+        "risk_approver": "independent-approver",
+        "risk_expiry": risk_expiry,
+        "risk_id": "risk.fixture",
+        "risk_owner": "risk-owner",
+        "verdict": "Risk accepted",
+    }
+    row = ApplicableEvidenceRow.model_validate(payload)
+
+    assert _row_release_blockers(
+        row,
+        _claim_policy(),
+        (),
+        as_of=datetime(2026, 8, 23, tzinfo=UTC),
+    ) == (expected,)
+
+
+def test_public_release_readiness_accepts_only_policy_bound_pass_evidence() -> None:
+    payload = _applicable_row_data() | {
+        "evidence_ids": ("ev.fixture",),
+        "required_evidence_kinds": ("test",),
+        "verdict": "Pass",
+    }
+    row = ApplicableEvidenceRow.model_validate(payload)
+    reference = _local_reference()
+
+    assert (
+        _row_release_blockers(
+            row,
+            _claim_policy(pass_required_kinds=("test",)),
+            (reference,),
+            as_of=datetime(2026, 8, 23, tzinfo=UTC),
+        )
+        == ()
+    )
+    assert _row_release_blockers(
+        row,
+        _claim_policy(),
+        (reference,),
+        as_of=datetime(2026, 8, 23, tzinfo=UTC),
+    ) == ("pass-policy-not-closed",)
+    assert _row_release_blockers(
+        row,
+        _claim_policy(pass_required_kinds=("test",)),
+        (),
+        as_of=datetime(2026, 8, 23, tzinfo=UTC),
+    ) == ("missing-required-evidence",)
+
+
+@pytest.mark.parametrize(
+    ("review_due", "governance", "expected"),
+    [
+        (date(2026, 8, 23), "governed", "expired-na-review"),
+        (date(2026, 8, 24), "ungoverned", "unjustified-na"),
+        (date(2026, 8, 24), "governed", "missing-absence-evidence"),
+    ],
+)
+def test_public_release_readiness_rejects_expired_or_ungoverned_na(
+    review_due: date,
+    governance: str,
+    expected: str,
+) -> None:
+    payload = _applicable_row_data() | {
+        "absence_evidence_ids": ("absence.fixture",),
+        "applicability": "not_applicable",
+        "applicability_review_due": review_due,
+        "applicability_reviewer": "independent-reviewer",
+        "verdict": "N/A",
+    }
+    row = NotApplicableEvidenceRow.model_validate(payload)
+
+    assert _row_release_blockers(
+        row,
+        _claim_policy(na_absence_required=governance == "governed"),
+        (),
+        as_of=datetime(2026, 8, 23, tzinfo=UTC),
+    ) == (expected,)
+
+
+def test_public_release_readiness_rejects_missing_evidence_revision() -> None:
+    payload = _applicable_row_data()
+    del payload["evidence_revision"]
+
+    with pytest.raises(ValidationError):
+        _ = ApplicableEvidenceRow.model_validate(payload)
+
+
+def test_selected_profile_release_eligibility_is_an_explicit_closure_gate() -> None:
+    if os.environ.get("REQUIRE_RELEASE_ELIGIBILITY") != "1":
+        return
+    profile = os.environ.get("RELEASE_PROFILE")
+    assert profile in {"alpic-metadata", "private-full"}
+
+    blockers = _profile_release_blockers(
+        profile,
+        as_of=datetime.now(tz=UTC),
+    )
+
+    assert not blockers, (
+        f"{profile} release eligibility blocked by {len(blockers)} ASVS rows: "
+        + ", ".join(blockers)
+    )
 
 
 def test_local_reference_rejects_traversal_and_unknown_fields() -> None:

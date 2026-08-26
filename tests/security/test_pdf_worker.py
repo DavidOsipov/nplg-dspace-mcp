@@ -21,6 +21,7 @@ from PIL import Image
 
 from nplg_mcp.bounded_work import STORAGE_WORK
 from nplg_mcp.contracts import MonotonicDeadline
+from nplg_mcp.errors import AppError, ErrorCode
 from nplg_mcp.pdf_executor import (
     PdfCircuitBreaker,
     PdfCircuitPolicy,
@@ -50,10 +51,12 @@ from nplg_mcp.pdf_ipc import (
 )
 from nplg_mcp.pdf_worker_client import SubprocessPdfExecutor, UnixSocketPdfExecutor
 from nplg_mcp.storage import ContentAddressedStore
+from tests.helpers.lease_store import lease_barrier_store, retention_sample
 from tests.helpers.pdf_factory import make_raster_pdf
 
 if TYPE_CHECKING:
     from asyncio.subprocess import Process
+    from collections.abc import Callable
     from typing import Literal
 
     from nplg_mcp.pdf_ipc import PdfResult
@@ -887,6 +890,135 @@ async def test_parent_rejects_malformed_or_unbounded_worker_frames(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["worker-error", "cancel"])
+async def test_source_staging_holds_a_prune_lease_until_copy_terminates(
+    tmp_path: Path,
+    outcome: Literal["worker-error", "cancel"],
+) -> None:
+    """Removing the staging lease must let pressure-prune delete the source."""
+    store, policy, clock = lease_barrier_store(tmp_path)
+    source = store.put_bytes(
+        b"%PDF-1.7\nactively-staged",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    evictable = store.put_bytes(
+        b"evictable",
+        namespace="documents",
+        filename="evictable.pdf",
+        media_type="application/pdf",
+    )
+    helper = Path(__file__).parents[1] / "fixtures" / "pdf_worker_bad_frame.py"
+    executor = SubprocessPdfExecutor(
+        store=store,
+        worker_argv=(sys.executable, str(helper), "invalid-json"),
+    )
+    operation = asyncio.create_task(
+        executor.execute(
+            InspectCommand(
+                request_id=UUID("00000000-0000-4000-8000-000000000073"),
+                operation="inspect",
+                source_relative_path=source.relative_path,
+                parameters=InspectParams(),
+            ),
+            deadline=_deadline(5.0),
+        )
+    )
+
+    entered = await asyncio.to_thread(store.wait_until_leased)
+    if not entered:
+        store.release_lease_barrier()
+        with suppress(PdfWorkerError):
+            _ = await operation
+        pytest.fail("PDF source staging did not acquire the public asset lease")
+
+    while_staging = store.prune(policy, clock=clock)
+    assert source.absolute_path.is_file()
+    assert not evictable.absolute_path.exists()
+    assert while_staging.retained_leased_objects == 1
+    assert (store.lease_acquisitions, store.lease_releases) == (1, 0)
+
+    if outcome == "cancel":
+        _ = operation.cancel()
+        store.release_lease_barrier()
+        with pytest.raises(asyncio.CancelledError):
+            _ = await operation
+    else:
+        store.release_lease_barrier()
+        with pytest.raises(PdfWorkerError, match="transport"):
+            _ = await operation
+
+    assert (store.lease_acquisitions, store.lease_releases) == (1, 1)
+    replacement = store.put_bytes(
+        b"replacement",
+        namespace="documents",
+        filename="replacement.pdf",
+        media_type="application/pdf",
+    )
+    after_staging = store.prune(policy, clock=retention_sample(2.0))
+    assert after_staging.retained_leased_objects == 0
+    assert not source.absolute_path.exists()
+    assert replacement.absolute_path.is_file()
+
+
+@pytest.mark.asyncio
+async def test_render_tree_staging_holds_one_object_lease_until_copy_finishes(
+    tmp_path: Path,
+) -> None:
+    """Leasing only an individual render file must still protect its object root."""
+    store, policy, clock = lease_barrier_store(tmp_path)
+    render_id = "rnd_" + "3" * 32
+    manifest_path, _digest = store.put_render_bytes(
+        f"renders/{render_id}/manifest.json",
+        b'{"render_id":"rnd_33333333333333333333333333333333"}',
+    )
+    _page_path, _page_digest = store.put_render_bytes(
+        f"renders/{render_id}/page-0001.jpg",
+        b"page",
+    )
+    evictable = store.put_bytes(
+        b"evictable",
+        namespace="documents",
+        filename="evictable.pdf",
+        media_type="application/pdf",
+    )
+    helper = Path(__file__).parents[1] / "fixtures" / "pdf_worker_bad_frame.py"
+    executor = SubprocessPdfExecutor(
+        store=store,
+        worker_argv=(sys.executable, str(helper), "invalid-json"),
+    )
+    operation = asyncio.create_task(
+        executor.execute(
+            ManifestCommand(
+                request_id=UUID("00000000-0000-4000-8000-000000000074"),
+                operation="manifest",
+                parameters=ManifestParams(render_id=render_id),
+            ),
+            deadline=_deadline(5.0),
+        )
+    )
+
+    entered = await asyncio.to_thread(store.wait_until_leased)
+    if not entered:
+        store.release_lease_barrier()
+        with suppress(PdfWorkerError):
+            _ = await operation
+        pytest.fail("PDF render staging did not acquire the public asset lease")
+
+    while_staging = store.prune(policy, clock=clock)
+    assert store.resolve_asset(manifest_path).is_file()
+    assert not evictable.absolute_path.exists()
+    assert while_staging.retained_leased_objects == 1
+    assert (store.lease_acquisitions, store.lease_releases) == (1, 0)
+
+    store.release_lease_barrier()
+    with pytest.raises(PdfWorkerError, match="transport"):
+        _ = await operation
+    assert (store.lease_acquisitions, store.lease_releases) == (1, 1)
+
+
+@pytest.mark.asyncio
 async def test_repeated_worker_transport_failures_open_the_executor_circuit(
     tmp_path: Path,
 ) -> None:
@@ -1178,7 +1310,7 @@ async def test_parent_rejects_input_metadata_drift_during_copy(
 
 
 @pytest.mark.asyncio
-async def test_parent_uses_safe_no_follow_fallback_when_flag_is_unavailable(
+async def test_parent_fails_closed_when_no_follow_flag_is_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1199,12 +1331,48 @@ async def test_parent_uses_safe_no_follow_fallback_when_flag_is_unavailable(
 
     with monkeypatch.context() as patch:
         patch.delattr(os, "O_NOFOLLOW")
-        result = await SubprocessPdfExecutor(store=store).execute(
-            command,
-            deadline=_deadline(15.0),
-        )
+        with pytest.raises(AppError) as raised:
+            _ = await SubprocessPdfExecutor(store=store).execute(
+                command,
+                deadline=_deadline(15.0),
+            )
 
-    assert isinstance(result, PdfSuccess)
+    assert raised.value.code is ErrorCode.INTERNAL_ERROR
+    assert not any((store.root / "renders").iterdir())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defect", ["permissive-directory", "symlink"])
+async def test_parent_rejects_an_unsafe_preexisting_worker_job_root(
+    tmp_path: Path,
+    defect: str,
+) -> None:
+    store = ContentAddressedStore(tmp_path / "unsafe-job-root")
+    artifact = store.put_bytes(
+        b"%PDF-1.7\nworker-root-fixture",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    work_parent = store.root / ".pdf-worker-jobs"
+    if defect == "permissive-directory":
+        work_parent.mkdir(mode=0o700)
+        work_parent.chmod(0o755)
+    else:
+        target = tmp_path / "outside-worker-root"
+        target.mkdir(mode=0o700)
+        work_parent.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(PdfWorkerError, match="staging directory is not private"):
+        _ = await SubprocessPdfExecutor(store=store).execute(
+            InspectCommand(
+                request_id=UUID("00000000-0000-4000-8000-000000000072"),
+                operation="inspect",
+                source_relative_path=artifact.relative_path,
+                parameters=InspectParams(),
+            ),
+            deadline=_deadline(5.0),
+        )
 
 
 @pytest.mark.asyncio
@@ -1225,7 +1393,7 @@ async def test_parent_rejects_unsafe_authoritative_render_trees_before_spawn(
     render_id = "rnd_" + "2" * 32
     render_root = store.root / "renders" / render_id
     if defect != "absent":
-        render_root.mkdir(parents=True)
+        render_root.mkdir(mode=0o700)
         target = tmp_path / "outside"
         if defect == "directory-symlink":
             target.mkdir()
@@ -1551,7 +1719,14 @@ async def test_parent_rehashes_worker_output_during_publication(
     real_stage = store.stage
     mutated = False
 
-    def stage_with_race(*, suffix: str = "") -> object:
+    def stage_with_race(
+        *,
+        suffix: str = "",
+        _transaction_token: object | None = None,
+        _transaction_guard: Callable[[], None] | None = None,
+        _transaction_cleanup_guard: Callable[[], None] | None = None,
+        _transaction_subtree: Path | None = None,
+    ) -> object:
         nonlocal mutated
         if not mutated:
             candidates = [
@@ -1564,7 +1739,13 @@ async def test_parent_rehashes_worker_output_during_publication(
             page_path = page_paths[0]
             _ = page_path.write_bytes(b"x" * page_path.stat().st_size)
             mutated = True
-        return real_stage(suffix=suffix)
+        return real_stage(
+            suffix=suffix,
+            _transaction_token=_transaction_token,
+            _transaction_guard=_transaction_guard,
+            _transaction_cleanup_guard=_transaction_cleanup_guard,
+            _transaction_subtree=_transaction_subtree,
+        )
 
     monkeypatch.setattr(store, "stage", stage_with_race)
 
@@ -1603,12 +1784,25 @@ async def test_parent_deadline_covers_output_publication(
     real_stage = store.stage
     delayed = False
 
-    def delayed_stage(*, suffix: str = "") -> object:
+    def delayed_stage(
+        *,
+        suffix: str = "",
+        _transaction_token: object | None = None,
+        _transaction_guard: Callable[[], None] | None = None,
+        _transaction_cleanup_guard: Callable[[], None] | None = None,
+        _transaction_subtree: Path | None = None,
+    ) -> object:
         nonlocal delayed
         if not delayed:
             delayed = True
             time.sleep(1.0)
-        return real_stage(suffix=suffix)
+        return real_stage(
+            suffix=suffix,
+            _transaction_token=_transaction_token,
+            _transaction_guard=_transaction_guard,
+            _transaction_cleanup_guard=_transaction_cleanup_guard,
+            _transaction_subtree=_transaction_subtree,
+        )
 
     monkeypatch.setattr(store, "stage", delayed_stage)
 
@@ -1650,14 +1844,27 @@ async def test_pdf_output_publication_does_not_block_the_event_loop(
     heartbeat_seen_during_publication = False
     delayed = False
 
-    def delayed_stage(*, suffix: str = "") -> object:
+    def delayed_stage(
+        *,
+        suffix: str = "",
+        _transaction_token: object | None = None,
+        _transaction_guard: Callable[[], None] | None = None,
+        _transaction_cleanup_guard: Callable[[], None] | None = None,
+        _transaction_subtree: Path | None = None,
+    ) -> object:
         nonlocal delayed, heartbeat_seen_during_publication
         if not delayed:
             delayed = True
             _ = loop.call_soon_threadsafe(heartbeat.set)
             time.sleep(0.2)
             heartbeat_seen_during_publication = heartbeat.is_set()
-        return real_stage(suffix=suffix)
+        return real_stage(
+            suffix=suffix,
+            _transaction_token=_transaction_token,
+            _transaction_guard=_transaction_guard,
+            _transaction_cleanup_guard=_transaction_cleanup_guard,
+            _transaction_subtree=_transaction_subtree,
+        )
 
     monkeypatch.setattr(store, "stage", delayed_stage)
 

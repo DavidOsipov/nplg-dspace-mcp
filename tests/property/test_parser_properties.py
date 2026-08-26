@@ -122,7 +122,11 @@ def _run_controlled_parser_resource_child(
     *,
     wall_timeout_seconds: float,
 ) -> subprocess.CompletedProcess[str]:
-    environment = dict(os.environ)
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in {"COVERAGE_PROCESS_CONFIG", "COVERAGE_PROCESS_START"}
+    }
     environment["PYTHONHASHSEED"] = "0"
     command = (sys.executable, "-c", script)
     return subprocess.run(  # noqa: S603
@@ -427,8 +431,9 @@ def _public_formats_document(*, extra: str = "") -> str:
 
 def _public_oai_record(metadata: str) -> str:
     return (
-        "<OAI-PMH><GetRecord><record><header><identifier>"
-        f"oai:dspace:{_ITEM_HANDLE}</identifier></header>{metadata}"
+        '<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">'
+        "<GetRecord><record><header><identifier>"
+        f"oai:dspace.nplg.gov.ge:{_ITEM_HANDLE}</identifier></header>{metadata}"
         "</record></GetRecord></OAI-PMH>"
     )
 
@@ -701,8 +706,9 @@ def formats(extra=""):
 
 def oai_record(metadata):
     return (
-        "<OAI-PMH><GetRecord><record><header><identifier>"
-        f"oai:dspace:{handle}</identifier></header>{metadata}"
+        '<OAI-PMH xmlns="http://www.openarchives.org/OAI/2.0/">'
+        "<GetRecord><record><header><identifier>"
+        f"oai:dspace.nplg.gov.ge:{handle}</identifier></header>{metadata}"
         "</record></GetRecord></OAI-PMH>"
     )
 

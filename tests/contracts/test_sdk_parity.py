@@ -38,6 +38,22 @@ _METADATA_TOOL_NAMES = (
     "list_document_files",
     "search_documents",
 )
+_FROZEN_MODERN_RESOURCE_CASES = frozenset(
+    {
+        "resource.list.modern",
+        "resource.read-about.modern",
+        "resource.read-artifact.modern",
+        "resource.read-render.modern",
+    }
+)
+_EXPECTED_DIFFERENCE_CASES = frozenset(
+    {
+        "metadata-tool-catalog-schema-projection",
+        "private-artifact-resource-content",
+        "private-render-resource-identity",
+        "private-resource-template-catalog",
+    }
+)
 
 
 def _stable_tool(name: object) -> dict[str, object]:
@@ -123,62 +139,165 @@ def _frozen_result(fixture: JsonObject, case_id: str) -> JsonObject:
     return cast("JsonObject", payload["result"])
 
 
+def _difference_records_by_case() -> dict[str, JsonObject]:
+    """Index the closed accepted-difference ledger without accepting duplicates."""
+    ledger = _load_difference_ledger()
+    raw_differences = ledger["differences"]
+    assert isinstance(raw_differences, list)
+    differences: dict[str, JsonObject] = {}
+    for raw_entry in raw_differences:
+        assert isinstance(raw_entry, dict)
+        entry = raw_entry
+        case_id = entry["case_id"]
+        assert isinstance(case_id, str)
+        assert case_id not in differences
+        differences[case_id] = entry
+    return differences
+
+
+def _assert_ledgered_difference(
+    *,
+    case_id: str,
+    frozen_value: object,
+    official_sdk_value: object,
+) -> None:
+    """Require one intentional semantic delta to match both reviewed digests."""
+    assert frozen_value != official_sdk_value
+    entry = _difference_records_by_case()[case_id]
+    assert entry["frozen_value_sha256"] == _canonical_digest(frozen_value)
+    assert entry["official_sdk_value_sha256"] == _canonical_digest(official_sdk_value)
+
+
 @pytest.mark.asyncio
 async def test_sdk_and_legacy_metadata_semantics_are_differentially_equal(
     app_services: MetadataServices,
 ) -> None:
-    """Catalog, result, resource, and read semantics match without envelopes."""
+    """The retained legacy baseline matches metadata tool semantics only."""
     server = create_mcp_server(app_services, DeploymentProfile.ALPIC_METADATA)
     catalog_fixture = _load_digest_verified_fixture("tool-catalog.json")
     result_fixture = _load_digest_verified_fixture("result-cases.json")
-    resource_fixture = _load_digest_verified_fixture("resources.json")
     legacy_catalog = [catalog_fixture[name] for name in _METADATA_TOOL_NAMES]
     legacy_result = _frozen_result(
         result_fixture,
         "tool.search_documents.modern.success",
     )
-    legacy_resources = _frozen_result(resource_fixture, "resource.list.modern")
-    legacy_resource = _frozen_result(
-        resource_fixture,
-        "resource.read-about.modern",
-    )
 
     async with Client(server, mode=MODERN_PROTOCOL_VERSION) as client:
         sdk_catalog = await client.list_tools()
         sdk_result = await client.call_tool("search_documents", {"query": "fixture"})
-        sdk_resources = await client.list_resources()
-        sdk_resource = await client.read_resource("nplg://about")
 
     assert normalize_tool_catalog(legacy_catalog) == normalize_tool_catalog(
         sdk_catalog.tools,
     )
     assert normalize_tool_result(legacy_result) == normalize_tool_result(sdk_result)
+    entry = _difference_records_by_case()["metadata-tool-catalog-schema-projection"]
+    assert entry == {
+        "approval_date": "2026-08-21",
+        "case_id": "metadata-tool-catalog-schema-projection",
+        "frozen_value_sha256": _canonical_digest(legacy_catalog),
+        "normative_source": "https://modelcontextprotocol.io/specification/2026-07-28/server/tools",
+        "official_sdk_value_sha256": _canonical_digest(
+            sdk_catalog.model_dump(mode="json", by_alias=True)["tools"]
+        ),
+        "rationale": (
+            "The frozen custom protocol suppresses outputSchema and selected "
+            "input-schema constraints; its retained compatibility result is "
+            "ledgered until Task 14 removes the adapter."
+        ),
+        "reviewer": "Codex local implementation review (not release authority)",
+    }
+
+
+@pytest.mark.asyncio
+async def test_sdk_and_legacy_private_resource_semantics_are_differentially_equal(
+    tmp_path: Path,
+) -> None:
+    """Relocate frozen resource list/read parity to the resource-owning profile."""
+    resource_fixture = _load_digest_verified_fixture("resources.json")
+    assert {
+        case_id for case_id in resource_fixture if case_id.endswith(".modern")
+    } == _FROZEN_MODERN_RESOURCE_CASES
+    legacy_resources = _frozen_result(resource_fixture, "resource.list.modern")
+    legacy_about = _frozen_result(
+        resource_fixture,
+        "resource.read-about.modern",
+    )
+    legacy_artifact = _frozen_result(
+        resource_fixture,
+        "resource.read-artifact.modern",
+    )
+    legacy_render = _frozen_result(
+        resource_fixture,
+        "resource.read-render.modern",
+    )
+    tools = make_tool_service(tmp_path, frozen_origin=True)
+    services = FullServiceComposition(tools=tools, store=tools.store)
+    server = create_mcp_server(services, DeploymentProfile.PRIVATE_FULL)
+
+    async with Client(server, mode=MODERN_PROTOCOL_VERSION) as client:
+        sdk_resources = await client.list_resources()
+        sdk_templates = await client.list_resource_templates()
+        sdk_about = await client.read_resource("nplg://about")
+        downloaded = await client.call_tool(
+            "download_document_file",
+            {"handle": "1234/560449", "bitstream_id": "bs_public"},
+        )
+        raw_downloaded_content = cast("object", downloaded.structured_content)
+        assert isinstance(raw_downloaded_content, dict)
+        downloaded_content = cast("JsonObject", raw_downloaded_content)
+        artifact_id = downloaded_content["artifact_id"]
+        assert isinstance(artifact_id, str)
+        sdk_artifact = await client.read_resource(f"nplg://artifact/{artifact_id}")
+        rendered = await client.call_tool(
+            "render_pdf_pages",
+            {"artifact_id": artifact_id, "pages": [1], "mode": "native"},
+        )
+        raw_rendered_content = cast("object", rendered.structured_content)
+        assert isinstance(raw_rendered_content, dict)
+        rendered_content = cast("JsonObject", raw_rendered_content)
+        render_id = rendered_content["render_id"]
+        assert isinstance(render_id, str)
+        sdk_render = await client.read_resource(f"nplg://render/{render_id}/manifest")
+
     assert legacy_resources["resources"] == [
         resource.model_dump(mode="json", by_alias=True, exclude_none=True)
         for resource in sdk_resources.resources
     ]
-    assert legacy_resource["contents"] == [
+    assert legacy_about["contents"] == [
         content.model_dump(mode="json", by_alias=True, exclude_none=True)
-        for content in sdk_resource.contents
+        for content in sdk_about.contents
     ]
-    ledger = _load_difference_ledger()
-    assert ledger["differences"] == [
-        {
-            "approval_date": "2026-08-21",
-            "case_id": "metadata-tool-catalog-schema-projection",
-            "frozen_value_sha256": _canonical_digest(legacy_catalog),
-            "normative_source": "https://modelcontextprotocol.io/specification/2026-07-28/server/tools",
-            "official_sdk_value_sha256": _canonical_digest(
-                sdk_catalog.model_dump(mode="json", by_alias=True)["tools"]
-            ),
-            "rationale": (
-                "The frozen custom protocol suppresses outputSchema and selected "
-                "input-schema constraints; its retained compatibility result is "
-                "ledgered until Task 14 removes the adapter."
-            ),
-            "reviewer": "Codex local implementation review (not release authority)",
-        }
+    official_artifact_contents = [
+        content.model_dump(mode="json", by_alias=True, exclude_none=True)
+        for content in sdk_artifact.contents
     ]
+    official_render_contents = [
+        content.model_dump(mode="json", by_alias=True, exclude_none=True)
+        for content in sdk_render.contents
+    ]
+    official_templates = [
+        template.model_dump(mode="json", by_alias=True, exclude_none=True)
+        for template in sdk_templates.resource_templates
+    ]
+    assert [template["uriTemplate"] for template in official_templates] == [
+        "nplg://artifact/{artifact_id}",
+        "nplg://render/{render_id}/manifest",
+    ]
+    _assert_ledgered_difference(
+        case_id="private-artifact-resource-content",
+        frozen_value=legacy_artifact["contents"],
+        official_sdk_value=official_artifact_contents,
+    )
+    _assert_ledgered_difference(
+        case_id="private-render-resource-identity",
+        frozen_value=legacy_render["contents"],
+        official_sdk_value=official_render_contents,
+    )
+    _assert_ledgered_difference(
+        case_id="private-resource-template-catalog",
+        frozen_value=[],
+        official_sdk_value=official_templates,
+    )
 
 
 @pytest.mark.asyncio
@@ -221,6 +340,7 @@ def test_accepted_sdk_difference_ledger_is_closed_and_digest_bound() -> None:
     assert raw["schema_version"] == "1.0"
     differences = raw["differences"]
     assert isinstance(differences, list)
+    assert frozenset(_difference_records_by_case()) == _EXPECTED_DIFFERENCE_CASES
     for entry in differences:
         assert isinstance(entry, dict)
         assert set(entry) == {

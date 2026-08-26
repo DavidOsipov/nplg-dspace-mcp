@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "policy_id": "nplg.private-full.artifact-recovery.v1",
+  "profile": "private-full",
+  "owner": "NPLG private storage operator",
+  "rto": {
+    "objective_seconds": 900,
+    "clock": "protected-controller-monotonic",
+    "starts_at": "synthetic-volume-loss-confirmed",
+    "ends_at": "recovery-integrity-verified",
+    "over_objective_action": "block_release"
+  },
+  "subjects": [
+    {
+      "subject_id": "source-pdfs",
+      "namespace": "documents",
+      "classification": "unique",
+      "recovery_strategy": "immutable-backup-and-restore",
+      "backup_required": true,
+      "cold_regeneration_permitted": false,
+      "identity_check": "sha256-content-address",
+      "required_proof": "protected-immutable-backup-restore"
+    },
+    {
+      "subject_id": "derived-renders",
+      "namespace": "renders",
+      "classification": "derived",
+      "recovery_strategy": "bounded-cold-regeneration",
+      "backup_required": false,
+      "cold_regeneration_required": true,
+      "source_subject_id": "source-pdfs",
+      "regeneration_recipe_paths": [
+        "src/nplg_mcp/pdf.py",
+        "src/nplg_mcp/pdf_identity.py"
+      ],
+      "identity_check": "sha256-manifest-and-assets",
+      "required_proof": "protected-bounded-cold-regeneration"
+    }
+  ],
+  "filesystem_expectations": {
+    "owner_uid": 10001,
+    "owner_gid": 10001,
+    "directory_mode": "0700",
+    "regular_file_mode": "0600",
+    "symlinks_permitted": false,
+    "hardlinks_permitted": false,
+    "applies_to": [
+      "subjects",
+      "lifecycle-state",
+      "staging-reconstruction"
+    ]
+  },
+  "state_inventory": [
+    {
+      "state_id": "clock-high-water-and-boot-state",
+      "classification": "reconstructible-safety-state",
+      "persistence": "fsynced-private-record",
+      "location": ".retention-clock-high-water.json",
+      "schema_version": "1.0",
+      "identity_check": "record-digest-and-boot-id",
+      "recovery_strategy": "fail-closed-baseline-then-healthy-window",
+      "missing_or_corrupt_semantics": "rewrite-untrusted-baseline-and-close-age-deletion-and-new-ingest",
+      "post_termination_semantics": "persisted-record-revalidated-against-current-boot",
+      "backup_required": false,
+      "required_proof": "protected-high-water-recovery-and-clock-anomaly-closure"
+    },
+    {
+      "state_id": "insertion-high-water",
+      "classification": "unique-ordering-state",
+      "persistence": "fsynced-private-record",
+      "location": ".lifecycle-insertion-high-water.json",
+      "schema_version": "1.0",
+      "identity_check": "record-digest",
+      "recovery_strategy": "restore-or-initialize-only-without-sequence-records",
+      "missing_or_corrupt_semantics": "reject-when-sequence-records-exist-otherwise-initialize-at-one",
+      "post_termination_semantics": "load-before-per-object-reconciliation",
+      "backup_required": true,
+      "required_proof": "protected-insertion-high-water-restore"
+    },
+    {
+      "state_id": "per-object-insertion-sequence-records",
+      "classification": "reconstructible-object-ordering-state",
+      "persistence": "fsynced-per-object-private-record",
+      "location_patterns": [
+        "documents/*/.lifecycle-insertion-sequence.json",
+        "renders/*/.lifecycle-insertion-sequence.json"
+      ],
+      "schema_version": "1.0",
+      "identity_check": "record-digest-object-key-and-high-water-bound",
+      "recovery_strategy": "validate-existing-or-allocate-from-persisted-high-water",
+      "missing_or_corrupt_semantics": "allocate-missing-from-high-water-and-reject-invalid-or-duplicate",
+      "post_termination_semantics": "validate-every-record-and-bind-below-high-water",
+      "backup_required": false,
+      "required_proof": "protected-insertion-sequence-reconciliation"
+    },
+    {
+      "state_id": "orphan-staging-cleanup",
+      "classification": "ephemeral-transaction-state",
+      "persistence": "uncommitted-filesystem-state",
+      "location": ".staging",
+      "identity_check": "not-authoritative",
+      "recovery_strategy": "delete-entire-inventory-before-accounting",
+      "missing_or_corrupt_semantics": "absence-is-valid-and-every-entry-is-discarded",
+      "post_termination_semantics": "empty-before-committed-object-scan",
+      "backup_required": false,
+      "expected_post_reconstruction_entries": 0,
+      "required_proof": "protected-partial-restore-cleanup"
+    },
+    {
+      "state_id": "post-process-lease-reservation-reconciliation",
+      "classification": "process-local-ephemeral-state",
+      "persistence": "never-persisted",
+      "components": [
+        "asset-leases",
+        "staging-byte-reservations",
+        "publication-reservations",
+        "publication-reserved-bytes",
+        "publication-reserved-objects",
+        "publication-reserved-inodes"
+      ],
+      "identity_check": "exact-empty-ledgers-and-recomputed-committed-usage",
+      "recovery_strategy": "release-or-abort-on-worker-exit-then-reconstruct-empty-on-restart",
+      "post_termination_semantics": "dead-process-leases-and-reservations-are-not-restored",
+      "worker_termination_semantics": "release-or-abort-worker-owned-leases-and-reservations",
+      "restart_reconstruction_semantics": "start-ledgers-empty-after-staging-cleanup-and-committed-object-scan",
+      "committed_usage_reconciliation": "rescan-documents-and-renders-excluding-sequence-records",
+      "backup_required": false,
+      "expected_active_leases": 0,
+      "expected_staging_reservations": 0,
+      "expected_publication_reservations": 0,
+      "expected_reserved_bytes": 0,
+      "expected_reserved_objects": 0,
+      "expected_reserved_inodes": 0,
+      "required_proof": "protected-empty-lease-reservation-reconciliation"
+    }
+  ],
+  "evidence": {
+    "status": "external_authority_required",
+    "gate_id": "private-full.recovery-proof",
+    "command_id": "container.private-full-recovery.v2",
+    "signed_proof_schema": "recovery-proof.v2",
+    "candidate_generated": false,
+    "measured_rto_seconds": null,
+    "source_backup_restore_proof_sha256": null,
+    "derived_regeneration_proof_sha256": null,
+    "state_reconstruction_proof_sha256": null,
+    "controller_receipt_sha256": null,
+    "blockers": [
+      "UNIQUE_SOURCE_BACKUP_RESTORE_PROOF_REQUIRED",
+      "DERIVED_RENDER_REGENERATION_PROOF_REQUIRED",
+      "PERSISTENT_STATE_RECONSTRUCTION_PROOF_REQUIRED",
+      "MEASURED_RTO_PROOF_REQUIRED",
+      "PROTECTED_RECOVERY_AUTHORITY_REQUIRED"
+    ]
+  },
+  "terminal_verdict": "do_not_release",
+  "release_ready": false,
+  "policy_digest": "sha256:6a9f6786479f139129f57c95d18820f55dc192a44d7d32d6ce2a385fe325bbf3"
+}

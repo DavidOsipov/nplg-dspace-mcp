@@ -4,6 +4,11 @@
 > required no-network, mTLS, scanner, quota, and recovery claims require the
 > controller-authoritative external gates in the implementation plan. Do not treat a
 > successful local Compose start as ASVS L2 or release evidence.
+>
+> **Activation blocker:** the checked-in OAuth provider verdict is unsupported, and
+> production startup deliberately stops before dependency construction. The commands
+> below remain future candidate scaffolding; do not start or expose this Compose stack,
+> and do not add a static bearer token, API key, or principal registry as a fallback.
 
 The Compose candidate assumes a dedicated Linux VPS, a public DNS name, Docker Engine,
 and Docker Compose v2. Caddy terminates public TLS and forwards only to the mutually
@@ -26,11 +31,12 @@ environment example with `DEPLOYMENT_PROFILE=private-full`,
 `PDF_EXECUTOR=unix-worker`, and `PRIVATE_EDGE_TLS=true`. The generic metadata-only
 profile remains separately supported but is not what this Compose file starts.
 `MAX_CONCURRENT_MCP_REQUESTS` is a fail-fast global emergency ceiling (default 16),
-while `MAX_CONCURRENT_MCP_REQUESTS_PER_PRINCIPAL` (default 4) prevents one configured
-credential from consuming every MCP permit. `MAX_CONCURRENT_HTTP_REQUESTS` supplies a
-larger Uvicorn-wide ceiling (default 128). Saturated gates return HTTP 503 instead of
-queueing unbounded work, and `REQUEST_BODY_TIMEOUT_SECONDS` (default 10) releases
-permits when a client stalls while uploading JSON.
+while `MAX_CONCURRENT_MCP_REQUESTS_PER_PRINCIPAL` (default 4) reserves the future
+identity-aware per-principal ceiling. It is not evidence that static credentials or the
+selected OIDC verifier are active. `MAX_CONCURRENT_HTTP_REQUESTS` supplies a larger
+Uvicorn-wide ceiling (default 128). Saturated gates return HTTP 503 instead of queueing
+unbounded work, and `REQUEST_BODY_TIMEOUT_SECONDS` (default 10) releases permits when a
+client stalls while uploading JSON.
 
 Create an A and/or AAAA record for the MCP hostname and point it at the VPS before starting Caddy.
 
@@ -44,23 +50,16 @@ chmod 600 .env
 
 python3 - <<'PY'
 from pathlib import Path
-import json
 import secrets
 
 path = Path('.env')
 text = path.read_text()
 text = text.replace('mcp.example.com', 'mcp.your-domain.example')
 text = text.replace(
-    'ASSET_SIGNING_SECRET=replace-with-at-least-32-random-characters',
-    f'ASSET_SIGNING_SECRET={secrets.token_hex(32)}',
+    'CURSOR_SIGNING_SECRET=replace-with-at-least-32-random-characters',
+    f'CURSOR_SIGNING_SECRET={secrets.token_hex(32)}',
 )
-text = text.replace(
-    'API_PRINCIPALS_JSON=[{"principal_id":"primary","bearer_token":"replace-with-at-least-32-random-characters"}]',
-    'API_PRINCIPALS_JSON=' + json.dumps(
-        [{"principal_id": "primary", "bearer_token": secrets.token_hex(32)}],
-        separators=(",", ":"),
-    ),
-)
+text += f'\nASSET_SIGNING_SECRET={secrets.token_hex(32)}\n'
 path.write_text(text)
 PY
 ```
@@ -88,9 +87,10 @@ only this one serialized, bounded slot plus their AF_UNIX socket; the worker
 has no mount of `/data/cache`.
 
 Review `.env`. `MCP_DOMAIN` must contain only the host name and `PUBLIC_BASE_URL` must
-be the matching HTTPS origin. Give each client or operator a distinct registry entry
-and credential. The Compose service overrides the profile and internal port values;
-do not try to enable private TLS by placing certificate material in `.env`.
+be the matching HTTPS origin. Do not add `API_PRINCIPALS_JSON`, `API_BEARER_TOKEN`,
+`API_KEY`, or any equivalent shared credential. The Compose service overrides the
+profile and internal port values; do not try to enable private TLS by placing
+certificate material in `.env`.
 
 Before any candidate start, the deployment-specific private CA must provision six
 **external Docker secrets** outside the repository and outside normal environment
@@ -111,9 +111,14 @@ set -a
 set +a
 ```
 
-Never commit `.env`, expose a principal credential in shell history, share one credential across callers, or reuse `ASSET_SIGNING_SECRET` as an API credential.
+Never commit `.env`, expose credentials in shell history, or reuse signing material
+for authentication.
 
 ## 3. Validate and start
+
+The validation command may be used to review Compose interpolation. Do not run the
+build/start commands until the governed provider contract and OIDC implementation are
+complete and a protected controller authorizes the candidate.
 
 ```bash
 docker compose --env-file .env config --quiet
@@ -129,14 +134,21 @@ Caddy obtains and renews certificates automatically. The application itself is n
 
 ## 4. Verify protocol and live repository access
 
-Run the deterministic deployment verifier first:
+These commands are retained as future protected-staging procedure, not as a runnable
+shared-secret flow. The current candidate has no authorized production endpoint to
+verify.
 
 ```bash
 python3 scripts/verify_deploy.py \
   --base-url "$PUBLIC_BASE_URL"
 ```
 
-It checks the sessionless MCP `2026-07-28` envelope, discovery, and the exact metadata-only tool catalog. It does not query the public probe paths because Caddy deliberately returns 404 for them. Before running it, export `API_BEARER_TOKEN` with the bearer value for one configured verification principal; this variable is a verifier input and is not present in the application container.
+The future protected verifier must receive an OAuth access-token handle from the
+credential broker after the selected issuer/resource/audience relationship is proven.
+Legacy bearer-token and API-key environment inputs are not substitutes. The verifier
+checks the sessionless MCP `2026-07-28` envelope, discovery, and the exact metadata-only
+tool catalog. It does not query the public probe paths because Caddy deliberately
+returns 404 for them.
 
 Probe verification is opt-in and accepts only a loopback HTTP URL, for example `--probe-base-url http://127.0.0.1:8000` when the verifier runs in the application network namespace. The verifier compares canonical origins, including default ports and host case, and rejects reuse of the public `--base-url` origin. The separate private-network commands in the operations section remain the default Docker procedure.
 

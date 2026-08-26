@@ -1,0 +1,8 @@
+SPDX-License-Identifier: CC0-1.0
+
+This directory contains only repository-authored synthetic PDF fixtures.
+No third-party documents, executable payloads, or copyrighted source PDFs are included.
+
+To the extent possible under law, the author has waived copyright and related
+rights in these fixture bytes under CC0 1.0 Universal.
+See https://creativecommons.org/publicdomain/zero/1.0/

@@ -46,10 +46,27 @@
 
 **Tech Stack:** CPython 3.12-3.14 (3.13 production), `mcp==2.0.0`, `mcp-types==2.0.0`, Pydantic 2.13.4, Starlette/FastAPI, `httpx2` for the official SDK client transport plus HTTPX/httpcore for project upstream I/O, conditional signed-JWT access-token verification with `PyJWT[crypto]==2.13.0` and `cryptography==50.0.0` only after the selected issuer capability record proves that token format (an opaque-token issuer requires a separately designed and locked RFC 7662 introspection branch), pypdfium2/PDFium, Pillow, `pytest==9.1.1`, `pytest-asyncio==1.4.0`, `hypothesis==6.165.9`, `coverage==7.15.4`, `build==1.5.0`, `setuptools==84.0.0`, `wheel==0.48.0`, Ruff 0.16.3, official npm `pyright@1.1.413` strict, `mypy==2.3.1` strict with the Pydantic plugin, Bandit, Semgrep, pip-audit, CycloneDX, Trivy, Node 24 for development/contract tests only, `typescript@6.0.3`, `eslint@10.8.1`, `@eslint/js@10.0.1`, `typescript-eslint@8.67.0`, `@types/node@24.13.3`, `zod@4.4.3`, the reviewed pre-release `@modelcontextprotocol/conformance@0.2.0-alpha.11`, and operational CLI/SDK/contracts `alpic@1.167.1`/`@alpic-ai/sdk@1.167.1`/`@alpic-ai/api@1.167.1`. TypeScript 7 is deliberately not used until the selected type-aware ESLint stack declares support.
 
+**Phase 6 provider/client-registration decision (2026-08-24):** The first protected `alpic-metadata` staging target is **Auth0 OIDC as the upstream identity provider plus Alpic's DCR proxy as the MCP client-registration compatibility layer**. Alpic's current documentation explicitly names Auth0 among providers without native DCR, lists its OIDC discovery endpoint template, and documents the DCR proxy/client-pool flow. This selects an integration topology, not a proven tenant or token-verification branch. The backend metadata must satisfy Alpic's documented DCR-pool precondition by referencing the server itself as issuer and omitting `registration_endpoint`; the public edge is expected to advertise Alpic's registration endpoint and proxy token requests through one upstream Auth0 client. The exact Auth0 token issuer, public/backend authorization-server metadata, registration/token endpoint rewrites, resource/audience, callback URI, scopes, token format, client identity, subject stability, and lifecycle behavior remain evidence-bound fields. Until a named Auth0 tenant and named Alpic environment witness that complete mapping, retain `OAUTH_PROVIDER_CAPABILITY_UNPROVEN`, `ALPIC_DCR_ISSUER_SEMANTICS_UNPROVEN`, and `OAUTH_END_TO_END_FLOW_UNPROVEN`; neither the provider directory nor this decision permits installing the JWT branch or deploying.
+
+**Phase 7 Alpic Tasks decision correction (2026-08-24):** Alpic is the
+selected hosting and control-plane provider for the `distributed-full`
+compatibility assessment. Alpic's current troubleshooting documentation
+advertises a separate long-running Tasks compute path with a default TTL of
+up to six hours, so the earlier claim that the platform exposed no
+long-running mechanism is superseded. This is a provider claim, not yet a
+version-matched Python integration or durability proof. The installed and
+pinned `mcp==2.0.0` package exports no SEP-2663 Tasks models or handlers, and
+the official Python SDK roadmap says the Tasks extension was deferred from
+2.0. Phase 7 is therefore revised below into an executable, expected-negative
+Alpic capability/conformance assessment. It must not enable
+`distributed-full`, invent a private Tasks wire implementation, or treat a
+six-hour TTL as proof of restart recovery, cross-principal isolation,
+artifact storage, retention, purge, or backup/restore.
+
 ## Global Constraints
 
 - Use the official [Model Context Protocol Python SDK](https://github.com/modelcontextprotocol/python-sdk); do not retain a private MCP wire implementation after parity cutover.
-- Let the official SDK own MCP parsing, modern-version metadata/body validation, authentication, and dispatch at the Python backend after a project-owned bounded framing/Host/Origin/admission gate. A narrowly reviewed version-routing guard rejects absent/unsafe/duplicate/handshake-era headers solely to prevent the pinned SDK's legacy path, passes supported and bounded safe unsupported modern tokens unchanged, and never parses or reimplements JSON-RPC/MCP semantics. On protected `/mcp`, that guard may run only after the SDK has produced the credentialless/invalid-token `401` challenge and authenticated an otherwise admissible request exactly once; it must not preempt Alpic's documented unauthenticated `initialize` OAuth detector or allow that detector to reach legacy dispatch. Task 0 must prove a supported public SDK/vendor composition, the selected issuer/token-validation/client-registration capabilities, and the exact protected-resource-metadata route; Task 21 must prove the deployed environment is classified `Protected`. Otherwise stable blockers `ALPIC_OAUTH_DETECTOR_FIXTURE_UNPROVEN`, `ALPIC_OAUTH_DISCOVERY_ORDERING_UNPROVEN`, `ALPIC_PRM_ROUTE_COMPATIBILITY_UNPROVEN`, `ALPIC_PROTECTED_CLASSIFICATION_UNPROVEN`, `OAUTH_PROVIDER_CAPABILITY_UNPROVEN`, and `OAUTH_END_TO_END_FLOW_UNPROVEN` remain. For Alpic, model the separate client-to-Alpic and Alpic-to-backend MCP hops explicitly: Alpic owns the public-edge MCP exchange and may translate protocol versions, rewrite its documented backend-local metadata coordinates to public coordinates, or normalize messages, but every such transformation must be observed and bound rather than assumed.
+- Let the official SDK own MCP parsing, modern-version metadata/body validation, authentication, and dispatch at the Python backend after a project-owned bounded framing/Host/Origin/admission gate. A narrowly reviewed version-routing guard rejects absent/unsafe/duplicate/handshake-era headers solely to prevent the pinned SDK's legacy path, passes supported and bounded safe unsupported modern tokens unchanged, and never parses or reimplements JSON-RPC/MCP semantics. On protected `/mcp`, that guard may run only after the SDK has produced the credentialless/invalid-token `401` challenge and authenticated an otherwise admissible request exactly once; it must not preempt Alpic's documented unauthenticated `initialize` OAuth detector or allow that detector to reach legacy dispatch. Task 0 must prove a supported public SDK/vendor composition, the selected issuer/token-validation/client-registration capabilities, and the exact protected-resource-metadata route; Task 21 must prove the deployed environment is classified `Protected`. Otherwise stable blockers `ALPIC_OAUTH_DETECTOR_FIXTURE_UNPROVEN`, `ALPIC_OAUTH_DISCOVERY_ORDERING_UNPROVEN`, `ALPIC_PRM_ROUTE_COMPATIBILITY_UNPROVEN`, `ALPIC_PROTECTED_CLASSIFICATION_UNPROVEN`, `ALPIC_DCR_ISSUER_SEMANTICS_UNPROVEN`, `OAUTH_PROVIDER_CAPABILITY_UNPROVEN`, and `OAUTH_END_TO_END_FLOW_UNPROVEN` remain. For Alpic, model the separate client-to-Alpic and Alpic-to-backend MCP hops explicitly: Alpic owns the public-edge MCP exchange and may translate protocol versions, rewrite its documented backend-local metadata coordinates to public coordinates, or normalize messages, but every such transformation must be observed and bound rather than assumed.
 - Pin reviewed runtime and development dependencies exactly and regenerate `requirements.lock` with hashes atomically.
 - Bootstrap development from an explicit CPython 3.13/hash-locked procedure before invoking `.venv/bin/*`; a machine-local environment is never an undocumented prerequisite.
 - Pydantic is the Python runtime authority. All boundary models use strict types, explicit bounds, `extra="forbid"`, and validated outputs.
@@ -66,7 +83,7 @@
 - Treat NPLG metadata, HTML, XML, filenames, PDFs, image contents, and MCP arguments as untrusted.
 - Preserve canonical-handle enforcement, bounded streaming, redirect validation, MIME/magic validation, content addressing, symlink defenses, atomic publication, and deterministic render semantics.
 - Do not run PDFium concurrently in Python threads. The immediate compatibility backend is serialized; the production full-fidelity backend is killable and OS-isolated.
-- Do not invent an MCP Tasks protocol. Python SDK 2.0.0 does not implement Tasks; any future Tasks integration requires a version-matched official or vendor-supported adapter.
+- Do not invent an MCP Tasks protocol. Python SDK 2.0.0 does not implement SEP-2663 Tasks. Alpic's advertised Tasks compute path is provider capability evidence, not a substitute for a version-matched stable Python API, strict wire models, official-client support, or staging conformance.
 - The first Alpic release profile is `alpic-metadata` and exposes exactly `search_documents`, `get_document_metadata`, and `list_document_files`.
 - The `alpic-metadata` profile must not rely on cross-invocation local filesystem state, runtime-generated `/assets` routes, or custom public health/metrics routes.
 - Keep ordinary Alpic tool execution below a 20-second local deadline, leaving at least 10 seconds of headroom under Alpic's documented 30-second ceiling.
@@ -124,15 +141,16 @@ This plan supersedes the runtime direction in `docs/superpowers/specs/2026-08-14
 | --- | ---: | --- | --- | --- |
 | `alpic-metadata` | Yes | Search, metadata, file inventory | No correctness dependency on local disk | Forbidden; 20-second local deadline |
 | `private-full` | Existing capability, hardened before release | Current full catalog | Persistent local volume | Isolated PDF worker |
-| `distributed-full` | Conditional | Full catalog or approved job tools | Durable object and job stores | External isolated worker |
+| `distributed-full` | Compatibility assessment only | No public surface until a later approved implementation plan | Alpic Tasks state plus artifact-store durability must be independently proven | Alpic Tasks control plane plus an isolated worker, both unproven |
 
 The metadata-first choice is confirmed by Task 1 and its accepted ADR:
-`alpic-metadata` is the only first-release Alpic profile. If that scope changes
-to include PDF download/render/tile processing, stop this plan and write the
-separate provider/job/object-storage design required by Phase 7.
-Full-fidelity Alpic remains blocked until the platform and official SDK expose
-a version-matched supported mechanism for durable long-running work, or the
-architecture uses an external service without presenting it as MCP Tasks.
+`alpic-metadata` is the only first-release Alpic profile. Alpic is selected as
+the Phase 7 provider, but that selection does not prove that Alpic Tasks owns
+the application job database, private artifact store, worker isolation, or
+recovery controls. Phase 7 may now execute its typed compatibility assessment;
+full-fidelity implementation remains blocked until the official Python SDK and
+an authorized Alpic staging environment prove the same Tasks revision and a
+separate approved plan freezes every remaining job/artifact decision.
 
 ## 2. Phase Dependency Graph
 
@@ -152,7 +170,10 @@ Phase 1 + Phase 3 + Phase 5
   └── Phase 6 Tasks 19–20: profile isolation and identity/audit controls
         └── Task 21: authenticated Alpic metadata staging/release
 
-Phase 7 is a stop gate for a separate provider-specific full-fidelity plan.
+Phase 6 + the pinned official Python SDK
+  └── Phase 7 Task 21A: typed Alpic Tasks capability/conformance assessment
+        └── supported verdict: separate full-fidelity implementation plan
+        └── unsupported verdict: retain the startup error and blocker ledger
 
 All selected phases
   └── Phase 8: ASVS evidence closure and release decision
@@ -193,7 +214,7 @@ The phases have independent deliverables and rollback boundaries, but their shar
 - `contracts/accepted-sdk-differences.json` — reviewed protocol-standard differences without mutating the baseline oracle.
 - `contracts/sdk-authorization-capability.json` — machine-readable, digest-bound Phase 0 verdict for the pinned SDK's parsed-operation HTTP-403 capability.
 - `contracts/alpic-oauth-discovery-capability.json` — machine-readable, digest-bound Phase 0 verdict for Alpic detector provenance, auth ordering, and the backend/public protected-resource tuple.
-- `contracts/oauth-provider-capability.json` — machine-readable, digest-bound issuer, access-token-validation, resource/audience, and client-registration capability verdict selected before auth implementation.
+- `contracts/oauth-provider-capability.json` — machine-readable, digest-bound Auth0 tenant issuer, access-token-validation, resource/audience, and Alpic-DCR client-registration capability verdict selected before auth implementation.
 - `contracts/generated/tool-contracts.schema.json` — the one deterministic, closed-inventory Pydantic JSON Schema bundle.
 - `contracts/zod/*.ts` — independent strict Zod definitions and fixture runner.
 - `tests/contracts/test_frozen_baseline.py` — baseline completeness and determinism.
@@ -381,7 +402,7 @@ existing lock authority.
 - Produces a closed, platform-keyed `security/bootstrap-toolchain-lock.json` for each supported developer/CI Linux target. Each entry records tool, exact version, upstream publisher, immutable HTTPS artifact/checksum/signature URLs, SHA-256, signer/key fingerprint where upstream signatures exist, archive format, allowed top-level entries, embedded-version command, current registry/upstream version at review time, chosen version, and hold rationale. `scripts/bootstrap_toolchain.py` requires only a documented system Python 3.12+ and OS trust store, accepts a caller-created external mode-`0700` tool root, disables ambient proxies, forbids redirects/credentials/symlinks/special files/path traversal, verifies digest/signature before safe extraction, and atomically installs without executing a remote installer. Unknown target, missing signature/digest, unexpected archive entry, embedded-version mismatch, or current/chosen ledger drift fails closed. This checked-in lock is the supply-chain trust root; Task 0 does not claim a bare host without the documented system-Python/CA prerequisite.
 - Produces a strict `SdkAuthorizationCapabilityVerdict` and canonical `contracts/sdk-authorization-capability.json` from one minimal raw-wire feasibility test against the exact installed MCP SDK: whether a supported public extension point can consume the SDK-parsed method/tool/resource identity and still return operation-specific transport HTTP 403 with the exact RFC 9728 minimum-scope challenge, without trusting routing headers or reparsing MCP. The record binds schema version, `mcp`/`mcp-types` versions, upstream tag/commit and installed-file digest, protocol revision, raw-wire case/observation digest, `supported`, stable blocker/reason, and reviewed date; generation/check is deterministic and SPEC/ADR/release manifests freeze its digest. SDK v2.0.0 is expected to report `supported=false`: its bearer middleware applies one static scope list before parsing, while parsed-operation handlers return MCP results rather than ASGI responses. True/false, SDK-file, challenge, case, and blocker mutations must fail. This negative verdict is valid evidence and creates stable blocker `MCP_DYNAMIC_SCOPE_403_UNSUPPORTED`; a reviewed upstream SDK release/adapter or explicit user-approved coarse-scope/header-binding design is required to clear it.
 - Produces a separate strict `AlpicOAuthDiscoveryCapabilityVerdict` and canonical `contracts/alpic-oauth-discovery-capability.json`. Alpic's public documentation states only that deployment sends an unauthenticated MCP `initialize` and requires HTTP 401 plus a root `/.well-known/oauth-protected-resource` challenge; it does not publish the detector's HTTP method, backend path, JSON-RPC ID/body/protocol version, `Accept`/`Content-Type`, `MCP-Protocol-Version`, Host/Origin, response-body contract, or tolerance for additional challenge parameters. The record therefore includes `detector_contract_source: Literal["vendor_fixture", "bounded_documented_approximation"]`, the complete bounded request fixture, its provenance/digest, and `exact_detector_fixture_supported`; absent a versioned raw vendor fixture preserves `ALPIC_OAUTH_DETECTOR_FIXTURE_UNPROVEN` and no local request may be called an exact replay. The local raw-wire matrix does not assume a modern protocol-version header and requires an SDK-owned HTTP 401 with exactly one syntactically valid `WWW-Authenticate: Bearer` challenge, zero legacy/session-manager/handler entry, and no second token verifier. It separately freezes the backend-local `AuthSettings.resource_server_url`, challenge `resource_metadata` URI, local metadata route/document `resource`, public MCP transport endpoint, public OAuth resource/audience, any observed Alpic rewrite mapping, SDK source digest, request/response digest, and whether a supported public composition authenticates before the modern-only routing guard. Do not assume the `/mcp` transport URL is also the OAuth resource: MCP 2026-07-28 permits both root and path-specific protected-resource discovery, while SDK v2.0.0 derives a root route for an origin resource and a path-qualified route for a `/mcp` resource. Test and freeze the one issuer/client/provider-compatible tuple. Any unresolved route/resource/rewrite mismatch is `ALPIC_PRM_ROUTE_COMPATIBILITY_UNPROVEN`; any private/internal SDK seam, duplicate verifier, legacy dispatch, or pre-auth 400 is `ALPIC_OAUTH_DISCOVERY_ORDERING_UNPROVEN`. A locally positive approximation is necessary but cannot clear the detector-fixture or protected-classification blockers; only vendor evidence can clear the former and Task 21's deployment-bound provider observation can clear the latter. Verdict, route, resource, rewrite, challenge, source, request, dispatch-count, and blocker mutations must fail.
-- Produces a strict `OAuthProviderCapabilityVerdict` and canonical `contracts/oauth-provider-capability.json` before choosing a verifier implementation. It binds the selected issuer/tenant and exact discovery issuer string; authorization/token/JWKS or RFC 7662 introspection endpoints; access-token format `Literal["signed_jwt", "opaque"]`; exact resource/audience issuance semantics; access-token-purpose and client-identity claims; PKCE S256; RFC 9207 authorization-response issuer behavior; scopes; token lifetime/revocation; and supported client-registration modes `preregistered`, `cimd`, and legacy `dcr`. A provider directory entry or synthetic token is not proof. No automatic JWT/opaque fallback is allowed: only a proven signed-JWT verdict selects the plan's PyJWT branch; an opaque verdict requires a separately reviewed introspection design, client-auth secret lifecycle, dependency/egress model, and TDD ledger. Missing or negative evidence preserves `OAUTH_PROVIDER_CAPABILITY_UNPROVEN`; an unproven registration mode additionally preserves `OAUTH_END_TO_END_FLOW_UNPROVEN`. If Alpic legacy DCR is selected, reconcile its OAuth-setup instruction to advertise the external IdP with its DCR-proxy instruction that the server reference itself as issuer; absent a versioned vendor contract and witnessed discovery flow preserves `ALPIC_DCR_ISSUER_SEMANTICS_UNPROVEN`. Field, endpoint, token-format, issuer, resource, registration-mode, evidence-digest, and blocker mutations must fail.
+- Produces a strict `OAuthProviderCapabilityVerdict` and canonical `contracts/oauth-provider-capability.json` before choosing a verifier implementation. For the selected first target it fixes `provider="auth0"` and `client_registration_mode="alpic_dcr_proxy"`, then binds one named Auth0 tenant/custom domain and its byte-exact OIDC discovery issuer string; authorization/token/JWKS or RFC 7662 introspection endpoints; access-token format `Literal["signed_jwt", "opaque"]`; exact resource/audience issuance semantics; access-token-purpose and client-identity claims; PKCE S256; RFC 9207 authorization-response issuer behavior; scopes; token lifetime/revocation; and the Alpic client-pool environment. It separately models the upstream Auth0 token issuer, the backend self-issuer metadata required to enable Alpic's DCR pool, and the public-edge authorization/registration/token endpoints observed by clients; equality is forbidden unless the witnessed contract requires it. Alpic's Auth0 directory entry, the documented DCR proxy shape, or a synthetic token proves topology compatibility only, never tenant capability. No automatic JWT/opaque fallback is allowed: only a proven signed-JWT verdict selects the plan's PyJWT branch; an opaque verdict requires a separately reviewed introspection design, client-auth secret lifecycle, dependency/egress model, and TDD ledger. Missing or negative evidence preserves `OAUTH_PROVIDER_CAPABILITY_UNPROVEN`; an unproven registration mode additionally preserves `OAUTH_END_TO_END_FLOW_UNPROVEN`. The backend must reference itself as issuer and omit `registration_endpoint` before DCR-pool creation, while the observed public edge must advertise Alpic's registration endpoint after pool creation. A versioned vendor contract plus witnessed before/after discovery and authorization flow must reconcile that self-versus-Auth0 issuer topology; otherwise preserve `ALPIC_DCR_ISSUER_SEMANTICS_UNPROVEN`. Field, provider, tenant, endpoint, token-format, issuer-role, resource, registration-mode, client-pool-environment, evidence-digest, and blocker mutations must fail.
 
 - [ ] **Step 1: Create the lock inputs before invoking `.venv`**
 
@@ -1802,7 +1823,7 @@ Configure Ruff for the lowest supported Python, `target-version = "py312"`, and 
 
 Configure Pyright `typeCheckingMode = "strict"`, `pythonVersion = "3.12"`, `include = ["src", "tests", "scripts", "typings"]`, `stubPath = "typings"`, `enableTypeIgnoreComments = false`, `reportMissingTypeStubs = "error"`, and no blanket ignore patterns. Strict mode is a preset, not a maximal guarantee: promote every non-error diagnostic in Pyright 1.1.413's official strict table—`reportMissingModuleSource`, `reportCallInDefaultInitializer`, `reportImplicitOverride`, `reportImplicitStringConcatenation`, `reportImportCycles`, `reportMissingSuperCall`, `reportPropertyTypeMismatch`, `reportUninitializedInstanceVariable`, `reportUnnecessaryTypeIgnoreComment`, `reportUnreachable`, and `reportUnusedCallResult`—to `"error"`. The static policy freezes that complete set and fails when a future Pyright version adds or changes a non-error strict diagnostic until it is reviewed. Use only official npm `pyright@1.1.413`; do not install or invoke the independently versioned PyPI wrapper.
 
-Configure mypy `python_version = "3.12"`, `strict = true`, `extra_checks = true`, `strict_equality_for_none = true`, `strict_bytes = true`, `warn_unreachable = true`, `warn_unused_configs = true`, `incremental = false`, `disallow_any_generics = true`, `disallow_any_explicit = true`, `disallow_any_unimported = true`, `disallow_any_decorated = true`, `disallow_any_expr = true`, `plugins = ["pydantic.mypy"]`, and an exact `mypy_path = "typings"`. Freeze the complete mypy 2.3.1 optional-check catalogue, including checks already activated indirectly by `strict`, in `enable_error_code`: `comparison-overlap`, `deprecated`, `exhaustive-match`, `explicit-any`, `explicit-override`, `ignore-without-code`, `mutable-override`, `no-any-return`, `no-any-unimported`, `no-untyped-call`, `no-untyped-def`, `possibly-undefined`, `redundant-cast`, `redundant-expr`, `redundant-self`, `truthy-bool`, `truthy-iterable`, `type-arg`, `unimported-reveal`, `unreachable`, `untyped-decorator`, `unused-awaitable`, and `unused-ignore`; an unknown/removed code or a new catalogue code fails configuration review rather than being ignored. `[tool.pydantic-mypy]` enables `init_forbid_extra`, `init_typed`, and `warn_required_dynamic_aliases`. Ruff, Pyright, and mypy must receive or automatically add the `typings` root on every repository-wide invocation; a gate that omits it fails its own static policy test. No `Any` annotation, alias, local, imported/decorated escape, `cast(Any, ...)`, or untyped adapter is permitted outside one exact AST-inventoried interoperability boundary with a typed `object` input and immediate strict validation; the preferred inventory is empty.
+Configure mypy `python_version = "3.12"`, `strict = true`, `extra_checks = true`, `strict_equality_for_none = true`, `strict_bytes = true`, `warn_unreachable = true`, `warn_unused_configs = true`, `incremental = false`, `disallow_any_generics = true`, `disallow_any_explicit = true`, `disallow_any_unimported = true`, `disallow_any_decorated = true`, `disallow_any_expr = true`, `plugins = ["pydantic.mypy"]`, and an exact `mypy_path = "typings:src"`. Freeze the complete mypy 2.3.1 optional-check catalogue, including checks already activated indirectly by `strict`, in `enable_error_code`: `comparison-overlap`, `deprecated`, `exhaustive-match`, `explicit-any`, `explicit-override`, `ignore-without-code`, `mutable-override`, `no-any-return`, `no-any-unimported`, `no-untyped-call`, `no-untyped-def`, `possibly-undefined`, `redundant-cast`, `redundant-expr`, `redundant-self`, `truthy-bool`, `truthy-iterable`, `type-arg`, `unimported-reveal`, `unreachable`, `untyped-decorator`, `unused-awaitable`, and `unused-ignore`; an unknown/removed code or a new catalogue code fails configuration review rather than being ignored. `[tool.pydantic-mypy]` enables `init_forbid_extra`, `init_typed`, and `warn_required_dynamic_aliases`. Ruff, Pyright, and mypy must receive or automatically add the `typings` root on every repository-wide invocation; mypy additionally retains `src` in its module search path, and a gate that omits either root fails its own static policy test. No `Any` annotation, alias, local, imported/decorated escape, `cast(Any, ...)`, or untyped adapter is permitted outside one exact AST-inventoried interoperability boundary with a typed `object` input and immediate strict validation; the preferred inventory is empty.
 
 The quality runner executes both checkers against Python 3.12, 3.13, and 3.14 using generated external exact configs/CLI overrides while preserving every base rule; it fails if a version-specific branch or typeshed signature is unchecked. Negative fixtures prove missing module source, a call in a default initializer, implicit string concatenation, a missing super call, import cycles, implicit overrides, uninitialized attributes, unreachable or redundant expressions, redundant casts and `Self`, discarded awaitables, unused call results, unimported `reveal_type`, explicit/aliased/imported/decorated `Any`, `cast(Any, ...)`, non-exhaustive matches, unsafe mutable overrides, possibly undefined names, truthy-only protocols, a misspelled/unused mypy override, `# type: ignore` without a code, an unnecessary coded ignore, and `# pyright: ignore` cannot silently bypass the gate. Any narrowly unavoidable suppression must name its checker code, rationale, upstream issue, and exact path/line in one closed static inventory; an uninventoryed, moved, unnecessary, or blanket suppression fails. Regenerate the exact/hash-locked Python and npm locks after every input change.
 
@@ -2446,9 +2467,9 @@ Cover every public error branch, timeout, cancellation cleanup, malformed/oversi
 
 Configure Coverage.py for spawned workers with subprocess patching, parallel data files, and `coverage combine`; add a canary subprocess test that fails if child-process lines are absent from the report. Unit-test `run_test_gate.py` with synthetic coverage XML proving that 99.99% for any named decision module, an absent module, or a report with no branch data fails even when project and diff floors pass. The 95% project floor does not replace the policy's 100% branch floor for the exact small allow/deny, authentication, schema-validation, and public-error decision modules.
 
-Also unit-test the changed-arc gate with synthetic Coverage JSON. A deliberate fixture executes a changed `if` line but only one destination: the changed-line metric must pass and the independent arc gate must fail. Reject one missing changed arc, JSON/XML disagreement, new-file arc omission, rename/copy evasion, a source line outside the verified diff, and a report with line data but no branch-pair data. Require zero missing changed arcs in addition to the existing decision-module policy.
+Also unit-test the changed-arc gate with synthetic Coverage JSON. A deliberate fixture executes a changed `if` line but only one destination: the changed-line metric must pass and the independent arc gate must fail whenever that omission takes changed branch-arc coverage below 95%. Reject JSON/XML disagreement, new-file arc omission, rename/copy evasion, a source line outside the verified diff, and a report with line data but no branch-pair data. Require exact changed-arc accounting and the executable 95% floor in addition to the 100% closed decision-module policy.
 
-Add real temporary-repository tests in which a newly created, untracked Python module and a separate untracked Python script each have an executable uncovered line: developer mode must report each line as changed and fail the 100% diff gate. Then cover the lines and prove GREEN. Also test rename/delete/binary/untracked-test cases, unstable bytes between the two snapshots, symlink/special-file input, ignored generated files, merge-base absence, and that neither the source repository's index nor refs change.
+Add real temporary-repository tests in which a newly created, untracked Python module and a separate untracked Python script each have an executable uncovered line: developer mode must report each line as changed and fail the 95% changed-line gate. Then cover the lines and prove GREEN. Also test rename/delete/binary/untracked-test cases, unstable bytes between the two snapshots, symlink/special-file input, ignored generated files, merge-base absence, and that neither the source repository's index nor refs change.
 
 - [ ] **Step 3: Add mutation checks for decision functions**
 
@@ -2478,7 +2499,7 @@ Run: `.venv/bin/python -m pytest tests/property -q`
 Run: `.venv/bin/python -m pytest tests/unit/test_mutation_gate.py tests/unit/test_test_gate.py -q`
 Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
 Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/security.py src/nplg_mcp/tokens.py src/nplg_mcp/downloader.py src/nplg_mcp/storage.py src/nplg_mcp/errors.py scripts/delete_render.py scripts/smoke_live.py scripts/run_quality_gate.py`
-Expected: PASS at 95% or higher with combined branch measurement, at least 65% exact test-failure mutation kills over the closed generated inventory, and 100% coverage of changed lines and changed branch arcs. An absent/shallow comparison base is a hard local failure; Task 8 separately wires sufficient CI history and the explicit base ref.
+Expected: PASS at 95% or higher for combined branch measurement, changed lines, and changed branch arcs, with at least 65% exact test-failure mutation kills over the closed generated inventory. Every closed decision module separately retains 100% branch coverage. An absent/shallow comparison base is a hard local failure; Task 8 separately wires sufficient CI history and the explicit base ref.
 
 Phase 1 sequencing correction: Task 7 and Task 8 intentionally modify tracked
 inputs covered by the frozen schema-v3 baseline manifest. Do not publish an
@@ -2541,7 +2562,7 @@ Any other open Task 7 blocker stops Task 8 implementation.
 
 #### Detailed acceptance criteria: static RED
 
-Assert that candidate CI pins every third-party Action to a full peeled commit SHA and runs exact CPython patches 3.12.14, 3.13.15, and 3.14.7. `actions/checkout` always uses `persist-credentials: false`; repository-code jobs have no `id-token: write`, `ACTIONS_ID_TOKEN_REQUEST_*`, persisted `http.*.extraheader`, credential helper/token/file, or other GitHub credential. If provenance/custody needs OIDC, grant it only after candidate execution to an immutable reusable workflow/controller outside the candidate repository, protected environment/ref, and candidate-controlled YAML/scripts; issuer policy pins the exact `job_workflow_ref`, workflow commit/digest, repository owner, ref/environment, audience, and subject, and the candidate artifact is data only. A same-repository “separate job” is not a protected authority. Canary candidates prove they cannot request OIDC or read Git config/environment/credential files, and receipts bind the external workflow identity. Every patch must create a fresh environment, sync the identical 3.12-lower-bound universal `requirements-dev.lock` with `--require-hashes`, import every direct runtime/test dependency, install the once-built canonical wheel, assert its `Requires-Python` is `>=3.12,<3.15`, run its CLI smoke, and execute the suite; a resolution/import/test failure on any patch invalidates the compatibility claim. A separate scheduled non-release job may float to the latest 3.12/3.13/3.14 patches to warn about drift, but its result never substitutes for candidate evidence and any discovered newer patch requires a reviewed bootstrap/CI-lock update. CI also executes all strict gates, verifies 95% coverage and 100% diff coverage, builds exactly one quarantined comparison wheel/sdist plus one canonical wheel/sdist, requires their reproducibility comparison before canonical digest selection, and preserves canonical test reports/SBOMs/provenance. Static policy rejects any build-system specifier/range, requires exact `setuptools==84.0.0` and `wheel==0.48.0` in both `[build-system].requires` and the hash lock, and rejects a package/release invocation missing `--no-isolation`. Require every exact development-tool pin to map to an executed local, CI, or release-manifest command; an installed-but-unused checker is a policy failure. Reject Semgrep `auto`, mutable registry aliases, an unverified rules digest, shallow history that makes diff coverage indeterminate, or any unexecuted required job. Test `verify_release.py` with injected fake runners: one failing command must stop the battery and no absent/skipped command may be reported as passed.
+Assert that candidate CI pins every third-party Action to a full peeled commit SHA and runs exact CPython patches 3.12.14, 3.13.15, and 3.14.7. `actions/checkout` always uses `persist-credentials: false`; repository-code jobs have no `id-token: write`, `ACTIONS_ID_TOKEN_REQUEST_*`, persisted `http.*.extraheader`, credential helper/token/file, or other GitHub credential. If provenance/custody needs OIDC, grant it only after candidate execution to an immutable reusable workflow/controller outside the candidate repository, protected environment/ref, and candidate-controlled YAML/scripts; issuer policy pins the exact `job_workflow_ref`, workflow commit/digest, repository owner, ref/environment, audience, and subject, and the candidate artifact is data only. A same-repository “separate job” is not a protected authority. Canary candidates prove they cannot request OIDC or read Git config/environment/credential files, and receipts bind the external workflow identity. Every patch must create a fresh environment, sync the identical 3.12-lower-bound universal `requirements-dev.lock` with `--require-hashes`, import every direct runtime/test dependency, install the once-built canonical wheel, assert its `Requires-Python` is `>=3.12,<3.15`, run its CLI smoke, and execute the suite; a resolution/import/test failure on any patch invalidates the compatibility claim. A separate scheduled non-release job may float to the latest 3.12/3.13/3.14 patches to warn about drift, but its result never substitutes for candidate evidence and any discovered newer patch requires a reviewed bootstrap/CI-lock update. CI also executes all strict gates, verifies at least 95% project branch, changed-line, and changed branch-arc coverage plus 100% branch coverage for every closed decision module, builds exactly one quarantined comparison wheel/sdist plus one canonical wheel/sdist, requires their reproducibility comparison before canonical digest selection, and preserves canonical test reports/SBOMs/provenance. Static policy rejects any build-system specifier/range, requires exact `setuptools==84.0.0` and `wheel==0.48.0` in both `[build-system].requires` and the hash lock, and rejects a package/release invocation missing `--no-isolation`. Require every exact development-tool pin to map to an executed local, CI, or release-manifest command; an installed-but-unused checker is a policy failure. Reject Semgrep `auto`, mutable registry aliases, an unverified rules digest, shallow history that makes diff coverage indeterminate, or any unexecuted required job. Test `verify_release.py` with injected fake runners: one failing command must stop the battery and no absent/skipped command may be reported as passed.
 
 Before the behavior assertion, create typed, behavior-free release-runner and external-bootstrap scaffolds. The former exposes immutable `GateCommand`/`GateResult` values and an injected `CommandRunner` protocol; its execution method deliberately raises `NotImplementedError`. The bootstrap is only a thin adapter over `bootstrap_toolchain.install_from_lock`, not a second downloader/extractor. Prove both new test files collect before asserting behavior. Test the adapter with local fake archives for digest mismatch, archive traversal/symlink entries, wrong embedded version, unsupported platform, partial download, and atomic replacement; tests never need the network. Verify that `.gitignore` already excludes exactly `/.tools/`; do not rewrite it or add broad executable/archive ignores.
 
@@ -3613,7 +3634,7 @@ class WorkerStagingQuota(Protocol):
 - `ContentAddressedStore.prune(policy: RetentionPolicy, *, clock: RetentionClockSample) -> PruneReport` never deletes leased/in-use objects, requires `utc_now` to be timezone-aware and exactly UTC, samples byte/inode capacity from the held store-root descriptor before and after pruning, and returns a discriminated satisfied/unsatisfied post-state without exposing names or metadata. `satisfied` is legal only when stored bytes/objects and post-prune byte/inode reserves all meet the policy and the retention clock is trustworthy; every other post-state is `unsatisfied` with the exact low-cardinality blocker set.
 - `ContentAddressedStore.reserve_publication(policy: RetentionPolicy, *, maximum_new_bytes: StoredByteCount, maximum_new_objects: StoredObjectCount, maximum_new_inodes: StoredObjectCount, clock: RetentionClockSample) -> AsyncContextManager[PublicationReservation]` acquires the store's atomic accounting/admission lock before any download, worker dispatch, or staging-file creation. All requested maxima must be positive exact integers within the global ceilings. Under that lock it counts committed unique bytes/logical objects plus every in-flight reservation and requires `stored + reserved + requested <= policy.maximum_bytes/maximum_objects`, the clock to be trustworthy, and the prospective destination and staging-filesystem byte/inode reserves to remain above policy. An unknown-length download reserves the configured per-download maximum and its worst-case staging/final inode footprint up front; streaming can never grow beyond it. A PDF render command derives and reserves the complete worst-case aggregate from its already validated page/tile count, per-file byte ceilings, manifest, temporary/publication duplication, and filesystem topology **before** worker dispatch (up to the bounded 8-page-plus-manifest or 100-tile-plus-manifest tree), never one file at a time after rendering. Completion rechecks actual aggregate bytes/objects/inodes, capacity, clock, policy totals, and content-addressed deduplication under the same lock, then atomically converts or releases the one tree reservation. Cancellation, timeout, infected input, duplicate digest/tree, partial output, and every failure release it exactly once; restart recovery accounts for/removes bounded orphan staging trees before reopening admission. Rejection carries only a stable `PublicationBlocker`, never paths or usage details.
 - `validate_configured_absolute_directory` accepts only an already-absolute, existing configured directory without `.`/`..`, symlink, control, or normalization ambiguity; `validate_safe_path_segment` accepts one ASCII `[A-Za-z0-9][A-Za-z0-9._-]{0,127}` segment and additionally rejects `.`/`..`. `WorkerStagingQuota` is the enforcement counterpart to accounting: before dispatch, the trusted parent leases the one pre-provisioned bounded worker slot, reserves that slot's entire verified byte/inode capacity (not merely estimated output), verifies those effective limits through the descriptor-bound `QuotaBoundStagingRoot`, and exposes only that root to the untrusted worker. `DirectoryFd` is an opaque `init=False` owner, never a `NewType`: only `open_configured_root_fd` and descriptor-relative `open_child_directory_fd` may instantiate it. They require `type(raw_fd) is int`, reject negative/closed/inheritable descriptors, verify `fstat` is a directory on the expected device/mount, use no-follow safe-open primitives, and close on every failed check; a static AST test rejects `object.__new__(DirectoryFd)` or direct `_value` assignment anywhere else. The selected Linux backend is exactly one host-provisioned ext4 filesystem mounted at configured `PDF_WORKER_SLOT_ROOT` with a fixed reviewed block count and inode count, mount options `rw,nodev,nosuid,noexec`, a device distinct from the shared store/staging filesystem, no nested mounts, and one serialized worker job. A strict checked-in slot policy fixes expected filesystem type, maximum total/available bytes and inodes, mount options, concurrency `1`, and root identity; startup descriptor-parses `/proc/self/mountinfo`, cross-checks `fstat`/`statvfs` device, blocks, fragment size, inodes, ownership, emptiness, and mount flags, and rejects overlay/tmpfs/bind/loop aliases, larger/unknown capacity, shared device, submounts, symlinks, or drift. Host provisioning/mounting is an explicit operational prerequisite outside the process; the application and worker receive no mount/quota capability and cannot resize or remount it. The reservation rounds up to the slot's full hard byte/inode capacity, so the kernel's filesystem boundary is never larger than the accounting reservation. If the exact ext4 slot cannot make an N+1 byte or inode allocation fail with `ENOSPC`, `private-full` startup fails—project-quota alternatives, post-hoc counting, `RLIMIT_FSIZE`, open-file limits, and cooperative filenames are not accepted by this plan. Cleanup kills the worker first, descriptor-removes only entries beneath the exact held mount root, fsyncs, proves the slot is empty and capacity restored, and rechecks global headroom before releasing the full-slot publication reservation.
-- `deploy/pdf-worker-slot-policy.json` is exactly `{"schema_version":1,"filesystem_type":"ext4","required_mount_options":["nodev","noexec","nosuid","rw"],"maximum_total_bytes":2147483648,"maximum_total_inodes":131072,"concurrency":1}` in canonical-key form. The static policy and runtime reject missing/extra/reordered option values, coercion, an alternate filesystem/backend, a larger capacity, or concurrency other than one. `PDF_WORKER_SLOT_ROOT` supplies only the configured absolute mount path; no device, mount, size, or option is attacker/runtime configurable. The deployment guide provides bounded host-provisioning and destructive teardown procedures but labels them operator-authorized prerequisites, never commands the implementation agent may execute implicitly.
+- `deploy/pdf-worker-slot-policy.json` is exactly `{"concurrency":1,"filesystem_type":"ext4","maximum_total_bytes":1073741824,"maximum_total_inodes":65536,"minimum_available_bytes":805306368,"minimum_available_inodes":32768,"mount_options":["nodev","noexec","nosuid","rw"],"root":"/var/lib/nplg/pdf-worker-slot","version":1}` in canonical-key form. The root-bound 1 GiB/65,536-inode policy is the reviewed upper bound, and its 768 MiB/32,768-inode minimum available headroom must still be present at startup and before dispatch. The static policy and runtime reject missing/extra/reordered option values, coercion, an alternate filesystem/backend, a larger capacity, insufficient headroom, a different root, or concurrency other than one. `PDF_WORKER_SLOT_ROOT` must equal the root bound into the policy; no device, mount, size, option, or alternate root is attacker/runtime configurable. The deployment guide provides bounded host-provisioning and destructive teardown procedures but labels them operator-authorized prerequisites, never commands the implementation agent may execute implicitly.
 
 - [ ] **Step 1: Write failing scan/lifecycle tests**
 
@@ -3821,7 +3842,7 @@ Expected: FAIL specifically because metadata startup still constructs full-profi
 
 - [ ] **Step 3: Add fail-closed profile composition**
 
-Parse one exact profile enum at startup, instantiate only required services, and filter registrations at server creation. Unknown profiles fail startup. `distributed-full` fails startup throughout this plan and requires the separate provider-specific plan mandated by Phase 7. The metadata profile uses no artifact signing secret and no correctness dependency on cache persistence.
+Parse one exact profile enum at startup, instantiate only required services, and filter registrations at server creation. Unknown profiles fail startup. `distributed-full` fails startup throughout this plan. Phase 7 may prove provider compatibility, but even a supported capability verdict cannot enable the profile without the later approved implementation plan. The metadata profile uses no artifact signing secret and no correctness dependency on cache persistence.
 
 - [ ] **Step 4: Run profile, official-client, and configuration suites**
 
@@ -3853,7 +3874,7 @@ Stage profile/config/server/tool/app changes, `security/coverage-policy.json`, a
 
 #### Interfaces
 
-- Conditionally produces `OidcJwtTokenVerifier(TokenVerifier)` with `async def verify_token(token: str) -> AccessToken | None` using the official SDK's `mcp.server.auth.provider.TokenVerifier` and `AccessToken` only when `contracts/oauth-provider-capability.json` selects and proves `access_token_format="signed_jwt"`. There is no token-shape sniffing, JWT/opaque fallback, or acceptance of an ID token. If the selected provider issues opaque access tokens, Task 20 stops with `OAUTH_PROVIDER_CAPABILITY_UNPROVEN` until a separate RFC 7662 introspection verifier, authorization-server client authentication/secret lifecycle, response schema, egress policy, and TDD ledger are reviewed and added.
+- Conditionally produces `OidcJwtTokenVerifier(TokenVerifier)` with `async def verify_token(token: str) -> AccessToken | None` using the official SDK's `mcp.server.auth.provider.TokenVerifier` and `AccessToken` only when `contracts/oauth-provider-capability.json` names the selected Auth0 tenant and Alpic environment, selects `client_registration_mode="alpic_dcr_proxy"`, and proves `access_token_format="signed_jwt"`. There is no token-shape sniffing, JWT/opaque fallback, acceptance of an ID token, or inference from Auth0's general product behavior. If that tenant issues opaque access tokens or the DCR issuer-role mapping is unproven, Task 20 stops with `OAUTH_PROVIDER_CAPABILITY_UNPROVEN` and/or `ALPIC_DCR_ISSUER_SEMANTICS_UNPROVEN` until the corresponding reviewed verifier/topology design and TDD ledger exist.
 - Produces `Principal(subject: StableSubject, client_id: OAuthClientId, issuer: HttpsIssuer, audience: CanonicalResource, scopes: frozenset[Scope], auth_method: AuthMethod, authorization_details: tuple[AuthorizationDetail, ...])` and rejects `authorization_details` entirely until a selected issuer-specific policy models and enforces every detail. The issuer contract requires one unambiguous signed client identity through `client_id` or one reviewed `azp` mapping; absent, array-valued, duplicate, or disagreeing client claims fail closed. `StableSubject` is not established by syntax or signature alone: strict `contracts/oidc-subject-capability.json` binds the selected issuer/tenant, subject type (`public` or `pairwise`), sector/mapping policy, machine-bound evidence that an `iss + sub` pair is immutable and never recycled/reassigned, migration behavior, reviewer, observation digest/date, and `supported`. Missing evidence creates `OIDC_SUBJECT_NON_REASSIGNMENT_UNPROVEN`; no public profile may use issuer+subject for ownership, quotas, pseudonyms, or release eligibility while that blocker remains.
 - Produces `AuditEvent(event_type, outcome, principal_pseudonym, client_id, issuer_id, auth_method, request_id, parsed_method, tool_or_resource, required_scopes, policy_decision, trusted_source_context, deployment_id, instance_id, latency_ms, error_code, occurred_at)` and `async AuditSink.emit(event: AuditEvent, *, deadline: MonotonicDeadline) -> EmitResult`; an expired deadline records the bounded loss/backpressure outcome without attempting delivery. `principal_pseudonym` is a versioned, purpose-specific HMAC over canonical `issuer || "\x00" || sub`, never a plain hash; `client_id` is separately bounded and retained for accountability even if an explicitly documented quota/artifact policy keys on the human subject.
 - Extends `create_mcp_server(...)` with a required, no-default `PrincipalSource` and a closed `OperationAuthorizationPolicy`; `create_app(...)` passes the production `SdkAuthContextPrincipalSource`, explicit `TokenVerifier`, and `AuthSettings` to `Server.streamable_http_app(...)`. `SdkAuthContextPrincipalSource.current()` calls `mcp.server.auth.middleware.auth_context.get_access_token()` exactly once, rejects a missing context, and copies only validated safe fields. The only direct `Client(server)` construction uses `tests/fixtures/sdk_principal.py::FixedTestPrincipalSource` for auth-disabled catalog/serialization contracts; that fixture cannot be imported by production code or included in a wheel/deploy pack and is never authentication evidence. The low-level handlers and any supported transport authorization extension use the same immutable operation-to-scope map, with no route-header-derived identity.
@@ -3862,7 +3883,7 @@ Stage profile/config/server/tool/app changes, `security/coverage-policy.json`, a
 
 - [ ] **Step 1: Write failing auth/audit tests**
 
-First generate and verify the selected provider capability record. Only a proven `signed_jwt` result permits adding `PyJWT[crypto]==2.13.0` and `cryptography==50.0.0`, regenerating/syncing the hash lock, and adding typed behavior-free JWT auth/audit interfaces; an opaque or unselected result is an observed stop, not permission to guess a token format. Prove the focused modules collect before running any case.
+First generate and verify the selected Auth0-tenant/Alpic-DCR capability record. Its RED matrix must reject the generic `{tenant}.us.auth0.com` template, an unbound custom domain, tenant/issuer mismatch, an Auth0 discovery document without evidence of the requested API audience, a missing or unexpected token format, conflated backend-self/token/public-edge issuer roles, a backend `registration_endpoint`, a missing post-pool Alpic `registration_endpoint`, and a pool bound to the wrong Alpic environment. Only a proven `signed_jwt` result permits adding `PyJWT[crypto]==2.13.0` and `cryptography==50.0.0`, regenerating/syncing the hash lock, and adding typed behavior-free JWT auth/audit interfaces; an opaque or unselected result is an observed stop, not permission to guess a token format. Prove the focused modules collect before running any case.
 
 Cover missing, expired, not-yet-valid, overlong-lifetime, wrong issuer, single/wrong/ambiguous multiple audiences, wrong algorithm, ID-token or token-purpose substitution, missing scope, unexpected `authorization_details`, ambiguous credentials, quota exhaustion, reconnect, and cross-principal request/session IDs. Require a bounded signed `client_id` or the one configured `azp` mapping and distinguish two OAuth clients sharing the same issuer/subject; reject missing, duplicate, array-valued, or disagreeing client claims. Prove exact `AccessToken(token=raw_token, client_id=..., scopes=[...], expires_at=..., resource=..., subject=..., claims={"iss": ...})` construction with canonical bounded values. The base SDK model's repr includes its required token, so project code must never repr/log/serialize/persist the model; canary tests instrument every logging/error boundary and prove only a copied safe `Principal` escapes request scope. In the production modern/stateless configuration, the trusted outer middleware explicitly rejects any `Mcp-Session-Id` header before SDK dispatch; test single/duplicate/empty/overlong/legacy-looking values, exact bounded error, zero verifier/handler entry, and a mutation that merely lets the pinned SDK ignore the header. Assert the server issues no session ID and no principal state survives a request. In the separate non-production legacy stateful fixture, prove the pinned SDK binds each session identifier to authenticated issuer+subject+client identity and rejects reuse after any identity change; never trust `_meta.clientInfo`, MCP metadata headers, forwarding headers, or request IDs as principal identity, and never report that fixture as deployed legacy support. Add strict configuration tables for every declared environment key, secret classification, unknown/duplicate key, missing/inconsistent base/resource/path value, `ALPIC_HOST` versus custom domain, and rejection of every static/legacy credential configuration.
 
@@ -3982,9 +4003,11 @@ Add exactly `/.alpic/` to `.gitignore`; reject `.alpic`, `.alpic*`, `**/.alpic/*
 
 Before relying on source detection, perform a stop/go build/auth-capability spike for this exact official SDK low-level `Server.streamable_http_app()` nested in a FastAPI/Uvicorn entry point. Archive the linked project's supported transport setting and complete successful build/start log, then invoke the vendor-supplied detector fixture or the explicitly labelled bounded documented approximation matrix and fetch every challenge's protected-resource metadata URI. Require SDK 401/challenge before the modern-only guard, tuple equality with `contracts/alpic-oauth-discovery-capability.json`, zero legacy/handler entry, and provider classification `Protected`. An approximation never clears `ALPIC_OAUTH_DETECTOR_FIXTURE_UNPROVEN`. Alpic documents detection through its own recognized MCP entry patterns, so if a dashboard transport/start/auth override is required, record it as immutable deployment configuration. A modern-header assumption, unbound root-versus-path or backend-versus-public resource mismatch, `Public`/unknown classification, unsupported app pattern, or missing machine-readable classification is a stop for vendor confirmation or a documented adapter; never add dead-code detector markers, an ungoverned metadata alias, or an anonymous legacy exception.
 
+Treat Auth0 application and Alpic DCR-pool configuration as a separate protected operational node, not as part of source deployment. After the named environment is detected as `Protected`, require an authority-signed receipt for: the exact Auth0 tenant/application ID; the exact callback URL displayed by Alpic and registered in Auth0; least-privilege scopes; the Alpic team/project/environment and DCR-pool identity; proof that backend authorization-server metadata referenced itself as issuer and omitted `registration_endpoint` before pool creation; and proof that the public edge advertised the expected Alpic `registration_endpoint` afterwards. The controller may consume only a short-lived broker handle for the upstream client secret and must never place that secret in argv, source, ordinary environment evidence, logs, or the MCP probe process. Rotation updates the existing pool and proves existing dynamic registrations still work; deletion is forbidden for an environment with issued clients and is allowed only under a separately approved decommission/native-DCR migration procedure. Missing feature entitlement, callback binding, redacted pool observation, or before/after discovery evidence preserves `OAUTH_END_TO_END_FLOW_UNPROVEN` and `ALPIC_DCR_ISSUER_SEMANTICS_UNPROVEN`.
+
 Keep total environment key/value material under 4 KiB, secrets outside source/build artifacts, anonymous access off, and all upstream timeouts below the local deadline. `.env.example` and strict `deploy/alpic-environment-manifest.json` enumerate every Task 20 non-secret runtime key plus blank secret names; bind its byte count/digest to environment and deployment evidence and reject missing, duplicate, unknown, legacy-auth, or inconsistent base/MCP/issuer/JWKS/Host/Origin values. Provider and MCP credentials are never loaded together: `ALPIC_API_KEY` exists only inside the isolated trusted provider helper, `ALPIC_STAGING_ACCESS_TOKEN` only inside the isolated MCP probe helper, and an operation-insufficient-scope token exists only when a supported dynamic-403 capability verdict requires it. No real value is committed. Store Alpic credentials and cryptographic roots only in verified environment secret-manager controls with least privilege; document inventory, owner, creation, rotation, revocation/destruction, and access review. Docker uses mounted secrets rather than image layers, Compose plaintext, or ordinary env files.
 
-With a fresh pre-issued staging access token, the verifier tests resource-server discovery, list, each metadata tool, missing-token unauthorized, malformed current-protocol requests, stateless reconnect/no-session-ID behavior, strict raw arguments, client/audience/purpose, and token-secret redaction. Only a later `supported=true` dynamic-scope verdict adds an insufficient-scope token and exact deployed 403/minimum-scope challenge; while the pinned verdict is unsupported, the runner omits that probe and carries `MCP_DYNAMIC_SCOPE_403_UNSUPPORTED`. It exports the exact current-protocol `Client.list_tools()` schemas and compares them with the Pydantic/Zod corpus; recursively closed schemas may not become open after deployment. A separate local legacy fixture result is diagnostic only and must not appear in Alpic deployed-support evidence. These tokens do **not** prove authorization-code issuance. A complete real-edge flow requires the separately governed issuer/client-registration manifest and authority and executes RFC 9728 plus AS/OIDC discovery, the selected pre-registration/CIMD/legacy-DCR mode, PKCE S256, OAuth `resource`, RFC 9207 issuer response, least-privilege initial/step-up scope, final client/audience/purpose, missing/wrong/replayed `state`, duplicate callback parameters, authorization-code replay, redirect-URI mismatch/open redirect, PKCE-verifier mismatch, issuer mix-up, and scope escalation/downgrade cases. PKCE is not a substitute for `state`. Until this proof exists, emit `OAUTH_END_TO_END_FLOW_UNPROVEN`; do not manufacture a browser/admin flow from prose. Prefer pre-registration or CIMD when the selected clients/provider support it. If legacy DCR is selected for compatibility, document and prove the compatibility reason, Alpic proxy behavior, exact external-versus-self issuer semantics, callback URI, client-pool rotation/deletion behavior, and plan tier; until the conflicting Alpic guidance is resolved and witnessed, also emit `ALPIC_DCR_ISSUER_SEMANTICS_UNPROVEN`. Alpic's provider directory alone is not capability evidence.
+With a fresh pre-issued staging access token, the verifier tests resource-server discovery, list, each metadata tool, missing-token unauthorized, malformed current-protocol requests, stateless reconnect/no-session-ID behavior, strict raw arguments, client/audience/purpose, and token-secret redaction. Only a later `supported=true` dynamic-scope verdict adds an insufficient-scope token and exact deployed 403/minimum-scope challenge; while the pinned verdict is unsupported, the runner omits that probe and carries `MCP_DYNAMIC_SCOPE_403_UNSUPPORTED`. It exports the exact current-protocol `Client.list_tools()` schemas and compares them with the Pydantic/Zod corpus; recursively closed schemas may not become open after deployment. A separate local legacy fixture result is diagnostic only and must not appear in Alpic deployed-support evidence. These tokens do **not** prove authorization-code issuance. A complete real-edge flow requires the separately governed Auth0/Alpic client-registration manifest and authority and executes RFC 9728 plus AS/OIDC discovery, Alpic DCR registration, PKCE S256, OAuth `resource`, RFC 9207 issuer response, least-privilege initial/step-up scope, final client/audience/purpose, missing/wrong/replayed `state`, duplicate callback parameters, authorization-code replay, redirect-URI mismatch/open redirect, PKCE-verifier mismatch, issuer mix-up, and scope escalation/downgrade cases. PKCE is not a substitute for `state`. The first `alpic-metadata` target must exercise Auth0 OIDC plus Alpic DCR proxy; preregistration, CIMD, native DCR, or a different IdP is a new reviewed plan input, not equivalent evidence. Prove the proxy behavior, exact Auth0-token/backend-self/public-edge issuer roles, callback URI, client-pool update semantics, feature availability in the named environment, and a deliberately isolated decommission-only deletion rule. Until this proof exists, emit `OAUTH_END_TO_END_FLOW_UNPROVEN` and `ALPIC_DCR_ISSUER_SEMANTICS_UNPROVEN`; do not manufacture a browser/admin flow from prose. Alpic's provider directory and generic Auth0 discovery template alone are topology evidence, not tenant capability evidence.
 
 Before obtaining a staging access token, the protected verifier performs the credentialless detector/challenge/metadata/classification proof with no credential in its process or parent-visible environment. A separate MCP helper with the fresh token then tests authenticated absent/handshake-era version rejection after exactly one verifier call in addition to the current-protocol client suite. The credentialless proof and authenticated proof have disjoint process/command records; neither may infer the other's result.
 
@@ -4072,24 +4095,181 @@ The release-usable Task 21 result remains external input to Task 22 and is not c
 
 ---
 
-## Phase 7 — Conditional Distributed Full-fidelity Profile
+## Phase 7 — Alpic Tasks Compatibility Proof and Conditional Distributed Profile
 
-This phase is deliberately non-executable in this plan. Provider choice, job database, object store, migrations, worker deployment unit, artifact-delivery mechanism, cost/SLOs, and the public job-tool surface are material architectural decisions that the user has not approved.
+Alpic is selected as the provider for this assessment. The current provider
+documentation says ordinary tool calls have a 30-second limit and recommends
+MCP Tasks on a separate compute path, with a default TTL of up to six hours,
+for longer work. The provider's July 2026 protocol announcement also describes
+Tasks as supported on Alpic. These statements justify a bounded proof phase;
+they do not prove the exact extension revision, Python SDK integration,
+durable state semantics, worker termination, private artifact delivery, or
+client interoperability required by this application.
 
-Create a separate Superpowers design and provider-specific TDD plan only after the user selects those components. That plan must freeze the Phase 4 worker contract and include durable idempotency, compare-and-set transitions, leases, restart recovery, cross-principal denial, retention/purge, authenticated artifact delivery without URL credentials, backup/restore, chaos tests, and operational evidence.
+### Task 21A: Produce a typed Alpic Tasks capability verdict without enabling the profile
 
-Before representing any future jobs as MCP Tasks, all of these conditions must pass against then-current primary sources:
+#### Files
 
-1. the Tasks extension revision is stable/frozen rather than draft;
-2. the official Python SDK has a stable implementation of that exact revision;
-3. Alpic supports the same exact revision through a documented Python integration;
-4. Alpic documents persistence, timeout, cancellation, isolation, and client support;
-5. official-client and Alpic staging conformance tests pass;
-6. cooperative cancellation is never described as guaranteed worker termination.
+- Create: `contracts/alpic-tasks-capability.json`
+- Create: `contracts/alpic-tasks-source-evidence.json`
+- Modify: `src/nplg_mcp/capabilities.py`
+- Modify: `contracts/zod/capability-contracts.mjs`, `contracts/zod/models.ts`
+- Create: `scripts/probe_alpic_tasks_capability.py`
+- Create: `tests/contracts/test_alpic_tasks_capability.py`
+- Create: `tests/unit/test_probe_alpic_tasks_capability.py`
+- Modify: `tests/contracts/zod_contracts.test.mjs`
+- Modify: `tests/static/test_deployment.py`, `security/coverage-policy.json`
 
-If any condition fails, `distributed-full` remains a startup error, stays out of Alpic, and emits no Tasks methods or claims.
+#### Interfaces
 
-**Phase 7 exit gate:** an explicitly approved provider selection and a separate provider-specific plan exist. This plan cannot mark Phase 7 complete.
+Add one strict Pydantic `AlpicTasksCapabilityVerdict` and an independently
+written Zod 4.4.3 oracle. Both schemas use `extra="forbid"`/
+`z.strictObject()`, bounded strings and arrays, exact literals, Draft 2020-12
+JSON Schema, and a discriminated `supported: Literal[True] |
+Literal[False]` state. The verdict records:
+
+- exact extension identifier and revision/source digest;
+- installed Python SDK package/version and an executable public-API probe;
+- Alpic documentation URL, retrieval timestamp, final URL, content digest,
+  advertised compute path, timeout, and maximum advertised TTL;
+- separate `proven`, `unsupported`, or `not_assessed` states for SDK server
+  support, SDK client support, Alpic Python integration, task creation
+  durability, restart/reconnect recovery, cancellation semantics, tenant and
+  principal isolation, retention/purge, artifact delivery, and client support;
+- the exact staging environment/deployment/pack identities when live evidence
+  exists; and
+- `supported`, a bounded blocker tuple, and a reviewed date.
+
+The blocker vocabulary is closed to
+`MCP_TASKS_REVISION_UNFROZEN`,
+`PYTHON_SDK_TASKS_EXTENSION_UNAVAILABLE`,
+`PYTHON_SDK_TASKS_CLIENT_UNAVAILABLE`,
+`ALPIC_TASKS_PYTHON_INTEGRATION_UNPROVEN`,
+`ALPIC_TASK_CREATION_DURABILITY_UNPROVEN`,
+`ALPIC_TASK_RESTART_RECOVERY_UNPROVEN`,
+`ALPIC_TASK_CANCELLATION_UNPROVEN`,
+`ALPIC_TASK_ISOLATION_UNPROVEN`,
+`ALPIC_TASK_RETENTION_UNPROVEN`,
+`ALPIC_TASK_ARTIFACT_DELIVERY_UNPROVEN`, and
+`ALPIC_TASK_CLIENT_SUPPORT_UNPROVEN`.
+
+`supported=true` is valid only when the exact stable extension revision is
+digest-bound, both official Python SDK directions expose that revision through
+public APIs, every provider state above is `proven`, every required live
+evidence identity/digest is present, and `blockers` is empty. The negative
+branch requires at least one blocker and forbids fields that would imply an
+unperformed live probe. It is valid evidence closure, never profile enablement.
+
+- [ ] **Step 1: Write strict Pydantic and Zod RED tests**
+
+Write table-driven tests for the current evidence: Alpic selected, a documented
+30-second ordinary-call ceiling, advertised separate Tasks compute, advertised
+TTL no greater than 21,600 seconds, installed `mcp==2.0.0`, no public SDK Tasks
+server/client API, `supported=false`, and the exact SDK/provider blocker set.
+Add positive synthetic fixtures only for schema reachability; label them
+synthetic and forbid their use as operational evidence. Reject unknown fields,
+string-to-boolean/number coercion, duplicate blockers, unsupported blocker
+strings, inconsistent supported states, missing/changed digests, mutable or
+credential-bearing URLs, non-UTC timestamps, TTL overflow, a live claim
+without deployment identity, and a supported verdict with any unproven field.
+Independently mutate each discriminator and conditional validator and require
+the Pydantic and Zod suites to reject every mutant.
+
+- [ ] **Step 2: Observe contract RED**
+
+Run: `.venv/bin/python -m pytest tests/contracts/test_alpic_tasks_capability.py -q`
+Run: `npm run contracts:zod:all`
+Expected: FAIL because the strict capability model, canonical contract, and
+independent Zod branch do not exist. A failure caused only by a missing fixture
+path is not a relevant RED; the tests must reach the absent model/schema seam.
+
+- [ ] **Step 3: Implement the minimal typed negative verdict**
+
+Add the strict model, canonical serialization/digest validation, Zod oracle,
+one bounded source-evidence record, and one canonical current negative
+contract. The Python SDK probe uses public
+imports and a minimal in-memory server/client registration attempt; it does
+not grep installed source, accept private symbols, monkeypatch SDK internals,
+or hand-write Tasks JSON-RPC. The current verdict must retain at least
+`PYTHON_SDK_TASKS_EXTENSION_UNAVAILABLE`,
+`PYTHON_SDK_TASKS_CLIENT_UNAVAILABLE`, and every provider behavior not proven
+by a live authorized test. A provider marketing statement or mutable docs page
+may establish `advertised`, never `proven`.
+
+- [ ] **Step 4: Observe focused GREEN and mutation resistance**
+
+Run: `.venv/bin/python -m pytest tests/contracts/test_alpic_tasks_capability.py tests/contracts/test_zod_contracts.py -q`
+Run: `npm run contracts:zod:all && npm run contracts:baseline-static`
+Run: `.venv/bin/python scripts/run_mutation_gate.py --targets src/nplg_mcp/capabilities.py`
+Expected: PASS with the exact negative canonical verdict and every malformed,
+adversarial, and cross-language mutant rejected.
+
+- [ ] **Step 5: Add a fail-closed probe command**
+
+Implement `scripts/probe_alpic_tasks_capability.py` with no ambient proxy,
+credential, Git, shell, or deployment authority. Its default offline mode
+validates the pinned SDK public API and the strict
+`contracts/alpic-tasks-source-evidence.json` record, then atomically writes
+only the strict verdict. A separate `capture-sources` mode fetches only the
+allowlisted HTTPS Alpic documentation, official SDK roadmap, and Tasks
+specification hosts with ambient proxies, redirects, credentials, cookies,
+and content encodings disabled; enforces exact status/media type and bounded
+streamed bytes; and atomically emits URL, final URL, retrieval time, digest,
+and closed observations without copying third-party prose. Tests cover wrong
+host/status/media type, redirects, proxy variables, credential-bearing URLs,
+oversize/chunk overflow, duplicate observations, response mutation, symlink/
+hard-link/special-file outputs, inode replacement, interrupted writes, and
+cleanup failure. Exit 0 means
+`supported=true`; exit 24 means a valid, canonical/digest-bound unsupported
+verdict; malformed evidence, source drift, unexpected SDK behavior, symlink or
+replacement output, or an unregistered blocker is an ordinary nonzero tool
+failure and publishes nothing. The current expected result is exit 24 before
+any Alpic deployment command can run.
+
+The future live mode is available only through the protected Task 21
+controller and a separately authorized non-production Alpic environment. It
+must bind environment, deployment, pack, SDK wheel, protocol revision, and
+client identities; verify extension negotiation and per-request capability
+checks; create a task before returning its handle; reconnect and poll it;
+exercise unknown/cross-principal task IDs; request cancellation without
+claiming worker termination; cross a cold start/redeployment only when the
+provider documents that test as safe; and retrieve an authenticated artifact
+without credentials in a URL. Raw evidence remains in protected custody.
+
+- [ ] **Step 6: Prove that unsupported evidence cannot enable the profile**
+
+Add tests that inject every negative or `not_assessed` verdict into startup,
+catalog generation, deployment verification, and release-manifest selection.
+Each must preserve the existing `distributed-full` startup error, advertise no
+Tasks extension or methods, construct no PDF/job/artifact services, issue no
+provider command, and reject release evidence that imports the verdict as a
+PASS. Mutate each guard independently and require at least one test to fail.
+
+Run: `.venv/bin/python -m pytest tests/integration/test_profiles.py tests/static/test_deployment.py tests/unit/test_probe_alpic_tasks_capability.py -q`
+Run: `.venv/bin/python scripts/run_quality_gate.py --node-executable "$(command -v node)" src tests scripts`
+Run: `.venv/bin/python scripts/run_test_gate.py --compare-branch origin/main`
+Expected: PASS locally while the capability command truthfully exits 24 and
+`distributed-full` remains unreachable.
+
+- [ ] **Step 7: Freeze the follow-up implementation boundary**
+
+If and only if a later capability verdict is `supported=true`, write and obtain
+approval for a separate Superpowers design and TDD implementation plan before
+changing production registration. That plan must freeze the Phase 4 worker
+contract and the public job-tool surface; name the durable job and artifact
+stores; specify migrations, idempotency keys, compare-and-set transitions,
+leases, retry/dead-letter policy, restart recovery, cross-principal denial,
+retention/purge, authenticated artifact delivery without URL credentials,
+quota/cost/SLOs, backup/restore, chaos tests, rollback, and operational
+evidence. Alpic remains the selected provider, but any behavior that Alpic does
+not prove must be supplied by a named external component rather than inferred.
+
+**Phase 7 assessment exit gate:** a canonical Pydantic/Zod-validated Alpic
+Tasks verdict is produced from current source evidence, the fail-closed guard
+tests pass, and either (a) the current expected-negative verdict preserves the
+startup error with exact blockers or (b) a future supported verdict triggers a
+separately approved implementation plan. Phase 7 assessment completion does
+not make `distributed-full` implemented, deployable, or release-eligible.
 
 ---
 
@@ -4417,7 +4597,7 @@ Expected: structural attestation emits truthful typed verdicts and the complete 
 
 ### `distributed-full` production candidate
 
-This candidate is outside the executable scope of this plan. Its separate provider-specific plan must restate all `private-full` criteria, durable job/artifact tests, provider identity/rotation proof, Tasks stop gate, and full `distributed-full` matrix closure. No checkbox in this plan can authorize or certify that profile.
+This candidate remains outside the executable implementation scope of this plan. Phase 7 now permits only the typed Alpic compatibility assessment and may close truthfully with an unsupported verdict. A later implementation plan must restate all `private-full` criteria, durable job/artifact tests, provider identity/rotation proof, the supported Tasks verdict, and full `distributed-full` matrix closure. No checkbox in this plan can authorize or certify that profile.
 
 ## 6. Rollback Boundaries
 
@@ -4431,7 +4611,7 @@ This candidate is outside the executable scope of this plan. Its separate provid
 - Phase 4 retains `PDF_EXECUTOR=serialized` only for development/compatibility. Production rollback disables PDF tools or returns to `alpic-metadata`; it never moves untrusted PDFium back into the credential-bearing control plane and never returns to parallel `to_thread()` execution.
 - Phase 5 can disable live traffic if socket binding cannot be proven; do not silently use pre-check-only DNS.
 - Phase 6 can disable the Alpic project or return to authenticated staging without affecting Docker/VPS.
-- Phase 7 remains a fail-closed `distributed-full` startup error until a separately approved provider-specific plan is complete; it cannot alter `alpic-metadata` tool registration.
+- Phase 7 may add only typed capability contracts, offline/protected probe machinery, and negative guard tests. Rollback removes that assessment machinery while retaining the fail-closed `distributed-full` startup error; Phase 7 cannot alter `alpic-metadata` tool registration, and a supported verdict still requires a separately approved implementation plan.
 
 ## 7. Primary Sources and Version Revalidation
 
@@ -4446,6 +4626,8 @@ Recheck these primary sources at the start of the task that consumes them; exact
 - [MCP Python SDK issue 3067: strict decorator-argument validation gap](https://github.com/modelcontextprotocol/python-sdk/issues/3067)
 - [MCP Python SDK v2.0.0 documented low-level `Server` API](https://github.com/modelcontextprotocol/python-sdk/blob/v2.0.0/docs/advanced/low-level-server.md)
 - [MCP Python SDK v2.0.0 low-level `Server` implementation](https://github.com/modelcontextprotocol/python-sdk/blob/v2.0.0/src/mcp/server/lowlevel/server.py)
+- [MCP Python SDK roadmap and deferred SEP-2663 Tasks status](https://github.com/modelcontextprotocol/python-sdk/blob/main/ROADMAP.md)
+- [MCP Python SDK SEP-2663 implementation tracker](https://github.com/modelcontextprotocol/python-sdk/issues/2806)
 - [MCP Python SDK v2.0.0 auth context](https://github.com/modelcontextprotocol/python-sdk/blob/v2.0.0/src/mcp/server/auth/middleware/auth_context.py), [bearer middleware](https://github.com/modelcontextprotocol/python-sdk/blob/v2.0.0/src/mcp/server/auth/middleware/bearer_auth.py), and [token provider models](https://github.com/modelcontextprotocol/python-sdk/blob/v2.0.0/src/mcp/server/auth/provider.py)
 - [MCP Python SDK v2.0.0 protected-resource route builder](https://github.com/modelcontextprotocol/python-sdk/blob/v2.0.0/src/mcp/server/auth/routes.py)
 - [MCP Python SDK v2.0.0 `MCPError` constructor](https://github.com/modelcontextprotocol/python-sdk/blob/v2.0.0/src/mcp/shared/exceptions.py)
@@ -4492,10 +4674,12 @@ Recheck these primary sources at the start of the task that consumes them; exact
 - [Alpic asset model](https://docs.alpic.ai/build-deploy/assets)
 - [Alpic build detection](https://docs.alpic.ai/build-deploy/builds)
 - [Alpic compatibility and Playground controls](https://docs.alpic.ai/compatibility)
+- [Alpic authentication overview](https://docs.alpic.ai/secure/auth/overview)
 - [Alpic OAuth setup](https://docs.alpic.ai/secure/auth/oauth-setup)
 - [Alpic Dynamic Client Registration proxy](https://docs.alpic.ai/secure/auth/dcr-proxy)
 - [Alpic OAuth provider endpoint directory](https://docs.alpic.ai/secure/auth/oauth-providers)
 - [Alpic troubleshooting, deploy-time OAuth detection, protected-resource path, and 30-second tool limit](https://docs.alpic.ai/troubleshooting)
+- [Alpic 2026-07-28 protocol and Tasks support announcement](https://alpic.ai/blog/mcp-2026-07-28-makes-the-protocol-stateless-and-the-app-extensions-official)
 - [Alpic audit behavior and JSON output](https://docs.alpic.ai/cli/audit)
 - [Alpic noninteractive deploy command and existing-project flag behavior](https://docs.alpic.ai/cli/deploy)
 - [Alpic project inspection](https://docs.alpic.ai/cli/project-inspect), [environment inspection](https://docs.alpic.ai/cli/environment-inspect), and [deployment inspection](https://docs.alpic.ai/cli/deployment-inspect)
@@ -4526,7 +4710,8 @@ Recommended execution uses `superpowers:subagent-driven-development` with a fres
 7. Tasks 11–14 perform the official SDK cutover. Task 13's auth-disabled version ordering is provisional; before any protected deployment, Task 20 must consume the Task 0 Alpic capability record and prove one supported auth-before-version composition or stop with the named blockers.
 8. Tasks 15, 16, and 16A run only after Task 9 and follow the dependency chain Task 15 → Task 16 → Task 16A. Tasks 17–18 also require Task 9. These branches may proceed alongside SDK work only when their declared write sets do not overlap; integrate one branch at a time.
 9. Tasks 19–21 produce the first authenticated Alpic metadata candidate after Phases 1, 3, and 5 are green. Task 21 may proceed past its build/auth spike only when the exact detector challenge/metadata tuple is compatible and the named environment is machine-classified `Protected`; a `Public`/unknown result is a stop, not a staging success.
-10. Phase 7 remains a non-executable stop gate and requires a separately approved provider-specific plan.
-11. Task 22 starts after every selected-profile code/offline dependency is committed; it then creates the immutable battery, runs the protected selected-profile external gates, and, for metadata, obtains the one preparation-bound Task 21 staging result inside its own state machine. No prior metadata staging result is a prerequisite or reusable input, and metadata does not wait for Tasks 15-16A. Zero blockers/all required results green is required only by the separate release-eligibility gate, not by a truthful `do not release` evidence closure; actual release authority remains external.
+10. Phase 7 Task 21A may run after Phase 6's local profile guards and the pinned SDK environment exist. It produces a typed Alpic Tasks capability verdict and is expected to close negatively while `mcp==2.0.0` lacks the extension. It never enables the profile or blocks the metadata release.
+11. A `supported=true` Phase 7 verdict starts a new approval gate for the separate full-fidelity implementation plan; an unsupported verdict preserves the blocker ledger and startup error without making Phase 7 assessment incomplete.
+12. Task 22 starts after every selected-profile code/offline dependency is committed; it then creates the immutable battery, runs the protected selected-profile external gates, and, for metadata, obtains the one preparation-bound Task 21 staging result inside its own state machine. No prior metadata staging result is a prerequisite or reusable input, and metadata does not wait for Tasks 15-16A or Task 21A. Zero blockers/all required results green is required only by the separate release-eligibility gate, not by a truthful `do not release` evidence closure; actual release authority remains external.
 
-Enforce stop gates only along the selected profile's executable dependency DAG. `alpic-metadata` does not traverse Phase 4, and the deliberately non-executable Phase 7 is not a prerequisite for Tasks 19-22; `private-full` does traverse Phase 4. If any boundary selected by that DAG is unmet, stop—never reinterpret its red gate as documentation debt. Entering `distributed-full` itself always stops for the separately approved provider plan described in Phase 7.
+Enforce stop gates only along the selected profile's executable dependency DAG. `alpic-metadata` does not traverse Phase 4 or require the Phase 7 assessment; `private-full` does traverse Phase 4. If any boundary selected by that DAG is unmet, stop—never reinterpret its red gate as documentation debt. Phase 7 may assess Alpic Tasks compatibility, but entering `distributed-full` implementation always stops unless a supported verdict and the separately approved implementation plan both exist.

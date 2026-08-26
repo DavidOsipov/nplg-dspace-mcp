@@ -16,6 +16,8 @@ from nplg_mcp.pdf_ipc import (
     InspectCommand,
     InspectParams,
     PdfIpcError,
+    RenderPagesOutput,
+    RenderTilesOutput,
     RenderTilesParams,
     encode_frame,
     parse_command_frame,
@@ -26,6 +28,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from hypothesis.strategies import SearchStrategy
+    from pydantic import BaseModel
 
 
 _ARBITRARY_FRAME_STRATEGY: SearchStrategy[bytes] = st.binary(max_size=1_024)
@@ -33,6 +36,81 @@ _GIVEN_ARBITRARY_FRAME = cast(
     "Callable[[Callable[[bytes], None]], Callable[[], None]]",
     given(frame=_ARBITRARY_FRAME_STRATEGY),
 )
+
+_PIPELINE_VERSION_FIELDS = (
+    "manifest_schema_version",
+    "render_pipeline_version",
+    "classification_algorithm_version",
+    "tile_pipeline_version",
+)
+
+
+def _render_pages_payload() -> dict[str, object]:
+    return {
+        "render_id": "rnd_" + "0" * 32,
+        "source_sha256": "0" * 64,
+        "renderer_version": "renderer/1.0",
+        "mode": "native",
+        "pages": (
+            {
+                "page_number": 1,
+                "width": 1,
+                "height": 1,
+                "rotation": 0,
+                "classification": "image-only",
+                "effective_dpi_x": 72.0,
+                "effective_dpi_y": 72.0,
+                "resolution_source": "native-raster",
+                "conversion_path": "direct-jpeg-extraction",
+                "relative_path": "renders/rnd_" + "0" * 32 + "/page-0001.jpg",
+                "sha256": "1" * 64,
+                "media_type": "image/jpeg",
+                "resize_applied": False,
+                "pixel_dimensions_preserved": True,
+                "renderer_resampling": "none",
+                "reencoded": False,
+                "lossy_conversion": False,
+            },
+        ),
+        "manifest_relative_path": "renders/rnd_" + "0" * 32 + "/manifest.json",
+        **dict.fromkeys(_PIPELINE_VERSION_FIELDS, "1.0.0"),
+    }
+
+
+def _render_tiles_payload() -> dict[str, object]:
+    return {
+        "render_id": "rnd_" + "0" * 32,
+        "page_number": 1,
+        "page_sha256": "1" * 64,
+        "tile_width": 256,
+        "tile_height": 256,
+        "overlap": 0,
+        "tiles": (
+            {
+                "tile_id": "p0001_tpv1-0-0-w0256-h0256-o000_x000000_y000000",
+                "page_number": 1,
+                "x": 0,
+                "y": 0,
+                "width": 1,
+                "height": 1,
+                "full_page_width": 1,
+                "full_page_height": 1,
+                "overlap": 0,
+                "relative_path": "renders/rnd_" + "0" * 32 + "/tiles/p0001/tile.jpg",
+                "sha256": "2" * 64,
+                "media_type": "image/jpeg",
+                "resize_applied": False,
+                "pixel_dimensions_preserved": True,
+                "renderer_resampling": "none",
+                "reencoded": True,
+                "lossy_conversion": True,
+            },
+        ),
+        "manifest_relative_path": "renders/rnd_"
+        + "0" * 32
+        + "/tiles/p0001/manifest.json",
+        **dict.fromkeys(_PIPELINE_VERSION_FIELDS, "1.0.0"),
+    }
 
 
 @_GIVEN_ARBITRARY_FRAME
@@ -194,3 +272,84 @@ def test_result_decoder_rejects_impossible_status_payload_pairs(frame: bytes) ->
     """Success and failure envelopes cannot be cross-wired."""
     with pytest.raises(ValueError, match="validation error"):
         _ = parse_result_frame(frame)
+
+
+@pytest.mark.parametrize(
+    ("model", "payload_factory"),
+    [
+        (RenderPagesOutput, _render_pages_payload),
+        (RenderTilesOutput, _render_tiles_payload),
+    ],
+)
+def test_derivative_outputs_require_all_canonical_pipeline_versions(
+    model: type[BaseModel],
+    payload_factory: Callable[[], dict[str, object]],
+) -> None:
+    payload = payload_factory()
+
+    validated = model.model_validate(payload, strict=True)
+
+    for field in _PIPELINE_VERSION_FIELDS:
+        assert cast("str", getattr(validated, field)) == "1.0.0"
+        missing = payload_factory()
+        del missing[field]
+        with pytest.raises(ValueError, match=field):
+            _ = model.model_validate(missing, strict=True)
+
+
+@pytest.mark.parametrize(
+    ("model", "payload_factory"),
+    [
+        (RenderPagesOutput, _render_pages_payload),
+        (RenderTilesOutput, _render_tiles_payload),
+    ],
+)
+@pytest.mark.parametrize(
+    "invalid_version",
+    [
+        "v1",
+        "0.0.0",
+        "01.0.0",
+        "1.0",
+        "1.0.0 ",
+        "1.0.0-rc.1",
+        "\uff11\uff0e\uff10\uff0e\uff10",
+        1,
+        True,
+        None,
+    ],
+)
+def test_derivative_outputs_reject_invalid_or_extra_version_metadata(
+    model: type[BaseModel],
+    payload_factory: Callable[[], dict[str, object]],
+    invalid_version: object,
+) -> None:
+    invalid = payload_factory()
+    invalid["manifest_schema_version"] = invalid_version
+    with pytest.raises(ValueError, match="manifest_schema_version"):
+        _ = model.model_validate(invalid, strict=True)
+
+    extra = payload_factory()
+    extra["pipeline_version"] = "1.0.0"
+    with pytest.raises(ValueError, match="pipeline_version"):
+        _ = model.model_validate(extra, strict=True)
+
+
+@pytest.mark.parametrize(
+    ("model", "payload_factory"),
+    [
+        (RenderPagesOutput, _render_pages_payload),
+        (RenderTilesOutput, _render_tiles_payload),
+    ],
+)
+@pytest.mark.parametrize("field", _PIPELINE_VERSION_FIELDS)
+def test_derivative_outputs_reject_semantically_valid_pipeline_version_drift(
+    model: type[BaseModel],
+    payload_factory: Callable[[], dict[str, object]],
+    field: str,
+) -> None:
+    drifted = payload_factory()
+    drifted[field] = "2.0.0"
+
+    with pytest.raises(ValueError, match="pipeline version drift"):
+        _ = model.model_validate(drifted, strict=True)

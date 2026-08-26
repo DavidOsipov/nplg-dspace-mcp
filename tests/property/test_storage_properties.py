@@ -265,7 +265,9 @@ def test_incomplete_render_transaction_rollback_removes_every_artifact(
             subtree,
             completion_file="manifest.json",
         )
-        _ = store.put_render_bytes(relative_asset, payload)
+        with transaction.stage(suffix=".bin") as staged:
+            assert staged.write(payload) == len(payload)
+            _ = staged.commit_render(relative_asset)
         assert store.resolve_asset(relative_asset).read_bytes() == payload
 
         transaction.rollback()

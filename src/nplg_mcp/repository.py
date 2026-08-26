@@ -7,27 +7,24 @@ import asyncio
 import math
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TypeVar, cast
+from typing import Literal, TypeVar, cast
 from urllib.parse import urljoin
 
 import httpx
 
-from .bounded_work import DNS_WORK, PARSER_WORK, BlockingWorkCapacityError
+from .bounded_work import DNS_WORK, BlockingWorkCapacityError
 from .contracts import MonotonicDeadline
 from .errors import AppError, ErrorCode
 from .http_types import HttpClientProtocol, HttpResponseProtocol
 from .network import classify_transport_failure
-from .parsers import (
+from .parser_executor import ParserExecutor, ParserWorkerError, SubprocessParserExecutor
+from .parsers import (  # noqa: TC001 - get_type_hints is a tested runtime contract.
     Bitstream,
     DocumentRecord,
     SearchPage,
-    parse_item_page,
-    parse_metadata_formats,
-    parse_oai_record,
-    parse_search_results,
 )
 from .rate_limit import RateLimiter
 from .resilience import AttemptPermit, UpstreamGuard, UpstreamUnavailableError
@@ -221,6 +218,7 @@ class NplgRepository:
     )
     cursor_clock: Callable[[], datetime] = lambda: datetime.now(UTC)
     cache_clock: Callable[[], float] = time.monotonic
+    parser_executor: ParserExecutor = field(default_factory=SubprocessParserExecutor)
     _metadata_format_cache: dict[str, _OaiFormatCacheEntry] = field(
         default_factory=_empty_oai_format_cache,
         init=False,
@@ -245,6 +243,10 @@ class NplgRepository:
         guard = cast("object", self.guard)
         if not isinstance(guard, UpstreamGuard):
             msg = "guard must be an UpstreamGuard"
+            raise TypeError(msg)
+        parser_executor = cast("object", self.parser_executor)
+        if not isinstance(parser_executor, ParserExecutor):
+            msg = "parser_executor must implement the strict parser protocol"
             raise TypeError(msg)
         _ = derive_cursor_signing_key(self.cursor_signing_secret)
 
@@ -308,13 +310,10 @@ class NplgRepository:
 
     async def _parse_within_deadline(
         self,
-        parser: Callable[[], _ParsedT],
-        *,
-        deadline: float,
+        parser: Awaitable[_ParsedT],
     ) -> _ParsedT:
         try:
-            async with asyncio.timeout_at(deadline):
-                return await PARSER_WORK.run(parser)
+            return await parser
         except BlockingWorkCapacityError as exc:
             raise AppError(
                 ErrorCode.RATE_LIMITED,
@@ -325,6 +324,12 @@ class NplgRepository:
             raise AppError(
                 ErrorCode.UPSTREAM_FAILURE,
                 _REQUEST_DEADLINE_MESSAGE,
+                http_status=502,
+            ) from exc
+        except ParserWorkerError as exc:
+            raise AppError(
+                ErrorCode.UPSTREAM_FAILURE,
+                "The repository response could not be parsed safely.",
                 http_status=502,
             ) from exc
 
@@ -570,12 +575,12 @@ class NplgRepository:
             deadline=deadline,
         )
         page = await self._parse_within_deadline(
-            lambda: parse_search_results(
+            self.parser_executor.parse_search(
                 text,
                 source_url=final_url,
                 page_size=page_size,
+                deadline=deadline,
             ),
-            deadline=deadline,
         )
         return page.with_cursor(
             encode_cursor(
@@ -601,12 +606,12 @@ class NplgRepository:
             deadline=deadline,
         )
         return await self._parse_within_deadline(
-            lambda: parse_item_page(
+            self.parser_executor.parse_item(
                 text,
                 expected_handle=canonical,
                 source_url=final_url,
+                deadline=deadline,
             ),
-            deadline=deadline,
         )
 
     async def list_files(self, handle: str) -> tuple[Bitstream, ...]:
@@ -633,8 +638,7 @@ class NplgRepository:
                 deadline=deadline,
             )
             formats = await self._parse_within_deadline(
-                lambda: parse_metadata_formats(text),
-                deadline=deadline,
+                self.parser_executor.parse_metadata_formats(text, deadline=deadline),
             )
             stored_at = self.cache_clock()
             if stored_at < now:
@@ -668,12 +672,12 @@ class NplgRepository:
                 deadline=deadline,
             )
             return await self._parse_within_deadline(
-                lambda: parse_oai_record(
+                self.parser_executor.parse_oai_record(
                     text,
                     expected_handle=canonical,
                     metadata_prefix=prefix,
+                    deadline=deadline,
                 ),
-                deadline=deadline,
             )
         except AppError as error:
             if error.code not in {ErrorCode.UPSTREAM_FAILURE, ErrorCode.NOT_FOUND}:
@@ -685,21 +689,24 @@ class NplgRepository:
             deadline=deadline,
         )
         return await self._parse_within_deadline(
-            lambda: parse_item_page(
+            self.parser_executor.parse_item(
                 text,
                 expected_handle=canonical,
                 source_url=final_url,
+                deadline=deadline,
             ),
-            deadline=deadline,
         )
 
 
-def _require_metadata_prefix(formats: tuple[str, ...]) -> str:
-    prefix = "dim" if "dim" in formats else "oai_dc" if "oai_dc" in formats else None
-    if prefix is None:
-        raise AppError(
-            ErrorCode.UPSTREAM_FAILURE,
-            "The repository did not expose a supported OAI-PMH metadata format.",
-            http_status=502,
-        )
-    return prefix
+def _require_metadata_prefix(
+    formats: tuple[str, ...],
+) -> Literal["dim", "oai_dc"]:
+    if "dim" in formats:
+        return "dim"
+    if "oai_dc" in formats:
+        return "oai_dc"
+    raise AppError(
+        ErrorCode.UPSTREAM_FAILURE,
+        "The repository did not expose a supported OAI-PMH metadata format.",
+        http_status=502,
+    )

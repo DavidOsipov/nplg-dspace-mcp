@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-import ast
+import asyncio
 import base64
 import hashlib
 from dataclasses import dataclass, field
@@ -12,11 +12,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 
 import pytest
-from mcp import types
+from mcp import Client, types
 from mcp.shared.exceptions import MCPError
+from pydantic import ValidationError
 
+from nplg_mcp import sdk_boundary
+from nplg_mcp.config import HARD_MAX_INLINE_RESOURCE_BYTES
+from nplg_mcp.errors import AppError, ErrorCode
+from nplg_mcp.mcp_server import create_mcp_server
+from nplg_mcp.profiles import DeploymentProfile
 from nplg_mcp.sdk_boundary import SdkHandlers
-from nplg_mcp.services import MetadataServiceComposition
+from nplg_mcp.services import FullServiceComposition, MetadataServiceComposition
 
 if TYPE_CHECKING:
     from mcp.server.context import ServerRequestContext
@@ -29,6 +35,8 @@ if TYPE_CHECKING:
 
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
+_EXPECTED_BASE64_VALIDATION_CHUNK_CODE_POINTS = 64 * 1024
+_EXPECTED_ADMITTED_RESOURCE_READS = 2
 
 
 def _call_log() -> list[tuple[str, JsonObject]]:
@@ -78,6 +86,32 @@ class InvalidOutputTools(RecordingTools):
 
 
 @dataclass(slots=True)
+class DomainErrorTools(RecordingTools):
+    """Raise one expected project-owned domain error after handler entry."""
+
+    @override
+    async def call(self, name: str, arguments: JsonObject) -> StrictOutput | JsonObject:
+        self.calls.append((name, arguments))
+        raise AppError(
+            ErrorCode.UPSTREAM_FAILURE,
+            "The upstream repository is temporarily unavailable.",
+            http_status=502,
+            internal_details={"canary": "domain-private-canary"},
+        )
+
+
+@dataclass(slots=True)
+class UnexpectedErrorTools(RecordingTools):
+    """Raise one unexpected canary-bearing exception after handler entry."""
+
+    @override
+    async def call(self, name: str, arguments: JsonObject) -> StrictOutput | JsonObject:
+        self.calls.append((name, arguments))
+        message = "unexpected-private-canary"
+        raise RuntimeError(message)
+
+
+@dataclass(slots=True)
 class ResourcePayloadTools(RecordingTools):
     """Return one deliberately controlled service resource payload."""
 
@@ -111,28 +145,186 @@ def _context() -> ServerRequestContext[None]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "arguments",
+    ("arguments", "expected_location"),
     [
-        {"query": "fixture", "unexpected": True},
-        {"query": 1},
-        {"query": "fixture", "page_size": True},
+        ({"query": "fixture", "unexpected": True}, "arguments"),
+        ({"query": 1}, "query"),
+        ({"query": "fixture", "page_size": True}, "page_size"),
     ],
 )
 async def test_sdk_boundary_rejects_bad_raw_arguments_before_tool_entry(
     tool_service: ToolService,
     arguments: dict[str, object],
+    expected_location: str,
 ) -> None:
-    """Adapter validation is a pre-dispatch boundary, not a service convenience."""
+    """Known-tool validation is an actionable tool result before service entry."""
     tools = RecordingTools(tool_service)
     handlers = SdkHandlers(MetadataServiceComposition(tools=tools))
     params = types.CallToolRequestParams(name="search_documents", arguments=arguments)
+
+    result = await handlers.on_call_tool(_context(), params)
+
+    assert result.is_error is True
+    assert result.structured_content == {
+        "error": {
+            "code": ErrorCode.INVALID_INPUT.value,
+            "message": "Tool arguments did not match the declared schema.",
+            "details": {"locations": [expected_location]},
+        }
+    }
+    assert len(result.content) == 1
+    assert isinstance(result.content[0], types.TextContent)
+    assert result.content[0].text == "Tool arguments did not match the declared schema."
+    assert tools.calls == []
+
+
+@pytest.mark.asyncio
+async def test_sdk_boundary_sanitizes_malformed_validation_error_locations(
+    tool_service: ToolService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed dependency diagnostics collapse to one bounded safe location."""
+    tools = RecordingTools(tool_service)
+    handlers = SdkHandlers(MetadataServiceComposition(tools=tools))
+    params = types.CallToolRequestParams(
+        name="search_documents",
+        arguments={"query": 1},
+    )
+
+    def malformed_errors(
+        _error: ValidationError,
+        *,
+        include_url: bool = True,
+        include_context: bool = True,
+        include_input: bool = True,
+    ) -> list[object]:
+        _ = include_url, include_context, include_input
+        return ["not-an-error-object", {"loc": []}]
+
+    monkeypatch.setattr(ValidationError, "errors", malformed_errors)
+
+    result = await handlers.on_call_tool(_context(), params)
+
+    assert result.is_error is True
+    assert result.structured_content == {
+        "error": {
+            "code": ErrorCode.INVALID_INPUT.value,
+            "message": "Tool arguments did not match the declared schema.",
+            "details": {"locations": ["arguments"]},
+        }
+    }
+    assert tools.calls == []
+
+
+@pytest.mark.asyncio
+async def test_sdk_boundary_uses_fallback_text_for_malformed_public_error_message(
+    tool_service: ToolService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed public-error projection cannot enter SDK text content."""
+    tools = RecordingTools(tool_service)
+    handlers = SdkHandlers(MetadataServiceComposition(tools=tools))
+    params = types.CallToolRequestParams(
+        name="search_documents",
+        arguments={"query": 1},
+    )
+
+    def malformed_public_error(_error: BaseException) -> JsonObject:
+        return {
+            "code": ErrorCode.INTERNAL_ERROR.value,
+            "message": 7,
+        }
+
+    monkeypatch.setattr(sdk_boundary, "to_public_error", malformed_public_error)
+
+    result = await handlers.on_call_tool(_context(), params)
+
+    assert result.is_error is True
+    assert len(result.content) == 1
+    content = result.content[0]
+    assert isinstance(content, types.TextContent)
+    assert content.text == "The server could not complete the request."
+    assert tools.calls == []
+
+
+@pytest.mark.asyncio
+async def test_sdk_boundary_uses_exact_protocol_error_for_unknown_tool(
+    tool_service: ToolService,
+) -> None:
+    """An unknown tool is a sanitized protocol error and never enters services."""
+    tools = RecordingTools(tool_service)
+    handlers = SdkHandlers(MetadataServiceComposition(tools=tools))
+    params = types.CallToolRequestParams(
+        name="attacker-controlled-unknown-tool",
+        arguments={},
+    )
 
     with pytest.raises(MCPError) as captured:
         _ = await handlers.on_call_tool(_context(), params)
 
     assert captured.value.error.code == INVALID_PARAMS
+    assert captured.value.error.message == "Unknown tool."
+    assert captured.value.error.data == {"code": "UNKNOWN_TOOL"}
+    assert "attacker-controlled" not in str(
+        captured.value.error.model_dump(mode="json")
+    )
     assert tools.calls == []
-    assert "fixture" not in captured.value.error.message
+
+
+@pytest.mark.asyncio
+async def test_sdk_boundary_returns_expected_domain_error_as_tool_result(
+    tool_service: ToolService,
+) -> None:
+    """An actionable AppError stays in the tool-result channel without private data."""
+    tools = DomainErrorTools(tool_service)
+    handlers = SdkHandlers(MetadataServiceComposition(tools=tools))
+    params = types.CallToolRequestParams(
+        name="search_documents",
+        arguments={"query": "fixture"},
+    )
+
+    result = await handlers.on_call_tool(_context(), params)
+
+    assert result.is_error is True
+    assert result.structured_content == {
+        "error": {
+            "code": ErrorCode.UPSTREAM_FAILURE.value,
+            "message": "The upstream repository is temporarily unavailable.",
+        }
+    }
+    assert len(result.content) == 1
+    assert isinstance(result.content[0], types.TextContent)
+    assert result.content[0].text == (
+        "The upstream repository is temporarily unavailable."
+    )
+    assert "domain-private-canary" not in str(
+        result.model_dump(mode="json", by_alias=True)
+    )
+    assert tools.calls == [("search_documents", {"query": "fixture"})]
+
+
+@pytest.mark.asyncio
+async def test_sdk_boundary_sanitizes_unexpected_tool_exception(
+    tool_service: ToolService,
+) -> None:
+    """Unexpected tool failures use the project-owned internal protocol error."""
+    tools = UnexpectedErrorTools(tool_service)
+    handlers = SdkHandlers(MetadataServiceComposition(tools=tools))
+    params = types.CallToolRequestParams(
+        name="search_documents",
+        arguments={"query": "fixture"},
+    )
+
+    with pytest.raises(MCPError) as captured:
+        _ = await handlers.on_call_tool(_context(), params)
+
+    assert captured.value.error.code == INTERNAL_ERROR
+    assert captured.value.error.message == "Internal tool error."
+    assert captured.value.error.data is None
+    assert "unexpected-private-canary" not in str(
+        captured.value.error.model_dump(mode="json")
+    )
+    assert tools.calls == [("search_documents", {"query": "fixture"})]
 
 
 @pytest.mark.asyncio
@@ -152,6 +344,7 @@ async def test_sdk_boundary_sanitizes_invalid_untrusted_handler_output(
 
     assert captured.value.error.code == INTERNAL_ERROR
     assert "canary-secret-value" not in captured.value.error.message
+    assert captured.value.error.message == "Internal tool error."
     assert tools.calls == [("search_documents", {"query": "fixture"})]
 
 
@@ -173,7 +366,10 @@ async def test_sdk_boundary_sanitizes_resource_uri_binding_mismatch(
             "text": "{}",
         }
     tools = ResourcePayloadTools(tool_service, resource=resource)
-    handlers = SdkHandlers(MetadataServiceComposition(tools=tools))
+    handlers = SdkHandlers(
+        FullServiceComposition(tools=tools, store=tool_service.store),
+        DeploymentProfile.PRIVATE_FULL,
+    )
     params = types.ReadResourceRequestParams(uri=requested_uri)
 
     with pytest.raises(MCPError) as captured:
@@ -198,7 +394,10 @@ async def test_sdk_boundary_sanitizes_each_blob_identity_mismatch(
     else:
         resource["sha256"] = "f" * 64
     tools = ResourcePayloadTools(tool_service, resource=resource)
-    handlers = SdkHandlers(MetadataServiceComposition(tools=tools))
+    handlers = SdkHandlers(
+        FullServiceComposition(tools=tools, store=tool_service.store),
+        DeploymentProfile.PRIVATE_FULL,
+    )
     params = types.ReadResourceRequestParams(uri=requested_uri)
 
     with pytest.raises(MCPError) as captured:
@@ -209,6 +408,412 @@ async def test_sdk_boundary_sanitizes_each_blob_identity_mismatch(
 
 
 @pytest.mark.asyncio
+async def test_sdk_boundary_rejects_blob_encoded_length_mismatch_before_decode(
+    tool_service: ToolService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An impossible encoded length is rejected without decoding attacker data."""
+    requested_uri = "nplg://artifact/doc_" + "0" * 64
+    resource = _blob_resource(requested_uri)
+    resource["size"] = str(int(resource["size"]) + 2)
+    tools = ResourcePayloadTools(tool_service, resource=resource)
+    handlers = SdkHandlers(
+        FullServiceComposition(tools=tools, store=tool_service.store),
+        DeploymentProfile.PRIVATE_FULL,
+    )
+    decode_called = False
+    real_decode = base64.b64decode
+
+    def measured_decode(value: str, *, validate: bool) -> bytes:
+        nonlocal decode_called
+        decode_called = True
+        return real_decode(value, validate=validate)
+
+    monkeypatch.setattr(base64, "b64decode", measured_decode)
+
+    with pytest.raises(MCPError) as captured:
+        _ = await handlers.on_read_resource(
+            _context(),
+            types.ReadResourceRequestParams(uri=requested_uri),
+        )
+
+    assert captured.value.error.code == INTERNAL_ERROR
+    assert captured.value.error.message == "Internal server error"
+    assert decode_called is False
+
+
+@pytest.mark.asyncio
+async def test_sdk_boundary_stops_before_hashing_decoded_size_overflow(
+    tool_service: ToolService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decoded bytes exceeding the declaration are rejected before hashing."""
+    requested_uri = "nplg://artifact/doc_" + "0" * 64
+    tools = ResourcePayloadTools(
+        tool_service,
+        resource={
+            "uri": requested_uri,
+            "mime_type": "image/jpeg",
+            "text": "",
+            "blob": "Zm9v",
+            "sha256": "0" * 64,
+            "size": "1",
+            "render_id": "",
+        },
+    )
+    handlers = SdkHandlers(
+        FullServiceComposition(tools=tools, store=tool_service.store),
+        DeploymentProfile.PRIVATE_FULL,
+    )
+
+    class HashingMustNotStart:
+        def update(self, _decoded: bytes) -> None:
+            pytest.fail("oversize decoded bytes reached the digest")
+
+        def hexdigest(self) -> str:
+            return "0" * 64
+
+    def rejecting_sha256() -> HashingMustNotStart:
+        return HashingMustNotStart()
+
+    monkeypatch.setattr(hashlib, "sha256", rejecting_sha256)
+
+    with pytest.raises(MCPError) as captured:
+        _ = await handlers.on_read_resource(
+            _context(),
+            types.ReadResourceRequestParams(uri=requested_uri),
+        )
+
+    assert captured.value.error.code == INTERNAL_ERROR
+    assert captured.value.error.message == "Internal server error"
+
+
+@pytest.mark.asyncio
+async def test_sdk_boundary_rejects_oversize_blob_declaration_before_decode(
+    tool_service: ToolService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_uri = "nplg://artifact/doc_" + "0" * 64
+    resource = _blob_resource(requested_uri)
+    resource["size"] = str(HARD_MAX_INLINE_RESOURCE_BYTES + 1)
+    tools = ResourcePayloadTools(tool_service, resource=resource)
+    handlers = SdkHandlers(
+        FullServiceComposition(tools=tools, store=tool_service.store),
+        DeploymentProfile.PRIVATE_FULL,
+    )
+    params = types.ReadResourceRequestParams(uri=requested_uri)
+    decode_called = False
+
+    def reject_decode(_value: str, *, validate: bool) -> bytes:
+        nonlocal decode_called
+        _ = validate
+        decode_called = True
+        pytest.fail("oversize blob was decoded")
+
+    monkeypatch.setattr(base64, "b64decode", reject_decode)
+
+    with pytest.raises(MCPError) as captured:
+        _ = await handlers.on_read_resource(_context(), params)
+
+    assert captured.value.error.code == INTERNAL_ERROR
+    assert captured.value.error.message == "Internal server error"
+    assert decode_called is False
+
+
+@pytest.mark.asyncio
+async def test_sdk_boundary_rejects_text_over_utf8_byte_limit(
+    tool_service: ToolService,
+) -> None:
+    """Multibyte text cannot exceed the byte-denominated inline ceiling."""
+    requested_uri = "nplg://artifact/doc_" + "0" * 64
+    over_limit = "🙂" * ((HARD_MAX_INLINE_RESOURCE_BYTES // 4) + 1)
+    tools = ResourcePayloadTools(
+        tool_service,
+        resource={
+            "uri": requested_uri,
+            "mime_type": "application/json",
+            "text": over_limit,
+        },
+    )
+    handlers = SdkHandlers(
+        FullServiceComposition(tools=tools, store=tool_service.store),
+        DeploymentProfile.PRIVATE_FULL,
+    )
+
+    with pytest.raises(MCPError) as captured:
+        _ = await handlers.on_read_resource(
+            _context(),
+            types.ReadResourceRequestParams(uri=requested_uri),
+        )
+
+    assert captured.value.error.code == INTERNAL_ERROR
+    assert captured.value.error.message == "Internal server error"
+
+
+@pytest.mark.asyncio
+async def test_sdk_boundary_rejects_blob_text_over_utf8_byte_limit(
+    tool_service: ToolService,
+) -> None:
+    """Unused blob text cannot bypass the byte-denominated inline ceiling."""
+    requested_uri = "nplg://artifact/doc_" + "0" * 64
+    resource = _blob_resource(requested_uri)
+    resource["text"] = "🙂" * ((HARD_MAX_INLINE_RESOURCE_BYTES // 4) + 1)
+    tools = ResourcePayloadTools(tool_service, resource=resource)
+    handlers = SdkHandlers(
+        FullServiceComposition(tools=tools, store=tool_service.store),
+        DeploymentProfile.PRIVATE_FULL,
+    )
+
+    with pytest.raises(MCPError) as captured:
+        _ = await handlers.on_read_resource(
+            _context(),
+            types.ReadResourceRequestParams(uri=requested_uri),
+        )
+
+    assert captured.value.error.code == INTERNAL_ERROR
+    assert captured.value.error.message == "Internal server error"
+
+
+@pytest.mark.asyncio
+async def test_sdk_boundary_accepts_text_at_exact_utf8_byte_limit(
+    tool_service: ToolService,
+) -> None:
+    """The byte ceiling remains inclusive for exact multibyte content."""
+    requested_uri = "nplg://artifact/doc_" + "0" * 64
+    exact_limit = "🙂" * (HARD_MAX_INLINE_RESOURCE_BYTES // 4)
+    tools = ResourcePayloadTools(
+        tool_service,
+        resource={
+            "uri": requested_uri,
+            "mime_type": "application/json",
+            "text": exact_limit,
+        },
+    )
+    handlers = SdkHandlers(
+        FullServiceComposition(tools=tools, store=tool_service.store),
+        DeploymentProfile.PRIVATE_FULL,
+    )
+
+    result = await handlers.on_read_resource(
+        _context(),
+        types.ReadResourceRequestParams(uri=requested_uri),
+    )
+
+    assert len(result.contents) == 1
+    content = result.contents[0]
+    assert isinstance(content, types.TextResourceContents)
+    assert len(content.text.encode("utf-8")) == HARD_MAX_INLINE_RESOURCE_BYTES
+
+
+@pytest.mark.asyncio
+async def test_sdk_boundary_rejects_noncanonical_base64_pad_bits(
+    tool_service: ToolService,
+) -> None:
+    """Equivalent but noncanonical RFC 4648 spellings fail closed."""
+    requested_uri = "nplg://artifact/doc_" + "0" * 64
+    raw = b"f"
+    tools = ResourcePayloadTools(
+        tool_service,
+        resource={
+            "uri": requested_uri,
+            "mime_type": "image/jpeg",
+            "text": "",
+            "blob": "Zh==",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "size": "1",
+            "render_id": "",
+        },
+    )
+    handlers = SdkHandlers(
+        FullServiceComposition(tools=tools, store=tool_service.store),
+        DeploymentProfile.PRIVATE_FULL,
+    )
+
+    with pytest.raises(MCPError) as captured:
+        _ = await handlers.on_read_resource(
+            _context(),
+            types.ReadResourceRequestParams(uri=requested_uri),
+        )
+
+    assert captured.value.error.code == INTERNAL_ERROR
+    assert captured.value.error.message == "Internal server error"
+
+
+@pytest.mark.asyncio
+async def test_sdk_boundary_accepts_canonical_one_byte_base64(
+    tool_service: ToolService,
+) -> None:
+    requested_uri = "nplg://artifact/doc_" + "0" * 64
+    raw = b"f"
+    tools = ResourcePayloadTools(
+        tool_service,
+        resource={
+            "uri": requested_uri,
+            "mime_type": "image/jpeg",
+            "text": "",
+            "blob": "Zg==",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "size": "1",
+            "render_id": "",
+        },
+    )
+    handlers = SdkHandlers(
+        FullServiceComposition(tools=tools, store=tool_service.store),
+        DeploymentProfile.PRIVATE_FULL,
+    )
+
+    result = await handlers.on_read_resource(
+        _context(),
+        types.ReadResourceRequestParams(uri=requested_uri),
+    )
+
+    assert len(result.contents) == 1
+    content = result.contents[0]
+    assert isinstance(content, types.BlobResourceContents)
+    assert content.blob == "Zg=="
+
+
+@pytest.mark.asyncio
+async def test_sdk_boundary_rejects_multiple_adapted_resource_contents(
+    tool_service: ToolService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compromised adapter cannot reserve or publish an ambiguous response."""
+    requested_uri = "nplg://artifact/doc_" + "0" * 64
+    tools = ResourcePayloadTools(
+        tool_service,
+        resource={
+            "uri": requested_uri,
+            "mime_type": "application/json",
+            "text": "{}",
+        },
+    )
+    handlers = SdkHandlers(
+        FullServiceComposition(tools=tools, store=tool_service.store),
+        DeploymentProfile.PRIVATE_FULL,
+    )
+
+    def multiple_contents(
+        uri: str,
+        _resource: dict[str, str],
+    ) -> types.ReadResourceResult:
+        content = types.TextResourceContents(
+            uri=uri,
+            mime_type="application/json",
+            text="{}",
+        )
+        return types.ReadResourceResult(
+            contents=[content, content],
+            ttl_ms=0,
+            cache_scope="private",
+        )
+
+    monkeypatch.setattr(sdk_boundary, "_adapt_resource", multiple_contents)
+
+    with pytest.raises(MCPError) as captured:
+        _ = await handlers.on_read_resource(
+            _context(),
+            types.ReadResourceRequestParams(uri=requested_uri),
+        )
+
+    assert captured.value.error.code == INTERNAL_ERROR
+    assert captured.value.error.message == "Internal server error"
+
+
+@pytest.mark.asyncio
+async def test_resource_response_admission_rejects_third_maximum_reader(
+    tool_service: ToolService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Maximum-size response work is rejected before a third service read."""
+    requested_uri = "nplg://artifact/doc_" + "0" * 64
+    tools = ResourcePayloadTools(
+        tool_service,
+        resource={
+            "uri": requested_uri,
+            "mime_type": "application/json",
+            "text": "{}",
+        },
+    )
+    release = asyncio.Event()
+    two_entered = asyncio.Event()
+    entered: list[str] = []
+
+    async def blocking_read(
+        _tools: ResourcePayloadTools,
+        uri: str,
+    ) -> dict[str, str]:
+        entered.append(uri)
+        if len(entered) >= _EXPECTED_ADMITTED_RESOURCE_READS:
+            two_entered.set()
+        _ = await release.wait()
+        return dict(tools.resource)
+
+    monkeypatch.setattr(ResourcePayloadTools, "read_resource", blocking_read)
+    handlers = SdkHandlers(
+        FullServiceComposition(tools=tools, store=tool_service.store),
+        DeploymentProfile.PRIVATE_FULL,
+    )
+    params = types.ReadResourceRequestParams(uri=requested_uri)
+    tasks = [
+        asyncio.create_task(handlers.on_read_resource(_context(), params))
+        for _ in range(3)
+    ]
+    try:
+        async with asyncio.timeout(1):
+            _ = await two_entered.wait()
+        await asyncio.sleep(0)
+        calls_before_release = len(entered)
+    finally:
+        release.set()
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert calls_before_release == _EXPECTED_ADMITTED_RESOURCE_READS
+    failures = [outcome for outcome in outcomes if isinstance(outcome, MCPError)]
+    assert len(failures) == 1
+    assert failures[0].error.code == INTERNAL_ERROR
+    assert failures[0].error.message == "Internal server error"
+
+
+@pytest.mark.asyncio
+async def test_sdk_boundary_validates_blob_digest_in_bounded_decode_chunks(
+    tool_service: ToolService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_uri = "nplg://artifact/doc_" + "0" * 64
+    raw = b"x" * (_EXPECTED_BASE64_VALIDATION_CHUNK_CODE_POINTS * 2)
+    resource = {
+        "uri": requested_uri,
+        "mime_type": "image/jpeg",
+        "text": "",
+        "blob": base64.b64encode(raw).decode("ascii"),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size": str(len(raw)),
+        "render_id": "",
+    }
+    tools = ResourcePayloadTools(tool_service, resource=resource)
+    handlers = SdkHandlers(
+        FullServiceComposition(tools=tools, store=tool_service.store),
+        DeploymentProfile.PRIVATE_FULL,
+    )
+    params = types.ReadResourceRequestParams(uri=requested_uri)
+    real_decode = base64.b64decode
+    maximum_decode_input = 0
+
+    def measured_decode(value: str, *, validate: bool) -> bytes:
+        nonlocal maximum_decode_input
+        maximum_decode_input = max(maximum_decode_input, len(value))
+        return real_decode(value, validate=validate)
+
+    monkeypatch.setattr(base64, "b64decode", measured_decode)
+
+    result = await handlers.on_read_resource(_context(), params)
+
+    assert len(result.contents) == 1
+    assert maximum_decode_input <= _EXPECTED_BASE64_VALIDATION_CHUNK_CODE_POINTS
+
+
+@pytest.mark.asyncio
 async def test_sdk_boundary_omits_empty_render_provenance_metadata(
     tool_service: ToolService,
 ) -> None:
@@ -216,7 +821,10 @@ async def test_sdk_boundary_omits_empty_render_provenance_metadata(
     requested_uri = "nplg://artifact/doc_" + "0" * 64
     resource = _blob_resource(requested_uri)
     tools = ResourcePayloadTools(tool_service, resource=resource)
-    handlers = SdkHandlers(MetadataServiceComposition(tools=tools))
+    handlers = SdkHandlers(
+        FullServiceComposition(tools=tools, store=tool_service.store),
+        DeploymentProfile.PRIVATE_FULL,
+    )
     params = types.ReadResourceRequestParams(uri=requested_uri)
 
     result = await handlers.on_read_resource(_context(), params)
@@ -231,34 +839,35 @@ async def test_sdk_boundary_omits_empty_render_provenance_metadata(
     }
 
 
-def test_server_uses_all_constructor_bound_handlers_without_decorators() -> None:
-    """The low-level SDK registration seam cannot silently revert to decorators."""
-    source = Path("src/nplg_mcp/mcp_server.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    function = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "create_mcp_server"
-    )
-    calls = [
-        node
-        for node in ast.walk(function)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "Server"
-    ]
+@pytest.mark.asyncio
+async def test_private_full_server_registers_resource_handlers(
+    tool_service: ToolService,
+) -> None:
+    """Private-full retains its resource capability and resource catalog."""
+    services = FullServiceComposition(tools=tool_service, store=tool_service.store)
+    server = create_mcp_server(services, DeploymentProfile.PRIVATE_FULL)
 
-    assert len(calls) == 1
-    registered = {keyword.arg for keyword in calls[0].keywords}
-    assert {
-        "on_list_tools",
-        "on_call_tool",
-        "on_list_resources",
-        "on_list_resource_templates",
-        "on_read_resource",
-    } <= registered
-    assert ".tool(" not in source
-    assert ".resource(" not in source
+    async with Client(server, mode="2026-07-28") as client:
+        resources = await client.list_resources()
+
+    assert [resource.uri for resource in resources.resources] == ["nplg://about"]
+
+
+@pytest.mark.asyncio
+async def test_metadata_boundary_rejects_resource_reads_before_service_entry(
+    tool_service: ToolService,
+) -> None:
+    """Metadata profile cannot adapt resources even from an untrusted service."""
+    requested_uri = "nplg://artifact/doc_" + "0" * 64
+    tools = ResourcePayloadTools(tool_service, resource=_blob_resource(requested_uri))
+    handlers = SdkHandlers(MetadataServiceComposition(tools=tools))
+    params = types.ReadResourceRequestParams(uri=requested_uri)
+
+    with pytest.raises(MCPError) as captured:
+        _ = await handlers.on_read_resource(_context(), params)
+
+    assert captured.value.error.code == INVALID_PARAMS
+    assert captured.value.error.message == "Resource not found"
 
 
 def test_runtime_manifests_pin_the_official_sdk_transport_stack() -> None:

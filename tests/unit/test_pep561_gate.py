@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import os
 import subprocess
 import tarfile
 import warnings
@@ -20,11 +22,96 @@ from scripts import verify_pep561 as gate
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from typing import BinaryIO
 
 _EXPECTED_ARTIFACT_COUNT = 2
 _EXPECTED_TOOL_PROBE_COUNT = 3
 _EXPECTED_FAULT_CHECK_COUNT = 4
 _SHA256_HEX_LENGTH = 64
+_SECOND_IDENTITY_READ = 2
+
+
+def test_source_snapshot_identity_ignores_atime_but_detects_mutation(
+    tmp_path: Path,
+) -> None:
+    baseline = os.stat_result((0o100600, 11, 22, 1, 1000, 1000, 7, 31, 41, 51))
+    accessed = os.stat_result((0o100600, 11, 22, 1, 1000, 1000, 7, 32, 41, 51))
+    assert gate._stable_file_identity(accessed) == gate._stable_file_identity(baseline)
+
+    member = tmp_path / "member.py"
+    _ = member.write_bytes(b"a")
+    before = member.lstat()
+    _ = member.write_bytes(b"changed")
+
+    assert gate._stable_file_identity(member.lstat()) != gate._stable_file_identity(
+        before
+    )
+
+
+def test_stable_digest_binds_the_opened_file_against_path_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reviewed = tmp_path / "reviewed"
+    _ = reviewed.write_bytes(b"GOOD")
+    substituted = b"EVIL"
+
+    def substituted_open(
+        path: Path,
+        mode: str = "r",
+    ) -> BinaryIO:
+        assert path == reviewed
+        assert mode == "rb"
+        return io.BytesIO(substituted)
+
+    monkeypatch.setattr(Path, "open", substituted_open)
+
+    assert (
+        gate._stable_sha256(reviewed, max_bytes=4)
+        == hashlib.sha256(b"GOOD").hexdigest()
+    )
+
+
+def test_tree_digest_binds_the_opened_file_against_path_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "tree"
+    root.mkdir()
+    member = root / "member.py"
+    _ = member.write_bytes(b"GOOD")
+    expected = gate._tree_sha256(root)
+    real_read_bytes = Path.read_bytes
+
+    def substituted_read(path: Path) -> bytes:
+        if path == member:
+            return b"EVIL"
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", substituted_read)
+
+    assert gate._tree_sha256(root) == expected
+
+
+def test_source_copy_binds_the_opened_file_against_path_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worktree = _minimal_worktree(tmp_path / "worktree-race")
+    source = worktree / "src" / "nplg_mcp" / "__init__.py"
+    expected = source.read_bytes()
+    assert len(expected) == len(b"VALUE = 2\n")
+    real_read_bytes = Path.read_bytes
+
+    def substituted_read(path: Path) -> bytes:
+        if path == source:
+            return b"VALUE = 2\n"
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", substituted_read)
+    snapshot = gate._copy_source_snapshot(worktree, tmp_path / "snapshot-race")
+
+    assert (snapshot / "src" / "nplg_mcp" / "__init__.py").read_bytes() == expected
 
 
 def _result(
@@ -52,6 +139,68 @@ def _minimal_worktree(root: Path) -> Path:
     return root
 
 
+def _commit_candidate(worktree: Path) -> tuple[str, str]:
+    environment = {
+        "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+00:00",
+        "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+00:00",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "HOME": worktree.as_posix(),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+    }
+    commands = (
+        ("/usr/bin/git", "init", "--quiet"),
+        (
+            "/usr/bin/git",
+            "add",
+            "--",
+            "LICENSE",
+            "README.md",
+            "THIRD_PARTY_NOTICES.md",
+            "pyproject.toml",
+            "src/nplg_mcp",
+        ),
+        (
+            "/usr/bin/git",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "user.name=Fixture",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture candidate",
+        ),
+    )
+    for command in commands:
+        _ = subprocess.run(  # noqa: S603
+            command,
+            cwd=worktree,
+            env=environment,
+            check=True,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+        )
+
+    def resolve(revision: str) -> str:
+        result = subprocess.run(  # noqa: S603
+            ("/usr/bin/git", "rev-parse", "--verify", revision),
+            cwd=worktree,
+            env=environment,
+            check=True,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+        )
+        return result.stdout.decode("ascii", errors="strict").strip()
+
+    return resolve("HEAD"), resolve("HEAD^{tree}")
+
+
 def _valid_evidence(*, require_full: bool) -> JsonObject:
     check_result = True if require_full else None
     tool = {"sha256": "2" * 64, "version": "fixture"}
@@ -61,6 +210,7 @@ def _valid_evidence(*, require_full: bool) -> JsonObject:
             "wheel": {"filename": "fixture.whl", "sha256": "1" * 64},
         },
         "candidate": "a" * 40 if require_full else None,
+        "candidate_tree": "b" * 40 if require_full else None,
         "checks": {
             "annotation_fault_mypy": check_result,
             "annotation_fault_pyright": check_result,
@@ -124,12 +274,290 @@ def test_path_and_digest_boundaries_fail_closed(tmp_path: Path) -> None:
     with pytest.raises(gate.Pep561GateError, match="unavailable"):
         _ = gate._stable_sha256(tmp_path / "absent", max_bytes=64)
 
+    assert (
+        gate._run(
+            ("/usr/bin/true",),
+            cwd=tmp_path,
+            environment=gate._closed_environment(tmp_path),
+        ).returncode
+        == 0
+    )
     with pytest.raises(gate.Pep561GateError, match="subprocess failed"):
         _ = gate._run(
             ("/usr/bin/false",),
             cwd=tmp_path,
             environment=gate._closed_environment(tmp_path),
         )
+
+
+def test_stable_digest_rejects_growth_read_failure_and_size_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_lstat = Path.lstat
+    real_fstat = os.fstat
+
+    grown = tmp_path / "grown"
+    _ = grown.write_bytes(b"x" * 65)
+
+    def undersized_lstat(path: Path) -> os.stat_result:
+        metadata = real_lstat(path)
+        if path == grown:
+            fields = list(metadata)
+            fields[6] = 64
+            return os.stat_result(fields)
+        return metadata
+
+    def undersized_fstat(descriptor: int) -> os.stat_result:
+        metadata = real_fstat(descriptor)
+        fields = list(metadata)
+        fields[6] = 64
+        return os.stat_result(fields)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Path, "lstat", undersized_lstat)
+        scoped.setattr(os, "fstat", undersized_fstat)
+        with pytest.raises(gate.Pep561GateError, match="exceeded its byte ceiling"):
+            _ = gate._stable_sha256(grown, max_bytes=64)
+
+    disappearing = tmp_path / "disappearing"
+    _ = disappearing.write_bytes(b"payload")
+
+    def removing_lstat(path: Path) -> os.stat_result:
+        metadata = real_lstat(path)
+        if path == disappearing:
+            path.unlink()
+        return metadata
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Path, "lstat", removing_lstat)
+        with pytest.raises(gate.Pep561GateError, match="could not be read"):
+            _ = gate._stable_sha256(disappearing, max_bytes=64)
+
+    drifted = tmp_path / "drifted"
+    _ = drifted.write_bytes(b"drift")
+
+    def wrong_size_lstat(path: Path) -> os.stat_result:
+        metadata = real_lstat(path)
+        if path == drifted:
+            fields = list(metadata)
+            fields[6] += 1
+            return os.stat_result(fields)
+        return metadata
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Path, "lstat", wrong_size_lstat)
+        with pytest.raises(gate.Pep561GateError, match="changed while it was read"):
+            _ = gate._stable_sha256(drifted, max_bytes=64)
+
+
+def test_descriptor_reader_fails_closed_without_nofollow_on_open_or_close_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reviewed = tmp_path / "descriptor-errors"
+    _ = reviewed.write_bytes(b"payload")
+    metadata = reviewed.lstat()
+    policy = gate._StableReadPolicy(
+        max_bytes=64,
+        read_error="descriptor read failed",
+        changed_error="descriptor identity changed",
+        ceiling_error="descriptor exceeded ceiling",
+    )
+
+    with monkeypatch.context() as scoped:
+        scoped.delattr(os, "O_NOFOLLOW")
+        with pytest.raises(gate.Pep561GateError, match="descriptor read failed"):
+            _ = gate._read_stable_file(
+                reviewed,
+                before=metadata,
+                policy=policy,
+                consume=bytearray().extend,
+            )
+
+    def failing_open(_path: Path, _flags: int) -> int:
+        message = "simulated open failure"
+        raise OSError(message)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "open", failing_open)
+        with pytest.raises(gate.Pep561GateError, match="descriptor read failed"):
+            _ = gate._read_stable_file(
+                reviewed,
+                before=metadata,
+                policy=policy,
+                consume=bytearray().extend,
+            )
+
+    def failing_read(_descriptor: int, _maximum_bytes: int) -> bytes:
+        message = "simulated read failure"
+        raise OSError(message)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "read", failing_read)
+        with pytest.raises(gate.Pep561GateError, match="descriptor read failed"):
+            _ = gate._read_stable_file(
+                reviewed,
+                before=metadata,
+                policy=policy,
+                consume=bytearray().extend,
+            )
+
+    real_close = os.close
+
+    def failing_close(descriptor: int) -> None:
+        real_close(descriptor)
+        message = "simulated close failure"
+        raise OSError(message)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "close", failing_close)
+        with pytest.raises(gate.Pep561GateError, match="descriptor read failed"):
+            _ = gate._read_stable_file(
+                reviewed,
+                before=metadata,
+                policy=policy,
+                consume=bytearray().extend,
+            )
+
+
+def test_descriptor_reader_consumes_one_exact_stable_file(tmp_path: Path) -> None:
+    reviewed = tmp_path / "stable-descriptor"
+    payload = b"descriptor-bound payload"
+    _ = reviewed.write_bytes(payload)
+    consumed = bytearray()
+
+    total = gate._read_stable_file(
+        reviewed,
+        before=reviewed.lstat(),
+        policy=gate._StableReadPolicy(
+            max_bytes=len(payload),
+            read_error="descriptor read failed",
+            changed_error="descriptor identity changed",
+            ceiling_error="descriptor exceeded ceiling",
+        ),
+        consume=consumed.extend,
+    )
+
+    assert total == len(payload)
+    assert bytes(consumed) == payload
+
+
+def test_descriptor_reader_rejects_a_preopen_identity_mismatch(tmp_path: Path) -> None:
+    reviewed = tmp_path / "identity-mismatch"
+    _ = reviewed.write_bytes(b"payload")
+    metadata_fields = list(reviewed.lstat())
+    metadata_fields[1] += 1
+    mismatched_identity = os.stat_result(metadata_fields)
+    consumed = bytearray()
+
+    with pytest.raises(gate.Pep561GateError, match="descriptor identity changed"):
+        _ = gate._read_stable_file(
+            reviewed,
+            before=mismatched_identity,
+            policy=gate._StableReadPolicy(
+                max_bytes=64,
+                read_error="descriptor read failed",
+                changed_error="descriptor identity changed",
+                ceiling_error="descriptor exceeded ceiling",
+            ),
+            consume=consumed.extend,
+        )
+
+    assert consumed == b""
+
+
+def test_tree_digest_rejects_symlink_special_read_and_identity_faults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    symlink_root = tmp_path / "symlink-tree"
+    symlink_root.mkdir()
+    target = symlink_root / "target"
+    _ = target.write_bytes(b"target")
+    (symlink_root / "alias").symlink_to(target)
+    with pytest.raises(gate.Pep561GateError, match="symbolic link"):
+        _ = gate._tree_sha256(symlink_root)
+
+    special_root = tmp_path / "special-tree"
+    special_root.mkdir()
+    os.mkfifo(special_root / "pipe")
+    with pytest.raises(gate.Pep561GateError, match="non-regular file"):
+        _ = gate._tree_sha256(special_root)
+
+    read_root = tmp_path / "read-tree"
+    read_root.mkdir()
+    disappearing = read_root / "member"
+    _ = disappearing.write_bytes(b"member")
+    real_open = os.open
+
+    def removing_open(path: Path, flags: int) -> int:
+        if path == disappearing:
+            path.unlink()
+        return real_open(path, flags)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(os, "open", removing_open)
+        with pytest.raises(gate.Pep561GateError, match="could not read a file"):
+            _ = gate._tree_sha256(read_root)
+
+    identity_root = tmp_path / "identity-tree"
+    identity_root.mkdir()
+    member = identity_root / "member"
+    _ = member.write_bytes(b"member")
+    real_lstat = Path.lstat
+    calls = 0
+
+    def drifting_lstat(path: Path) -> os.stat_result:
+        nonlocal calls
+        metadata = real_lstat(path)
+        if path == member:
+            calls += 1
+            if calls == _SECOND_IDENTITY_READ:
+                fields = list(metadata)
+                fields[1] += 1
+                return os.stat_result(fields)
+        return metadata
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Path, "lstat", drifting_lstat)
+        with pytest.raises(gate.Pep561GateError, match="changed while it was digested"):
+            _ = gate._tree_sha256(identity_root)
+
+
+def test_evidence_mapping_and_source_copy_reject_nonregular_members(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(gate.Pep561GateError, match="non-string key"):
+        _ = gate._require_evidence_mapping({1: "value"}, context="fixture")
+
+    worktree = _minimal_worktree(tmp_path / "nested-worktree")
+    package = worktree / "src" / "nplg_mcp"
+    nested = package / "nested"
+    nested.mkdir()
+    _ = (nested / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    snapshot = gate._copy_source_snapshot(worktree, tmp_path / "nested-snapshot")
+    assert (snapshot / "src" / "nplg_mcp" / "nested" / "module.py").is_file()
+
+    special_worktree = _minimal_worktree(tmp_path / "special-worktree")
+    os.mkfifo(special_worktree / "src" / "nplg_mcp" / "pipe")
+    with pytest.raises(gate.Pep561GateError, match="non-regular file"):
+        _ = gate._copy_source_snapshot(special_worktree, tmp_path / "special-snapshot")
+
+
+def test_subprocess_output_is_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def oversized_run(
+        *_arguments: object,
+        **_keywords: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        return _result(("fixture",), stdout=b"x" * (gate._MAX_OUTPUT_BYTES + 1))
+
+    monkeypatch.setattr(subprocess, "run", oversized_run)
+    with pytest.raises(gate.Pep561GateError, match="output bound"):
+        _ = gate._run(("fixture",), cwd=tmp_path, environment={})
 
 
 def test_source_snapshot_owns_only_python_and_exact_marker(tmp_path: Path) -> None:
@@ -154,6 +582,18 @@ def test_source_snapshot_owns_only_python_and_exact_marker(tmp_path: Path) -> No
 
 
 def test_source_snapshot_rejects_symlinks_and_nonempty_marker(tmp_path: Path) -> None:
+    required_worktree = _minimal_worktree(tmp_path / "required-worktree")
+    required_input = required_worktree / "LICENSE"
+    required_target = tmp_path / "license-target"
+    _ = required_target.write_bytes(b"license")
+    required_input.unlink()
+    required_input.symlink_to(required_target)
+    with pytest.raises(gate.Pep561GateError, match="required build input"):
+        _ = gate._copy_source_snapshot(
+            required_worktree,
+            tmp_path / "required-linked",
+        )
+
     worktree = _minimal_worktree(tmp_path / "worktree")
     package = worktree / "src" / "nplg_mcp"
     (package / "linked.py").symlink_to(package / "__init__.py")
@@ -164,6 +604,28 @@ def test_source_snapshot_rejects_symlinks_and_nonempty_marker(tmp_path: Path) ->
     _ = (package / "py.typed").write_bytes(b"not empty")
     with pytest.raises(gate.Pep561GateError, match="marker"):
         _ = gate._copy_source_snapshot(worktree, tmp_path / "nonempty")
+
+
+def test_source_snapshot_rejects_a_symlinked_package_ancestor(
+    tmp_path: Path,
+) -> None:
+    worktree = _minimal_worktree(tmp_path / "worktree-ancestor")
+    package = worktree / "src" / "nplg_mcp"
+    (package / "__init__.py").unlink()
+    (package / "py.typed").unlink()
+    package.rmdir()
+    external_package = tmp_path / "external-package"
+    external_package.mkdir()
+    external_payload = b"EXTERNAL_VALUE = 1\n"
+    _ = (external_package / "__init__.py").write_bytes(external_payload)
+    _ = (external_package / "py.typed").write_bytes(b"")
+    package.symlink_to(external_package, target_is_directory=True)
+    snapshot = tmp_path / "ancestor-snapshot"
+
+    with pytest.raises(gate.Pep561GateError, match="source package directory"):
+        _ = gate._copy_source_snapshot(worktree, snapshot)
+
+    assert not (snapshot / "src" / "nplg_mcp" / "__init__.py").exists()
 
 
 def test_archive_marker_validators_reject_misplacement(tmp_path: Path) -> None:
@@ -215,6 +677,33 @@ def test_archive_marker_validators_reject_misplacement(tmp_path: Path) -> None:
         gate._verify_wheel_marker(duplicate_wheel)
 
 
+@pytest.mark.parametrize(
+    "marker_payload",
+    [None, b"not-empty"],
+    ids=("missing-stream", "nonempty-stream"),
+)
+def test_sdist_marker_rejects_missing_or_nonempty_extracted_stream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker_payload: bytes | None,
+) -> None:
+    sdist = tmp_path / "fixture-1.0.tar.gz"
+    with tarfile.open(sdist, mode="w:gz") as archive:
+        marker = tarfile.TarInfo("fixture-1.0/src/nplg_mcp/py.typed")
+        marker.size = 0
+        archive.addfile(marker)
+
+    def extracted_stream(
+        _archive: tarfile.TarFile,
+        _member: tarfile.TarInfo,
+    ) -> io.BytesIO | None:
+        return None if marker_payload is None else io.BytesIO(marker_payload)
+
+    monkeypatch.setattr(tarfile.TarFile, "extractfile", extracted_stream)
+    with pytest.raises(gate.Pep561GateError, match="marker payload is not empty"):
+        gate._verify_sdist_marker(sdist)
+
+
 def test_build_requires_exact_artifact_kinds(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -251,6 +740,40 @@ def test_build_requires_exact_artifact_kinds(
     (tmp_path / "wrong").mkdir()
     with pytest.raises(gate.Pep561GateError, match="canonical sdist"):
         _ = gate._build_artifacts(tmp_path, tmp_path / "wrong", environment={})
+
+
+def test_build_accepts_exact_bounded_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+
+    def exact_build(
+        command: Sequence[str],
+        *,
+        cwd: Path,
+        environment: dict[str, str],
+        expected_returncode: int = 0,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del environment, expected_returncode
+        distribution = cwd / "dist"
+        sdist = distribution / "fixture-1.0.tar.gz"
+        with tarfile.open(sdist, mode="w:gz") as archive:
+            marker = tarfile.TarInfo("fixture-1.0/src/nplg_mcp/py.typed")
+            marker.size = 0
+            archive.addfile(marker)
+        wheel = distribution / "fixture-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, mode="w") as archive:
+            archive.writestr("nplg_mcp/py.typed", b"")
+        return _result(command)
+
+    monkeypatch.setattr(gate, "_run", exact_build)
+
+    sdist, wheel = gate._build_artifacts(tmp_path, work, environment={})
+
+    assert sdist.name == "fixture-1.0.tar.gz"
+    assert wheel.name == "fixture-1.0-py3-none-any.whl"
 
 
 def test_locked_checker_toolchain_is_probed(
@@ -657,11 +1180,157 @@ def test_annotation_fault_target_must_be_unique(
         )
 
 
+@pytest.mark.parametrize(
+    ("artifact_only", "candidate", "message"),
+    [
+        (False, None, "requires an exact candidate SHA"),
+        (True, "not-a-candidate", "candidate SHA is invalid"),
+    ],
+    ids=("full-missing-candidate", "artifact-invalid-candidate"),
+)
+def test_verify_rejects_mode_confused_candidate_before_output(
+    tmp_path: Path,
+    *,
+    artifact_only: bool,
+    candidate: str | None,
+    message: str,
+) -> None:
+    worktree = _minimal_worktree(tmp_path / "worktree").resolve()
+    output = tmp_path / "evidence"
+
+    with pytest.raises(gate.Pep561GateError, match=message):
+        gate.verify(
+            worktree=worktree,
+            output_dir=output,
+            node_executable=None,
+            artifact_only=artifact_only,
+            candidate=candidate,
+        )
+
+    assert not output.exists()
+
+
+def test_verify_artifact_only_records_no_toolchain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worktree = _minimal_worktree(tmp_path / "worktree").resolve()
+    output = tmp_path / "evidence"
+
+    def fake_build(
+        source: Path,
+        work: Path,
+        *,
+        environment: dict[str, str],
+    ) -> tuple[Path, Path]:
+        del source, environment
+        distribution = work / "fake-dist"
+        distribution.mkdir()
+        sdist = distribution / "fixture.tar.gz"
+        wheel = distribution / "fixture.whl"
+        _ = sdist.write_bytes(b"sdist")
+        _ = wheel.write_bytes(b"wheel")
+        return sdist, wheel
+
+    monkeypatch.setattr(gate, "_build_artifacts", fake_build)
+
+    gate.verify(
+        worktree=worktree,
+        output_dir=output,
+        node_executable=None,
+        artifact_only=True,
+        candidate=None,
+    )
+
+    evidence = require_json_object(
+        load_json_value((output / "pep561-evidence.json").read_bytes()),
+        context="artifact-only evidence",
+    )
+    assert evidence["mode"] == "artifact-only"
+    assert evidence["candidate_tree"] is None
+    assert evidence["toolchain"] is None
+
+
+def test_verify_full_mode_rejects_candidate_whose_tree_differs_from_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worktree = _minimal_worktree(tmp_path / "candidate-worktree").resolve()
+    candidate, _candidate_tree = _commit_candidate(worktree)
+    _ = (worktree / "src" / "nplg_mcp" / "__init__.py").write_text(
+        "VALUE = 2\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "mismatched-candidate-evidence"
+    node = tmp_path / "node"
+    pyright = tmp_path / "pyright"
+    mypy = tmp_path / "mypy"
+    build_calls: list[Path] = []
+    external_calls: list[gate._ConsumerContext] = []
+    for tool in (node, pyright, mypy):
+        _ = tool.write_bytes(tool.name.encode())
+
+    def fake_build(
+        source: Path,
+        work: Path,
+        *,
+        environment: dict[str, str],
+    ) -> tuple[Path, Path]:
+        del source, environment
+        build_calls.append(work)
+        distribution = work / "fake-dist"
+        distribution.mkdir()
+        sdist = distribution / "fixture.tar.gz"
+        wheel = distribution / "fixture.whl"
+        _ = sdist.write_bytes(b"sdist")
+        _ = wheel.write_bytes(b"wheel")
+        return sdist, wheel
+
+    def fake_toolchain(
+        root: Path,
+        reviewed_node: Path,
+        *,
+        environment: dict[str, str],
+    ) -> tuple[Path, Path]:
+        del root, reviewed_node, environment
+        return pyright, mypy
+
+    def fake_external(
+        work: Path,
+        wheel: Path,
+        *,
+        context: gate._ConsumerContext,
+    ) -> None:
+        del work, wheel
+        external_calls.append(context)
+
+    monkeypatch.setattr(gate, "_build_artifacts", fake_build)
+    monkeypatch.setattr(gate, "_validate_toolchain", fake_toolchain)
+    monkeypatch.setattr(gate, "_verify_external_consumers", fake_external)
+
+    with pytest.raises(
+        gate.Pep561GateError,
+        match="candidate source tree does not match the captured snapshot",
+    ):
+        gate.verify(
+            worktree=worktree,
+            output_dir=output,
+            node_executable=node,
+            artifact_only=False,
+            candidate=candidate,
+        )
+
+    assert not (output / "pep561-evidence.json").exists()
+    assert build_calls == []
+    assert external_calls == []
+
+
 def test_verify_full_mode_records_external_consumer_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     worktree = _minimal_worktree(tmp_path / "worktree").resolve()
+    candidate, candidate_tree = _commit_candidate(worktree)
     output = tmp_path / "evidence"
     node = tmp_path / "node"
     _ = node.write_bytes(b"node")
@@ -713,7 +1382,7 @@ def test_verify_full_mode_records_external_consumer_evidence(
         output_dir=output,
         node_executable=node,
         artifact_only=False,
-        candidate="a" * 40,
+        candidate=candidate,
     )
 
     assert len(external_calls) == 1
@@ -723,7 +1392,8 @@ def test_verify_full_mode_records_external_consumer_evidence(
         context="full PEP 561 evidence",
     )
     assert evidence["mode"] == "full"
-    assert evidence["candidate"] == "a" * 40
+    assert evidence["candidate"] == candidate
+    assert evidence["candidate_tree"] == candidate_tree
     assert isinstance(evidence["source_snapshot_sha256"], str)
     artifacts = require_json_object(evidence["artifacts"], context="artifacts")
     assert frozenset(artifacts) == {"sdist", "wheel"}
@@ -750,6 +1420,7 @@ def test_verify_full_mode_records_external_consumer_evidence(
     "fault",
     [
         "candidate",
+        "candidate_tree",
         "source_snapshot_sha256",
         "wheel_sha256",
         "sdist_sha256",
@@ -767,6 +1438,7 @@ def test_full_evidence_rejects_missing_identity_and_digest_fields(fault: str) ->
             "wheel": dict(artifact),
         },
         "candidate": "a" * 40,
+        "candidate_tree": "b" * 40,
         "checks": {
             "annotation_fault_mypy": True,
             "annotation_fault_pyright": True,
@@ -784,7 +1456,7 @@ def test_full_evidence_rejects_missing_identity_and_digest_fields(fault: str) ->
             "pyright": dict(tool),
         },
     }
-    if fault in {"candidate", "source_snapshot_sha256"}:
+    if fault in {"candidate", "candidate_tree", "source_snapshot_sha256"}:
         del evidence[fault]
     elif fault in {"wheel_sha256", "sdist_sha256"}:
         name = fault.removesuffix("_sha256")
@@ -806,7 +1478,7 @@ def test_full_evidence_rejects_missing_identity_and_digest_fields(fault: str) ->
 
 @pytest.mark.parametrize(
     "fault",
-    ["mode", "candidate", "source-digest"],
+    ["mode", "candidate", "candidate-tree", "source-digest"],
 )
 def test_full_evidence_rejects_top_level_authority_faults(fault: str) -> None:
     evidence = _valid_evidence(require_full=True)
@@ -814,6 +1486,8 @@ def test_full_evidence_rejects_top_level_authority_faults(fault: str) -> None:
         evidence["mode"] = "artifact-only"
     elif fault == "candidate":
         evidence["candidate"] = None
+    elif fault == "candidate-tree":
+        evidence["candidate_tree"] = evidence["candidate"]
     elif fault == "source-digest":
         evidence["source_snapshot_sha256"] = "g" * 64
 
@@ -891,11 +1565,16 @@ def test_full_evidence_rejects_check_and_toolchain_faults(fault: str) -> None:
         gate._validate_evidence_document(evidence, require_full=True)
 
 
-@pytest.mark.parametrize("fault", ["candidate", "toolchain", "check-result"])
+@pytest.mark.parametrize(
+    "fault",
+    ["candidate", "candidate-tree", "toolchain", "check-result"],
+)
 def test_artifact_only_evidence_rejects_full_authority_claims(fault: str) -> None:
     evidence = _valid_evidence(require_full=False)
     if fault == "candidate":
         evidence["candidate"] = "not-a-candidate"
+    elif fault == "candidate-tree":
+        evidence["candidate_tree"] = "b" * 40
     elif fault == "toolchain":
         evidence["toolchain"] = {"mypy": {"sha256": "2" * 64, "version": "fixture"}}
     else:

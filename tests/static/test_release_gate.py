@@ -3,30 +3,45 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib.machinery
+import importlib.metadata
 import json
 import os
 import runpy
 import sys
+import sysconfig
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast
+from typing import Literal, Protocol, cast
 
 import pytest
 
 import scripts.verify_release as release_module
 from nplg_mcp.json_types import JsonValue, load_json_value, require_json_object
-from scripts.baseline_capture_io import ChildResult, ProcessLimits
+from scripts.baseline_capture_io import ChildResult, ProcessLimits, canonical_json_bytes
 from scripts.run_test_gate import (
     CommandResult,
     SourceSnapshot,
     SystemGit,
     capture_source_snapshot,
+    parse_external_gate_registry,
 )
 from scripts.verify_release import (
     GateCommand,
+    LauncherCommandSpec,
+    ReadOnlyUtilitySpec,
+    ReleaseCommandManifest,
+    ReleaseOperationSpec,
+    ReleaseProfile,
     ReleaseVerificationError,
+    candidate_release_status,
+    load_release_command_manifest,
+    release_command_manifest_digest,
     run_gate_battery,
+    validate_candidate_contract_transcript,
 )
 
 SUBJECT_DIGEST = "sha256:" + "a" * 64
@@ -39,7 +54,56 @@ PYRIGHT_EVIDENCE = (
 PROJECT_ROOT = Path(__file__).parents[2]
 _CLI_FAILURE = 2
 _SECOND_CAPTURE = 2
+_TOOL_EVIDENCE_ITEMS = 2
+_TRUSTED_DRIVER_REJECTION = 97
 _EXPECTED_IDENTITY_VALIDATIONS = 3
+_RECOVERY_RTO_OBJECTIVE_SECONDS = 900
+_RECOVERY_POLICY_SHA256 = (
+    "sha256:6a9f6786479f139129f57c95d18820f55dc192a44d7d32d6ce2a385fe325bbf3"
+)
+_RECOVERY_STATE_IDS = (
+    "clock-high-water-and-boot-state",
+    "insertion-high-water",
+    "per-object-insertion-sequence-records",
+    "orphan-staging-cleanup",
+    "post-process-lease-reservation-reconciliation",
+)
+_RELEASE_COMMAND_MANIFEST = PROJECT_ROOT / "security/release-command-manifests.json"
+_OPERATION_IDS = (
+    "candidate-battery",
+    "external-gate",
+    "prepare",
+    "staging-proof",
+    "reconcile-staging",
+    "finalize",
+    "custody",
+    "reconcile-custody",
+    "attestation-workspace",
+    "commit-attestation",
+    "attest",
+    "eligibility",
+    "cleanup-run",
+)
+_LAUNCHER_IDS = (
+    "initialize-run",
+    "run-operation",
+    "run-through",
+    "resume-run",
+)
+_UTILITY_IDS = (
+    "validate-output-parent",
+    "validate-output-parents",
+    "capture-alpic",
+)
+_COMMON_EXTERNAL_GATE = "common.nplg-live-canary"
+_PRIVATE_EXTERNAL_GATES = (
+    "private-full.edge-http",
+    "private-full.pdf-worker-container",
+    "private-full.pdf-worker-write-quota",
+    "private-full.recovery-proof",
+    "private-full.scanner-container",
+)
+_CASE_CLASSES = ("adversarial", "fault", "negative", "property", "recovery")
 
 
 @dataclass(slots=True)
@@ -70,6 +134,67 @@ class _RuntimeIdentityFixture:
     offline_evidence: tuple[str, ...] = PYRIGHT_EVIDENCE
 
 
+type _ReleaseToolMode = Literal["module", "console"]
+
+
+class _TrustedReleaseToolView(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def module(self) -> str: ...
+
+    @property
+    def distribution(self) -> str: ...
+
+    @property
+    def version(self) -> str: ...
+
+    @property
+    def mode(self) -> _ReleaseToolMode: ...
+
+    @property
+    def entry_name(self) -> str | None: ...
+
+    @property
+    def entry_value(self) -> str | None: ...
+
+
+class _TrustedReleaseToolProofResolver(Protocol):
+    def __call__(self, tool: _TrustedReleaseToolView, /) -> object: ...
+
+
+class _ClosedPythonToolValidator(Protocol):
+    def __call__(
+        self,
+        command: GateCommand,
+        completed: ChildResult,
+        /,
+    ) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _TrustedReleaseToolFixture:
+    name: str
+    module: str
+    distribution: str
+    version: str
+    mode: _ReleaseToolMode
+    entry_name: str | None = None
+    entry_value: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ReleaseDistributionFixture:
+    version: str
+    entry_points: tuple[object, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _ReleaseSpecificationFixture:
+    origin: str | None
+
+
 @dataclass(frozen=True, slots=True)
 class _EmptyEvidenceRunner:
     stdout: bytes = b""
@@ -79,13 +204,319 @@ class _EmptyEvidenceRunner:
         return ChildResult(0, self.stdout, b"")
 
 
+@dataclass(frozen=True, slots=True)
+class _PayloadRunner:
+    stdout: bytes
+    stderr: bytes
+
+    def __call__(self, command: GateCommand) -> ChildResult:
+        del command
+        return ChildResult(0, self.stdout, self.stderr)
+
+
+def _trusted_release_tools() -> tuple[_TrustedReleaseToolView, ...]:
+    return cast(
+        "tuple[_TrustedReleaseToolView, ...]",
+        object.__getattribute__(release_module, "_TRUSTED_RELEASE_TOOLS"),
+    )
+
+
+def _trusted_release_tool_proof_resolver() -> _TrustedReleaseToolProofResolver:
+    return cast(
+        "_TrustedReleaseToolProofResolver",
+        object.__getattribute__(release_module, "_trusted_release_tool_proof"),
+    )
+
+
+def _closed_python_tool_validator() -> _ClosedPythonToolValidator:
+    return cast(
+        "_ClosedPythonToolValidator",
+        object.__getattribute__(release_module, "_valid_closed_python_tool_success"),
+    )
+
+
+def _patch_release_tool_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    purelib: Path,
+    distributions: tuple[_ReleaseDistributionFixture, ...],
+    specification: _ReleaseSpecificationFixture | None,
+) -> None:
+    """Install one closed import-identity fixture for verifier edge tests."""
+
+    def selected_purelib(_name: str) -> str:
+        return purelib.as_posix()
+
+    def selected_distributions(
+        *,
+        name: str,
+        path: list[str],
+    ) -> tuple[_ReleaseDistributionFixture, ...]:
+        _ = (name, path)
+        return distributions
+
+    def selected_specification(
+        fullname: str,
+        path: list[str] | None = None,
+        target: object | None = None,
+    ) -> _ReleaseSpecificationFixture | None:
+        _ = (fullname, path, target)
+        return specification
+
+    monkeypatch.setattr(sysconfig, "get_path", selected_purelib)
+    monkeypatch.setattr(
+        importlib.metadata,
+        "distributions",
+        selected_distributions,
+    )
+    monkeypatch.setattr(
+        importlib.machinery.PathFinder,
+        "find_spec",
+        selected_specification,
+    )
+
+
+def _bandit_success_bytes() -> bytes:
+    metric: dict[str, JsonValue] = {
+        "CONFIDENCE.HIGH": 0,
+        "CONFIDENCE.LOW": 0,
+        "CONFIDENCE.MEDIUM": 0,
+        "CONFIDENCE.UNDEFINED": 0,
+        "SEVERITY.HIGH": 0,
+        "SEVERITY.LOW": 0,
+        "SEVERITY.MEDIUM": 0,
+        "SEVERITY.UNDEFINED": 0,
+        "loc": 1,
+        "nosec": 0,
+        "skipped_tests": 0,
+    }
+    return canonical_json_bytes(
+        {
+            "errors": [],
+            "generated_at": "2026-08-26T00:00:00Z",
+            "metrics": {"_totals": metric},
+            "results": [],
+        }
+    )
+
+
+def _cyclonedx_success_payload() -> dict[str, JsonValue]:
+    component: dict[str, JsonValue] = {}
+    tool_component: dict[str, JsonValue] = {}
+    return {
+        "$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json",
+        "bomFormat": "CycloneDX",
+        "components": [component],
+        "dependencies": [],
+        "metadata": {
+            "timestamp": "2026-08-26T00:00:00Z",
+            "tools": {"components": [tool_component]},
+        },
+        "serialNumber": "urn:uuid:123e4567-e89b-42d3-a456-426614174000",
+        "specVersion": "1.6",
+        "version": 1,
+    }
+
+
+def _cyclonedx_success_bytes() -> bytes:
+    return canonical_json_bytes(_cyclonedx_success_payload())
+
+
 class _PassingRunner:
     def __call__(self, command: GateCommand) -> ChildResult:
-        if command.name == "mypy":
-            return ChildResult(0, b"", b"")
-        if command.name == "pyright":
-            return ChildResult(0, _pyright_stdout(), b"")
-        return ChildResult(0, b"{}", b"")
+        stdout_by_name = {
+            "bandit": _bandit_success_bytes(),
+            "cyclonedx": _cyclonedx_success_bytes(),
+            "mypy": b"",
+            "pip-audit": canonical_json_bytes({"dependencies": [], "fixes": []}),
+            "pyright": _pyright_stdout(),
+            "ruff": b"[]",
+        }
+        return ChildResult(0, stdout_by_name.get(command.name, b"{}"), b"")
+
+
+def _load_checked_in_release_command_manifest() -> ReleaseCommandManifest:
+    assert _RELEASE_COMMAND_MANIFEST.is_file(), (
+        "candidate release-command manifest is missing"
+    )
+    return load_release_command_manifest(_RELEASE_COMMAND_MANIFEST)
+
+
+def _manifest_payload() -> dict[str, object]:
+    assert _RELEASE_COMMAND_MANIFEST.is_file(), (
+        "candidate release-command manifest is missing"
+    )
+    value = load_json_value(_RELEASE_COMMAND_MANIFEST.read_bytes())
+    return cast(
+        "dict[str, object]",
+        require_json_object(value, context="release-command manifest fixture"),
+    )
+
+
+def test_release_command_manifest_accepts_json_arrays_and_rejects_duplicate_names(
+    tmp_path: Path,
+) -> None:
+    """Mutation caught: Python-object strict parsing or duplicate-key acceptance."""
+    raw = _RELEASE_COMMAND_MANIFEST.read_bytes()
+    valid_path = tmp_path / "valid-release-command-manifest.json"
+    _ = valid_path.write_bytes(raw)
+    manifest = load_release_command_manifest(valid_path)
+    assert tuple(item.operation_id for item in manifest.operations) == _OPERATION_IDS
+
+    duplicate_path = tmp_path / "duplicate-release-command-manifest.json"
+    duplicate = raw.replace(
+        b'  "schema_version": 1,',
+        b'  "schema_version": 1,\n  "schema_version": 1,',
+        1,
+    )
+    _ = duplicate_path.write_bytes(duplicate)
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="release command manifest rejected",
+    ) as captured:
+        _ = load_release_command_manifest(duplicate_path)
+    assert captured.value.__cause__ is not None
+    assert "duplicate release-policy JSON name: schema_version" in str(
+        captured.value.__cause__
+    )
+
+
+def _exception_chain_text(error: BaseException) -> str:
+    """Render only the public exception chain asserted by loader boundary tests."""
+    messages = [str(error)]
+    cause = error.__cause__
+    while cause is not None:
+        messages.append(str(cause))
+        cause = cause.__cause__
+    return "\n".join(messages)
+
+
+@pytest.mark.parametrize(
+    ("case", "old", "new", "cause_fragment"),
+    [
+        (
+            "nested-duplicate-name",
+            (
+                b'            "flag": "--operation",\n'
+                b'            "value_kind": "literal",\n'
+                b'            "literal_value": "candidate-battery"'
+            ),
+            (
+                b'            "flag": "--operation",\n'
+                b'            "value_kind": "literal",\n'
+                b'            "literal_value": "candidate-battery",\n'
+                b'            "literal_value": "candidate-battery"'
+            ),
+            "duplicate release-policy JSON name: literal_value",
+        ),
+        (
+            "nan",
+            b'  "schema_version": 1,',
+            b'  "schema_version": NaN,',
+            "unsupported release-policy JSON number: NaN",
+        ),
+        (
+            "infinity",
+            b'  "schema_version": 1,',
+            b'  "schema_version": Infinity,',
+            "unsupported release-policy JSON number: Infinity",
+        ),
+        (
+            "coercible-schema-version",
+            b'  "schema_version": 1,',
+            b'  "schema_version": "1",',
+            "release policy schema rejected",
+        ),
+        (
+            "coercible-container-runtime-flag",
+            b'      "container_runtime_required": false,',
+            b'      "container_runtime_required": "false",',
+            "release policy schema rejected",
+        ),
+        (
+            "coercible-gate-timeout",
+            b'      "timeout_seconds": 60,',
+            b'      "timeout_seconds": "60",',
+            "release policy schema rejected",
+        ),
+    ],
+)
+def test_release_command_manifest_rejects_nonfinite_and_coercible_json_values(
+    tmp_path: Path,
+    case: str,
+    old: bytes,
+    new: bytes,
+    cause_fragment: str,
+) -> None:
+    """Mutation caught: parser precheck or strict JSON model validation is bypassed."""
+    raw = _RELEASE_COMMAND_MANIFEST.read_bytes()
+    assert raw.count(old) == 1, case
+    path = tmp_path / f"{case}-release-command-manifest.json"
+    _ = path.write_bytes(raw.replace(old, new, 1))
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="release command manifest rejected",
+    ) as captured:
+        _ = load_release_command_manifest(path)
+    assert cause_fragment in _exception_chain_text(captured.value)
+
+
+def _valid_contract_transcript(
+    manifest: ReleaseCommandManifest,
+) -> dict[str, object]:
+    completed_at = datetime(2026, 8, 23, 10, tzinfo=UTC)
+    expires_at = completed_at + timedelta(hours=1)
+
+    def receipt(target_kind: str, target_id: str) -> dict[str, object]:
+        return {
+            "target_kind": target_kind,
+            "target_id": target_id,
+            "red_exit": 1,
+            "green_exit": 0,
+            "refactor_exit": 0,
+            "collected_tests": [f"protected::{target_id}"],
+            "case_classes": [
+                "adversarial",
+                "fault",
+                "negative",
+                "property",
+                "recovery",
+            ],
+            "mutations_total": 1,
+            "mutations_killed": 1,
+            "source_diff_sha256": "sha256:" + "5" * 64,
+            "integration_exit": 0,
+            "protected_controller_signed": True,
+            "candidate_generated": False,
+            "completed_at": completed_at.isoformat().replace("+00:00", "Z"),
+            "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+        }
+
+    return {
+        "schema_version": 1,
+        "profile": "alpic-metadata",
+        "manifest_digest": release_command_manifest_digest(manifest),
+        "operation_receipts": [
+            receipt("operation", operation_id) for operation_id in _OPERATION_IDS
+        ],
+        "launcher_receipts": [
+            receipt("launcher", launcher_id) for launcher_id in _LAUNCHER_IDS
+        ],
+        "external_gate_ids": [_COMMON_EXTERNAL_GATE],
+        "critical_suite": {
+            "collected_tests": ["protected::candidate-battery"],
+            "replaced_suite_detected": True,
+            "empty_suite_detected": True,
+            "always_pass_suite_detected": True,
+            "source_mutation_detected": True,
+            "changed_line_coverage_percent": 100,
+            "changed_branch_coverage_percent": 100,
+            "surviving_mutants": 0,
+            "conditional_skips": 0,
+            "evidence_location": "external-protected-custody",
+        },
+    }
 
 
 def _pyright_stderr_runner(command: GateCommand) -> ChildResult:
@@ -194,6 +625,128 @@ def test_system_command_runner_reuses_bounded_process_seam(
     assert observed[0][3] == ProcessLimits(30.0, 4096, 4096)
 
 
+def test_local_ruff_gate_cannot_be_forged_by_candidate_module_shadow(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "src"
+    scripts = tmp_path / "scripts"
+    source.mkdir()
+    scripts.mkdir()
+    _ = (source / "bad.py").write_text("import os\n", encoding="utf-8")
+    sentinel = tmp_path / "candidate-shadow-executed"
+    _ = (tmp_path / "ruff.py").write_text(
+        """from pathlib import Path
+Path('candidate-shadow-executed').write_text('forged')
+print('[]')
+""",
+        encoding="utf-8",
+    )
+    request = release_module.LocalGatesRequest(
+        worktree=tmp_path,
+        output=tmp_path / "output",
+        node_executable=Path(sys.executable),
+        compare_branch="refs/heads/main",
+    )
+    command = release_module.local_gate_commands(
+        request,
+        SUBJECT_DIGEST,
+        pyright_evidence=PYRIGHT_EVIDENCE,
+    )[0]
+
+    results = run_gate_battery(
+        (command,),
+        release_module.SystemCommandRunner(),
+        monotonic=_Clock(),
+    )
+
+    assert not sentinel.exists()
+    assert results[0].verdict == "findings"
+
+
+def test_isolated_tool_driver_allows_only_the_proved_in_tree_purelib() -> None:
+    request = release_module.LocalGatesRequest(
+        worktree=PROJECT_ROOT,
+        output=Path("/external/release-evidence"),
+        node_executable=Path("/reviewed/node"),
+        compare_branch="origin/main",
+    )
+    command = release_module.local_gate_commands(
+        request,
+        SUBJECT_DIGEST,
+        pyright_evidence=PYRIGHT_EVIDENCE,
+    )[0]
+
+    completed = release_module.SystemCommandRunner()(command)
+
+    assert completed.returncode != _TRUSTED_DRIVER_REJECTION
+
+
+@pytest.mark.parametrize(
+    ("command_name", "module_name", "forged_stdout", "expected_returncode"),
+    [
+        ("mypy", "mypy", "", 1),
+        ("bandit", "bandit", "{}", 0),
+        ("pip-audit", "pip_audit", "{}", 0),
+        ("cyclonedx", "cyclonedx_py", "{}", 0),
+    ],
+)
+def test_console_python_gate_cannot_be_forged_by_candidate_module_shadow(
+    tmp_path: Path,
+    command_name: str,
+    module_name: str,
+    forged_stdout: str,
+    expected_returncode: int,
+) -> None:
+    source = tmp_path / "src"
+    scripts = tmp_path / "scripts"
+    source.mkdir()
+    scripts.mkdir()
+    _ = (scripts / "ok.py").write_text("value = 1\n", encoding="utf-8")
+    _ = (source / "bad.py").write_text(
+        """import subprocess
+value: int = "not an integer"
+subprocess.Popen("/bin/ls *", shell=True)
+""",
+        encoding="utf-8",
+    )
+    _ = (tmp_path / "requirements-dev.lock").write_text("", encoding="utf-8")
+    sentinel = tmp_path / f"{module_name}-shadow-executed"
+    _ = (tmp_path / f"{module_name}.py").write_text(
+        "".join(
+            (
+                "from pathlib import Path\n",
+                f"Path({sentinel.name!r}).write_text('forged')\n",
+                f"print({forged_stdout!r})\n",
+            )
+        ),
+        encoding="utf-8",
+    )
+    request = release_module.LocalGatesRequest(
+        worktree=tmp_path,
+        output=tmp_path / "output",
+        node_executable=Path(sys.executable),
+        compare_branch="refs/heads/main",
+    )
+    commands = release_module.local_gate_commands(
+        request,
+        SUBJECT_DIGEST,
+        pyright_evidence=PYRIGHT_EVIDENCE,
+    )
+    command = next(item for item in commands if item.name == command_name)
+
+    completed = release_module.SystemCommandRunner()(command)
+
+    assert not sentinel.exists()
+    assert completed.returncode == expected_returncode
+    if expected_returncode == 0:
+        results = run_gate_battery(
+            (command,),
+            _PayloadRunner(completed.stdout, completed.stderr),
+            monotonic=_Clock(),
+        )
+        assert results[0].verdict == "passed"
+
+
 def test_gate_battery_rejects_success_without_json_evidence(tmp_path: Path) -> None:
     command = _command(tmp_path, "scanner")
 
@@ -212,6 +765,95 @@ def test_gate_battery_accepts_json_array_evidence(tmp_path: Path) -> None:
     result = run_gate_battery(
         (command,),
         _JsonArrayRunner(),
+        monotonic=_Clock(),
+    )
+
+    assert result[0].verdict == "passed"
+
+
+@pytest.mark.parametrize("name", ["ruff", "bandit", "pip-audit", "cyclonedx"])
+def test_gate_battery_rejects_wrong_tool_specific_success_shape(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    command = _command(tmp_path, name)
+
+    result = run_gate_battery(
+        (command,),
+        _FakeRunner({name: 0}),
+        monotonic=_Clock(),
+    )
+
+    assert result[0].verdict == "tool_error"
+
+
+def test_gate_battery_rejects_bandit_metrics_without_totals(tmp_path: Path) -> None:
+    """Bandit success evidence must retain its aggregate metrics binding."""
+    stdout = _bandit_success_bytes().replace(b'"_totals"', b'"other"', 1)
+
+    result = run_gate_battery(
+        (_command(tmp_path, "bandit"),),
+        _PayloadRunner(stdout, b""),
+        monotonic=_Clock(),
+    )
+
+    assert result[0].verdict == "tool_error"
+
+
+def test_closed_python_tool_validator_rejects_unknown_tool(tmp_path: Path) -> None:
+    """The private validator fails closed outside its exact command allowlist."""
+    assert not _closed_python_tool_validator()(
+        _command(tmp_path, "unknown"),
+        ChildResult(0, b"", b""),
+    )
+
+
+_TOOL_SPECIFIC_SUCCESS_CASES: tuple[tuple[str, JsonValue, bytes], ...] = (
+    ("ruff", [], b""),
+    (
+        "bandit",
+        {
+            "errors": [],
+            "generated_at": "2026-08-26T00:00:00Z",
+            "metrics": {
+                "_totals": {
+                    "CONFIDENCE.HIGH": 0,
+                    "CONFIDENCE.LOW": 0,
+                    "CONFIDENCE.MEDIUM": 0,
+                    "CONFIDENCE.UNDEFINED": 0,
+                    "SEVERITY.HIGH": 0,
+                    "SEVERITY.LOW": 0,
+                    "SEVERITY.MEDIUM": 0,
+                    "SEVERITY.UNDEFINED": 0,
+                    "loc": 1,
+                    "nosec": 0,
+                    "skipped_tests": 0,
+                }
+            },
+            "results": [],
+        },
+        b"progress is non-authoritative\n",
+    ),
+    ("pip-audit", {"dependencies": [], "fixes": []}, b""),
+    ("cyclonedx", _cyclonedx_success_payload(), b""),
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "payload", "stderr"),
+    _TOOL_SPECIFIC_SUCCESS_CASES,
+)
+def test_gate_battery_accepts_only_closed_tool_specific_success(
+    tmp_path: Path,
+    name: str,
+    payload: JsonValue,
+    stderr: bytes,
+) -> None:
+    command = _command(tmp_path, name)
+
+    result = run_gate_battery(
+        (command,),
+        _PayloadRunner(canonical_json_bytes(payload), stderr),
         monotonic=_Clock(),
     )
 
@@ -419,6 +1061,460 @@ def test_checked_in_release_policies_are_closed_and_fail_safe() -> None:
     assert policies.trusted_sources.acquisition.candidate_network == "offline"
     assert policies.controller.status == "external_authority_required"
     assert policies.controller.candidate_may_supply_controller is False
+    assert policies.recovery.evidence.status == "external_authority_required"
+    assert policies.recovery.policy_digest == _RECOVERY_POLICY_SHA256
+    assert policies.recovery.rto.objective_seconds == _RECOVERY_RTO_OBJECTIVE_SECONDS
+    assert (
+        tuple(item.state_id for item in policies.recovery.state_inventory)
+        == _RECOVERY_STATE_IDS
+    )
+    assert policies.recovery.state_inventory[-1].persistence == "never-persisted"
+    assert policies.recovery.release_ready is False
+    assert tuple(
+        gate.gate_id for gate in policies.external_gate_registry.gates
+    ) == tuple(gate.gate_id for gate in policies.commands.external_gates)
+
+
+def test_release_loader_rejects_coherently_redigested_recovery_policy_drift(
+    tmp_path: Path,
+) -> None:
+    """A self-consistent candidate policy cannot replace the reviewed release one."""
+    for name in (
+        "dependency-risk-policy.json",
+        "trusted-package-sources.json",
+        "release-controller-policy.json",
+        "private-recovery-policy.json",
+        "external-test-gates.json",
+        "release-command-manifests.json",
+    ):
+        _ = (tmp_path / name).write_bytes(
+            (PROJECT_ROOT / "security" / name).read_bytes()
+        )
+    policy = require_json_object(
+        load_json_value((tmp_path / "private-recovery-policy.json").read_bytes()),
+        context="private recovery policy fixture",
+    )
+    subjects = cast("list[JsonValue]", policy["subjects"])
+    derived = cast("dict[str, JsonValue]", subjects[1])
+    recipes = cast("list[JsonValue]", derived["regeneration_recipe_paths"])
+    recipes.append("src/nplg_mcp/pdf_worker_main.py")
+    unsigned = {key: value for key, value in policy.items() if key != "policy_digest"}
+    policy["policy_digest"] = (
+        "sha256:" + hashlib.sha256(canonical_json_bytes(unsigned)).hexdigest()
+    )
+    _ = (tmp_path / "private-recovery-policy.json").write_bytes(
+        canonical_json_bytes(policy)
+    )
+
+    with pytest.raises(ReleaseVerificationError, match="closed release binding"):
+        _ = release_module.load_release_policies(tmp_path)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "command-drift"])
+def test_release_policy_rejects_external_registry_manifest_join_drift(
+    mutation: str,
+) -> None:
+    """The independently owned registry and release manifest must agree exactly."""
+    registry = parse_external_gate_registry(
+        (PROJECT_ROOT / "security" / "external-test-gates.json").read_bytes()
+    )
+    manifest = _load_checked_in_release_command_manifest()
+    gates = list(registry.gates)
+    if mutation == "missing":
+        _ = gates.pop()
+    elif mutation == "extra":
+        gates.append(gates[-1])
+    else:
+        gates[-1] = replace(gates[-1], command_id="container.scanner.v3")
+    drifted = replace(registry, gates=tuple(gates))
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="external gate registry differs from release command manifest",
+    ):
+        release_module.validate_external_gate_manifest_join(drifted, manifest)
+
+
+def test_release_command_manifest_has_exact_candidate_side_contract() -> None:
+    manifest = _load_checked_in_release_command_manifest()
+
+    assert manifest.contract_id == "nplg.release-command-manifest.v1"
+    assert manifest.controller_authority == "separately-protected-external"
+    assert manifest.candidate_implements_controller is False
+    assert tuple(item.operation_id for item in manifest.operations) == _OPERATION_IDS
+    assert tuple(item.command_id for item in manifest.launcher_commands) == (
+        _LAUNCHER_IDS
+    )
+    assert tuple(item.command_id for item in manifest.utilities) == _UTILITY_IDS
+    assert tuple(item.gate_id for item in manifest.external_gates) == (
+        _COMMON_EXTERNAL_GATE,
+        *_PRIVATE_EXTERNAL_GATES,
+    )
+    assert manifest.missing_authority_status == (
+        "PROTECTED_RELEASE_CONTROLLER_UNAVAILABLE"
+    )
+    assert manifest.terminal_verdict == "do_not_release"
+
+
+def test_release_manifest_has_structural_argv_payload_and_tool_lock_contracts() -> None:
+    """Mutation caught: command labels replace closed executable contracts."""
+    manifest = _load_checked_in_release_command_manifest()
+    commands: tuple[
+        ReleaseOperationSpec | LauncherCommandSpec | ReadOnlyUtilitySpec,
+        ...,
+    ] = (*manifest.operations, *manifest.launcher_commands, *manifest.utilities)
+
+    assert len(commands) == (
+        len(_OPERATION_IDS) + len(_LAUNCHER_IDS) + len(_UTILITY_IDS)
+    )
+    assert all(
+        command.tool.tool_id == "nplg-release-controller" for command in commands
+    )
+    assert all(command.tool.interface_version == "2.0.0" for command in commands)
+    assert all(command.tool.require_exact_lock_digest is True for command in commands)
+    assert all(command.argv.allow_unknown_options is False for command in commands)
+    assert all(command.argv.allow_passthrough is False for command in commands)
+    assert all(command.argv.allow_shell is False for command in commands)
+    assert all(
+        command.input_contract.allow_unknown_fields is False for command in commands
+    )
+    assert all(
+        command.output_contract.allow_unknown_fields is False for command in commands
+    )
+    assert all(
+        command.output_contract.allow_digest_only is False for command in commands
+    )
+
+    eligibility = next(
+        operation
+        for operation in manifest.operations
+        if operation.operation_id == "eligibility"
+    )
+    eligibility_flags = tuple(
+        option.flag for option in eligibility.argv.required_options
+    )
+    assert "--require-eligible" in eligibility_flags
+    assert "--require-asvs-l2" in eligibility_flags
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "literal-shape",
+        "unsafe-literal",
+        "duplicate-option",
+        "unsafe-subcommand",
+        "duplicate-input-field",
+        "duplicate-output-schema",
+        "case-class-drift",
+    ],
+)
+def test_release_manifest_rejects_closed_command_contract_shape_mutants(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    """Every argv and payload grammar remains closed under adversarial drift."""
+    payload = _manifest_payload()
+    operations = cast("list[dict[str, object]]", payload["operations"])
+    operation = operations[0]
+    argv = cast("dict[str, object]", operation["argv"])
+    options = cast("list[dict[str, object]]", argv["required_options"])
+    input_contract = cast("dict[str, object]", operation["input_contract"])
+    output_contract = cast("dict[str, object]", operation["output_contract"])
+    sensitivity = cast("dict[str, object]", payload["sensitivity_policy"])
+    if mutation == "literal-shape":
+        options[0]["literal_value"] = "unexpected"
+    elif mutation == "unsafe-literal":
+        options[2]["literal_value"] = "candidate-battery;exec"
+    elif mutation == "duplicate-option":
+        options[1]["flag"] = options[0]["flag"]
+    elif mutation == "unsafe-subcommand":
+        argv["subcommand"] = "run-operation;exec"
+    elif mutation == "duplicate-input-field":
+        fields = cast("list[str]", input_contract["required_fields"])
+        fields.append(fields[0])
+    elif mutation == "duplicate-output-schema":
+        schemas = cast("list[str]", output_contract["schema_ids"])
+        schemas.append(schemas[0])
+    else:
+        case_classes = cast("list[str]", sensitivity["required_case_classes"])
+        _ = case_classes.pop()
+    path = tmp_path / f"{mutation}-release-command-manifests.json"
+    _ = path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ReleaseVerificationError, match="command manifest"):
+        _ = load_release_command_manifest(path)
+
+
+def test_release_command_manifest_selects_exact_profile_contracts() -> None:
+    manifest = _load_checked_in_release_command_manifest()
+    by_profile = {profile.profile_id: profile for profile in manifest.profiles}
+
+    metadata = by_profile["alpic-metadata"]
+    assert metadata.operation_ids == _OPERATION_IDS
+    assert metadata.external_gate_ids == (_COMMON_EXTERNAL_GATE,)
+    assert metadata.subject_roles == (
+        "alpic-deploy-pack",
+        "python-sdist",
+        "python-wheel",
+    )
+    assert metadata.task21_staging_imports == 1
+    assert metadata.container_runtime_required is False
+    assert metadata.private_nonconstruction_required is True
+    assert metadata.finalize_inputs == (
+        "common-live-plus-exactly-one-staging-or-reconciliation"
+    )
+
+    private = by_profile["private-full"]
+    assert private.operation_ids == tuple(
+        operation_id
+        for operation_id in _OPERATION_IDS
+        if operation_id not in {"staging-proof", "reconcile-staging"}
+    )
+    assert private.external_gate_ids == (
+        _COMMON_EXTERNAL_GATE,
+        *_PRIVATE_EXTERNAL_GATES,
+    )
+    assert private.subject_roles == (
+        "pdf-worker-image",
+        "private-app-image",
+        "private-edge-image",
+        "python-sdist",
+        "python-wheel",
+        "scanner-image",
+    )
+    assert private.task21_staging_imports == 0
+    assert private.container_runtime_required is True
+    assert private.private_nonconstruction_required is False
+    assert private.finalize_inputs == "common-live-plus-five-private-proofs"
+
+
+def _mutate_release_manifest_inventory(
+    payload: dict[str, object],
+    mutation: str,
+) -> bool:
+    operations = cast("list[dict[str, object]]", payload["operations"])
+    launchers = cast("list[dict[str, object]]", payload["launcher_commands"])
+    utilities = cast("list[dict[str, object]]", payload["utilities"])
+    if mutation == "missing-operation":
+        _ = operations.pop()
+    elif mutation == "duplicate-operation":
+        operations[-1] = deepcopy(operations[0])
+    elif mutation == "operation-exit-drift":
+        operations[0]["exit_codes"] = [0]
+    elif mutation == "missing-launcher":
+        _ = launchers.pop()
+    elif mutation == "direct-operation-launcher":
+        launchers[0]["command_id"] = "finalize"
+    elif mutation == "stateful-utility":
+        utilities[0]["read_only"] = False
+    elif mutation == "undocumented-utility":
+        utilities.append(deepcopy(utilities[0]))
+        utilities[-1]["command_id"] = "candidate"
+    else:
+        return False
+    return True
+
+
+def _mutate_release_manifest_profile(
+    payload: dict[str, object],
+    mutation: str,
+) -> None:
+    profiles = cast("list[dict[str, object]]", payload["profiles"])
+    utilities = cast("list[dict[str, object]]", payload["utilities"])
+    if mutation == "metadata-extra-gate":
+        cast("list[str]", profiles[0]["external_gate_ids"]).append(
+            "private-full.edge-http"
+        )
+    elif mutation == "metadata-container":
+        profiles[0]["container_runtime_required"] = True
+    elif mutation == "second-staging-import":
+        profiles[0]["task21_staging_imports"] = 2
+    elif mutation == "private-missing-gate":
+        _ = cast("list[str]", profiles[1]["external_gate_ids"]).pop()
+    elif mutation == "shell-schema":
+        utilities[2]["argv_schema"] = "sh -c ${ALPIC_API_KEY}"
+    else:
+        payload["unexpected"] = True
+
+
+def _mutate_release_manifest(
+    payload: dict[str, object],
+    mutation: str,
+) -> None:
+    if not _mutate_release_manifest_inventory(payload, mutation):
+        _mutate_release_manifest_profile(payload, mutation)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-operation",
+        "duplicate-operation",
+        "operation-exit-drift",
+        "missing-launcher",
+        "direct-operation-launcher",
+        "stateful-utility",
+        "undocumented-utility",
+        "metadata-extra-gate",
+        "metadata-container",
+        "second-staging-import",
+        "private-missing-gate",
+        "shell-schema",
+        "unknown-field",
+    ],
+)
+def test_release_command_manifest_rejects_profile_and_runner_policy_mutants(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    payload = _manifest_payload()
+    _mutate_release_manifest(payload, mutation)
+    path = tmp_path / "release-command-manifests.json"
+    _ = path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ReleaseVerificationError, match="command manifest"):
+        _ = load_release_command_manifest(path)
+
+
+def _mutate_contract_receipt(payload: dict[str, object], mutation: str) -> bool:
+    operations = cast("list[dict[str, object]]", payload["operation_receipts"])
+    launchers = cast("list[dict[str, object]]", payload["launcher_receipts"])
+    if mutation == "omitted-operation-receipt":
+        _ = operations.pop()
+    elif mutation == "omitted-launcher-receipt":
+        _ = launchers.pop()
+    elif mutation == "survived-operation-mutant":
+        operations[0]["mutations_killed"] = 0
+    elif mutation == "missing-case-class":
+        operations[0]["case_classes"] = (
+            "adversarial",
+            "fault",
+            "negative",
+            "property",
+        )
+    elif mutation == "forged-controller-signature":
+        operations[0]["protected_controller_signed"] = False
+    elif mutation == "candidate-issued-receipt":
+        operations[0]["candidate_generated"] = True
+    elif mutation == "stale-receipt":
+        operations[0]["expires_at"] = "2026-08-23T10:30:00Z"
+    else:
+        return False
+    return True
+
+
+def _mutate_contract_suite(payload: dict[str, object], mutation: str) -> None:
+    suite = cast("dict[str, object]", payload["critical_suite"])
+    if mutation == "empty-critical-suite":
+        suite["collected_tests"] = []
+    elif mutation == "replaced-suite-survives":
+        suite["replaced_suite_detected"] = False
+    elif mutation == "always-pass-survives":
+        suite["always_pass_suite_detected"] = False
+    elif mutation == "source-mutation-survives":
+        suite["source_mutation_detected"] = False
+    elif mutation == "shallow-diff":
+        suite["changed_line_coverage_percent"] = 94
+    elif mutation == "conditional-skip":
+        suite["conditional_skips"] = 1
+    elif mutation == "candidate-evidence":
+        suite["evidence_location"] = "candidate-worktree"
+    else:
+        cast("list[str]", payload["external_gate_ids"]).append("private-full.edge-http")
+
+
+def _mutate_contract_transcript(payload: dict[str, object], mutation: str) -> None:
+    if mutation == "invalid-manifest-digest":
+        payload["manifest_digest"] = "not-a-sha256"
+    elif mutation == "duplicate-critical-test":
+        suite = cast("dict[str, object]", payload["critical_suite"])
+        tests = cast("list[str]", suite["collected_tests"])
+        tests.append(tests[0])
+    elif not _mutate_contract_receipt(payload, mutation):
+        _mutate_contract_suite(payload, mutation)
+
+
+def test_candidate_fake_contract_transcript_accepts_complete_sensitive_fixture() -> (
+    None
+):
+    manifest = _load_checked_in_release_command_manifest()
+    payload = _valid_contract_transcript(manifest)
+
+    transcript = validate_candidate_contract_transcript(
+        json.dumps(payload).encode(),
+        manifest=manifest,
+        now=datetime(2026, 8, 23, 10, 15, tzinfo=UTC),
+    )
+
+    assert transcript.profile == "alpic-metadata"
+    assert tuple(item.target_id for item in transcript.operation_receipts) == (
+        _OPERATION_IDS
+    )
+    assert tuple(item.target_id for item in transcript.launcher_receipts) == (
+        _LAUNCHER_IDS
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "omitted-operation-receipt",
+        "omitted-launcher-receipt",
+        "survived-operation-mutant",
+        "missing-case-class",
+        "forged-controller-signature",
+        "candidate-issued-receipt",
+        "stale-receipt",
+        "empty-critical-suite",
+        "replaced-suite-survives",
+        "always-pass-survives",
+        "source-mutation-survives",
+        "shallow-diff",
+        "conditional-skip",
+        "candidate-evidence",
+        "profile-extra-gate",
+        "invalid-manifest-digest",
+        "duplicate-critical-test",
+    ],
+)
+def test_candidate_fake_contract_transcript_rejects_incomplete_or_forged_pass(
+    mutation: str,
+) -> None:
+    manifest = _load_checked_in_release_command_manifest()
+    payload = deepcopy(_valid_contract_transcript(manifest))
+    _mutate_contract_transcript(payload, mutation)
+
+    with pytest.raises(ReleaseVerificationError, match="contract transcript"):
+        _ = validate_candidate_contract_transcript(
+            json.dumps(payload).encode(),
+            manifest=manifest,
+            now=datetime(2026, 8, 23, 11, tzinfo=UTC),
+        )
+
+
+def test_candidate_release_status_is_nonclosure_without_external_authority() -> None:
+    status = candidate_release_status("alpic-metadata")
+
+    assert status.local_status == "PROTECTED_RELEASE_CONTROLLER_UNAVAILABLE"
+    assert status.terminal_verdict == "do_not_release"
+    assert status.release_ready is False
+    assert status.release_authorized is False
+
+
+def test_candidate_contract_rejects_non_utc_clock_and_unknown_profile() -> None:
+    manifest = _load_checked_in_release_command_manifest()
+    payload = _valid_contract_transcript(manifest)
+    non_utc = datetime(2026, 8, 23, 11, tzinfo=timezone(timedelta(hours=1)))
+
+    with pytest.raises(ReleaseVerificationError, match="contract transcript"):
+        _ = validate_candidate_contract_transcript(
+            json.dumps(payload).encode(),
+            manifest=manifest,
+            now=non_utc,
+        )
+    with pytest.raises(ReleaseVerificationError, match="closed manifest"):
+        _ = candidate_release_status(cast("ReleaseProfile", "unknown-profile"))
 
 
 def test_dependency_policy_rejects_unknown_source_and_type_coercion(
@@ -856,7 +1952,7 @@ def test_local_gates_records_external_requirements_as_not_passed(
     assert (output / "release-gate-results.json").is_file()
 
 
-def test_local_gate_commands_preserve_the_venv_python_executable() -> None:
+def test_local_gate_commands_bind_python_tools_to_the_isolated_driver() -> None:
     request = release_module.LocalGatesRequest(
         worktree=PROJECT_ROOT,
         output=Path("/external/release-evidence"),
@@ -870,12 +1966,26 @@ def test_local_gate_commands_preserve_the_venv_python_executable() -> None:
         pyright_evidence=PYRIGHT_EVIDENCE,
     )
 
-    assert commands[0].executable == Path(sys.executable)
-    assert commands[0].argv[0] == sys.executable
+    expected_modules = {
+        "bandit": ("bandit", "bandit", "1.9.4"),
+        "cyclonedx": ("cyclonedx_py", "cyclonedx-bom", "7.3.1"),
+        "mypy": ("mypy", "mypy", "2.3.1"),
+        "pip-audit": ("pip_audit", "pip-audit", "2.10.1"),
+        "ruff": ("ruff", "ruff", "0.16.3"),
+    }
+    for name, (module, distribution, version) in expected_modules.items():
+        command = next(item for item in commands if item.name == name)
+        proof = cast("list[object]", json.loads(command.argv[6]))
+        assert command.executable == Path(sys.executable)
+        assert command.argv[:5] == (sys.executable, "-I", "-S", "-B", "-c")
+        assert proof[1:4] == [module, distribution, version]
+        assert Path(cast("str", proof[4])).is_absolute()
+        assert command.offline_evidence[0] == SUBJECT_DIGEST
+        assert len(command.offline_evidence) == _TOOL_EVIDENCE_ITEMS
     bandit = next(command for command in commands if command.name == "bandit")
-    assert bandit.argv[3:6] == ("-ll", "-r", "src")
+    assert bandit.argv[7:10] == ("-ll", "-r", "src")
     pip_audit = next(command for command in commands if command.name == "pip-audit")
-    assert pip_audit.argv[3:] == (
+    assert pip_audit.argv[7:] == (
         "-r",
         "requirements-dev.lock",
         "--require-hashes",
@@ -889,6 +1999,117 @@ def test_local_gate_commands_preserve_the_venv_python_executable() -> None:
     assert zizmor.argv[1:] == ("--offline", "--format=json", ".github/workflows")
     pyright = next(command for command in commands if command.name == "pyright")
     assert pyright.offline_evidence == (SUBJECT_DIGEST, *PYRIGHT_EVIDENCE)
+
+
+def test_trusted_release_tool_rejects_non_string_purelib(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing interpreter purelib identity fails closed."""
+
+    def missing_purelib(_name: str) -> None:
+        return None
+
+    monkeypatch.setattr(sysconfig, "get_path", missing_purelib)
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="trusted release tool root is unavailable",
+    ):
+        _ = _trusted_release_tool_proof_resolver()(_trusted_release_tools()[0])
+
+
+def test_trusted_release_tool_rejects_missing_distribution_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool without one exact pinned distribution cannot become authoritative."""
+    _patch_release_tool_identity(
+        monkeypatch,
+        purelib=tmp_path,
+        distributions=(),
+        specification=None,
+    )
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="trusted release tool version or import origin is invalid",
+    ):
+        _ = _trusted_release_tool_proof_resolver()(_trusted_release_tools()[0])
+
+
+def test_trusted_release_tool_rejects_nonregular_import_origin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A directory cannot impersonate a pinned tool's import module."""
+    tool = _trusted_release_tools()[0]
+    origin = tmp_path / "ruff"
+    origin.mkdir()
+    _patch_release_tool_identity(
+        monkeypatch,
+        purelib=tmp_path,
+        distributions=(_ReleaseDistributionFixture(tool.version),),
+        specification=_ReleaseSpecificationFixture(origin.as_posix()),
+    )
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="trusted release tool import origin is not a regular purelib file",
+    ):
+        _ = _trusted_release_tool_proof_resolver()(tool)
+
+
+def test_trusted_release_console_tool_rejects_missing_entry_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Console tools require their exact pinned entry-point binding."""
+    tool = _trusted_release_tools()[1]
+    origin = tmp_path / "mypy.py"
+    _ = origin.write_text("", encoding="utf-8")
+    _patch_release_tool_identity(
+        monkeypatch,
+        purelib=tmp_path,
+        distributions=(_ReleaseDistributionFixture(tool.version),),
+        specification=_ReleaseSpecificationFixture(origin.as_posix()),
+    )
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="trusted release tool entry point is invalid",
+    ):
+        _ = _trusted_release_tool_proof_resolver()(tool)
+
+
+def test_trusted_release_module_rejects_console_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Module-mode tools cannot carry a console entry-point identity."""
+    base_tool = _trusted_release_tools()[0]
+    tool = _TrustedReleaseToolFixture(
+        name=base_tool.name,
+        module=base_tool.module,
+        distribution=base_tool.distribution,
+        version=base_tool.version,
+        mode=base_tool.mode,
+        entry_name="ruff",
+        entry_value="ruff:main",
+    )
+    origin = tmp_path / "ruff.py"
+    _ = origin.write_text("", encoding="utf-8")
+    _patch_release_tool_identity(
+        monkeypatch,
+        purelib=tmp_path,
+        distributions=(_ReleaseDistributionFixture(tool.version),),
+        specification=_ReleaseSpecificationFixture(origin.as_posix()),
+    )
+
+    with pytest.raises(
+        ReleaseVerificationError,
+        match="trusted release module invocation is invalid",
+    ):
+        _ = _trusted_release_tool_proof_resolver()(tool)
 
 
 @pytest.mark.parametrize(
@@ -1566,6 +2787,8 @@ def test_local_gates_cli_dispatches_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    policies = release_module.load_release_policies(PROJECT_ROOT / "security")
+    loaded_policy_roots: list[Path] = []
     report = release_module.LocalGatesReport(
         local_status="passed",
         results=(),
@@ -1573,6 +2796,10 @@ def test_local_gates_cli_dispatches_success(
         terminal_verdict="do_not_release",
         eligibility_reason="external_authority_required",
     )
+
+    def load_policies(root: Path) -> release_module.ReleasePolicies:
+        loaded_policy_roots.append(root)
+        return policies
 
     def run_local(
         request: release_module.LocalGatesRequest,
@@ -1584,6 +2811,7 @@ def test_local_gates_cli_dispatches_success(
         return report
 
     monkeypatch.setattr(release_module, "run_local_gates", run_local)
+    monkeypatch.setattr(release_module, "load_release_policies", load_policies)
     assert (
         release_module.main(
             [
@@ -1600,3 +2828,4 @@ def test_local_gates_cli_dispatches_success(
         )
         == 0
     )
+    assert loaded_policy_roots == [tmp_path / "security"]

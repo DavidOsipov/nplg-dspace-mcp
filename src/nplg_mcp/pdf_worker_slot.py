@@ -9,14 +9,17 @@ matches the reviewed policy before the parent dispatches any untrusted PDF.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import stat
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread, current_thread
 from typing import TYPE_CHECKING, Protocol, Self, cast
+from weakref import WeakSet
 
 from pydantic import (
     BaseModel,
@@ -385,6 +388,19 @@ def open_child_directory_fd(parent: DirectoryFd, name: object) -> DirectoryFd:
     )
 
 
+class _WorkerSlotLeaseState(Enum):
+    ISSUED = "issued"
+    ENTERED = "entered"
+
+
+def _current_async_task() -> object | None:
+    """Return the exact running task, or no task in synchronous code."""
+    try:
+        return cast("object | None", asyncio.current_task())
+    except RuntimeError:
+        return None
+
+
 class WorkerSlotLease:
     """One non-transferable reservation of the complete worker slot."""
 
@@ -398,11 +414,10 @@ class WorkerSlotLease:
         super().__init__()
         self._quota = quota
         self._root = root
-        self._released = False
 
     def __enter__(self) -> QuotaBoundStagingRoot:
         """Expose the verified root only while the parent owns this lease."""
-        return self._root
+        return self._quota.enter(self)
 
     def __exit__(
         self,
@@ -416,9 +431,6 @@ class WorkerSlotLease:
 
     def release(self) -> None:
         """Release the single slot exactly once."""
-        if self._released:
-            return
-        self._released = True
         self._quota.release(self)
 
 
@@ -436,7 +448,11 @@ class WorkerStagingQuota:
         self._policy = policy
         self._inspector = inspector
         self._lock = Lock()
-        self._leased = False
+        self._active_lease: WorkerSlotLease | None = None
+        self._active_lease_state: _WorkerSlotLeaseState | None = None
+        self._active_owner_thread: Thread | None = None
+        self._active_owner_task: object | None = None
+        self._released_leases: WeakSet[WorkerSlotLease] = WeakSet()
         if self._inspector is None:
             with open_configured_root_fd(self._policy):
                 pass
@@ -453,30 +469,74 @@ class WorkerStagingQuota:
     def lease(self) -> WorkerSlotLease:
         """Reserve the whole verified slot before handing it to the worker."""
         with self._lock:
-            if self._leased:
+            if self._active_lease is not None:
                 message = "PDF worker slot is already leased"
                 raise PdfWorkerSlotError(message)
-            self._leased = True
-            try:
-                root = validate_quota_bound_staging_root(
-                    self._policy,
-                    inspector=self._inspector,
-                )
-            except BaseException:
-                self._leased = False
-                raise
-        return WorkerSlotLease(quota=self, root=root)
+            root = validate_quota_bound_staging_root(
+                self._policy,
+                inspector=self._inspector,
+            )
+            lease = WorkerSlotLease(quota=self, root=root)
+            self._active_lease = lease
+            self._active_lease_state = _WorkerSlotLeaseState.ISSUED
+            self._active_owner_thread = current_thread()
+            self._active_owner_task = _current_async_task()
+            return lease
+
+    def enter(self, lease: WorkerSlotLease) -> QuotaBoundStagingRoot:
+        """Return the root only for the exact live lease issued by this quota."""
+        with self._lock:
+            if type(lease) is not WorkerSlotLease:
+                message = "PDF worker slot lease is invalid"
+                raise PdfWorkerSlotError(message)
+            if lease in self._released_leases:
+                message = "PDF worker slot lease was already released"
+                raise PdfWorkerSlotError(message)
+            if self._active_lease is not lease:
+                message = "PDF worker slot lease is invalid"
+                raise PdfWorkerSlotError(message)
+            self._require_owner_context()
+            if self._active_lease_state is _WorkerSlotLeaseState.ENTERED:
+                message = "PDF worker slot lease is already entered"
+                raise PdfWorkerSlotError(message)
+            if self._active_lease_state is not _WorkerSlotLeaseState.ISSUED:
+                message = "PDF worker slot lease is invalid"
+                raise PdfWorkerSlotError(message)
+            self._active_lease_state = _WorkerSlotLeaseState.ENTERED
+            return self._root
+
+    def _require_owner_context(self) -> None:
+        """Reject transfer away from the exact issuing thread and async task."""
+        if (
+            self._active_owner_thread is not current_thread()
+            or self._active_owner_task is not _current_async_task()
+        ):
+            message = "PDF worker slot lease belongs to another execution context"
+            raise PdfWorkerSlotError(message)
 
     def release(self, lease: WorkerSlotLease) -> None:
         """Return one slot lease; callers can never underflow the reservation."""
-        if type(lease) is not WorkerSlotLease:
-            message = "PDF worker slot lease is invalid"
-            raise PdfWorkerSlotError(message)
         with self._lock:
-            if not self._leased:
-                message = "PDF worker slot lease release is unbalanced"
-                raise RuntimeError(message)
-            self._leased = False
+            if type(lease) is not WorkerSlotLease:
+                message = "PDF worker slot lease is invalid"
+                raise PdfWorkerSlotError(message)
+            if self._active_lease is lease:
+                self._require_owner_context()
+                if self._active_lease_state not in {
+                    _WorkerSlotLeaseState.ISSUED,
+                    _WorkerSlotLeaseState.ENTERED,
+                }:
+                    message = "PDF worker slot lease is invalid"
+                    raise PdfWorkerSlotError(message)
+                self._released_leases.add(lease)
+                self._active_lease = None
+                self._active_lease_state = None
+                self._active_owner_thread = None
+                self._active_owner_task = None
+                return
+            if lease not in self._released_leases:
+                message = "PDF worker slot lease is invalid"
+                raise PdfWorkerSlotError(message)
 
 
 class _SystemWorkerSlotFilesystemInspector:

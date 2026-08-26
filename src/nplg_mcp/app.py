@@ -12,7 +12,8 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
 from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
-from typing import TYPE_CHECKING, Protocol, cast, override, runtime_checkable
+from pathlib import PurePosixPath
+from typing import TYPE_CHECKING, Never, Protocol, cast, override, runtime_checkable
 from urllib.parse import urlsplit
 
 import httpx
@@ -21,7 +22,14 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Res
 from prometheus_client import CollectorRegistry, generate_latest
 
 from .admission import PathAdmissionMiddleware
-from .bounded_work import STORAGE_WORK, BlockingWorkCapacityError
+from .bounded_work import READINESS_WORK, BlockingWorkCapacityError
+from .capabilities import (
+    AlpicTasksCapabilityVerdict,
+    CapabilityContractError,
+    OAuthProviderCapabilityVerdict,
+    probe_alpic_tasks_capability,
+    probe_oauth_provider,
+)
 from .config import AppConfig, load_config, validate_deployment_profile
 from .errors import AppError, ErrorCode, to_public_error
 from .http_security import McpSecurityMiddleware, build_transport_security_settings
@@ -31,11 +39,13 @@ from .profiles import DeploymentProfile as SdkDeploymentProfile
 from .rate_limit import AsyncRateLimiter
 from .repository import NplgRepository
 from .resilience import UpstreamGuard, UpstreamGuardPolicy
+from .resource_admission import InlineResourceAdmission
 from .security import OutboundPurpose, build_outbound_headers
 from .services import (
     AppServices,
     FullServiceComposition,
     MetadataServiceComposition,
+    validate_service_composition,
 )
 from .tokens import verify_asset_token
 from .tools import ToolService, ToolServiceDependencies
@@ -49,8 +59,9 @@ _UPSTREAM_TRANSITIONS = {
 }
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Mapping
-    from contextlib import AbstractAsyncContextManager
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+    from contextlib import AbstractAsyncContextManager, AbstractContextManager
+    from pathlib import Path
     from urllib.request import Request as UrlRequest
 
     from mcp.server import Server
@@ -120,10 +131,9 @@ def _full_runtime_module() -> _FullRuntimeModule:
 
 
 def _ensure_runtime_ready(runtime: AppServices) -> None:
-    """Check storage and optional stateful dependencies without network I/O."""
+    """Read stateful dependency health without mutating persistent storage."""
     if isinstance(runtime, FullServiceComposition):
-        with runtime.store.stage(suffix=".ready"):
-            pass
+        runtime.store.ensure_ready()
     if isinstance(runtime.tools, _ReadinessSurface):
         runtime.tools.ensure_ready()
 
@@ -159,17 +169,19 @@ class _DisconnectAwareFileResponse(FileResponse):
 
     def __init__(
         self,
-        path: str | os.PathLike[str],
+        relative_path: str,
         *,
         headers: Mapping[str, str],
+        lease: AbstractContextManager[Path],
         media_type: str,
         timeouts: _AssetStreamTimeouts,
     ) -> None:
         super().__init__(
-            path,
+            relative_path,
             headers=headers,
             media_type=media_type,
         )
+        self._lease = lease
         self._timeouts = timeouts
 
     @staticmethod
@@ -183,6 +195,16 @@ class _DisconnectAwareFileResponse(FileResponse):
 
     @override
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        with self._lease as path:
+            self.path = path
+            await self._stream_leased_file(scope, receive, send)
+
+    async def _stream_leased_file(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._timeouts.total_seconds
 
@@ -359,11 +381,54 @@ def _observe_upstream_transition(before: str, after: str) -> None:
     )
 
 
+def _reject_distributed_full(verdict: AlpicTasksCapabilityVerdict) -> Never:
+    """Consume the typed verdict without treating support as implementation."""
+    if verdict.supported is False:
+        msg = "distributed-full is disabled: Alpic Tasks capability is unsupported"
+        raise ValueError(msg)
+    msg = "distributed-full requires a separately approved implementation plan"
+    raise ValueError(msg)
+
+
+def _reject_unavailable_production_oauth(
+    verdict: OAuthProviderCapabilityVerdict,
+) -> Never:
+    """Revalidate capability evidence and keep unimplemented auth unreachable."""
+    try:
+        validated = OAuthProviderCapabilityVerdict.model_validate_json(
+            verdict.model_dump_json()
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
+        msg = "production OAuth provider capability assessment failed closed"
+        raise ValueError(msg) from exc
+    if validated.supported is False:
+        msg = "production OAuth provider capability is unsupported"
+        raise ValueError(msg)
+    msg = "production OAuth requires a separately approved implementation"
+    raise ValueError(msg)
+
+
+def _validate_production_auth_activation(config: AppConfig) -> None:
+    """Stop production before dependency construction until OAuth is implemented."""
+    if config.environment != "production":
+        return
+    try:
+        verdict = probe_oauth_provider()
+    except CapabilityContractError as exc:
+        msg = "production OAuth provider capability assessment failed closed"
+        raise ValueError(msg) from exc
+    _reject_unavailable_production_oauth(verdict)
+
+
 def _runtime_services(config: AppConfig) -> AppServices:
     profile = validate_deployment_profile(config.deployment_profile)
     if profile == "distributed-full":
-        msg = "distributed-full is not implemented and must remain disabled"
-        raise ValueError(msg)
+        try:
+            verdict = probe_alpic_tasks_capability()
+        except CapabilityContractError as exc:
+            msg = "distributed-full capability assessment failed closed"
+            raise ValueError(msg) from exc
+        _reject_distributed_full(verdict)
     limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(config.upstream_timeout_seconds),
@@ -393,7 +458,7 @@ def _runtime_services(config: AppConfig) -> AppServices:
         limiter=limiter,
         total_timeout_seconds=float(config.upstream_timeout_seconds),
         guard=guard,
-        cursor_signing_secret=config.asset_signing_secret,
+        cursor_signing_secret=config.cursor_signing_secret,
     )
     if profile == "alpic-metadata":
         tools = ToolService(
@@ -461,8 +526,16 @@ def _asset_response(
     services: AppServices,
 ) -> Response:
     _require_public_host(request, config)
+    try:
+        asset_signing_secret = config.require_asset_signing_secret()
+    except ValueError:
+        raise AppError(
+            ErrorCode.NOT_FOUND,
+            "The requested asset was not found.",
+            http_status=404,
+        ) from None
     grant = verify_asset_token(
-        config.asset_signing_secret,
+        asset_signing_secret,
         token,
         max_ttl_seconds=config.asset_ttl_seconds,
     )
@@ -473,8 +546,7 @@ def _asset_response(
             http_status=404,
         )
     store = services.store
-    path = store.resolve_asset(grant.path)
-    filename = path.name.replace('"', "")
+    filename = PurePosixPath(grant.path).name.replace('"', "")
     headers = {
         "Cache-Control": "private, no-store",
         "Content-Disposition": f'inline; filename="{filename}"',
@@ -483,9 +555,10 @@ def _asset_response(
         "X-Content-Type-Options": "nosniff",
     }
     return _DisconnectAwareFileResponse(
-        path,
+        grant.path,
         media_type=grant.media_type,
         headers=headers,
+        lease=store.lease_asset(grant.path),
         timeouts=_AssetStreamTimeouts(
             idle_seconds=config.asset_stream_idle_timeout_seconds,
             total_seconds=config.asset_stream_total_timeout_seconds,
@@ -499,8 +572,12 @@ def _validate_startup_config(config: AppConfig) -> None:
     if config.environment == "production" and config.allow_anonymous:
         msg = "anonymous authorization is forbidden in production"
         raise ValueError(msg)
-    if config.environment == "production" and not config.api_principals:
-        msg = "production requires a named API principal registry"
+    if config.environment == "production" and (
+        config.api_bearer_token is not None
+        or config.api_key is not None
+        or config.api_principals
+    ):
+        msg = "static authentication configuration is forbidden in production"
         raise ValueError(msg)
     if (
         config.environment == "production"
@@ -508,9 +585,6 @@ def _validate_startup_config(config: AppConfig) -> None:
         >= config.max_concurrent_mcp_requests
     ):
         msg = "production per-principal admission must reserve global capacity"
-        raise ValueError(msg)
-    if profile == "distributed-full":
-        msg = "distributed-full is not implemented and must remain disabled"
         raise ValueError(msg)
     if (
         config.environment == "production"
@@ -530,16 +604,37 @@ def _validate_startup_config(config: AppConfig) -> None:
         raise ValueError(msg)
 
 
+def _register_full_profile_asset_route(
+    app: NplgFastAPI,
+    *,
+    config: AppConfig,
+    services: AppServices,
+    endpoint: Callable[[str, Request], Awaitable[Response]],
+) -> None:
+    """Expose the legacy asset route only to the full service composition."""
+    if not isinstance(services, FullServiceComposition):
+        return
+    app.add_middleware(
+        PathAdmissionMiddleware,
+        capacity=config.max_concurrent_asset_streams,
+        path_prefix="/assets/",
+    )
+    app.add_api_route("/assets/{token}", endpoint, methods=["GET"])
+
+
 def create_app(
     config: AppConfig | None = None, *, services: AppServices | None = None
 ) -> NplgFastAPI:
     """Create one configured FastAPI application and its bounded routes."""
     cfg = config or load_config(os.environ)
     _validate_startup_config(cfg)
+    _validate_production_auth_activation(cfg)
     runtime = services or _runtime_services(cfg)
+    validate_service_composition(cfg.deployment_profile, runtime)
     mcp_server = create_mcp_server(
         runtime,
         SdkDeploymentProfile(cfg.deployment_profile),
+        resource_admission=(resource_admission := InlineResourceAdmission()),
     )
     sdk_app = mcp_server.streamable_http_app(
         streamable_http_path="/mcp",
@@ -548,7 +643,11 @@ def create_app(
         max_request_body_size=cfg.mcp_max_body_bytes,
         transport_security=build_transport_security_settings(cfg),
     )
-    secured_sdk_app = McpSecurityMiddleware(sdk_app, config=cfg)
+    secured_sdk_app = McpSecurityMiddleware(
+        sdk_app,
+        config=cfg,
+        resource_admission=resource_admission,
+    )
     registry = CollectorRegistry(auto_describe=True)
 
     @asynccontextmanager
@@ -580,11 +679,6 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
-    app.add_middleware(
-        PathAdmissionMiddleware,
-        capacity=cfg.max_concurrent_asset_streams,
-        path_prefix="/assets/",
-    )
     app.config = cfg
     app.services = runtime
     app.mcp_server = mcp_server
@@ -602,13 +696,13 @@ def create_app(
 
     async def ready() -> dict[str, str]:
         try:
-            await STORAGE_WORK.run_to_completion(
+            await READINESS_WORK.run_to_completion(
                 partial(_ensure_runtime_ready, runtime)
             )
         except BlockingWorkCapacityError as exc:
             raise AppError(
                 ErrorCode.RATE_LIMITED,
-                "The readiness storage check is at capacity.",
+                "The readiness check is at capacity.",
                 http_status=503,
             ) from exc
         return {"status": "ready"}
@@ -619,11 +713,16 @@ def create_app(
     async def asset(token: str, request: Request) -> Response:
         return _asset_response(token, request, config=cfg, services=runtime)
 
+    _register_full_profile_asset_route(
+        app,
+        config=cfg,
+        services=runtime,
+        endpoint=asset,
+    )
     app.add_exception_handler(AppError, app_error_handler)
     app.add_api_route("/healthz", health, methods=["GET"])
     app.add_api_route("/readyz", ready, methods=["GET"])
     app.add_api_route("/metrics", metrics, methods=["GET"])
-    app.add_api_route("/assets/{token}", asset, methods=["GET"])
     app.mount("/", secured_sdk_app)
 
     return app

@@ -8,9 +8,10 @@ import asyncio
 import copy
 import hashlib
 import json
+import os
 import threading
 from dataclasses import FrozenInstanceError, dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeVar, cast, override
@@ -19,7 +20,12 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 import nplg_mcp.tools as tools_module
-from nplg_mcp.config import AppConfig
+from nplg_mcp.config import (
+    HARD_MAX_INLINE_RESOURCE_BYTES,
+    HARD_MAX_RENDER_PAGES,
+    HARD_MAX_TILES_PER_PAGE,
+    AppConfig,
+)
 from nplg_mcp.contracts import RenderTilesInput, SearchDocumentsInput
 from nplg_mcp.downloader import DownloadResult
 from nplg_mcp.errors import AppError, ErrorCode
@@ -32,14 +38,28 @@ from nplg_mcp.pdf import (
     RenderManifest,
     TileManifest,
 )
-from nplg_mcp.pdf_executor import PdfWorkerError, PdfWorkerUnavailableError
-from nplg_mcp.storage import ContentAddressedStore
+from nplg_mcp.pdf_executor import (
+    PdfWorkerError,
+    PdfWorkerUnavailableError,
+    PublicationReservingPdfExecutor,
+)
+from nplg_mcp.pdf_worker_slot import PdfWorkerSlotPolicy
+from nplg_mcp.storage import ContentAddressedStore, StoreLifecycleConfiguration
+from nplg_mcp.storage_lifecycle import (
+    ClockHighWater,
+    PublicationBlocker,
+    PublicationReservationError,
+    RetentionClockSample,
+    RetentionPolicy,
+    StorageCapacity,
+)
 from nplg_mcp.tokens import verify_asset_token
 from nplg_mcp.tools import (
     ToolService,
     ToolServiceDependencies,
 )
 from tests.helpers.inline_pdf_executor import InlinePdfExecutor
+from tests.helpers.lease_store import lease_barrier_store, retention_sample
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -49,6 +69,8 @@ if TYPE_CHECKING:
     from nplg_mcp.json_types import JsonObject, JsonValue
     from nplg_mcp.pdf_ipc import PdfCommand, PdfResult, PdfSuccess
 ControlledResultT = TypeVar("ControlledResultT")
+_GIB = 1024 * 1024 * 1024
+_RENDER_RESOURCE_INDEX_BYTES = 4096
 _EXPECTED_SERIALIZED_CALL_COUNT = 2
 _EXPECTED_DEFAULT_TILE_OVERLAP = 128
 _EXPLICIT_TILE_DIMENSION_BOUNDARY = 256
@@ -731,6 +753,129 @@ class PopulatedTilePdfProcessor(FakePdfProcessor):
         )
 
 
+class _OverproducingPagePdfProcessor(SharedPagePdfProcessor):
+    """Return the schema maximum rather than the smaller requested selection."""
+
+    @override
+    def render_pages(
+        self,
+        pdf_path: Path,
+        *,
+        pages: tuple[int, ...],
+        mode: str,
+    ) -> RenderManifest:
+        assert pages == (1,)
+        return super().render_pages(pdf_path, pages=(1, 2), mode=mode)
+
+
+class _MutablePublicationCapacity:
+    """Expose one deterministic capacity value to lifecycle admission."""
+
+    def __init__(self, value: StorageCapacity) -> None:
+        super().__init__()
+        self.value = value
+
+    def __call__(self) -> StorageCapacity:
+        return self.value
+
+
+class _PublicationClock:
+    """Issue strictly advancing trusted samples for reservation boundaries."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._seconds = 61.0
+
+    def __call__(self) -> RetentionClockSample:
+        seconds = self._seconds
+        self._seconds += 1.0
+        return RetentionClockSample(
+            utc_now=datetime(2026, 8, 25, tzinfo=UTC) + timedelta(seconds=seconds),
+            monotonic_now=seconds,
+            boot_id="tool-publication-test",
+            synchronized=True,
+        )
+
+
+class _IndexReservationObservingStore(ContentAddressedStore):
+    """Observe real lifecycle accounting exactly when an index is published."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        lifecycle: StoreLifecycleConfiguration,
+    ) -> None:
+        super().__init__(root, max_bytes=2 * _GIB, lifecycle=lifecycle)
+        self.index_reservations: list[tuple[int, int, int]] = []
+        self.index_failure: BaseException | None = None
+
+    @override
+    def put_render_bytes(self, relative_path: str, data: bytes) -> tuple[str, str]:
+        if "/resources/" in relative_path:
+            self.index_reservations.append(
+                (
+                    self.publication_reserved_bytes,
+                    self.publication_reserved_objects,
+                    self.publication_reserved_inodes,
+                )
+            )
+            failure = self.index_failure
+            if failure is not None:
+                raise failure
+        return super().put_render_bytes(relative_path, data)
+
+
+class _ObservedInlinePdfExecutor(InlinePdfExecutor):
+    """Count real executor dispatches and optionally close later admission."""
+
+    def __init__(
+        self,
+        *,
+        processor: FakePdfProcessor,
+        store: _IndexReservationObservingStore,
+        lifecycle: StoreLifecycleConfiguration,
+        close_admission_during_dispatch: bool = False,
+    ) -> None:
+        super().__init__(processor=processor, store=store)
+        self._publication_store = store
+        self._lifecycle = lifecycle
+        self._close_admission_during_dispatch = close_admission_during_dispatch
+        self.execute_calls = 0
+
+    @override
+    async def execute(
+        self,
+        command: PdfCommand,
+        *,
+        deadline: MonotonicDeadline,
+    ) -> PdfResult:
+        self.execute_calls += 1
+        if self._close_admission_during_dispatch:
+            try:
+                async with self._publication_store.reserve_publication(
+                    self._lifecycle.policy,
+                    maximum_new_bytes=self._publication_store.max_bytes,
+                    maximum_new_objects=1,
+                    maximum_new_inodes=1,
+                    clock=self._lifecycle.clock_sampler(),
+                ):
+                    message = "oversized reservation was unexpectedly admitted"
+                    raise AssertionError(message)
+            except PublicationReservationError:
+                pass
+        return await super().execute(command, deadline=deadline)
+
+
+class _InvalidAssetUrlToolService(ToolService):
+    """Force final output validation to fail after artifact registration."""
+
+    @override
+    def _signed_asset_url(self, relative_path: str, media_type: str) -> str:
+        del relative_path, media_type
+        return "not-an-http-url"
+
+
 class ObservedPdfJobLimiter:
     """Observe real semaphore admission without changing its behavior."""
 
@@ -890,7 +1035,124 @@ def config(tmp_path: Path) -> AppConfig:
         upstream_timeout_seconds=30,
         upstream_rate_per_second=1,
         max_redirects=3,
+        cursor_signing_secret=b"c" * 32,
     )
+
+
+def _publication_slot_policy() -> PdfWorkerSlotPolicy:
+    payload: dict[str, object] = {
+        "version": 1,
+        "root": "/var/lib/nplg/pdf-worker-slot",
+        "filesystem_type": "ext4",
+        "maximum_total_bytes": _GIB,
+        "minimum_available_bytes": _GIB,
+        "maximum_total_inodes": 65_536,
+        "minimum_available_inodes": 65_536,
+        "mount_options": ["nodev", "noexec", "nosuid", "rw"],
+        "concurrency": 1,
+    }
+    return PdfWorkerSlotPolicy.model_validate(
+        payload,
+        strict=True,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicationToolOptions:
+    """Typed variations for the lifecycle-backed render fixture."""
+
+    available_bytes: int = 3 * _GIB
+    index_failure: BaseException | None = None
+    close_admission_during_dispatch: bool = False
+    service_type: type[ToolService] = ToolService
+    processor_type: type[FakePdfProcessor] = FakePdfProcessor
+
+
+def _publication_tool_service(
+    tmp_path: Path,
+    *,
+    options: _PublicationToolOptions | None = None,
+) -> tuple[
+    ToolService,
+    _IndexReservationObservingStore,
+    _ObservedInlinePdfExecutor,
+    str,
+]:
+    selected = options or _PublicationToolOptions()
+    policy = RetentionPolicy(
+        maximum_age_seconds=3600,
+        maximum_bytes=2 * _GIB,
+        maximum_objects=1000,
+        minimum_free_bytes=64 * 1024 * 1024,
+        minimum_free_inodes=128,
+    )
+    capacity = _MutablePublicationCapacity(
+        StorageCapacity(
+            total_bytes=4 * _GIB,
+            available_bytes=selected.available_bytes,
+            total_inodes=1_000_000,
+            available_inodes=900_000,
+        )
+    )
+    clock_high_water = ClockHighWater(
+        tmp_path / "publication-clock-high-water.json",
+        healthy_window_seconds=60,
+        maximum_forward_slew_seconds=5,
+    )
+    initial = RetentionClockSample(
+        utc_now=datetime(2026, 8, 25, tzinfo=UTC),
+        monotonic_now=0.0,
+        boot_id="tool-publication-test",
+        synchronized=True,
+    )
+    trusted = RetentionClockSample(
+        utc_now=initial.utc_now + timedelta(seconds=60),
+        monotonic_now=60.0,
+        boot_id=initial.boot_id,
+        synchronized=True,
+    )
+    _ = clock_high_water.observe(initial)
+    assert clock_high_water.observe(trusted).trusted is True
+    lifecycle = StoreLifecycleConfiguration(
+        policy=policy,
+        capacity_sampler=capacity,
+        clock_high_water=clock_high_water,
+        clock_sampler=_PublicationClock(),
+    )
+    store = _IndexReservationObservingStore(
+        tmp_path / "publication-cache",
+        lifecycle=lifecycle,
+    )
+    processor = selected.processor_type(store)
+    artifact = store.put_bytes(
+        b"%PDF-1.7\nfixture",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    inner = _ObservedInlinePdfExecutor(
+        processor=processor,
+        store=store,
+        lifecycle=lifecycle,
+        close_admission_during_dispatch=selected.close_admission_during_dispatch,
+    )
+    store.index_failure = selected.index_failure
+    wrapped = PublicationReservingPdfExecutor(
+        inner=inner,
+        store=store,
+        lifecycle=lifecycle,
+        slot_policy=_publication_slot_policy(),
+    )
+    tools = selected.service_type(
+        dependencies=ToolServiceDependencies(
+            repository=FakeRepository(),
+            downloader=FakeDownloader(store),
+            pdf=wrapped,
+            store=store,
+        ),
+        config=config(tmp_path),
+    )
+    return tools, store, inner, artifact.object_id
 
 
 def test_tool_service_dependencies_are_frozen_and_slotted(tmp_path: Path) -> None:
@@ -928,6 +1190,52 @@ def test_tool_service_readiness_maps_an_open_pdf_circuit_to_503(tmp_path: Path) 
 
     assert caught.value.http_status == HTTPStatus.SERVICE_UNAVAILABLE
     assert caught.value.code is ErrorCode.PDF_PROCESSING_FAILED
+
+
+@pytest.mark.asyncio
+async def test_tool_service_readiness_reports_closed_lifecycle_without_mutation(
+    tmp_path: Path,
+) -> None:
+    store, policy, clock = lease_barrier_store(tmp_path)
+    artifact = store.put_bytes(
+        b"document",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    with pytest.raises(PublicationReservationError):
+        async with store.reserve_publication(
+            policy,
+            maximum_new_bytes=1,
+            maximum_new_objects=1,
+            maximum_new_inodes=1,
+            clock=clock,
+        ):
+            pass
+    assert store.lifecycle_admission_closed
+    expired_timestamp = clock.utc_now.timestamp() - 7200.0
+    os.utime(
+        artifact.absolute_path,
+        (expired_timestamp, expired_timestamp),
+        follow_symlinks=False,
+    )
+    tools = ToolService(
+        dependencies=ToolServiceDependencies(
+            repository=FakeRepository(),
+            downloader=FakeDownloader(store),
+            pdf=ExpiredDeadlineProbePdfExecutor(),
+            store=store,
+        ),
+        config=config(tmp_path),
+    )
+
+    with pytest.raises(AppError) as caught:
+        tools.ensure_ready()
+
+    assert caught.value.http_status == HTTPStatus.SERVICE_UNAVAILABLE
+    assert caught.value.code is ErrorCode.CACHE_FULL
+    assert store.lifecycle_admission_closed
+    assert artifact.absolute_path.exists()
 
 
 def test_metadata_profile_readiness_does_not_consult_private_pdf_circuit(
@@ -1276,7 +1584,7 @@ async def test_download_uses_only_discovered_bitstream_and_returns_bound_signed_
     assert asset_url.startswith("https://mcp.example.test/assets/")
     token = asset_url.rsplit("/", 1)[-1]
     grant = verify_asset_token(
-        config(tmp_path).asset_signing_secret, token, now=datetime.now(UTC)
+        config(tmp_path).require_asset_signing_secret(), token, now=datetime.now(UTC)
     )
     assert grant.path == relative_path
     assert grant.media_type == "application/pdf"
@@ -1351,6 +1659,45 @@ async def test_artifact_chain_inspect_render_tile_manifest_and_delete(
     assert _json_string(manifest.get("render_id"), context="manifest render ID") == (
         render_id
     )
+
+
+@pytest.mark.asyncio
+async def test_private_pdf_pipeline_versions_do_not_leak_into_public_outputs(
+    tmp_path: Path,
+) -> None:
+    tools, _ = service(tmp_path)
+    downloaded = _output_json(
+        await tools.call(
+            "download_document_file",
+            {"handle": "1234/560449", "bitstream_id": "bs_public"},
+        )
+    )
+    artifact_id = _json_string(downloaded.get("artifact_id"), context="artifact ID")
+    rendered = _output_json(
+        await tools.call(
+            "render_pdf_pages",
+            {"artifact_id": artifact_id, "pages": [1]},
+        )
+    )
+    render_id = _json_string(rendered.get("render_id"), context="render ID")
+    tiled = _output_json(
+        await tools.call(
+            "render_pdf_page_tiles",
+            {"render_id": render_id, "page_number": 1},
+        )
+    )
+    manifest = _output_json(
+        await tools.call("get_render_manifest", {"render_id": render_id})
+    )
+    private_fields = {
+        "manifest_schema_version",
+        "render_pipeline_version",
+        "classification_algorithm_version",
+        "tile_pipeline_version",
+    }
+
+    for public_output in (rendered, tiled, manifest):
+        assert private_fields.isdisjoint(public_output)
 
 
 @pytest.mark.asyncio
@@ -1895,6 +2242,328 @@ async def test_tool_resources_cover_about_document_render_and_not_found(
         _ = await tools.read_resource("nplg://unknown")
 
 
+def test_document_resource_rejects_oversize_before_reading_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools, _ = service(tmp_path)
+    source = tools.store.put_bytes(
+        b"bounded",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    with source.absolute_path.open("r+b") as stream:
+        _ = stream.truncate(HARD_MAX_INLINE_RESOURCE_BYTES + 1)
+    tools.force_missing_document_for_test(source.absolute_path)
+    content_read = False
+
+    def reject_content_read(descriptor: int, size: int) -> bytes:
+        nonlocal content_read
+        del descriptor, size
+        content_read = True
+        pytest.fail("oversize resource content reached os.read")
+
+    monkeypatch.setattr(os, "read", reject_content_read)
+
+    with pytest.raises(AppError) as captured:
+        _ = tools.read_artifact_for_test(
+            f"nplg://artifact/{source.object_id}",
+            source.object_id,
+        )
+
+    assert captured.value.code is ErrorCode.DOWNLOAD_TOO_LARGE
+    assert captured.value.http_status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+    assert content_read is False
+
+
+def test_registered_resource_rejects_oversize_declaration_before_content_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools, _ = service(tmp_path)
+    render_id = "rnd_" + "1" * 32
+    data = b"jpeg"
+    digest = hashlib.sha256(data).hexdigest()
+    artifact_id = f"doc_{digest}"
+    relative_path = f"renders/{render_id}/page.jpg"
+    _ = tools.store.put_render_bytes(relative_path, data)
+    index = _persist_render_index(
+        tools,
+        render_id=render_id,
+        identity=(
+            artifact_id,
+            relative_path,
+            digest,
+            HARD_MAX_INLINE_RESOURCE_BYTES + 1,
+        ),
+    )
+    assert tools.load_and_cache_resource_for_test(index.parents[2], artifact_id)
+    content_read = False
+
+    def reject_content_read(descriptor: int, size: int) -> bytes:
+        nonlocal content_read
+        del descriptor, size
+        content_read = True
+        pytest.fail("oversize registered resource content reached os.read")
+
+    monkeypatch.setattr(os, "read", reject_content_read)
+
+    with pytest.raises(AppError) as captured:
+        _ = tools.read_artifact_for_test(
+            f"nplg://artifact/{artifact_id}",
+            artifact_id,
+        )
+
+    assert captured.value.code is ErrorCode.DOWNLOAD_TOO_LARGE
+    assert captured.value.http_status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+    assert content_read is False
+
+
+@pytest.mark.asyncio
+async def test_document_resource_read_holds_a_prune_lease_until_bytes_are_copied(
+    tmp_path: Path,
+) -> None:
+    """Removing the resource-read lease must expose the source to pruning."""
+    store, policy, clock = lease_barrier_store(tmp_path)
+    source = store.put_bytes(
+        b"%PDF-1.7\nresource-read",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    processor = FakePdfProcessor(store)
+    tools = ToolService(
+        dependencies=ToolServiceDependencies(
+            repository=FakeRepository(),
+            downloader=FakeDownloader(store),
+            pdf=InlinePdfExecutor(processor=processor, store=store),
+            store=store,
+        ),
+        config=config(tmp_path),
+    )
+    uri = f"nplg://artifact/{source.object_id}"
+
+    def read_resource() -> dict[str, str]:
+        return asyncio.run(tools.read_resource(uri))
+
+    operation = asyncio.create_task(asyncio.to_thread(read_resource))
+    entered = await asyncio.to_thread(store.wait_until_leased)
+    if not entered:
+        store.release_lease_barrier()
+        _ = await operation
+        pytest.fail("document resource read did not acquire the public asset lease")
+
+    while_reading = store.prune(policy, clock=clock)
+    assert source.absolute_path.is_file()
+    assert not (store.root / "renders" / processor.render_id).exists()
+    assert while_reading.retained_leased_objects == 1
+    assert (store.lease_acquisitions, store.lease_releases) == (1, 0)
+
+    store.release_lease_barrier()
+    result = await operation
+    assert result["sha256"] == source.sha256
+    assert (store.lease_acquisitions, store.lease_releases) == (1, 1)
+
+    replacement = store.put_bytes(
+        b"replacement",
+        namespace="documents",
+        filename="replacement.pdf",
+        media_type="application/pdf",
+    )
+    after_read = store.prune(policy, clock=retention_sample(2.0))
+    assert after_read.retained_leased_objects == 0
+    assert not source.absolute_path.exists()
+    assert replacement.absolute_path.is_file()
+
+
+@pytest.mark.asyncio
+async def test_document_resource_integrity_error_releases_its_lease_exactly_once(
+    tmp_path: Path,
+) -> None:
+    store, _policy, _clock = lease_barrier_store(tmp_path)
+    source = store.put_bytes(
+        b"%PDF-1.7\nauthoritative",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    processor = FakePdfProcessor(store)
+    tools = ToolService(
+        dependencies=ToolServiceDependencies(
+            repository=FakeRepository(),
+            downloader=FakeDownloader(store),
+            pdf=InlinePdfExecutor(processor=processor, store=store),
+            store=store,
+        ),
+        config=config(tmp_path),
+    )
+    _ = source.absolute_path.write_bytes(b"tampered")
+    store.release_lease_barrier()
+
+    with pytest.raises(AppError, match="integrity verification failed"):
+        _ = await tools.read_resource(f"nplg://artifact/{source.object_id}")
+
+    assert (store.lease_acquisitions, store.lease_releases) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_render_registration_hash_holds_a_prune_lease_until_digest_finishes(
+    tmp_path: Path,
+) -> None:
+    """Content identity hashing must protect the complete render object root."""
+    store, policy, clock = lease_barrier_store(tmp_path)
+    processor = FakePdfProcessor(store)
+    source = store.put_bytes(
+        b"%PDF-1.7\nrender-source",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    tools = ToolService(
+        dependencies=ToolServiceDependencies(
+            repository=FakeRepository(),
+            downloader=FakeDownloader(store),
+            pdf=InlinePdfExecutor(processor=processor, store=store),
+            store=store,
+        ),
+        config=config(tmp_path),
+    )
+
+    def render_page() -> StrictOutput:
+        return asyncio.run(
+            tools.call(
+                "render_pdf_pages",
+                {"artifact_id": source.object_id, "pages": [1]},
+            )
+        )
+
+    operation = asyncio.create_task(asyncio.to_thread(render_page))
+    entered = await asyncio.to_thread(store.wait_until_leased)
+    if not entered:
+        store.release_lease_barrier()
+        _ = await operation
+        pytest.fail("render content hashing did not acquire the public asset lease")
+
+    while_hashing = store.prune(policy, clock=clock)
+    render_root = store.root / "renders" / processor.render_id
+    assert render_root.is_dir()
+    assert not source.absolute_path.exists()
+    assert while_hashing.retained_leased_objects == 1
+    assert (store.lease_acquisitions, store.lease_releases) == (1, 0)
+
+    store.release_lease_barrier()
+    rendered = _output_json(await operation)
+    assert rendered.get("render_id") == processor.render_id
+    assert (store.lease_acquisitions, store.lease_releases) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_registered_render_resource_read_holds_its_object_lease(
+    tmp_path: Path,
+) -> None:
+    store, policy, clock = lease_barrier_store(tmp_path)
+    store.release_lease_barrier()
+    processor = FakePdfProcessor(store)
+    source = store.put_bytes(
+        b"%PDF-1.7\nregistered-resource",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    tools = ToolService(
+        dependencies=ToolServiceDependencies(
+            repository=FakeRepository(),
+            downloader=FakeDownloader(store),
+            pdf=InlinePdfExecutor(processor=processor, store=store),
+            store=store,
+        ),
+        config=config(tmp_path),
+    )
+    rendered = _output_json(
+        await tools.call(
+            "render_pdf_pages",
+            {"artifact_id": source.object_id, "pages": [1]},
+        )
+    )
+    page = require_json_object(
+        _json_array(rendered.get("pages"), context="rendered pages")[0],
+        context="rendered page",
+    )
+    resource_uri = _json_string(page.get("resource_uri"), context="resource URI")
+    store.arm_lease_barrier()
+
+    def read_resource() -> dict[str, str]:
+        return asyncio.run(tools.read_resource(resource_uri))
+
+    operation = asyncio.create_task(asyncio.to_thread(read_resource))
+    entered = await asyncio.to_thread(store.wait_until_leased)
+    if not entered:
+        store.release_lease_barrier()
+        _ = await operation
+        pytest.fail("registered render read did not acquire the public asset lease")
+
+    while_reading = store.prune(policy, clock=clock)
+    assert (store.root / "renders" / processor.render_id).is_dir()
+    assert not source.absolute_path.exists()
+    assert while_reading.retained_leased_objects == 1
+
+    store.release_lease_barrier()
+    resource = await operation
+    assert resource["sha256"] == processor.page_sha256
+    assert store.leased_relative_paths == [processor.page_path]
+    assert (store.lease_acquisitions, store.lease_releases) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_render_registration_leases_index_and_representative_reads(
+    tmp_path: Path,
+) -> None:
+    """The duplicate path reads three files; omitting either lease is observable."""
+    store, _policy, _clock = lease_barrier_store(tmp_path)
+    store.release_lease_barrier()
+    processor = FakePdfProcessor(store)
+    source = store.put_bytes(
+        b"%PDF-1.7\nduplicate-registration",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    tools = ToolService(
+        dependencies=ToolServiceDependencies(
+            repository=FakeRepository(),
+            downloader=FakeDownloader(store),
+            pdf=InlinePdfExecutor(processor=processor, store=store),
+            store=store,
+        ),
+        config=config(tmp_path),
+    )
+    arguments: JsonObject = {"artifact_id": source.object_id, "pages": [1]}
+    _ = await tools.call("render_pdf_pages", arguments)
+    store.arm_lease_barrier()
+
+    def render_again() -> StrictOutput:
+        return asyncio.run(tools.call("render_pdf_pages", arguments))
+
+    operation = asyncio.create_task(asyncio.to_thread(render_again))
+    entered = await asyncio.to_thread(store.wait_until_leased)
+    if not entered:
+        store.release_lease_barrier()
+        _ = await operation
+        pytest.fail("duplicate registration did not lease its content hash input")
+    store.release_lease_barrier()
+    _ = await operation
+
+    artifact_id = f"doc_{processor.page_sha256}"
+    expected_index = f"renders/{processor.render_id}/resources/{artifact_id}/index.json"
+    assert store.leased_relative_paths == [
+        processor.page_path,
+        expected_index,
+        processor.page_path,
+    ]
+    assert (store.lease_acquisitions, store.lease_releases) == (3, 3)
+
+
 @pytest.mark.asyncio
 async def test_metadata_and_file_tools_expose_repository_results(
     tmp_path: Path,
@@ -2102,6 +2771,170 @@ async def test_render_tiles_exposes_signed_tile_and_resource_coordinates(
     assert asset_url.startswith("https://mcp.example.test/assets/")
 
 
+@pytest.mark.parametrize("operation", ["pages", "tiles"])
+@pytest.mark.asyncio
+async def test_render_resource_indexes_hold_bounded_publication_capacity(
+    tmp_path: Path,
+    operation: Literal["pages", "tiles"],
+) -> None:
+    tools, store, inner, artifact_id = _publication_tool_service(tmp_path)
+    if operation == "pages":
+        tool_name = "render_pdf_pages"
+        arguments: JsonObject = {"artifact_id": artifact_id, "pages": [1]}
+        maximum_indexes = HARD_MAX_RENDER_PAGES
+        actual_indexes = 1
+    else:
+        tool_name = "render_pdf_page_tiles"
+        arguments = {"render_id": "rnd_" + "1" * 32, "page_number": 1}
+        maximum_indexes = HARD_MAX_TILES_PER_PAGE + 1
+        actual_indexes = 2
+    expected_reservation = (
+        maximum_indexes * _RENDER_RESOURCE_INDEX_BYTES,
+        1,
+        2 * maximum_indexes + 2,
+    )
+
+    _ = await tools.call(tool_name, arguments)
+
+    assert inner.execute_calls == 1
+    assert store.index_reservations == [expected_reservation] * actual_indexes
+    assert (
+        store.publication_reserved_bytes,
+        store.publication_reserved_objects,
+        store.publication_reserved_inodes,
+    ) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_page_index_reservation_covers_schema_bounded_worker_overproduction(
+    tmp_path: Path,
+) -> None:
+    tools, store, inner, artifact_id = _publication_tool_service(
+        tmp_path,
+        options=_PublicationToolOptions(
+            processor_type=_OverproducingPagePdfProcessor,
+        ),
+    )
+
+    _ = await tools.call(
+        "render_pdf_pages",
+        {"artifact_id": artifact_id, "pages": [1]},
+    )
+
+    assert inner.execute_calls == 1
+    assert store.index_reservations == [(32_768, 1, 18), (32_768, 1, 18)]
+    assert (
+        store.publication_reserved_bytes,
+        store.publication_reserved_objects,
+        store.publication_reserved_inodes,
+    ) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_render_index_reservation_precedes_worker_headroom_admission(
+    tmp_path: Path,
+) -> None:
+    minimum_free_bytes = 64 * 1024 * 1024
+    tools, store, inner, artifact_id = _publication_tool_service(
+        tmp_path,
+        options=_PublicationToolOptions(
+            available_bytes=(
+                minimum_free_bytes + _GIB + _RENDER_RESOURCE_INDEX_BYTES - 1
+            ),
+        ),
+    )
+
+    with pytest.raises(PublicationReservationError) as caught:
+        _ = await tools.call(
+            "render_pdf_pages",
+            {"artifact_id": artifact_id, "pages": [1]},
+        )
+
+    assert caught.value.blocker is PublicationBlocker.BYTE_HEADROOM
+    assert inner.execute_calls == 0
+    assert store.index_reservations == []
+    assert (
+        store.publication_reserved_bytes,
+        store.publication_reserved_objects,
+        store.publication_reserved_inodes,
+    ) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_render_index_reservation_survives_later_closed_admission(
+    tmp_path: Path,
+) -> None:
+    tools, store, inner, artifact_id = _publication_tool_service(
+        tmp_path,
+        options=_PublicationToolOptions(close_admission_during_dispatch=True),
+    )
+
+    _ = await tools.call(
+        "render_pdf_pages",
+        {"artifact_id": artifact_id, "pages": [1]},
+    )
+
+    assert inner.execute_calls == 1
+    assert store.lifecycle_admission_closed
+    assert store.index_reservations == [(32_768, 1, 18)]
+    assert (
+        store.publication_reserved_bytes,
+        store.publication_reserved_objects,
+        store.publication_reserved_inodes,
+    ) == (0, 0, 0)
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, asyncio.CancelledError])
+@pytest.mark.asyncio
+async def test_render_index_exception_or_cancellation_releases_reservation(
+    tmp_path: Path,
+    failure_type: type[BaseException],
+) -> None:
+    failure = failure_type("postprocessing index failure")
+    tools, store, inner, artifact_id = _publication_tool_service(
+        tmp_path,
+        options=_PublicationToolOptions(index_failure=failure),
+    )
+
+    with pytest.raises(failure_type, match="postprocessing index failure"):
+        _ = await tools.call(
+            "render_pdf_pages",
+            {"artifact_id": artifact_id, "pages": [1]},
+        )
+
+    assert inner.execute_calls == 1
+    assert store.index_reservations == [(32_768, 1, 18)]
+    assert (
+        store.publication_reserved_bytes,
+        store.publication_reserved_objects,
+        store.publication_reserved_inodes,
+    ) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_render_index_reservation_covers_final_output_validation(
+    tmp_path: Path,
+) -> None:
+    tools, store, inner, artifact_id = _publication_tool_service(
+        tmp_path,
+        options=_PublicationToolOptions(service_type=_InvalidAssetUrlToolService),
+    )
+
+    with pytest.raises(ValidationError, match="asset_url"):
+        _ = await tools.call(
+            "render_pdf_pages",
+            {"artifact_id": artifact_id, "pages": [1]},
+        )
+
+    assert inner.execute_calls == 1
+    assert store.index_reservations == [(32_768, 1, 18)]
+    assert (
+        store.publication_reserved_bytes,
+        store.publication_reserved_objects,
+        store.publication_reserved_inodes,
+    ) == (0, 0, 0)
+
+
 def test_private_full_requires_every_stateful_dependency(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="requires downloader, PDF, and store"):
         _ = ToolService(
@@ -2259,6 +3092,7 @@ class UnexpectedPdfSuccess:
 class TestableToolService(ToolService):
     """Typed public test facade for internal fail-closed resource invariants."""
 
+    __test__ = False
     _forced_document_path: Path | None = None
 
     def ensure_profile_catalog_for_test(self) -> None:
@@ -2692,9 +3526,13 @@ def test_unregistered_document_rejects_content_digest_mismatch(
 ) -> None:
     tools, _ = service(tmp_path)
     artifact_id = "doc_" + "2" * 64
-    mismatched = tmp_path / "mismatched.pdf"
-    _ = mismatched.write_bytes(b"not-the-addressed-content")
-    tools.force_missing_document_for_test(mismatched)
+    mismatched = tools.store.put_bytes(
+        b"not-the-addressed-content",
+        namespace="documents",
+        filename="source.pdf",
+        media_type="application/pdf",
+    )
+    tools.force_missing_document_for_test(mismatched.absolute_path)
 
     with pytest.raises(AppError, match="integrity verification failed"):
         _ = tools.read_artifact_for_test(f"nplg://artifact/{artifact_id}", artifact_id)

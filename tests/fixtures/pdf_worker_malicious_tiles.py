@@ -12,6 +12,11 @@ from typing import BinaryIO, cast
 
 from PIL import Image
 
+from nplg_mcp.pdf_identity import (
+    PDF_PIPELINE_VERSIONS,
+    TileGeometryRequest,
+    tile_geometry_identifier,
+)
 from nplg_mcp.pdf_ipc import (
     MAX_RESULT_FRAME_BYTES,
     PdfSuccess,
@@ -64,7 +69,13 @@ def main() -> None:
     )
     page_number = 2 if mode == "page-number" else 1
     tile_width = 512 if mode == "geometry" else 256
-    geometry = f"w{tile_width:04d}-h0256-o000"
+    geometry = tile_geometry_identifier(
+        TileGeometryRequest(
+            width=tile_width,
+            height=256,
+            overlap=0,
+        )
+    )
     root = f"renders/{render_id}/tiles/page-{page_number:04d}/{geometry}"
     if mode == "root":
         root = f"renders/{render_id}/tiles/page-{page_number:04d}"
@@ -88,6 +99,12 @@ def main() -> None:
     output_height = min(256, source_page.height)
     page_bytes = _jpeg_bytes(width=output_width, height=output_height)
     output = RenderTilesOutput(
+        manifest_schema_version=PDF_PIPELINE_VERSIONS.manifest_schema_version,
+        render_pipeline_version=PDF_PIPELINE_VERSIONS.render_pipeline_version,
+        classification_algorithm_version=(
+            PDF_PIPELINE_VERSIONS.classification_algorithm_version
+        ),
+        tile_pipeline_version=PDF_PIPELINE_VERSIONS.tile_pipeline_version,
         render_id=render_id,
         page_number=page_number,
         page_sha256=source_page.sha256,

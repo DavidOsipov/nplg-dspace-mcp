@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import os
 import sys
 from dataclasses import dataclass
@@ -14,6 +13,11 @@ from typing import BinaryIO, cast
 
 from PIL import Image
 
+from nplg_mcp.pdf_identity import (
+    PDF_PIPELINE_VERSIONS,
+    RenderIdentityRequest,
+    render_identifier,
+)
 from nplg_mcp.pdf_ipc import (
     MAX_RESULT_FRAME_BYTES,
     PdfSuccess,
@@ -76,17 +80,15 @@ class _DefectPaths:
 
 
 def _render_id(source_sha256: str, command: RenderPagesCommand) -> str:
-    key = {
-        "fallback_dpi": 400,
-        "mode": command.parameters.mode,
-        "pages": list(command.parameters.pages),
-        "renderer_version": _RENDERER_VERSION,
-        "source_sha256": source_sha256,
-    }
-    digest = hashlib.sha256(
-        json.dumps(key, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    return f"rnd_{digest[:32]}"
+    return render_identifier(
+        RenderIdentityRequest(
+            source_sha256=source_sha256,
+            pages=command.parameters.pages,
+            mode=command.parameters.mode,
+            renderer_version=_RENDERER_VERSION,
+            fallback_dpi=400,
+        )
+    )
 
 
 def _default_claims(render_id: str, *, page_number: int = 1) -> _OutputClaims:
@@ -182,6 +184,10 @@ def _stage_manifest_defect(
         _ = manifest_path.write_bytes(b"not-json")
     elif mode == "manifest-mismatch":
         different = RenderPagesOutput(
+            manifest_schema_version=output.manifest_schema_version,
+            render_pipeline_version=output.render_pipeline_version,
+            classification_algorithm_version=(output.classification_algorithm_version),
+            tile_pipeline_version=output.tile_pipeline_version,
             render_id=output.render_id,
             source_sha256=output.source_sha256,
             renderer_version="different",
@@ -257,6 +263,12 @@ def main() -> None:
     else:
         raise RuntimeError(mode)
     output = RenderPagesOutput(
+        manifest_schema_version=PDF_PIPELINE_VERSIONS.manifest_schema_version,
+        render_pipeline_version=PDF_PIPELINE_VERSIONS.render_pipeline_version,
+        classification_algorithm_version=(
+            PDF_PIPELINE_VERSIONS.classification_algorithm_version
+        ),
+        tile_pipeline_version=PDF_PIPELINE_VERSIONS.tile_pipeline_version,
         render_id=render_id,
         source_sha256=source_sha256,
         renderer_version=_RENDERER_VERSION,

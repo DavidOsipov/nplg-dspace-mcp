@@ -7,12 +7,14 @@ import asyncio
 import base64
 import logging
 import socket
+import threading
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from http import HTTPStatus
 from http.cookiejar import Cookie, CookieJar
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast, override
 
 import httpx
 import pytest
@@ -23,6 +25,7 @@ from pydantic import SecretStr
 import nplg_mcp.app as app_module
 import nplg_mcp.http_security as http_security_module
 from nplg_mcp.app import create_app
+from nplg_mcp.bounded_work import STORAGE_WORK
 from nplg_mcp.config import (
     ApiPrincipalCredential,
     AppConfig,
@@ -39,12 +42,23 @@ from nplg_mcp.services import (
     FullServiceComposition,
     MetadataServiceComposition,
 )
-from nplg_mcp.storage import ContentAddressedStore
+from nplg_mcp.storage import ContentAddressedStore, StoreLifecycleConfiguration
+from nplg_mcp.storage_lifecycle import (
+    ClockHighWater,
+    RetentionClockSample,
+    RetentionPolicy,
+    StorageCapacity,
+)
 from nplg_mcp.tokens import sign_asset_token
 from tests.helpers.app_factory import make_tool_service
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Mapping
+    from collections.abc import (
+        AsyncIterator,
+        Callable,
+        Mapping,
+    )
+    from contextlib import AbstractContextManager
     from pathlib import Path
 
     from fastapi import FastAPI
@@ -63,11 +77,93 @@ METRICS_SECRET = "m" * 32
 JSON_RPC_INVALID_REQUEST = -32600
 JSON_RPC_METHOD_NOT_FOUND = -32601
 JSON_RPC_INVALID_PARAMS = -32602
+JSON_RPC_INTERNAL_ERROR = -32603
 MCP_PROTOCOL_VERSION_REQUIRED = -32020
 MCP_PROTOCOL_VERSION_UNSUPPORTED = -32022
 REQUEST_BODY_LIMIT_BYTES = 4096
 OVERSIZED_REQUEST_CHUNK_BYTES = REQUEST_BODY_LIMIT_BYTES + 1
 EXPECTED_ADMITTED_TOOL_CALLS = 2
+_STORAGE_WORK_CAPACITY = 2
+_LEASE_TEST_GIB = 1024 * 1024 * 1024
+_LEASE_TEST_CLOCK_ORIGIN = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+class _LeaseAuditedStore(ContentAddressedStore):
+    """Observe the public lease contract while retaining real prune behavior."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        lifecycle: StoreLifecycleConfiguration,
+    ) -> None:
+        super().__init__(root, max_bytes=_LEASE_TEST_GIB, lifecycle=lifecycle)
+        self.lease_acquisitions = 0
+        self.lease_releases = 0
+
+    @override
+    def acquire_asset_lease(self, relative_path: str) -> tuple[str, Path]:
+        leased = super().acquire_asset_lease(relative_path)
+        self.lease_acquisitions += 1
+        return leased
+
+    @override
+    def release_asset_lease(
+        self,
+        key: str,
+        *,
+        transaction_token: object | None = None,
+    ) -> None:
+        if transaction_token is None:
+            self.lease_releases += 1
+        super().release_asset_lease(key, transaction_token=transaction_token)
+
+
+def _lease_clock_sample(seconds: float) -> RetentionClockSample:
+    return RetentionClockSample(
+        utc_now=_LEASE_TEST_CLOCK_ORIGIN + timedelta(seconds=seconds),
+        monotonic_now=seconds,
+        boot_id="lease-test-boot",
+        synchronized=True,
+    )
+
+
+def _lease_test_store(
+    tmp_path: Path,
+) -> tuple[_LeaseAuditedStore, RetentionPolicy, RetentionClockSample]:
+    policy = RetentionPolicy(
+        maximum_age_seconds=3600,
+        maximum_bytes=_LEASE_TEST_GIB,
+        maximum_objects=1,
+        minimum_free_bytes=64 * 1024 * 1024,
+        minimum_free_inodes=128,
+    )
+    capacity = StorageCapacity(
+        total_bytes=4 * _LEASE_TEST_GIB,
+        available_bytes=3 * _LEASE_TEST_GIB,
+        total_inodes=1_000_000,
+        available_inodes=900_000,
+    )
+    guard = ClockHighWater(
+        tmp_path / "lease-clock-high-water.json",
+        healthy_window_seconds=0,
+        maximum_forward_slew_seconds=5,
+    )
+    initial = _lease_clock_sample(0.0)
+    _ = guard.observe(initial)
+    assert guard.observe(initial).trusted is True
+    clock = _lease_clock_sample(1.0)
+    lifecycle = StoreLifecycleConfiguration(
+        policy=policy,
+        capacity_sampler=lambda: capacity,
+        clock_high_water=guard,
+        clock_sampler=lambda: clock,
+    )
+    return (
+        _LeaseAuditedStore(tmp_path / "lease-cache", lifecycle=lifecycle),
+        policy,
+        clock,
+    )
 
 
 class StubTools:
@@ -225,6 +321,7 @@ def config(
         upstream_timeout_seconds=30,
         upstream_rate_per_second=1,
         max_redirects=3,
+        cursor_signing_secret=b"c" * 32,
         max_concurrent_mcp_requests=16,
         max_concurrent_asset_streams=8,
     )
@@ -1098,11 +1195,164 @@ async def test_streamable_http_strict_arguments_never_enter_handler(
         )
 
     for response in rejected:
-        assert response.status_code == HTTPStatus.BAD_REQUEST
-        assert _response_value(response, "error", "code") == JSON_RPC_INVALID_PARAMS
+        assert response.status_code == HTTPStatus.OK
+        assert _response_value(response, "result", "isError") is True
+        assert (
+            _response_value(
+                response,
+                "result",
+                "structuredContent",
+                "error",
+                "code",
+            )
+            == ErrorCode.INVALID_INPUT.value
+        )
+        assert _response_value(response, "result", "content", 0, "text") == (
+            "Tool arguments did not match the declared schema."
+        )
         assert canary not in response.text
     assert tools.calls == [("search_documents", {"query": "fixture"})]
     assert admitted.status_code == HTTPStatus.OK
+    assert _response_value(admitted, "result", "content", 0, "text") == (
+        "Tool completed successfully."
+    )
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_preserves_exact_unknown_tool_protocol_error(
+    tmp_path: Path,
+) -> None:
+    configured = replace(
+        config(tmp_path),
+        deployment_profile="alpic-metadata",
+        mcp_allowed_hosts=(CanonicalHost("mcp.example.test"),),
+        mcp_allowed_origins=(CanonicalOrigin("https://mcp.example.test"),),
+    )
+    application = create_app(configured)
+    async with (
+        application.router.lifespan_context(application),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application),
+            base_url="https://mcp.example.test",
+        ) as client,
+    ):
+        response = await client.post(
+            "/mcp",
+            headers=modern_headers(
+                "tools/call",
+                name="attacker-controlled-unknown-tool",
+            ),
+            json=modern_body(
+                "tools/call",
+                {"name": "attacker-controlled-unknown-tool", "arguments": {}},
+            ),
+        )
+
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+    assert _response_value(response, "error", "code") == JSON_RPC_INVALID_PARAMS
+    assert _response_value(response, "error", "message") == "Unknown tool."
+    assert _response_value(response, "error", "data") == {"code": "UNKNOWN_TOOL"}
+    assert "attacker-controlled" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_keeps_domain_and_unexpected_tool_failures_separate(
+    tmp_path: Path,
+) -> None:
+    class FaultTools:
+        def __init__(self, delegate: ToolSurface) -> None:
+            super().__init__()
+            self.delegate = delegate
+
+        def list_tools(self) -> list[JsonObject]:
+            return self.delegate.list_tools()
+
+        async def call(
+            self,
+            name: str,
+            arguments: JsonObject,
+        ) -> StrictOutput | JsonObject:
+            query = arguments.get("query")
+            if query == "domain-error":
+                raise AppError(
+                    ErrorCode.RESTRICTED,
+                    "The requested operation is restricted.",
+                    http_status=403,
+                    internal_details={"canary": "domain-http-private-canary"},
+                )
+            if query == "unexpected-error":
+                message = "unexpected-http-private-canary"
+                raise RuntimeError(message)
+            return await self.delegate.call(name, arguments)
+
+        def list_resources(self) -> list[JsonObject]:
+            return self.delegate.list_resources()
+
+        async def read_resource(self, uri: str) -> dict[str, str]:
+            return await self.delegate.read_resource(uri)
+
+    tools = FaultTools(make_tool_service(tmp_path, deployment_profile="alpic-metadata"))
+    configured = replace(
+        config(tmp_path),
+        deployment_profile="alpic-metadata",
+        mcp_allowed_hosts=(CanonicalHost("mcp.example.test"),),
+        mcp_allowed_origins=(CanonicalOrigin("https://mcp.example.test"),),
+    )
+    application = create_app(
+        configured,
+        services=MetadataServiceComposition(tools=tools),
+    )
+    async with (
+        application.router.lifespan_context(application),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application),
+            base_url="https://mcp.example.test",
+        ) as client,
+    ):
+        domain = await client.post(
+            "/mcp",
+            headers=modern_headers("tools/call", name="search_documents"),
+            json=modern_body(
+                "tools/call",
+                {
+                    "name": "search_documents",
+                    "arguments": {"query": "domain-error"},
+                },
+            ),
+        )
+        unexpected = await client.post(
+            "/mcp",
+            headers=modern_headers("tools/call", name="search_documents"),
+            json=modern_body(
+                "tools/call",
+                {
+                    "name": "search_documents",
+                    "arguments": {"query": "unexpected-error"},
+                },
+                request_id=2,
+            ),
+        )
+
+    assert domain.status_code == HTTPStatus.OK
+    assert _response_value(domain, "result", "isError") is True
+    assert (
+        _response_value(
+            domain,
+            "result",
+            "structuredContent",
+            "error",
+            "code",
+        )
+        == ErrorCode.RESTRICTED.value
+    )
+    assert _response_value(domain, "result", "content", 0, "text") == (
+        "The requested operation is restricted."
+    )
+    assert "domain-http-private-canary" not in domain.text
+    assert unexpected.status_code == HTTPStatus.OK
+    assert _response_value(unexpected, "error", "code") == JSON_RPC_INTERNAL_ERROR
+    assert _response_value(unexpected, "error", "message") == "Internal tool error."
+    assert "unexpected-http-private-canary" not in unexpected.text
 
 
 @pytest.mark.asyncio
@@ -1449,6 +1699,91 @@ async def test_readiness_fails_when_a_stateful_tool_dependency_is_open(
 
 
 @pytest.mark.asyncio
+async def test_readiness_does_not_consume_authenticated_storage_capacity(
+    tmp_path: Path,
+) -> None:
+    application = create_app(
+        config(tmp_path),
+        services=FullServiceComposition(
+            tools=StubTools(),
+            store=ContentAddressedStore(tmp_path),
+        ),
+    )
+    loop = asyncio.get_running_loop()
+    release = threading.Event()
+    started = (asyncio.Event(), asyncio.Event())
+
+    def occupy_storage(index: int) -> None:
+        _ = loop.call_soon_threadsafe(started[index].set)
+        if not release.wait(timeout=5.0):
+            message = "readiness storage-saturation fixture timed out"
+            raise TimeoutError(message)
+
+    blockers: list[asyncio.Task[None]] = [
+        asyncio.create_task(
+            STORAGE_WORK.run_to_completion(partial(occupy_storage, index))
+        )
+        for index in range(_STORAGE_WORK_CAPACITY)
+    ]
+    try:
+        async with asyncio.timeout(2.0):
+            _ = await started[0].wait()
+            _ = await started[1].wait()
+        assert STORAGE_WORK.active == _STORAGE_WORK_CAPACITY
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application),
+            base_url="https://mcp.example.test",
+        ) as client:
+            ready = await client.get("/readyz")
+    finally:
+        release.set()
+        for blocker in blockers:
+            await blocker
+
+    assert ready.status_code == HTTPStatus.OK
+    assert load_json_value(ready.text) == {"status": "ready"}
+    assert STORAGE_WORK.active == 0
+
+
+@pytest.mark.asyncio
+async def test_readiness_is_nonmutating_for_full_profile_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ContentAddressedStore(tmp_path)
+    original_stage = store.stage
+    stage_calls = 0
+
+    def observed_stage(
+        *,
+        suffix: str = ".tmp",
+    ) -> AbstractContextManager[object, bool | None]:
+        nonlocal stage_calls
+        stage_calls += 1
+        return cast(
+            "AbstractContextManager[object, bool | None]",
+            original_stage(suffix=suffix),
+        )
+
+    monkeypatch.setattr(store, "stage", observed_stage)
+    application = create_app(
+        config(tmp_path),
+        services=FullServiceComposition(tools=StubTools(), store=store),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="https://mcp.example.test",
+    ) as client:
+        responses = [await client.get("/readyz") for _ in range(8)]
+
+    assert all(response.status_code == HTTPStatus.OK for response in responses)
+    assert stage_calls == 0
+    assert tuple(store.staging_dir.iterdir()) == ()
+
+
+@pytest.mark.asyncio
 async def test_metadata_only_runtime_is_ready_without_storage_and_has_no_assets(
     tmp_path: Path,
 ) -> None:
@@ -1457,24 +1792,17 @@ async def test_metadata_only_runtime_is_ready_without_storage_and_has_no_assets(
         cfg,
         services=MetadataServiceComposition(tools=StubTools()),
     )
-    token = sign_asset_token(
-        cfg.asset_signing_secret,
-        path="renders/rnd_" + ("0" * 32) + "/manifest.json",
-        media_type="application/json",
-        expires_at=datetime.now(UTC) + timedelta(minutes=5),
-    )
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=application),
         base_url="https://mcp.example.test",
     ) as client:
         ready = await client.get("/readyz")
-        asset = await client.get(f"/assets/{token}")
+        asset = await client.get("/assets/not-present")
 
     assert ready.status_code == HTTPStatus.OK
     assert load_json_value(ready.text) == {"status": "ready"}
     assert asset.status_code == HTTPStatus.NOT_FOUND
-    assert _response_value(asset, "error", "code") == ErrorCode.NOT_FOUND.value
 
 
 def test_header_mapping_fallback_is_case_insensitive() -> None:
@@ -1812,7 +2140,7 @@ async def test_signed_asset_delivery_is_bound_to_path_and_media_type(
         cfg, services=FullServiceComposition(tools=StubTools(), store=store)
     )
     token = sign_asset_token(
-        cfg.asset_signing_secret,
+        cfg.require_asset_signing_secret(),
         path=artifact.relative_path,
         media_type="image/jpeg",
         expires_at=datetime.now(UTC) + timedelta(minutes=5),
@@ -1844,7 +2172,7 @@ async def test_signed_asset_delivery_rejects_expiry_beyond_configured_ttl(
         cfg, services=FullServiceComposition(tools=StubTools(), store=store)
     )
     token = sign_asset_token(
-        cfg.asset_signing_secret,
+        cfg.require_asset_signing_secret(),
         path=artifact.relative_path,
         media_type="image/jpeg",
         expires_at=datetime.now(UTC) + timedelta(minutes=2),
@@ -1893,7 +2221,7 @@ async def test_asset_admission_is_held_until_stream_completion(
         cfg, services=FullServiceComposition(tools=StubTools(), store=store)
     )
     token = sign_asset_token(
-        cfg.asset_signing_secret,
+        cfg.require_asset_signing_secret(),
         path=artifact.relative_path,
         media_type="image/jpeg",
         expires_at=datetime.now(UTC) + timedelta(minutes=5),
@@ -1942,7 +2270,7 @@ async def test_asset_response_stops_reading_after_client_disconnect(
         cfg, services=FullServiceComposition(tools=StubTools(), store=store)
     )
     token = sign_asset_token(
-        cfg.asset_signing_secret,
+        cfg.require_asset_signing_secret(),
         path=artifact.relative_path,
         media_type="application/octet-stream",
         expires_at=datetime.now(UTC) + timedelta(minutes=5),
@@ -1974,6 +2302,138 @@ async def test_asset_response_stops_reading_after_client_disconnect(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("termination", ["disconnect", "cancel"])
+async def test_active_asset_stream_is_leased_until_disconnect_or_cancellation(
+    tmp_path: Path,
+    termination: Literal["disconnect", "cancel"],
+) -> None:
+    """Removing the response lease must let prune delete the active object."""
+    body_entered = asyncio.Event()
+    disconnect = asyncio.Event()
+
+    async def receive_message() -> dict[str, object]:
+        _ = await disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    async def blocked_send(message: dict[str, object]) -> None:
+        body = message.get("body")
+        if isinstance(body, bytes) and body:
+            body_entered.set()
+            _ = await asyncio.Event().wait()
+
+    store, policy, clock = _lease_test_store(tmp_path)
+    active = store.put_bytes(
+        b"actively-streamed",
+        namespace="renders",
+        filename="active.bin",
+        media_type="application/octet-stream",
+    )
+    evictable = store.put_bytes(
+        b"evictable",
+        namespace="renders",
+        filename="evictable.bin",
+        media_type="application/octet-stream",
+    )
+    cfg = config(tmp_path)
+    app = create_app(
+        cfg, services=FullServiceComposition(tools=StubTools(), store=store)
+    )
+    token = sign_asset_token(
+        cfg.require_asset_signing_secret(),
+        path=active.relative_path,
+        media_type=active.media_type,
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    request = asyncio.create_task(
+        app(
+            cast("Scope", _http_scope(f"/assets/{token}", method="GET")),
+            cast("Receive", receive_message),
+            cast("Send", blocked_send),
+        )
+    )
+    async with asyncio.timeout(1):
+        _ = await body_entered.wait()
+
+    while_active = store.prune(policy, clock=clock)
+
+    assert active.absolute_path.is_file()
+    assert not evictable.absolute_path.exists()
+    assert while_active.retained_leased_objects == 1
+    assert (store.lease_acquisitions, store.lease_releases) == (1, 0)
+
+    if termination == "disconnect":
+        disconnect.set()
+        await request
+    else:
+        _ = request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+    assert (store.lease_acquisitions, store.lease_releases) == (1, 1)
+    replacement = store.put_bytes(
+        b"replacement",
+        namespace="renders",
+        filename="replacement.bin",
+        media_type="application/octet-stream",
+    )
+    after_stream = store.prune(policy, clock=_lease_clock_sample(2.0))
+    assert after_stream.retained_leased_objects == 0
+    assert not active.absolute_path.exists()
+    assert replacement.absolute_path.is_file()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "send-error"])
+async def test_asset_stream_releases_its_lease_exactly_once_on_terminal_outcomes(
+    tmp_path: Path,
+    outcome: Literal["success", "send-error"],
+) -> None:
+    """Dropping the response cleanup must leave a durable lease behind."""
+    never_disconnect = asyncio.Event()
+
+    async def receive_message() -> dict[str, object]:
+        _ = await never_disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    async def send_message(message: dict[str, object]) -> None:
+        body = message.get("body")
+        if outcome == "send-error" and isinstance(body, bytes) and body:
+            msg = "test asset send failure"
+            raise RuntimeError(msg)
+
+    store, _policy, _clock = _lease_test_store(tmp_path)
+    artifact = store.put_bytes(
+        b"leased-response",
+        namespace="renders",
+        filename="response.bin",
+        media_type="application/octet-stream",
+    )
+    cfg = config(tmp_path)
+    app = create_app(
+        cfg, services=FullServiceComposition(tools=StubTools(), store=store)
+    )
+    token = sign_asset_token(
+        cfg.require_asset_signing_secret(),
+        path=artifact.relative_path,
+        media_type=artifact.media_type,
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    invocation = app(
+        cast("Scope", _http_scope(f"/assets/{token}", method="GET")),
+        cast("Receive", receive_message),
+        cast("Send", send_message),
+    )
+
+    if outcome == "send-error":
+        with pytest.raises(RuntimeError, match="test asset send failure"):
+            await invocation
+    else:
+        await invocation
+
+    assert (store.lease_acquisitions, store.lease_releases) == (1, 1)
+
+
+@pytest.mark.asyncio
 async def test_asset_stream_idle_timeout_releases_its_admission_permit(
     tmp_path: Path,
 ) -> None:
@@ -2002,7 +2462,7 @@ async def test_asset_stream_idle_timeout_releases_its_admission_permit(
         cfg, services=FullServiceComposition(tools=StubTools(), store=store)
     )
     token = sign_asset_token(
-        cfg.asset_signing_secret,
+        cfg.require_asset_signing_secret(),
         path=artifact.relative_path,
         media_type="image/jpeg",
         expires_at=datetime.now(UTC) + timedelta(minutes=5),
@@ -2061,7 +2521,7 @@ async def test_asset_stream_total_timeout_stops_a_slow_reader(
         cfg, services=FullServiceComposition(tools=StubTools(), store=store)
     )
     token = sign_asset_token(
-        cfg.asset_signing_secret,
+        cfg.require_asset_signing_secret(),
         path=artifact.relative_path,
         media_type="application/octet-stream",
         expires_at=datetime.now(UTC) + timedelta(minutes=5),
