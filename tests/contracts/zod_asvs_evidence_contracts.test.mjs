@@ -5,6 +5,7 @@ import { test } from "node:test";
 import {
   parseCanonicalAsvsArtifactSet,
   parseCanonicalAsvsMatrix,
+  parseCanonicalCandidateAsvsArtifactSet,
   parseCanonicalEvidenceManifest,
   parseCanonicalEvidencePolicy,
   parseCanonicalThreatLedger,
@@ -13,6 +14,8 @@ import {
 const root = new URL("../../", import.meta.url);
 const evidenceRevision = "da5cc20e4f8bf3e1cacf74c49d5391487cb11cb0";
 const candidateTree = "f50987fe97ed12a0da3295929e2ef8dba94693389a0a3bec2b2458a9f87aa32c";
+const nonHistoricalRevision = "a".repeat(40);
+const nonHistoricalTree = "b".repeat(64);
 
 function checkedArtifacts() {
   return {
@@ -82,12 +85,415 @@ const localEvidence = {
   verifier: "test-report-v1",
 };
 
+/**
+ * @param {{ readonly invariant: string; readonly requirement_id: string }} row
+ * @param {number} index
+ * @param {{ kind?: "design" | "code_config" | "test" | "operational" }} [options]
+ */
+function candidateImplementationEvidence(row, index, options = {}) {
+  return {
+    ...localEvidence,
+    asserted_invariant: row.invariant,
+    candidate_tree_sha256: nonHistoricalTree,
+    claim_purpose: "implementation-proof",
+    evidence_id: `candidate.pass.${String(index).padStart(3, "0")}`,
+    evidence_revision: nonHistoricalRevision,
+    kind: options.kind ?? "test",
+    requirement_ids: [row.requirement_id],
+  };
+}
+
+/**
+ * @param {ReturnType<typeof parseCanonicalAsvsMatrix>[number]} row
+ * @param {number} index
+ */
+function candidatePassRow(row, index) {
+  return {
+    ...row,
+    evidence_ids: [`candidate.pass.${String(index).padStart(3, "0")}`],
+    evidence_revision: nonHistoricalRevision,
+    required_evidence_kinds: ["test"],
+    verdict: "Pass",
+  };
+}
+
+/**
+ * @param {ReturnType<typeof parseCanonicalAsvsMatrix>[number]} row
+ * @param {number} index
+ */
+function governedNotApplicableRow(row, index) {
+  return {
+    ...row,
+    absence_evidence_ids: [`candidate.absence.${String(index).padStart(3, "0")}`],
+    applicability: "not_applicable",
+    applicability_rationale: "The reviewed candidate does not expose this capability.",
+    applicability_review_due: "2026-12-31",
+    applicability_reviewer: "independent-security-reviewer",
+    evidence_ids: [],
+    evidence_revision: nonHistoricalRevision,
+    required_evidence_kinds: [],
+    verdict: "N/A",
+  };
+}
+
+/**
+ * @param {{ readonly invariant: string; readonly requirement_id: string }} row
+ * @param {number} index
+ */
+function candidateAbsenceEvidence(row, index) {
+  const digest = "3".repeat(64);
+  return {
+    artifact_object_version: `version-${String(index).padStart(3, "0")}`,
+    asserted_invariant: row.invariant,
+    candidate_tree_sha256: nonHistoricalTree,
+    claim_purpose: "absence-proof",
+    collected_at: "2026-08-16T08:00:00Z",
+    covered_surface: "The reviewed candidate deployment profile and configuration.",
+    custody_authority_id: "ci.example",
+    custody_receipt_id: `receipt.absence.${String(index).padStart(3, "0")}`,
+    deployment_id: null,
+    evidence_id: `candidate.absence.${String(index).padStart(3, "0")}`,
+    evidence_revision: nonHistoricalRevision,
+    expires_at: "2026-09-16T08:00:00Z",
+    image_digest: null,
+    immutable_artifact_uri: `https://evidence.example.invalid/objects/sha256/${digest}`,
+    kind: "design",
+    profiles: ["alpic-metadata"],
+    requirement_ids: [row.requirement_id],
+    result: "pass",
+    reviewer: "independent-security-reviewer",
+    selectors: [`absence-probe-${String(index).padStart(3, "0")}`],
+    sha256: digest,
+    storage: "custodied-uri",
+    verifier: "ci-custody-v1",
+  };
+}
+
+/**
+ * @param {{ governedNaIndex?: number }} [options]
+ */
+function candidateArtifacts(options = {}) {
+  const raw = checkedArtifacts();
+  const sourceRows = parseCanonicalAsvsMatrix(raw.matrix)
+    .filter((row) => row.profile === "alpic-metadata");
+  const rows = sourceRows.map((row, index) => options.governedNaIndex === index
+    ? governedNotApplicableRow(row, index)
+    : candidatePassRow(row, index));
+  const evidence = rows.map((row, index) => row.applicability === "not_applicable"
+    ? candidateAbsenceEvidence(row, index)
+    : candidateImplementationEvidence(row, index));
+  return {
+    artifact: {
+      assessment: {
+        as_of: "2026-08-23T00:00:00Z",
+        mode: "candidate",
+        profile: "alpic-metadata",
+        revision: nonHistoricalRevision,
+        tree_sha256: nonHistoricalTree,
+      },
+      manifest: canonicalLines(evidence),
+      matrix: canonicalLines(rows),
+      requirements: raw.requirements,
+    },
+    evidence,
+    rows,
+  };
+}
+
+void test("candidate Zod parser accepts a complete non-historical Pass product", () => {
+  const { artifact } = candidateArtifacts();
+
+  const parsed = parseCanonicalCandidateAsvsArtifactSet(artifact);
+
+  assert.equal(parsed.assessment.revision, nonHistoricalRevision);
+  assert.equal(parsed.matrix.length, 253);
+  assert.equal(parsed.evidence.length, 253);
+  assert.ok(parsed.matrix.every((row) => row.verdict === "Pass"));
+});
+
+void test("candidate Zod parser accepts one governed N/A in the exact selected product", () => {
+  const { artifact } = candidateArtifacts({ governedNaIndex: 0 });
+
+  const parsed = parseCanonicalCandidateAsvsArtifactSet(artifact);
+
+  assert.equal(parsed.matrix.length, 253);
+  assert.equal(parsed.matrix.filter((row) => row.verdict === "N/A").length, 1);
+  assert.equal(parsed.evidence.find((item) => item.claim_purpose === "absence-proof")?.storage,
+    "custodied-uri");
+});
+
+void test("candidate Zod parser requires the N/A review to outlive the assessment", () => {
+  const product = candidateArtifacts({ governedNaIndex: 0 });
+  const first = product.rows.at(0);
+  assert.ok(first?.applicability === "not_applicable");
+  const cases = [
+    ["2026-08-22", false],
+    ["2026-08-23", false],
+    ["2026-08-24", true],
+  ];
+
+  for (const [applicability_review_due, valid] of cases) {
+    const candidate = {
+      ...product.artifact,
+      matrix: canonicalLines([
+        { ...first, applicability_review_due },
+        ...product.rows.slice(1),
+      ]),
+    };
+    if (valid) {
+      assert.doesNotThrow(() => parseCanonicalCandidateAsvsArtifactSet(candidate));
+    } else {
+      assert.throws(
+        () => parseCanonicalCandidateAsvsArtifactSet(candidate),
+        /candidate N\/A review is not current/u,
+      );
+    }
+  }
+});
+
+void test("candidate Zod parser rejects impossible assessment datetime components", () => {
+  const product = candidateArtifacts({ governedNaIndex: 0 });
+  const first = product.rows.at(0);
+  assert.ok(first?.applicability === "not_applicable");
+
+  for (const as_of of [
+    "2026-02-29T00:00:00Z",
+    "2026-08-22T24:00:00Z",
+    "2026-08-22T00:60:00Z",
+    "2026-08-22T00:00:60Z",
+    "2026-08-22T00:00:00+24:00",
+    "2026-08-22T00:00:00+01:60",
+  ]) {
+    assert.throws(
+      () => parseCanonicalCandidateAsvsArtifactSet({
+        ...product.artifact,
+        assessment: {
+          ...product.artifact.assessment,
+          as_of,
+        },
+        matrix: canonicalLines([
+          { ...first, applicability_review_due: "2026-08-23" },
+          ...product.rows.slice(1),
+        ]),
+      }),
+      /datetime must be valid/u,
+    );
+  }
+});
+
+void test("candidate Zod parser rejects selected-set substitutions, missing rows, and extras", () => {
+  const { artifact, rows } = candidateArtifacts();
+  const products = [
+    [{ ...rows[0], requirement_id: "v5.0.0-V99.9.9" }, ...rows.slice(1)],
+    rows.slice(0, -1),
+    [...rows, rows[0]],
+  ];
+
+  for (const matrix of products) {
+    assert.throws(() => parseCanonicalCandidateAsvsArtifactSet({
+      ...artifact,
+      matrix: canonicalLines(matrix),
+    }));
+  }
+});
+
+void test("candidate Zod parser binds every row to pinned source semantics", () => {
+  const product = candidateArtifacts();
+  const first = product.rows.at(0);
+  const second = product.rows.at(1);
+  const firstEvidence = product.evidence.at(0);
+  const secondEvidence = product.evidence.at(1);
+  assert.ok(first !== undefined && second !== undefined);
+  assert.ok(firstEvidence !== undefined && secondEvidence !== undefined);
+  const mutants = [
+    {
+      evidence: [
+        { ...firstEvidence, requirement_ids: [second.requirement_id] },
+        { ...secondEvidence, requirement_ids: [first.requirement_id] },
+        ...product.evidence.slice(2),
+      ],
+      rows: [
+        { ...first, requirement_id: second.requirement_id },
+        { ...second, requirement_id: first.requirement_id },
+        ...product.rows.slice(2),
+      ],
+    },
+    {
+      evidence: product.evidence,
+      rows: [{ ...first, level: first.level === 1 ? 2 : 1 }, ...product.rows.slice(1)],
+    },
+    {
+      evidence: product.evidence,
+      rows: [
+        { ...first, requirement_text: `${first.requirement_text} Altered.` },
+        ...product.rows.slice(1),
+      ],
+    },
+  ];
+
+  for (const mutant of mutants) {
+    assert.throws(
+      () => parseCanonicalCandidateAsvsArtifactSet({
+        ...product.artifact,
+        manifest: canonicalLines(mutant.evidence),
+        matrix: canonicalLines(mutant.rows),
+      }),
+      /candidate row does not match pinned ASVS semantics/u,
+    );
+  }
+});
+
+void test("candidate Zod parser rejects evidence asserting a different invariant", () => {
+  const product = candidateArtifacts();
+  const first = product.evidence.at(0);
+  assert.ok(first !== undefined);
+
+  assert.throws(
+    () => parseCanonicalCandidateAsvsArtifactSet({
+      ...product.artifact,
+      manifest: canonicalLines([
+        { ...first, asserted_invariant: "A different security invariant." },
+        ...product.evidence.slice(1),
+      ]),
+    }),
+    /candidate evidence is not fresh and bound to its assessed row/u,
+  );
+});
+
+void test("candidate Zod parser rejects revision, purpose, and required-kind drift", () => {
+  const passProduct = candidateArtifacts();
+  const naProduct = candidateArtifacts({ governedNaIndex: 0 });
+  const firstPassRow = passProduct.rows.at(0);
+  assert.ok(firstPassRow !== undefined);
+  const mutants = [
+    {
+      ...passProduct.artifact,
+      matrix: canonicalLines([
+        { ...passProduct.rows[0], evidence_revision: evidenceRevision },
+        ...passProduct.rows.slice(1),
+      ]),
+    },
+    {
+      ...naProduct.artifact,
+      manifest: canonicalLines([
+        { ...naProduct.evidence[0], claim_purpose: "implementation-proof" },
+        ...naProduct.evidence.slice(1),
+      ]),
+    },
+    {
+      ...passProduct.artifact,
+      manifest: canonicalLines([
+        candidateImplementationEvidence(firstPassRow, 0, { kind: "design" }),
+        ...passProduct.evidence.slice(1),
+      ]),
+    },
+  ];
+
+  for (const mutant of mutants) {
+    assert.throws(() => parseCanonicalCandidateAsvsArtifactSet(mutant));
+  }
+});
+
+void test("candidate Zod evidence compares parsed instants across offsets", () => {
+  const product = candidateArtifacts();
+  const first = product.evidence.at(0);
+  assert.ok(first !== undefined);
+  const evidence = [
+    {
+      ...first,
+      collected_at: "2026-08-23T01:00:00+01:00",
+      expires_at: "2026-08-22T23:30:00-02:00",
+    },
+    ...product.evidence.slice(1),
+  ];
+
+  assert.doesNotThrow(() => parseCanonicalCandidateAsvsArtifactSet({
+    ...product.artifact,
+    manifest: canonicalLines(evidence),
+  }));
+});
+
+void test("candidate Zod evidence requires collected <= as_of < expiry by instant", () => {
+  const product = candidateArtifacts();
+  const first = product.evidence.at(0);
+  assert.ok(first !== undefined);
+  const invalidWindows = [
+    { expires_at: "2026-08-23T00:30:00+01:00" },
+    { expires_at: "2026-08-23T00:00:00Z" },
+    { collected_at: "2026-08-22T23:30:00-01:00" },
+  ];
+
+  for (const window of invalidWindows) {
+    assert.throws(
+      () => parseCanonicalCandidateAsvsArtifactSet({
+        ...product.artifact,
+        manifest: canonicalLines([{ ...first, ...window }, ...product.evidence.slice(1)]),
+      }),
+      /candidate evidence is not current at the assessment instant/u,
+    );
+  }
+});
+
+void test("candidate Zod parser sends exact bulk N/A conversion through governance", () => {
+  const raw = checkedArtifacts();
+  const rows = parseCanonicalAsvsMatrix(raw.matrix)
+    .filter((row) => row.profile === "alpic-metadata")
+    .map(governedNotApplicableRow);
+  const artifact = candidateArtifacts().artifact;
+
+  assert.throws(
+    () => parseCanonicalCandidateAsvsArtifactSet({
+      ...artifact,
+      manifest: Buffer.alloc(0),
+      matrix: canonicalLines(rows),
+    }),
+    /candidate evidence is not fresh and bound/u,
+  );
+});
+
+void test("candidate Zod artifacts require an explicit assessment and claim purpose", () => {
+  const row = {
+    applicability: "applicable",
+    applicability_rationale: "The profile exposes the assessed surface.",
+    asvs_version: "5.0.0",
+    evidence_date: "2026-08-16",
+    evidence_ids: ["evidence.test-report"],
+    evidence_revision: evidenceRevision,
+    invariant: localEvidence.asserted_invariant,
+    level: 1,
+    owner: "security-owner",
+    profile: "alpic-metadata",
+    required_evidence_kinds: ["test"],
+    requirement_id: "v5.0.0-V1.1.1",
+    requirement_text: "Fixture requirement.",
+    target_phase: "phase-0",
+    threat_boundary: "client-to-alpic-edge",
+    verdict: "Pass",
+  };
+  const artifact = {
+    assessment: { mode: "candidate", profile: "alpic-metadata", revision: evidenceRevision,
+      tree_sha256: candidateTree, as_of: "2026-08-23T00:00:00Z" },
+    manifest: canonicalLines([{ ...localEvidence, claim_purpose: "implementation-proof" }]),
+    matrix: canonicalLines(Array.from({ length: 253 }, () => row)),
+  };
+
+  assert.throws(() => parseCanonicalCandidateAsvsArtifactSet(artifact));
+  assert.throws(() => parseCanonicalCandidateAsvsArtifactSet({ ...artifact,
+    manifest: canonicalLines([localEvidence]) }));
+});
+
 void test("Zod 4 parses the exact checked-in Task 2 artifact set", () => {
-  const parsed = parseCanonicalAsvsArtifactSet(checkedArtifacts());
+  const raw = checkedArtifacts();
+  const parsed = parseCanonicalAsvsArtifactSet(raw);
+  const rawMatrix = raw.matrix.toString("utf8");
 
   assert.equal(parsed.matrix.length, 759);
+  assert.equal(rawMatrix.split(`"evidence_revision":"${evidenceRevision}"`).length - 1, 759);
+  assert.equal(rawMatrix.split('"verdict":"Not assessed"').length - 1, 759);
+  assert.deepEqual(canonicalLines(parsed.matrix), raw.matrix);
   assert.equal(parsed.policy.claims.length, 759);
   assert.equal(parsed.manifest.length, 0);
+  assert.deepEqual(canonicalLines(parsed.manifest), raw.manifest);
   assert.equal(parsed.threatLedger.threats.length, 6);
   assert.equal(parsed.threatLedger.release_status, "do_not_release");
   assert.deepEqual(
@@ -120,6 +526,24 @@ void test("independent schemas parse every checked-in Task 2 artifact", () => {
   assert.equal(parseCanonicalEvidenceManifest(raw.manifest).length, 0);
   assert.equal(parseCanonicalEvidencePolicy(raw.policy).claims.length, 759);
   assert.equal(parseCanonicalThreatLedger(raw.threatLedger).threats.length, 6);
+});
+
+void test("Pydantic parity requires the explicit exact attestation allowlist", () => {
+  const raw = checkedArtifacts();
+  const policy = parseCanonicalEvidencePolicy(raw.policy);
+  const missing = { ...policy };
+  assert.equal(Reflect.deleteProperty(missing, "attestation_allowlist"), true);
+  const allowlist = policy.attestation_allowlist;
+  const mutants = [
+    missing,
+    { ...policy, attestation_allowlist: [...allowlist].reverse() },
+    { ...policy, attestation_allowlist: [allowlist[0], "docs/security/other.json"] },
+    { ...policy, attestation_allowlist: [...allowlist, "docs/security/extra.json"] },
+  ];
+
+  for (const mutant of mutants) {
+    assert.throws(() => parseCanonicalEvidencePolicy(canonicalBytes(mutant)));
+  }
 });
 
 void test("raw loaders reject invalid UTF-8, BOM, duplicates, drift, and oversize", () => {

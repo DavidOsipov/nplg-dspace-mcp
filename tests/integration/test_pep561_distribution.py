@@ -17,6 +17,9 @@ ROOT = Path(__file__).resolve().parents[2]
 GATE = ROOT / "scripts" / "verify_pep561.py"
 _TIMEOUT_SECONDS = 180
 _FIXTURE_CANDIDATE = "0" * 40
+_AGENT_WORKFLOW_RELATIVE = Path(
+    "agent_skills/georgian-newspaper-visual-analysis/SKILL.md"
+)
 
 
 def _closed_environment() -> dict[str, str]:
@@ -74,7 +77,11 @@ def _committed_candidate_worktree(root: Path) -> tuple[Path, str, str]:
         if member.is_dir():
             destination.mkdir(mode=0o700, parents=True)
         else:
-            assert member.name == "py.typed" or member.suffix == ".py"
+            assert (
+                member.name == "py.typed"
+                or member.suffix == ".py"
+                or relative == _AGENT_WORKFLOW_RELATIVE
+            )
             destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             _ = destination.write_bytes(member.read_bytes())
     _ = _run_git(worktree, "init", "--quiet")

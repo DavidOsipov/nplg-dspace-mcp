@@ -200,6 +200,7 @@ const caseIdSchema = z.string()
   .min(1)
   .max(128)
   .regex(/^[a-z0-9][a-z0-9._-]{0,127}$/u);
+const gitRevisionSchema = z.string().regex(/^[0-9a-f]{40}$/u);
 const requirementIdSchema = z.string()
   .max(256)
   .regex(/^v5\.0\.0-[A-Za-z0-9._-]+$/u);
@@ -222,12 +223,43 @@ const dateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).refine((value) => {
   return !Number.isNaN(parsed.valueOf())
     && parsed.toISOString().slice(0, 10) === value;
 }, "date must be a real canonical calendar date");
+const awareDatetimePattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?(?:Z|[+-](\d{2}):(\d{2}))$/u;
 const awareDatetimeSchema = z.string()
   .max(64)
-  .regex(
-    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/u,
-  )
-  .refine((value) => Number.isFinite(Date.parse(value)), "datetime must be valid");
+  .regex(awareDatetimePattern)
+  .refine((value) => {
+    const match = awareDatetimePattern.exec(value);
+    if (match === null) {
+      return false;
+    }
+    const [, year, month, day, hour, minute, second, offsetHour, offsetMinute] = match;
+    if (
+      year === undefined
+      || month === undefined
+      || day === undefined
+      || hour === undefined
+      || minute === undefined
+      || second === undefined
+    ) {
+      return false;
+    }
+    const parsedHour = Number.parseInt(hour, 10);
+    const parsedMinute = Number.parseInt(minute, 10);
+    const parsedSecond = Number.parseInt(second, 10);
+    const offsetIsValid = (offsetHour === undefined && offsetMinute === undefined)
+      || (
+        offsetHour !== undefined
+        && offsetMinute !== undefined
+        && Number.parseInt(offsetHour, 10) <= 23
+        && Number.parseInt(offsetMinute, 10) <= 59
+      );
+    return dateSchema.safeParse(`${year}-${month}-${day}`).success
+      && parsedHour <= 23
+      && parsedMinute <= 59
+      && parsedSecond <= 59
+      && offsetIsValid
+      && Number.isFinite(Date.parse(value));
+  }, "datetime must be valid");
 
 /**
  * @param {RefinementContext} context
@@ -534,6 +566,10 @@ export const evidencePolicySchema = z.strictObject({
   asvs_source_commit: z.literal(ASVS_COMMIT),
   evidence_revision: z.literal(EVIDENCE_REVISION),
   candidate_tree_sha256: z.literal(CANDIDATE_TREE_SHA256),
+  attestation_allowlist: z.tuple([
+    z.literal("docs/security/asvs-evidence-policy.json"),
+    z.literal("docs/security/threat-model.json"),
+  ]),
   profiles: z.tuple([
     z.literal("alpic-metadata"),
     z.literal("private-full"),
@@ -1066,6 +1102,195 @@ export function parseCanonicalEvidenceManifest(raw) {
     throw new Error("evidence manifest identifiers must be unique");
   }
   return references;
+}
+
+const candidateAssessmentSchema = z.strictObject({
+  mode: z.literal("candidate"),
+  profile: z.literal("alpic-metadata"),
+  revision: gitRevisionSchema,
+  tree_sha256: sha256Schema,
+  as_of: awareDatetimeSchema,
+}).readonly();
+
+const candidateCommonRowShape = {
+  ...commonRowShape,
+  evidence_revision: gitRevisionSchema,
+};
+
+const candidateApplicableRowSchema = z.strictObject({
+  ...candidateCommonRowShape,
+  applicability: z.literal("applicable"),
+  applicability_rationale: nonEmptySchema,
+  verdict: z.literal("Pass"),
+}).superRefine((value, context) => {
+  if (
+    !isUnique(value.evidence_ids)
+    || !isUnique(value.required_evidence_kinds)
+    || value.evidence_ids.length === 0
+    || value.required_evidence_kinds.length === 0
+  ) {
+    issue(context, ["verdict"], "candidate Pass requires unique named evidence and kinds");
+  }
+}).readonly();
+
+const candidateNotApplicableRowSchema = z.strictObject({
+  ...candidateCommonRowShape,
+  applicability: z.literal("not_applicable"),
+  verdict: z.literal("N/A"),
+  applicability_rationale: nonEmptySchema,
+  applicability_reviewer: nonEmptySchema,
+  applicability_review_due: dateSchema,
+  absence_evidence_ids: z.array(caseIdSchema).min(1).max(128),
+}).superRefine((value, context) => {
+  if (
+    value.evidence_ids.length !== 0
+    || value.required_evidence_kinds.length !== 0
+    || !isUnique(value.absence_evidence_ids)
+    || value.applicability_review_due <= value.evidence_date
+  ) {
+    issue(context, ["verdict"], "candidate N/A state is incomplete or contradictory");
+  }
+}).readonly();
+
+const candidateEvidenceRowSchema = z.discriminatedUnion("applicability", [
+  candidateApplicableRowSchema,
+  candidateNotApplicableRowSchema,
+]);
+
+const candidateEvidenceCommonShape = {
+  ...evidenceCommonShape,
+  evidence_revision: gitRevisionSchema,
+  candidate_tree_sha256: sha256Schema,
+};
+
+const candidateEvidenceSchema = z.discriminatedUnion("storage", [
+  z.strictObject({
+    ...candidateEvidenceCommonShape,
+    claim_purpose: z.literal("implementation-proof"),
+    storage: z.literal("local"),
+    artifact_path: z.string().refine(isCanonicalRelativePath, "artifact path is unsafe"),
+    verifier: z.enum(["sha256-file-v1", "json-record-v1", "test-report-v1", "config-symbol-v1"]),
+  }).superRefine(validateEvidenceReference).readonly(),
+  z.strictObject({
+    ...candidateEvidenceCommonShape,
+    claim_purpose: z.enum(["implementation-proof", "absence-proof"]),
+    storage: z.literal("custodied-uri"),
+    immutable_artifact_uri: z.string().refine(
+      isImmutableEvidenceUri, "custodied evidence URI is not immutable and safe",
+    ),
+    artifact_object_version: nonEmptySchema,
+    custody_authority_id: caseIdSchema,
+    custody_receipt_id: caseIdSchema,
+    verifier: z.literal("ci-custody-v1"),
+  }).superRefine(validateEvidenceReference).readonly(),
+]);
+
+/**
+ * Parse a closed candidate-only Alpic L2 assessment product.
+ *
+ * @param {unknown} rawArtifacts
+ */
+export function parseCanonicalCandidateAsvsArtifactSet(rawArtifacts) {
+  const envelope = z.strictObject({
+    assessment: candidateAssessmentSchema,
+    manifest: z.instanceof(Uint8Array),
+    matrix: z.instanceof(Uint8Array),
+    requirements: z.instanceof(Uint8Array),
+  }).parse(rawArtifacts);
+  const matrix = parseCanonicalJsonLines(envelope.matrix, candidateEvidenceRowSchema, {
+    maxBytes: MATRIX_MAX_BYTES,
+    maxLineBytes: MATRIX_MAX_LINE_BYTES,
+    maxRecords: 253,
+    exactRecords: 253,
+  });
+  const evidence = parseCanonicalJsonLines(envelope.manifest, candidateEvidenceSchema, {
+    maxBytes: MANIFEST_MAX_BYTES,
+    maxLineBytes: MANIFEST_MAX_LINE_BYTES,
+    maxRecords: MANIFEST_MAX_RECORDS,
+  });
+  const keys = matrix.map((row) => row.requirement_id);
+  const requirements = parsePinnedAsvsRequirements(envelope.requirements);
+  const selectedRequirementIds = [...requirements.entries()]
+    .filter(([, requirement]) => requirement.level <= 2)
+    .map(([requirementId]) => requirementId)
+    .sort((left, right) => Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")));
+  if (
+    !isUnique(keys)
+    || matrix.some((row) => row.profile !== "alpic-metadata")
+    || !sameStrings([...keys].sort((left, right) => Buffer.compare(
+      Buffer.from(left, "utf8"), Buffer.from(right, "utf8"),
+    )), selectedRequirementIds)
+  ) {
+    throw new Error("candidate matrix must contain exactly one Alpic row per requirement");
+  }
+  if (
+    !sameStrings(keys, selectedRequirementIds)
+    || matrix.some((row) => {
+      const requirement = requirements.get(row.requirement_id);
+      return row.level !== requirement?.level
+        || row.requirement_text !== requirement.text;
+    })
+  ) {
+    throw new Error("candidate row does not match pinned ASVS semantics");
+  }
+  if (!isUnique(evidence.map((reference) => reference.evidence_id))) {
+    throw new Error("candidate evidence identifiers must be unique");
+  }
+  const references = new Map(evidence.map((reference) => [reference.evidence_id, reference]));
+  const assessmentInstant = Date.parse(envelope.assessment.as_of);
+  const assessmentDate = envelope.assessment.as_of.slice(0, 10);
+  for (const row of matrix) {
+    if (
+      row.applicability === "not_applicable"
+      && row.applicability_review_due <= assessmentDate
+    ) {
+      throw new Error("candidate N/A review is not current");
+    }
+    const ids = row.applicability === "not_applicable"
+      ? row.absence_evidence_ids : row.evidence_ids;
+    for (const id of ids) {
+      const reference = references.get(id);
+      if (
+        reference === undefined
+        || !reference.requirement_ids.includes(row.requirement_id)
+        || !reference.profiles.includes("alpic-metadata")
+        || reference.asserted_invariant !== row.invariant
+        || reference.evidence_revision !== envelope.assessment.revision
+        || reference.candidate_tree_sha256 !== envelope.assessment.tree_sha256
+        || row.evidence_revision !== envelope.assessment.revision
+      ) {
+        throw new Error("candidate evidence is not fresh and bound to its assessed row");
+      }
+      const collectedInstant = Date.parse(reference.collected_at);
+      const expiresInstant = Date.parse(reference.expires_at);
+      if (!(collectedInstant <= assessmentInstant && assessmentInstant < expiresInstant)) {
+        throw new Error("candidate evidence is not current at the assessment instant");
+      }
+      if (row.applicability === "not_applicable" && (
+        reference.storage !== "custodied-uri"
+        || reference.claim_purpose !== "absence-proof"
+        || !["design", "code_config", "test"].includes(reference.kind)
+      )) {
+        throw new Error("candidate N/A requires approved custodied absence proof");
+      }
+      if (row.applicability === "applicable" && (
+        reference.claim_purpose !== "implementation-proof"
+        || !row.required_evidence_kinds.includes(reference.kind)
+      )) {
+        throw new Error("candidate Pass requires implementation proof of every named kind");
+      }
+    }
+    if (row.applicability === "applicable") {
+      const kinds = new Set(ids.map((id) => references.get(id)?.kind));
+      if (
+        row.required_evidence_kinds.length === 0
+        || row.required_evidence_kinds.some((kind) => !kinds.has(kind))
+      ) {
+        throw new Error("candidate Pass is missing a required evidence kind");
+      }
+    }
+  }
+  return { assessment: envelope.assessment, matrix, evidence };
 }
 
 /**

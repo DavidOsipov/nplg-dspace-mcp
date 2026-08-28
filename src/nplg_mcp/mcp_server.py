@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from mcp.server import Server
 
+from .agent_workflow import AGENT_WORKFLOW_DISCOVERY_INSTRUCTIONS
 from .profiles import DeploymentProfile
 from .resource_admission import InlineResourceAdmission
 from .sdk_boundary import SdkHandlers
@@ -22,9 +23,9 @@ if TYPE_CHECKING:
 
     from .services import FullServices, MetadataServices
 
-_SERVER_NAME = "nplg-dspace-mcp"
-_SERVER_VERSION = "0.1.0"
-_SERVER_TITLE = "NPLG DSpace MCP"
+SERVER_NAME = "nplg-dspace-mcp"
+SERVER_VERSION = "0.1.0"
+SERVER_TITLE = "NPLG DSpace MCP"
 
 
 @asynccontextmanager
@@ -47,9 +48,9 @@ def create_mcp_server(
     )
     if profile is DeploymentProfile.PRIVATE_FULL:
         server = Server(
-            _SERVER_NAME,
-            version=_SERVER_VERSION,
-            title=_SERVER_TITLE,
+            SERVER_NAME,
+            version=SERVER_VERSION,
+            title=SERVER_TITLE,
             lifespan=_server_lifespan,
             on_list_tools=handlers.on_list_tools,
             on_call_tool=handlers.on_call_tool,
@@ -59,12 +60,15 @@ def create_mcp_server(
         )
     else:
         server = Server(
-            _SERVER_NAME,
-            version=_SERVER_VERSION,
-            title=_SERVER_TITLE,
+            SERVER_NAME,
+            version=SERVER_VERSION,
+            title=SERVER_TITLE,
+            instructions=AGENT_WORKFLOW_DISCOVERY_INSTRUCTIONS,
             lifespan=_server_lifespan,
             on_list_tools=handlers.on_list_tools,
             on_call_tool=handlers.on_call_tool,
+            on_list_resources=handlers.on_list_resources,
+            on_read_resource=handlers.on_read_resource,
         )
     # The SDK enables OpenTelemetryMiddleware by default. It may capture exception
     # text and ambient tracing context, neither of which is an approved NPLG channel.

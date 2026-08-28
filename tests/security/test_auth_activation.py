@@ -148,6 +148,23 @@ def test_unsupported_provider_blocks_before_runtime_dependency_construction(
     assert touched is False
 
 
+def test_anonymous_production_metadata_starts_without_oauth_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public metadata profile must not need a deferred OAuth contract."""
+    config = load_config(_production_metadata_environment({"ALLOW_ANONYMOUS": "true"}))
+
+    def fail_probe() -> capabilities.OAuthProviderCapabilityVerdict:
+        msg = "anonymous metadata unexpectedly consulted OAuth capability"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(app_module, "probe_oauth_provider", fail_probe)
+
+    application = app_module.create_app(config)
+
+    assert application.title == "NPLG DSpace MCP"
+
+
 def test_provider_contract_error_blocks_before_runtime_dependency_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

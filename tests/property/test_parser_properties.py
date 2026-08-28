@@ -60,7 +60,8 @@ _PARSER_LIMIT_DEFAULTS = {
     "parse_deadline_ms": 2_000,
 }
 _MAX_PARSER_RSS_KIB = 256 * 1_024
-_PARSER_WALL_SECONDS = 2.0
+_MAX_PARSER_ELAPSED_SECONDS = 2.0
+_PARSER_CHILD_TIMEOUT_SECONDS = 3.0
 _EXPECTED_RESOURCE_CORPUS = [
     "html-bytes",
     "html-aggregate-text",
@@ -650,7 +651,7 @@ print("READY", flush=True)
     with pytest.raises(subprocess.TimeoutExpired):
         _ = _run_controlled_parser_resource_child(
             script,
-            wall_timeout_seconds=_PARSER_WALL_SECONDS,
+            wall_timeout_seconds=_MAX_PARSER_ELAPSED_SECONDS,
         )
 
 
@@ -815,10 +816,11 @@ print(json.dumps({
     try:
         completed = _run_controlled_parser_resource_child(
             script,
-            wall_timeout_seconds=_PARSER_WALL_SECONDS,
+            wall_timeout_seconds=_PARSER_CHILD_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
-        pytest.fail(f"parser resource subprocess exceeded 2 seconds: {exc}")
+        timeout = _PARSER_CHILD_TIMEOUT_SECONDS
+        pytest.fail(f"parser resource subprocess exceeded {timeout} seconds: {exc}")
     assert completed.returncode == 0, completed.stderr
     measurement = require_json_object(
         load_json_value(completed.stdout),
@@ -831,7 +833,7 @@ print(json.dumps({
     assert handle == "1234/499564"
     assert isinstance(elapsed, (int, float))
     assert not isinstance(elapsed, bool)
-    assert elapsed <= _PARSER_WALL_SECONDS
+    assert elapsed <= _MAX_PARSER_ELAPSED_SECONDS
     assert type(rss_kib) is int
     assert rss_kib <= _MAX_PARSER_RSS_KIB
 

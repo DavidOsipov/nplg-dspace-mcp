@@ -12,13 +12,18 @@ from typing import TYPE_CHECKING, cast
 
 import httpx
 import pytest
-from mcp import Client
+from mcp import Client, types
 from mcp.shared.exceptions import MCPError
 from pydantic import SecretStr
 from pypdf import PdfWriter
 
 import nplg_mcp.app as app_module
 from nplg_mcp import capabilities
+from nplg_mcp.agent_workflow import (
+    AGENT_WORKFLOW_MARKDOWN,
+    AGENT_WORKFLOW_MIME_TYPE,
+    AGENT_WORKFLOW_URI,
+)
 from nplg_mcp.capabilities import load_alpic_tasks_verdict
 from nplg_mcp.config import ApiPrincipalCredential, load_config
 from nplg_mcp.contracts import PdfInspectionOutput
@@ -192,8 +197,8 @@ async def test_alpic_metadata_uses_a_cursor_secret_without_an_asset_secret() -> 
 
 
 @pytest.mark.asyncio
-async def test_alpic_metadata_mcp_does_not_register_resource_routes() -> None:
-    """Metadata-only MCP advertises and registers neither resource route."""
+async def test_alpic_metadata_mcp_serves_only_the_static_workflow_resource() -> None:
+    """Metadata MCP serves one workflow without templates or private resources."""
     config = load_config(
         {
             "NODE_ENV": "test",
@@ -209,18 +214,31 @@ async def test_alpic_metadata_mcp_does_not_register_resource_routes() -> None:
     mcp_server = application.mcp_server
     assert mcp_server is not None
     try:
-        async with Client(mcp_server, mode="2026-07-28") as client:
-            assert client.server_capabilities.resources is None
-            with pytest.raises(MCPError) as list_caught:  # type: ignore[misc]
-                _ = await client.list_resources()
-            with pytest.raises(MCPError) as read_caught:  # type: ignore[misc]
+        async with Client(mcp_server) as client:
+            discovery = client.session.discover_result
+            assert discovery is not None
+            assert discovery.capabilities.resources is not None
+            listed = await client.list_resources()
+            read = await client.read_resource(AGENT_WORKFLOW_URI)
+            with pytest.raises(MCPError) as template_caught:  # type: ignore[misc]
+                _ = await client.list_resource_templates()
+            with pytest.raises(MCPError) as private_caught:  # type: ignore[misc]
                 _ = await client.read_resource("nplg://about")
     finally:
         assert services.http_client is not None
         await services.http_client.aclose()
 
-    assert list_caught.value.error.code == _METHOD_NOT_FOUND
-    assert read_caught.value.error.code == _METHOD_NOT_FOUND
+    assert [resource.uri for resource in listed.resources] == [AGENT_WORKFLOW_URI]
+    assert [resource.mime_type for resource in listed.resources] == [
+        AGENT_WORKFLOW_MIME_TYPE
+    ]
+    assert len(read.contents) == 1
+    content = read.contents[0]
+    assert isinstance(content, types.TextResourceContents)
+    assert content.text == AGENT_WORKFLOW_MARKDOWN
+    assert template_caught.value.error.code == _METHOD_NOT_FOUND
+    assert private_caught.value.error.code == _INVALID_PARAMS
+    assert private_caught.value.error.message == "Resource not found"
 
 
 def test_create_app_rejects_full_services_for_metadata_profile(tmp_path: Path) -> None:
@@ -571,7 +589,7 @@ def test_distributed_full_catalog_helper_fails_closed() -> None:
         _ = tool_names_for_profile(DeploymentProfile.DISTRIBUTED_FULL)
 
 
-def test_create_app_rejects_forged_anonymous_production_config_before_services(
+def test_create_app_rejects_forged_anonymous_full_production_config_before_services(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -582,7 +600,12 @@ def test_create_app_rejects_forged_anonymous_production_config_before_services(
             DEPLOYMENT_PROFILE="alpic-metadata",
         )
     )
-    forged = replace(valid, environment="production", allow_anonymous=True)
+    forged = replace(
+        valid,
+        deployment_profile="private-full",
+        environment="production",
+        allow_anonymous=True,
+    )
 
     def fail_on_touch(_config: object) -> None:
         raise AssertionError(_SERVICES_CONSTRUCTED_EARLY)

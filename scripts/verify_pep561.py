@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import unicodedata
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -34,6 +35,13 @@ _PROCESS_TIMEOUT_SECONDS = 120
 _SOURCE_DATE_EPOCH = "315532800"
 _SHA256_HEX_LENGTH = 64
 _GIT_SHA_HEX_LENGTH = 40
+_MAX_AGENT_WORKFLOW_BYTES = 16 * 1024
+_AGENT_WORKFLOW_RELATIVE_PARTS: tuple[str, ...] = (
+    "agent_skills",
+    "georgian-newspaper-visual-analysis",
+    "SKILL.md",
+)
+_ALLOWED_WORKFLOW_CONTROLS = frozenset({"\t", "\n", "\r"})
 _GIT = "/usr/bin/git"
 _REQUIRED_BUILD_INPUTS: tuple[str, ...] = (
     "LICENSE",
@@ -806,7 +814,7 @@ def _copy_package_directory(
             _fail("source package snapshot contains a non-regular file")
         if name == "py.typed":
             markers.append(member)
-        elif Path(name).suffix != ".py":
+        elif Path(name).suffix != ".py" and relative != _AGENT_WORKFLOW_RELATIVE_PARTS:
             _fail("source package snapshot contains undeclared package data")
         payload = bytearray()
         _ = _read_stable_file(
@@ -910,6 +918,12 @@ def _copy_source_snapshot(worktree: Path, destination: Path) -> Path:
     expected_marker = package_destination / "py.typed"
     if markers != [expected_marker] or expected_marker.read_bytes() != b"":
         _fail("source package marker is missing, misplaced, duplicated, or nonempty")
+    expected_workflow = package_destination.joinpath(*_AGENT_WORKFLOW_RELATIVE_PARTS)
+    try:
+        workflow_payload = expected_workflow.read_bytes()
+    except OSError:
+        _fail("source package agent workflow is missing")
+    _validate_agent_workflow_payload(workflow_payload)
     return destination
 
 
@@ -925,7 +939,33 @@ def _canonical_archive_name(name: str) -> str:
     return name
 
 
-def _verify_sdist_marker(path: Path) -> None:
+def _validate_agent_workflow_payload(
+    payload: bytes,
+    *,
+    expected: bytes | None = None,
+) -> None:
+    """Require one bounded canonical UTF-8 workflow payload."""
+    if not 0 < len(payload) <= _MAX_AGENT_WORKFLOW_BYTES:
+        _fail("agent workflow payload is empty or oversized")
+    try:
+        text = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        _fail("agent workflow payload is not valid UTF-8")
+    if any(
+        unicodedata.category(character) in {"Cc", "Cf"}
+        and character not in _ALLOWED_WORKFLOW_CONTROLS
+        for character in text
+    ):
+        _fail("agent workflow payload contains a forbidden control character")
+    if expected is not None and payload != expected:
+        _fail("agent workflow artifact does not match the source payload")
+
+
+def _verify_sdist_marker(
+    path: Path,
+    *,
+    expected_workflow: bytes | None = None,
+) -> None:
     try:
         with tarfile.open(path, mode="r:gz") as archive:
             members = archive.getmembers()
@@ -949,11 +989,35 @@ def _verify_sdist_marker(path: Path) -> None:
             marker_stream = archive.extractfile(marker_members[0])
             if marker_stream is None or marker_stream.read(1) != b"":
                 _fail("sdist marker payload is not empty")
+            workflow_path = (
+                f"{root}/src/nplg_mcp/{'/'.join(_AGENT_WORKFLOW_RELATIVE_PARTS)}"
+            )
+            workflow_members = [
+                member for member in members if member.name == workflow_path
+            ]
+            if (
+                len(workflow_members) != 1
+                or not workflow_members[0].isreg()
+                or not 0 < workflow_members[0].size <= _MAX_AGENT_WORKFLOW_BYTES
+            ):
+                _fail("sdist agent workflow is missing or malformed")
+            workflow_stream = archive.extractfile(workflow_members[0])
+            if workflow_stream is None:
+                _fail("sdist agent workflow is missing or malformed")
+            workflow_payload = workflow_stream.read(_MAX_AGENT_WORKFLOW_BYTES + 1)
+            _validate_agent_workflow_payload(
+                workflow_payload,
+                expected=expected_workflow,
+            )
     except (OSError, tarfile.TarError):
         _fail("sdist could not be parsed safely")
 
 
-def _verify_wheel_marker(path: Path) -> None:
+def _verify_wheel_marker(
+    path: Path,
+    *,
+    expected_workflow: bytes | None = None,
+) -> None:
     try:
         with zipfile.ZipFile(path, mode="r") as archive:
             members = archive.infolist()
@@ -974,6 +1038,19 @@ def _verify_wheel_marker(path: Path) -> None:
                 or archive.read(marker_members[0]) != b""
             ):
                 _fail("wheel marker is missing, misplaced, duplicated, or nonempty")
+            workflow_path = "nplg_mcp/" + "/".join(_AGENT_WORKFLOW_RELATIVE_PARTS)
+            workflow_members = [
+                member for member in members if member.filename == workflow_path
+            ]
+            if (
+                len(workflow_members) != 1
+                or not 0 < workflow_members[0].file_size <= _MAX_AGENT_WORKFLOW_BYTES
+            ):
+                _fail("wheel agent workflow is missing or malformed")
+            _validate_agent_workflow_payload(
+                archive.read(workflow_members[0]),
+                expected=expected_workflow,
+            )
     except (OSError, zipfile.BadZipFile):
         _fail("wheel could not be parsed safely")
 
@@ -1015,8 +1092,18 @@ def _build_artifacts(
     wheels = tuple(path for path in artifacts if path.suffix == ".whl")
     if len(sdists) != 1 or len(wheels) != 1:
         _fail("build did not produce one canonical sdist and one canonical wheel")
-    _verify_sdist_marker(sdists[0])
-    _verify_wheel_marker(wheels[0])
+    source_workflow = source.joinpath(
+        "src",
+        "nplg_mcp",
+        *_AGENT_WORKFLOW_RELATIVE_PARTS,
+    )
+    try:
+        expected_workflow = source_workflow.read_bytes()
+    except OSError:
+        _fail("source package agent workflow is missing")
+    _validate_agent_workflow_payload(expected_workflow)
+    _verify_sdist_marker(sdists[0], expected_workflow=expected_workflow)
+    _verify_wheel_marker(wheels[0], expected_workflow=expected_workflow)
     return sdists[0], wheels[0]
 
 

@@ -14,6 +14,11 @@ import pytest
 from mcp import Client, types
 from mcp.shared.exceptions import MCPError
 
+from nplg_mcp.agent_workflow import (
+    AGENT_WORKFLOW_MARKDOWN,
+    AGENT_WORKFLOW_MIME_TYPE,
+    AGENT_WORKFLOW_URI,
+)
 from nplg_mcp.errors import ErrorCode
 from nplg_mcp.json_types import JsonObject, require_json_object
 from nplg_mcp.mcp_server import create_mcp_server
@@ -85,10 +90,10 @@ async def test_official_client_lists_strict_metadata_tools(
 
 
 @pytest.mark.asyncio
-async def test_metadata_profile_advertises_no_private_resource_surfaces(
+async def test_metadata_profile_advertises_only_the_client_workflow_resource(
     app_services: MetadataServices,
 ) -> None:
-    """Metadata-only deployments cannot disclose private artifact capabilities."""
+    """Metadata deployments expose the workflow but no private capabilities."""
     handlers = SdkHandlers(app_services, DeploymentProfile.ALPIC_METADATA)
 
     resources = await handlers.on_list_resources(
@@ -100,7 +105,10 @@ async def test_metadata_profile_advertises_no_private_resource_surfaces(
         None,
     )
 
-    assert resources.resources == []
+    assert [resource.uri for resource in resources.resources] == [AGENT_WORKFLOW_URI]
+    assert [resource.mime_type for resource in resources.resources] == [
+        AGENT_WORKFLOW_MIME_TYPE
+    ]
     assert templates.resource_templates == []
     assert resources.ttl_ms == templates.ttl_ms == 0
     assert resources.cache_scope == templates.cache_scope == "private"
@@ -114,7 +122,12 @@ async def test_default_official_client_records_a_discovery_result(
     server = create_mcp_server(app_services, DeploymentProfile.ALPIC_METADATA)
 
     async with Client(server) as client:
-        assert client.session.discover_result is not None
+        result = client.session.discover_result
+
+    assert result is not None
+    assert result.capabilities.resources is not None
+    assert result.instructions is not None
+    assert AGENT_WORKFLOW_URI in result.instructions
 
 
 def test_official_server_has_no_ambient_telemetry_middleware(
@@ -207,16 +220,25 @@ async def test_official_client_receives_exact_unknown_tool_protocol_error(
 
 
 @pytest.mark.asyncio
-async def test_metadata_profile_does_not_register_resource_routes(
+async def test_metadata_profile_registers_workflow_without_resource_templates(
     app_services: MetadataServices,
 ) -> None:
-    """Metadata-only deployment has no resource route to advertise local state."""
+    """The static workflow is readable but templates remain unavailable."""
     server = create_mcp_server(app_services, DeploymentProfile.ALPIC_METADATA)
 
     async with Client(server, mode="2026-07-28") as client:
+        listed = await client.list_resources()
+        read = await client.read_resource(AGENT_WORKFLOW_URI)
         with pytest.raises(MCPError) as captured:
             _ = await client.list_resource_templates()
 
+    assert [resource.uri for resource in listed.resources] == [AGENT_WORKFLOW_URI]
+    assert len(read.contents) == 1
+    content = read.contents[0]
+    assert isinstance(content, types.TextResourceContents)
+    assert content.uri == AGENT_WORKFLOW_URI
+    assert content.mime_type == AGENT_WORKFLOW_MIME_TYPE
+    assert content.text == AGENT_WORKFLOW_MARKDOWN
     assert captured.value.error.code == METHOD_NOT_FOUND
 
 

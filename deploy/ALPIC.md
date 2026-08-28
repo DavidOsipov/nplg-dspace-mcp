@@ -1,6 +1,6 @@
 # Alpic deployment profile
 
-This repository contains enough build metadata for Alpic to identify and install the project as **Python 3.13** instead of Node.js. That build compatibility is not production authorization. **Do not deploy the current candidate publicly:** the reviewed OAuth provider capability remains unsupported, and production startup deliberately fails closed before constructing network or application dependencies.
+This repository contains enough build metadata for Alpic to identify and install the project as **Python 3.13** instead of Node.js. The initial Alpic deployment is a public, unauthenticated Streamable HTTP metadata MCP; it is not authorization to enable the private rendering profile.
 
 ## Required project settings
 
@@ -21,13 +21,13 @@ Add these environment variables:
 NODE_ENV=production
 DEPLOYMENT_PROFILE=alpic-metadata
 CURSOR_SIGNING_SECRET=<at least 32 random bytes>
-ALLOW_ANONYMOUS=false
+ALLOW_ANONYMOUS=true
 MAX_CONCURRENT_MCP_REQUESTS_PER_PRINCIPAL=4
 ```
 
-`DEPLOYMENT_PROFILE=alpic-metadata` is mandatory and, in local test mode, exposes only `search_documents`, `get_document_metadata`, and `list_document_files`; it does not initialize the downloader, content store, scanner, or PDF runtime. Alpic supplies `ALPIC_HOST`; the server derives `PUBLIC_BASE_URL=https://<ALPIC_HOST>` automatically, but `ALPIC_HOST` never selects a deployment profile. Do not add `PUBLIC_BASE_URL` unless a custom domain is already active.
+`DEPLOYMENT_PROFILE=alpic-metadata` is mandatory and exposes only `search_documents`, `get_document_metadata`, and `list_document_files`; it does not initialize the downloader, content store, scanner, or PDF runtime. `ALLOW_ANONYMOUS=true` is valid only for this profile. Alpic supplies `ALPIC_HOST`; the server derives `PUBLIC_BASE_URL=https://<ALPIC_HOST>` automatically, but `ALPIC_HOST` never selects a deployment profile. Do not add `PUBLIC_BASE_URL` unless a custom domain is already active.
 
-Do not configure `API_PRINCIPALS_JSON`, `API_BEARER_TOKEN`, `API_KEY`, `NPLG_PRIVATE_STATIC_TOKEN`, or any `X-API-Key` equivalent. Static authentication is forbidden for a production profile and cannot substitute for the selected Auth0/OIDC plus Alpic DCR contract. With the checked-in negative capability record, the expected startup result is `production OAuth provider capability is unsupported`. A supported provider record would still require the separately reviewed OIDC implementation; it is not itself an activation switch.
+Do not configure `API_PRINCIPALS_JSON`, `API_BEARER_TOKEN`, `API_KEY`, `NPLG_PRIVATE_STATIC_TOKEN`, or any `X-API-Key` equivalent. Static authentication is forbidden in production. OAuth/Auth0/DCR remains deferred work and must not be represented by a shared secret or enabled for this initial public profile.
 
 ## What this fixes
 
@@ -42,7 +42,8 @@ Local metadata-profile compatibility already covered by offline tests:
 - search;
 - metadata retrieval;
 - public/restricted bitstream inventory;
-- MCP discovery and tool listing.
+- MCP discovery and the exact three-tool listing;
+- listing and reading the static client-side PDF workflow resource.
 
 Not yet production-supported on Alpic:
 
@@ -50,10 +51,24 @@ Not yet production-supported on Alpic:
 - runtime-generated page or tile URLs under `/assets/`;
 - large downloads or PDF renders that can exceed the 30-second invocation limit.
 
-The Docker/VPS production deployment is also metadata-only. A future full profile requires an object store, authenticated MCP-native binary resources, and a separately deployed least-privilege worker for long-running PDF work.
+The current Docker Compose file selects `private-full` and is not an alternative
+deployment path for this anonymous metadata profile. A future full profile
+requires an object store, authenticated MCP-native binary resources, and a
+separately deployed least-privilege worker for long-running PDF work.
 
 ## Protected staging prerequisite
 
-Do not perform a public or staging deployment from this guide while the provider verdict is unsupported. A future authorized staging run must bind a named Auth0 tenant and Alpic environment, preserve the backend-self/DCR/upstream-issuer distinction, prove the access-token format and resource/audience relationship, and run through the protected controller and credential broker.
+Do not perform a public or staging deployment from this guide until the exact
+candidate and local gates are complete and an authorized provider-side action
+binds that candidate to the named Alpic environment. The hosted verification
+must prove the public `/mcp` route, exact three-tool catalog, sessionless
+behavior, effective Host and Origin values, the exact
+`nplg://skills/georgian-newspaper-visual-analysis` Markdown resource, absence
+of resource templates and private resources, and absence of asset routes.
+OAuth/Auth0/DCR evidence is not a prerequisite for this anonymous metadata-only
+profile. Resource availability proves retrieval only; arbitrary MCP clients are
+not required to load or follow the workflow.
 
-Until those external-authority records exist, `do_not_release` is the only supported decision. Never place a provider or MCP credential in command arguments, shell history, candidate-owned reports, or this environment file.
+Until those candidate and provider records exist, `do_not_release` is the only
+supported decision. Never place a provider or MCP credential in command
+arguments, shell history, candidate-owned reports, or this environment file.

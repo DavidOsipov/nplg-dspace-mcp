@@ -412,6 +412,8 @@ def _validate_production_auth_activation(config: AppConfig) -> None:
     """Stop production before dependency construction until OAuth is implemented."""
     if config.environment != "production":
         return
+    if config.deployment_profile == "alpic-metadata" and config.allow_anonymous:
+        return
     try:
         verdict = probe_oauth_provider()
     except CapabilityContractError as exc:
@@ -569,8 +571,12 @@ def _asset_response(
 def _validate_startup_config(config: AppConfig) -> None:
     """Reject unsafe or unavailable profiles before constructing services."""
     profile = validate_deployment_profile(config.deployment_profile)
-    if config.environment == "production" and config.allow_anonymous:
-        msg = "anonymous authorization is forbidden in production"
+    if (
+        config.environment == "production"
+        and config.allow_anonymous
+        and profile != "alpic-metadata"
+    ):
+        msg = "anonymous production access is limited to alpic-metadata"
         raise ValueError(msg)
     if config.environment == "production" and (
         config.api_bearer_token is not None

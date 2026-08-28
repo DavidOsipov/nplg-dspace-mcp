@@ -121,7 +121,10 @@ class _CanonicalTextCounter:
         )
         if not value:
             return
-        semantic_increment = len(_WHITESPACE_RUN_RE.sub(" ", value))
+        if _WHITESPACE_RUN_RE.search(value) is None:
+            semantic_increment = len(value)
+        else:
+            semantic_increment = len(_WHITESPACE_RUN_RE.sub(" ", value))
         if self.in_whitespace and value[0].isspace():
             semantic_increment -= 1
         self.semantic_code_points = _saturating_increment(
@@ -262,11 +265,7 @@ def _validate_text_budget(
     *,
     source_url: str | None = None,
 ) -> int:
-    updated = _saturating_increment(
-        current,
-        len(value) if value is not None else 0,
-        maximum=PARSER_LIMITS.max_total_text_code_points,
-    )
+    updated = current + (len(value) if value is not None else 0)
     if updated > PARSER_LIMITS.max_total_text_code_points:
         msg = "The repository response exceeded the aggregate text limit."
         raise _upstream_failure(msg, source_url=source_url)
@@ -613,26 +612,6 @@ def _html_attribute_text(value: object) -> str:
     return str(value)
 
 
-def _html_text_code_point_counts(
-    root: BeautifulSoup | Tag, *, source_url: str
-) -> tuple[int, int]:
-    counter = _CanonicalTextCounter()
-    for key, value in root.attrs.items():
-        counter.add(key)
-        counter.add(_html_attribute_text(value))
-    for current in root.descendants:
-        if isinstance(current, Tag):
-            for key, value in current.attrs.items():
-                counter.add(key)
-                counter.add(_html_attribute_text(value))
-        elif not isinstance(current, (Comment, Declaration, Doctype)):
-            counter.add(str(current))
-        if counter.code_points > PARSER_LIMITS.max_total_text_code_points:
-            msg = "The repository response exceeded the aggregate text limit."
-            raise _upstream_failure(msg, source_url=source_url)
-    return counter.code_points, counter.semantic_code_points
-
-
 def _html_field_code_point_counts(field: Tag) -> tuple[int, int]:
     counter = _CanonicalTextCounter()
     for current in field.descendants:
@@ -643,7 +622,7 @@ def _html_field_code_point_counts(field: Tag) -> tuple[int, int]:
     return counter.code_points, counter.semantic_code_points
 
 
-def _validate_html_tree(  # noqa: C901, PLR0912 - bounded DOM recount
+def _validate_html_tree(  # noqa: C901, PLR0912, PLR0915 - bounded DOM recount
     soup: BeautifulSoup, *, source_url: str
 ) -> _MarkupCounts:
     elements = 0
@@ -652,9 +631,14 @@ def _validate_html_tree(  # noqa: C901, PLR0912 - bounded DOM recount
     records = 0
     max_field_code_points = 0
     semantic_max_field_code_points = 0
-    stack: list[tuple[Tag, int, str | None, bool]] = [(soup, 1, None, False)]
+    text_counter = _CanonicalTextCounter()
+    stack: list[tuple[object, int, str | None, bool]] = [(soup, 1, None, False)]
     while stack:
         current, depth, context, in_search_body = stack.pop()
+        if not isinstance(current, Tag):
+            if not isinstance(current, (Comment, Declaration, Doctype)):
+                text_counter.add(str(current))
+            continue
         if depth > PARSER_LIMITS.max_depth + 3:
             msg = "The repository response exceeded the tree depth limit."
             raise _upstream_failure(msg, source_url=source_url)
@@ -678,6 +662,9 @@ def _validate_html_tree(  # noqa: C901, PLR0912 - bounded DOM recount
             attribute_count,
             maximum=PARSER_LIMITS.max_total_attributes,
         )
+        for key, value in current.attrs.items():
+            text_counter.add(key)
+            text_counter.add(_html_attribute_text(value))
         if current.name == "tr" and context == "metadata":
             metadata_fields = _saturating_increment(
                 metadata_fields,
@@ -702,9 +689,9 @@ def _validate_html_tree(  # noqa: C901, PLR0912 - bounded DOM recount
                 semantic_max_field_code_points,
                 semantic_field_code_points,
             )
-        for child in current.children:
+        for child in reversed(current.contents):
+            child_context = context
             if isinstance(child, Tag):
-                child_context = context
                 if child.name == "table":
                     class_value = _html_attribute_text(child.get("class", ""))
                     if "search-results" in class_value:
@@ -714,22 +701,17 @@ def _validate_html_tree(  # noqa: C901, PLR0912 - bounded DOM recount
                 child_in_search_body = in_search_body or (
                     child_context == "search" and child.name == "tbody"
                 )
-                stack.append(
-                    (
-                        child,
-                        depth + 1,
-                        child_context,
-                        child_in_search_body,
-                    )
-                )
-    total_text_code_points, semantic_total_text_code_points = (
-        _html_text_code_point_counts(soup, source_url=source_url)
-    )
+            else:
+                child_in_search_body = in_search_body
+            stack.append((child, depth + 1, child_context, child_in_search_body))
+    if text_counter.code_points > PARSER_LIMITS.max_total_text_code_points:
+        msg = "The repository response exceeded the aggregate text limit."
+        raise _upstream_failure(msg, source_url=source_url)
     return _MarkupCounts(
         nodes=elements,
         total_attributes=total_attributes,
-        total_text_code_points=total_text_code_points,
-        semantic_total_text_code_points=semantic_total_text_code_points,
+        total_text_code_points=text_counter.code_points,
+        semantic_total_text_code_points=text_counter.semantic_code_points,
         metadata_fields=metadata_fields,
         records=records,
         max_field_code_points=max_field_code_points,
@@ -1264,7 +1246,12 @@ def _metadata_rows(soup: BeautifulSoup) -> tuple[_MetadataRow, ...]:
             if identity in seen:
                 continue
             seen.add(identity)
-            rows.append((row, tuple(row.find_all("td", recursive=False))))
+            cells = tuple(
+                child
+                for child in row.children
+                if isinstance(child, Tag) and child.name == "td"
+            )
+            rows.append((row, cells))
     return tuple(rows)
 
 

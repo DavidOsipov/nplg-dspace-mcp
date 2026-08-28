@@ -256,12 +256,27 @@ def test_public_base_url_must_be_an_origin_without_path() -> None:
         _ = load_config(base_env(PUBLIC_BASE_URL="https://mcp.example.net/prefix"))
 
 
-def test_production_rejects_anonymous_mode_even_when_explicit() -> None:
-    with pytest.raises(ValueError, match="ALLOW_ANONYMOUS"):
+def test_production_allows_anonymous_alpic_metadata_mode() -> None:
+    config = load_config(
+        {
+            "NODE_ENV": "production",
+            "DEPLOYMENT_PROFILE": "alpic-metadata",
+            "CURSOR_SIGNING_SECRET": "c" * 32,
+            "PUBLIC_BASE_URL": "https://mcp.example.net",
+            "ALLOW_ANONYMOUS": "true",
+        }
+    )
+
+    assert config.allow_anonymous is True
+
+
+@pytest.mark.parametrize("profile", ["private-full", "distributed-full"])
+def test_production_rejects_anonymous_nonmetadata_profiles(profile: str) -> None:
+    with pytest.raises(ValueError, match=r"anonymous.*alpic-metadata"):
         _ = load_config(
             {
                 "NODE_ENV": "production",
-                "DEPLOYMENT_PROFILE": "alpic-metadata",
+                "DEPLOYMENT_PROFILE": profile,
                 "CURSOR_SIGNING_SECRET": "c" * 32,
                 "PUBLIC_BASE_URL": "https://mcp.example.net",
                 "ALLOW_ANONYMOUS": "true",

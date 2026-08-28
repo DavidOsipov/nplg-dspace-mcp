@@ -1,5 +1,6 @@
 {
   "$schema": "https://assets.alpic.ai/alpic.json",
+  "transportType": "streamablehttp",
   "installCommand": "uv venv --python python3 .venv && uv pip install --python .venv/bin/python --require-hashes --no-deps --only-binary=:all: -r requirements.lock",
   "buildCommand": ".venv/bin/python -m compileall -q src scripts",
   "startCommand": "HOST=0.0.0.0 PYTHONPATH=src .venv/bin/python -m nplg_mcp"

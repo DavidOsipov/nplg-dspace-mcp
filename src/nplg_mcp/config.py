@@ -548,11 +548,8 @@ def _authorization(
         "ALLOW_ANONYMOUS",
         default=False,
     )
-    if production and allow_anonymous:
-        msg = "ALLOW_ANONYMOUS must be false in production"
-        raise ValueError(msg)
     if production:
-        return None, None, False, ()
+        return None, None, allow_anonymous, ()
     api_bearer_token = env.get("API_BEARER_TOKEN") or None
     if (
         api_bearer_token is not None
@@ -629,11 +626,18 @@ def _api_principal_registry(
 def _validate_anonymous_scope(
     env: Mapping[str, str],
     *,
+    deployment_profile: DeploymentProfile,
+    production: bool,
     public_base_url: str,
     allow_anonymous: bool,
 ) -> None:
     if not allow_anonymous:
         return
+    if production:
+        if deployment_profile == "alpic-metadata":
+            return
+        msg = "anonymous production access is limited to alpic-metadata"
+        raise ValueError(msg)
     public_host = urlsplit(public_base_url).hostname
     bind_host = env.get("HOST", "127.0.0.1")
     if (
@@ -784,6 +788,8 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
     )
     _validate_anonymous_scope(
         env,
+        deployment_profile=deployment_profile,
+        production=production,
         public_base_url=public_base_url,
         allow_anonymous=allow_anonymous,
     )

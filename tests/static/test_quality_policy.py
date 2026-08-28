@@ -523,7 +523,8 @@ export default {
     )
     scripts = require_json_object(package["scripts"], context="package scripts")
     assert scripts["docs:lint"] == (
-        'markdownlint-cli2 "*.md" "docs/**/*.md" "deploy/**/*.md" "skills/**/*.md"'
+        'markdownlint-cli2 "*.md" "docs/**/*.md" "deploy/**/*.md" "skills/**/*.md" '
+        '"src/nplg_mcp/agent_skills/georgian-newspaper-visual-analysis/SKILL.md"'
     )
     result = run_bounded_command(
         (
@@ -543,8 +544,13 @@ export default {
         field.decode("utf-8") for field in result.stdout.split(b"\0") if field
     )
     assert paths
+    packaged_workflow = (
+        "src/nplg_mcp/agent_skills/georgian-newspaper-visual-analysis/SKILL.md"
+    )
     assert all(
-        "/" not in path or path.startswith(("docs/", "deploy/", "skills/"))
+        "/" not in path
+        or path.startswith(("docs/", "deploy/", "skills/"))
+        or path == packaged_workflow
         for path in paths
     )
 
@@ -929,12 +935,34 @@ def test_temporary_quality_ratchet_and_all_direct_references_are_removed() -> No
             assert token not in text, f"{relative_path}: {token}"
 
 
-def test_pep_561_marker_is_empty_and_not_declared_as_package_data() -> None:
-    """Leave PEP 561's automatic marker inclusion outside package-data records."""
-    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+def test_package_data_is_the_exact_client_workflow_only() -> None:
+    """Package the workflow while leaving PEP 561 marker inclusion automatic."""
+    pyproject = require_json_object(
+        cast(
+            "object",
+            tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8")),
+        ),
+        context="pyproject.toml",
+    )
+    tool = require_json_object(pyproject["tool"], context="pyproject.toml tool")
+    setuptools = require_json_object(
+        tool["setuptools"],
+        context="pyproject.toml setuptools",
+    )
+    package_data = require_json_object(
+        setuptools["package-data"],
+        context="pyproject.toml package-data",
+    )
+    raw_paths = package_data["nplg_mcp"]
 
     assert (ROOT / "src/nplg_mcp/py.typed").read_bytes() == b""
-    assert "[tool.setuptools.package-data]" not in pyproject
+    assert set(package_data) == {"nplg_mcp"}
+    assert type(raw_paths) is list
+    paths = cast("list[object]", raw_paths)
+    assert paths == [
+        "agent_skills/georgian-newspaper-visual-analysis/SKILL.md",
+    ]
+    assert "py.typed" not in paths
 
 
 def test_requirements_locks_are_the_only_python_resolution_authority() -> None:

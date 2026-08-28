@@ -57,6 +57,9 @@ nplg-dspace-mcp = "nplg_mcp.__main__:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+nplg_mcp = ["agent_skills/georgian-newspaper-visual-analysis/SKILL.md"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
 testpaths = ["tests"]

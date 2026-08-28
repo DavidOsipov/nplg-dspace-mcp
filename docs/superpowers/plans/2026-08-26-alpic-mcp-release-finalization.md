@@ -5,28 +5,32 @@
 > `superpowers:executing-plans` to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the existing `alpic-metadata` MCP candidate genuinely
-release-ready, then obtain a truthful, evidence-backed release decision without
-redesigning the release controller or broadening the deployed product.
+**Goal:** Make the existing public, anonymous `alpic-metadata` MCP candidate
+genuinely release-ready, then obtain a truthful, evidence-backed release
+decision without redesigning the release controller or broadening the deployed
+product.
 
 **Architecture:** Preserve the implemented Phase 0-8 architecture and the
-existing 13-operation protected-controller contract. Close only three real
-gaps: candidate-mode ASVS assessment, provider-bound OAuth for the three-tool
-metadata profile, and Alpic deployment evidence. Freeze one candidate and use
-the existing protected workflow for staging, custody, attestation, and
-eligibility; actual Production deployment remains a separately authorized
-external action.
+existing 13-operation protected-controller contract. The controller is a
+release-authority boundary, not end-user authentication for the MCP. Close only
+two real gaps: candidate-mode ASVS assessment and anonymous Alpic hosted
+evidence. Freeze one candidate and use the existing protected workflow for
+staging, custody, attestation, and eligibility; actual Production deployment
+remains a separately authorized external action.
 
 **Tech Stack:** CPython 3.12-3.14, `mcp==2.0.0`, strict Pydantic,
 TypeScript 6.0.3, Zod 4.4.3, Node 24.19.0, pytest, Hypothesis, Ruff, mypy,
-Pyright, ESLint, mutmut, Bandit, Semgrep, pip-audit, CycloneDX, Trivy, and the
-Alpic CLI/SDK/API 1.169.1 family.
+Pyright, ESLint, mutmut, Bandit, Semgrep, pip-audit, CycloneDX, and Trivy.
 
 **Spec:** `docs/2026-08-14-official-mcp-sdk-alpic-tdd-implementation-plan.md`
 
+**Scope precedence:** For this first release only, the approved anonymous
+boundary in Task 2 supersedes the Spec's identity-aware authentication and
+protected OAuth/Auth0/DCR activation requirements for `alpic-metadata`. It does
+not delete or satisfy those deferred requirements, and this release must not
+claim OAuth support or Alpic `Protected` classification.
+
 **Alpic references:** [builds](https://docs.alpic.ai/build-deploy/builds),
-[OAuth setup](https://docs.alpic.ai/secure/auth/oauth-setup),
-[DCR proxy](https://docs.alpic.ai/secure/auth/dcr-proxy),
 [audit/Beacon](https://docs.alpic.ai/testing/beacon), and
 [endpoints](https://docs.alpic.ai/build-deploy/endpoints).
 
@@ -34,8 +38,12 @@ Alpic CLI/SDK/API 1.169.1 family.
 
 - Release only `DeploymentProfile.ALPIC_METADATA` with exactly
   `search_documents`, `get_document_metadata`, and `list_document_files`.
-- Keep `private-full`, `distributed-full`, MCP Tasks, PDF execution, resources,
-  assets, and custom REST endpoints out of this release.
+- Keep `private-full`, `distributed-full`, MCP Tasks, PDF execution, resource
+  templates, every MCP resource except the exact fixed client workflow,
+  application-owned dynamic asset routes or private artifact bytes, and custom
+  application data APIs out of this release.
+  Treat `/healthz`, `/readyz`, `/metrics`, and provider-reserved `/assets/*` as
+  separately inventoried operational/platform surfaces, not MCP capabilities.
 - Reuse the existing 13 protected operation IDs and four launcher commands.
   Do not add a second command grammar or extend the controller in this plan.
 - Candidate code may validate evidence; it may not hold provider credentials,
@@ -45,18 +53,17 @@ Alpic CLI/SDK/API 1.169.1 family.
   coercion, unknown fields, and unbounded collections.
 - Cross-language contracts use Zod 4.4.3 strict objects and the same positive
   and negative corpus as Pydantic.
-- Keep TypeScript at 6.0.3. Pin `alpic`, `@alpic-ai/sdk`, and
-  `@alpic-ai/api` together at 1.169.1 after one registry recheck.
+- Keep TypeScript at 6.0.3. Do not add Alpic provider SDK packages for this
+  anonymous slice.
 - Declare `"transportType": "streamablehttp"` in `alpic.json`; the current
   low-level `Server.streamable_http_app(...)` integration is not a documented
   auto-detection case.
-- Do not accept opaque access tokens, ID tokens, token-shape inference, static
-  production credentials, arbitrary JWKS fetching, raw argv passthrough, or
-  secret-bearing evidence.
-- Use coarse `nplg:connect` only after explicit user approval of the documented
-  SDK limitation. Otherwise retain `do_not_release`.
+- Do not add OAuth/JWT/DCR activation, token-shape inference, static production
+  credentials, arbitrary JWKS fetching, raw argv passthrough, or secret-bearing
+  evidence. Existing OAuth capability records remain truthful negative evidence
+  for future work; do not rewrite them as supported.
 - Preserve the current Git index. Do not stage, unstage, commit, reset, stash,
-  clean, push, deploy, change Auth0/Alpic configuration, sign, or publish
+  clean, push, deploy, change Alpic configuration, sign, or publish
   without the exact authorization named below.
 - Every implementation task follows witnessed RED, minimal GREEN, focused
   rerun, adversarial/property coverage, mutation testing for decision logic,
@@ -68,6 +75,8 @@ Alpic CLI/SDK/API 1.169.1 family.
 
 - No new release-command request family.
 - No expansion from 13 to 27 controller operations.
+- No OAuth, Auth0, DCR, JWT verifier, or Alpic `Protected` classification in
+  this anonymous first release. That is separately planned future work.
 - No MCP Registry publication; that is an optional later plan.
 - No production rollback platform or generic release orchestrator in this
   repository.
@@ -80,8 +89,8 @@ Alpic CLI/SDK/API 1.169.1 family.
 | Blocker | Closure in this plan |
 | --- | --- |
 | ASVS tooling accepts only the bootstrap/unassessed state | Task 1 |
-| Auth0/Alpic provider capability is unsupported | Task 2 |
-| Alpic transport/build/hosted evidence is incomplete | Task 2 and Task 4 |
+| Anonymous runtime, catalog, and verifier behavior is incomplete | Task 2 |
+| Alpic deploy-pack and anonymous hosted evidence are incomplete | Task 4 |
 | The immutable candidate battery has no complete authoritative rerun | Task 3 |
 | Protected controller, custody, attestation, and Production authority are external | Task 4 |
 
@@ -175,270 +184,123 @@ governance, candidate binding, expiry, or blocker aggregation are killed.
 
 Rerun Step 4 after any refactor. Leave all edits unstaged.
 
-### Task 2: Complete the Protected Three-tool Alpic Vertical Slice
+### Task 2: Complete the Anonymous Three-tool Alpic Metadata Slice
 
-This task combines configuration, OAuth, audit, and deployment evidence because
-they form one deployable security boundary. It does not implement another
-profile or release system.
+This task implements the approved first runtime/candidate boundary: anonymous,
+sessionless Streamable HTTP for the public `alpic-metadata` profile only.
+OAuth, Auth0, DCR, protected provider custody, and private profiles remain
+explicitly deferred. Their absence is not an authentication vulnerability in
+this public metadata-only slice. This task does not establish a hosted
+deployment, deploy pack, custody, or release authority.
 
 **Files:**
 
-- Modify: `alpic.json`, `package.json`, `package-lock.json`
-- Modify: `requirements.in`, `requirements.lock`, `pyproject.toml`
-- Modify: `security/toolchain-lock.json`, `deploy/ALPIC.md`, `.env.example`
-- Modify: `security/coverage-policy.json`
-- Create: `deploy/alpic-runtime-manifest.json`
-- Create: `deploy/alpic-environment-manifest.json`
-- Create: `deploy/alpic-audit-dispositions.json`
-- Create: `deploy/alpic-submission-versions.json`
-- Modify: `contracts/oauth-provider-capability.json`
-- Modify: `contracts/alpic-oauth-discovery-capability.json`
-- Create: `contracts/alpic-dcr-flow-capability.json`
-- Create: `contracts/oidc-subject-capability.json`
-- Modify: `contracts/sdk-authorization-capability.json`
-- Modify: `contracts/accepted-sdk-differences.json`
-- Modify: `contracts/zod/capability-contracts.mjs`
-- Create: `src/nplg_mcp/auth.py`, `src/nplg_mcp/audit.py`
-- Modify: `src/nplg_mcp/capabilities.py`, `src/nplg_mcp/config.py`
-- Modify: `src/nplg_mcp/app.py`, `src/nplg_mcp/http_security.py`
-- Modify: `src/nplg_mcp/network.py`, `src/nplg_mcp/mcp_server.py`
-- Modify: `src/nplg_mcp/sdk_boundary.py`, `src/nplg_mcp/admission.py`
-- Modify: `src/nplg_mcp/errors.py`
-- Create: `security/crypto-policy.json`
-- Create: `docs/security/data-inventory.md`
-- Create: `docs/security/cryptographic-inventory.json`
-- Create: `docs/security/logging-inventory.json`
-- Create: `tsconfig.tools.json`
-- Create: `scripts/capture_alpic_deployment.ts`
-- Create: `scripts/capture_alpic_deployment.test.ts`
-- Create: `scripts/build_alpic_deploy_pack.py`
+- Modify: `alpic.json`, `.env.example`, `README.md`, `deploy/ALPIC.md`
+- Modify: `src/nplg_mcp/config.py`, `src/nplg_mcp/app.py`
 - Modify: `scripts/verify_deploy.py`
-- Create: `scripts/run_alpic_staging_proof.py`
-- Create: `tests/security/test_auth.py`, `tests/security/test_audit.py`
-- Create: `tests/property/test_auth_properties.py`
+- Modify: `tests/unit/test_config.py`
+- Modify: `tests/integration/test_profiles.py`
 - Modify: `tests/security/test_auth_activation.py`
-- Modify: `tests/security/test_network.py`
 - Modify: `tests/conformance/test_mcp_http.py`
-- Modify: `tests/unit/test_config.py`, `tests/unit/test_admission.py`
-- Modify: `tests/contracts/test_oauth_provider_capability.py`
-- Modify: `tests/contracts/test_alpic_oauth_discovery.py`
-- Create: `tests/contracts/test_alpic_dcr_flow_capability.py`
 - Modify: `tests/static/test_deployment.py`
 - Modify: `tests/unit/test_verify_deploy.py`
-- Create: `tests/unit/test_build_alpic_deploy_pack.py`
-- Create: `tests/unit/test_run_alpic_staging_proof.py`
-- Create: `tests/property/test_deployment_evidence_properties.py`
-- Modify: `scripts/run_mutation_gate.py`
-- Modify: `tests/unit/test_mutation_gate.py`
 
-**Interfaces:**
+The exact skill/package/resource files and their focused gates are specified by
+`docs/superpowers/plans/2026-08-28-alpic-client-pdf-skill-resource.md`; that
+bounded companion plan is part of this Task 2 implementation contract.
 
-```python
-OAuthProviderCapabilityVerdict = Annotated[
-    UnsupportedAuth0ProviderVerdict | SupportedAuth0SignedJwtVerdict,
-    Field(discriminator="supported"),
-]
+**Interfaces and invariants:**
 
-AlpicHostedOAuthVerdict = Annotated[
-    UnsupportedAlpicDcrFlowVerdict | SupportedAlpicDcrFlowVerdict,
-    Field(discriminator="supported"),
-]
+- `alpic.json` uses `transportType: "streamablehttp"`; the application
+  serves the official MCP Streamable HTTP endpoint at `POST /mcp`.
+- Production anonymous access is valid only when
+  `DEPLOYMENT_PROFILE=alpic-metadata` and `ALLOW_ANONYMOUS=true`.
+- The profile exposes exactly `search_documents`,
+  `get_document_metadata`, and `list_document_files`.
+- It registers exactly one fixed `text/markdown` MCP resource at
+  `nplg://skills/georgian-newspaper-visual-analysis`, no resource templates,
+  and initializes no asset route, downloader, content store, scanner, PDF
+  runtime, or rendering service. The resource is an instruction-only client
+  workflow, not server-side PDF execution.
+- Production static bearer tokens, API keys, and private static credentials
+  remain forbidden. `private-full` and `distributed-full` fail closed.
+- Host, Origin, JSON framing, protocol-version, request-size, body-time,
+  application-deadline, and concurrency controls remain active.
+- `verify_deploy.py` verifies only the methods implemented by the selected
+  profile. For `alpic-metadata` it requests `resources/list` and
+  `resources/read` only for the exact client workflow; `private-full` retains
+  its separate `nplg://about` verification.
+- OAuth/Auth0/DCR capability records remain negative evidence for future work
+  and cannot be represented as support, a shared-secret substitute, or a
+  prerequisite for this anonymous profile.
 
+- [ ] **Step 1: Write focused RED tests**
 
-class OidcAuthConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+Add or retain tests proving:
 
-    issuer: ExactHttpsUrl
-    jwks_url: ExactHttpsUrl
-    backend_resource_server_url: ExactHttpsUrl
-    public_mcp_transport_endpoint: ExactHttpsUrl
-    public_oauth_resource_url: ExactHttpsUrl
-    audiences: Annotated[tuple[Audience, ...], Field(min_length=1, max_length=8)]
-    algorithms: Annotated[
-        tuple[Literal["RS256", "PS256", "ES256"], ...],
-        Field(min_length=1, max_length=3),
-    ]
-    allowed_hosts: Annotated[
-        tuple[CanonicalHost, ...], Field(min_length=1, max_length=16)
-    ]
-    allowed_origins: Annotated[
-        tuple[CanonicalOrigin, ...], Field(max_length=16)
-    ]
-    required_scopes: tuple[Literal["nplg:connect"]]
-    jwks_timeout_ms: Literal[3000]
-    clock_skew_seconds: Literal[60]
-    access_token_max_lifetime_seconds: Literal[300]
+- production anonymous metadata configuration is accepted;
+- anonymous production for every other profile is rejected;
+- all production static credential combinations are rejected;
+- the public catalog has exactly three tools, one exact static workflow
+  resource, no resource templates or private resources, and no asset route;
+- malformed Host, Origin, headers, JSON, duplicate keys, bodies, and protocol
+  inputs fail closed at their existing bounds;
+- the deployment verifier issues `server/discover`, `tools/list`,
+  `resources/list`, and one exact `resources/read` for `alpic-metadata`, while
+  `private-full` still verifies `nplg://about`;
+- unknown profiles, extra tools, annotation drift, session creation, and
+  malformed private resource responses are rejected.
 
+- [ ] **Step 2: Observe RED**
 
-class OidcJwtTokenVerifier(TokenVerifier):
-    async def verify_token(self, token: str) -> AccessToken | None: ...
+Run only the focused cases introduced in Step 1 and confirm each fails for the
+missing or stale profile behavior, not for an import, fixture, or environment
+error. Preserve the command, exit status, and expected failure.
 
+- [ ] **Step 3: Implement the minimum anonymous slice**
 
-def build_auth_settings(config: OidcAuthConfig) -> AuthSettings: ...
+Reuse the existing official MCP server and metadata service composition. Add
+only the profile-scoped startup exception and profile-aware verifier behavior
+required by Step 1. Do not add OAuth code, provider SDK packages, deployment
+pack builders, audit subsystems, dynamic/private resource shims, or a second
+transport. The one fixed client-workflow resource is the only added resource
+surface.
 
-
-class SdkAuthContextPrincipalSource:
-    def current(self) -> Principal: ...
-
-
-def build_minimal_deploy_pack(
-    *, worktree: Path, candidate: GitCommit, output_dir: Path
-) -> MinimalDeployPackManifest: ...
-def verify_alpic_deployment(
-    capture: bytes, *, expected: AlpicDeploymentSelector
-) -> AlpicDeploymentEvidence: ...
-```
-
-`build_auth_settings()` passes the byte-exact issuer,
-`backend_resource_server_url`, and `required_scopes` to MCP 2.0
-`AuthSettings`. The public MCP/resource URLs are separate explicit route and
-challenge bindings; none is derived from `Host` or another configured URL.
-
-The two verdicts are not interchangeable. Exact Auth0 signed-JWT evidence may
-enable local/runtime construction, but `AlpicHostedOAuthVerdict` stays
-unsupported until Task 4 witnesses the deployed public/backend issuer mapping,
-DCR registration, callback, and authorization-code/PKCE flow. Task 2 cannot
-clear `OAUTH_END_TO_END_FLOW_UNPROVEN`.
-
-- [ ] **Step 1: Satisfy the external fact gate before positive activation**
-
-Obtain authorized evidence for the exact Auth0 tenant/application, byte-exact
-issuer, authorization/token/JWKS endpoints, audience/resource, signed-JWT
-access-token format, accepted algorithms, client identity claim, stable subject,
-scope, token lifetime, and PKCE S256. Obtain explicit approval for coarse
-`nplg:connect`. If either is absent, keep the capability unsupported and stop
-this task without guessing from generic documentation. This gate supports only
-the Auth0 signed-JWT provider branch; keep the checked-in hosted DCR verdict
-negative until Task 4.
-
-- [ ] **Step 2: Write strict capability/configuration RED tests**
-
-Reject templates, opaque tokens, ID tokens, wrong issuer/audience, unbounded
-lists, unknown fields, coercion, duplicate JSON keys, unknown algorithms,
-`offline_access`, callback/origin/Host drift, and any secret in configuration or
-evidence. Add identical Pydantic/Zod corpus cases. Prove that a supported
-pre-deploy provider plus an unsupported hosted-DCR verdict can construct local
-auth but cannot satisfy release eligibility. Add a failing mutation-policy test
-for the exact Task 2 tuple and reject target reordering, omission, or extras.
-
-- [ ] **Step 3: Write runtime OAuth and audit RED tests**
-
-Cover malformed JWT/JWK encodings, duplicate JOSE or claim keys, `alg=none`,
-algorithm confusion, token-controlled key URLs, wrong key type/use/size/curve,
-unknown/duplicate `kid`, JWKS redirect/private-IP/rebinding/timeout/oversize,
-wrong issuer/audience/scope/client/subject, expired/not-yet-valid/overlong token,
-`authorization_details`, concurrent requests, cancellation, and raw-token or
-claim leakage in logs.
-
-Run:
+- [ ] **Step 4: Observe focused GREEN**
 
 ```bash
-.venv/bin/python -m pytest \
-  tests/contracts/test_oauth_provider_capability.py \
-  tests/contracts/test_alpic_oauth_discovery.py \
-  tests/contracts/test_alpic_dcr_flow_capability.py \
-  tests/security/test_auth.py \
-  tests/security/test_audit.py \
-  tests/security/test_auth_activation.py \
-  tests/security/test_network.py \
-  tests/property/test_auth_properties.py \
-  tests/conformance/test_mcp_http.py \
-  tests/unit/test_config.py \
-  tests/unit/test_admission.py \
-  tests/unit/test_mutation_gate.py -q
-npm run contracts:zod:all
-```
-
-Expected: new positive-provider and runtime cases fail while the current
-unsupported fail-closed path remains GREEN.
-
-- [ ] **Step 4: Implement the minimum signed-JWT metadata path**
-
-Use the existing official SDK OAuth integration. Fetch JWKS only through the
-repository's bounded HTTPS/DNS/IP-pinned network boundary. Construct the SDK
-principal only after signature, issuer, audience, lifetime, scope, client, and
-subject validation. Audit only pseudonymous identity and bounded method/tool/
-outcome fields; never retain the raw token or claims.
-
-- [ ] **Step 5: Write Alpic build/evidence RED tests**
-
-Test exact `transportType`, exact 1.169.1 package pins, a minimal allowlisted
-deploy pack, symlink/path traversal and secret-file rejection, strict injected
-deployment JSON, zero/multiple/wrong/stale deployments, provider
-`sourceCommitId` as exact SHA-40 or truthful `unavailable`, warning/skip
-dispositions, three-tool catalog identity, and environment drift.
-
-- [ ] **Step 6: Observe the Alpic evidence RED**
-
-```bash
-.venv/bin/python -m pytest \
+PYTHONPATH=src .venv/bin/python -m pytest \
   tests/static/test_deployment.py \
-  tests/unit/test_verify_deploy.py \
-  tests/unit/test_build_alpic_deploy_pack.py \
-  tests/unit/test_run_alpic_staging_proof.py \
-  tests/property/test_deployment_evidence_properties.py -q
-npm run deployment:evidence:typecheck
-npm run deployment:evidence:lint
-npm run deployment:evidence:test
-```
-
-Expected: the new transport, pack, capture, and drift cases fail because the
-candidate-safe evidence tooling is absent.
-
-- [ ] **Step 7: Implement only candidate-safe Alpic tooling**
-
-Generate the exact lock update without lifecycle scripts:
-
-```bash
-npm install --package-lock-only --ignore-scripts --save-dev --save-exact \
-  alpic@1.169.1 @alpic-ai/sdk@1.169.1 @alpic-ai/api@1.169.1
-```
-
-Implement only the allowlisted pack builder and injected-evidence parsers.
-They perform no network access and execute no Alpic command. Register the exact
-Task 2 mutation tuple and its focused test paths/functions in
-`run_mutation_gate.py`; do not add wildcard or caller-selected targets.
-
-- [ ] **Step 8: Observe focused GREEN and mutation sensitivity**
-
-```bash
-.venv/bin/python -m pytest \
-  tests/contracts/test_oauth_provider_capability.py \
-  tests/contracts/test_alpic_oauth_discovery.py \
-  tests/contracts/test_alpic_dcr_flow_capability.py \
-  tests/security/test_auth.py \
-  tests/security/test_audit.py \
-  tests/security/test_auth_activation.py \
-  tests/security/test_network.py \
-  tests/property/test_auth_properties.py \
-  tests/conformance/test_mcp_http.py \
   tests/unit/test_config.py \
-  tests/unit/test_admission.py \
-  tests/static/test_deployment.py \
-  tests/unit/test_verify_deploy.py \
-  tests/unit/test_build_alpic_deploy_pack.py \
-  tests/unit/test_run_alpic_staging_proof.py \
-  tests/property/test_deployment_evidence_properties.py \
-  tests/unit/test_mutation_gate.py -q
-npm run contracts:zod:all
-npm run deployment:evidence:typecheck
-npm run deployment:evidence:lint
-npm run deployment:evidence:test
+  tests/integration/test_profiles.py \
+  tests/security/test_auth_activation.py \
+  tests/conformance/test_mcp_http.py \
+  tests/unit/test_verify_deploy.py -q
+```
+
+Expected: the focused suites pass with no skips or warnings that hide missing
+coverage. The verifier must retain distinct negative cases for metadata and
+private resource behavior.
+
+- [ ] **Step 5: Run the existing exact catalog mutation gate**
+
+```bash
 .venv/bin/python scripts/run_mutation_gate.py \
-  --targets src/nplg_mcp/auth.py src/nplg_mcp/audit.py \
-  scripts/build_alpic_deploy_pack.py scripts/verify_deploy.py \
-  scripts/run_alpic_staging_proof.py
+  --targets src/nplg_mcp/profiles.py
 ```
 
-Expected: focused suites pass and mutations in auth decisions, redaction,
-deployment identity, source-identity honesty, or blocker propagation are
-killed. Document provider-owned `/`, `/mcp`, `/try`, `/assets`, and OAuth/DCR
-routes separately from application-owned handlers.
+This gate proves mutation sensitivity for the exact three-tool profile
+inventory only. Do not represent it as mutation coverage for configuration,
+HTTP admission, or deployment verification. Any broader Task 2 mutation policy
+requires a separate reviewed closed tuple and focused-test mapping; do not
+resurrect the obsolete OAuth/audit/deploy-pack tuple.
 
-- [ ] **Step 9: Refactor only within the vertical-slice boundaries**
+- [ ] **Step 6: Reconcile deployment guidance and refactor only while GREEN**
 
-Keep token verification, audit serialization, deployment parsing, and pack
-construction separately reviewable. Rerun Step 8 and leave edits unstaged.
+`README.md` and `deploy/ALPIC.md` must describe the same anonymous-first
+boundary and keep provider deployment/custody/release authority separate from
+local runtime correctness. Rerun Step 4, Step 5, and the strict quality gate
+after any refactor. Leave all edits unstaged.
 
 ### Task 3: Freeze and Qualify One Immutable Candidate
 
@@ -447,12 +309,15 @@ construction separately reviewable. Rerun Step 8 and leave edits unstaged.
 - Modify only when a gate exposes a concrete defect: that source file and its
   focused test.
 - Create only as ignored local evidence:
-  `.superpowers/sdd/2026-08-26-alpic-release-finalization/`
+  `.superpowers/sdd/2026-08-26-alpic-mcp-release-finalization/`
 
 **Interfaces:**
 
-- Produces one clean candidate commit/tree, wheel, sdist, minimal Alpic deploy
-  pack, local gate report, and exact subject digests.
+- Produces one clean candidate commit/tree, wheel, sdist, local gate report,
+  and exact subject digests. Provider deployment packaging and the
+  `alpic-deploy-pack` remain outside Task 3 authority; only the externally
+  provisioned protected workflow's `candidate-battery` in Task 4 may build and
+  bind the pack.
 - Local qualification cannot grant provider, custody, release, or publication
   authority.
 
@@ -471,9 +336,7 @@ clean, or broadly stage.
 .venv/bin/python scripts/run_mutation_gate.py \
   --targets scripts/build_asvs_matrix.py
 .venv/bin/python scripts/run_mutation_gate.py \
-  --targets src/nplg_mcp/auth.py src/nplg_mcp/audit.py \
-  scripts/build_alpic_deploy_pack.py scripts/verify_deploy.py \
-  scripts/run_alpic_staging_proof.py
+  --targets src/nplg_mcp/profiles.py
 ```
 
 Expected: every command returns an authoritative zero. Timeout, interruption,
@@ -495,17 +358,15 @@ test "$NPLG_CANDIDATE_TMP_DIR" != "${NPLG_CANDIDATE_TMP_DIR#/}"
 QUALITY_CACHE="$NPLG_CANDIDATE_TMP_DIR/quality-cache"
 TEST_OUTPUT="$NPLG_CANDIDATE_TMP_DIR/test-output"
 ASVS_MUTATION_OUTPUT="$NPLG_CANDIDATE_TMP_DIR/asvs-mutation-output"
-ALPIC_MUTATION_OUTPUT="$NPLG_CANDIDATE_TMP_DIR/alpic-mutation-output"
+METADATA_MUTATION_OUTPUT="$NPLG_CANDIDATE_TMP_DIR/metadata-mutation-output"
 LOCAL_GATES="$NPLG_CANDIDATE_TMP_DIR/local-gates.json"
 DIST_DIR="$NPLG_CANDIDATE_TMP_DIR/dist"
-DEPLOY_PACK="$NPLG_CANDIDATE_TMP_DIR/deploy-pack"
 test ! -e "$QUALITY_CACHE"
 test ! -e "$TEST_OUTPUT"
 test ! -e "$ASVS_MUTATION_OUTPUT"
-test ! -e "$ALPIC_MUTATION_OUTPUT"
+test ! -e "$METADATA_MUTATION_OUTPUT"
 test ! -e "$LOCAL_GATES"
 test ! -e "$DIST_DIR"
-test ! -e "$DEPLOY_PACK"
 .venv/bin/python scripts/run_quality_gate.py \
   --worktree "$PWD" --require-clean --candidate "$CANDIDATE_COMMIT" \
   --cache-dir "$QUALITY_CACHE" \
@@ -519,23 +380,22 @@ test ! -e "$DEPLOY_PACK"
   --targets scripts/build_asvs_matrix.py
 .venv/bin/python scripts/run_mutation_gate.py \
   --worktree "$PWD" --require-clean --candidate "$CANDIDATE_COMMIT" \
-  --output-dir "$ALPIC_MUTATION_OUTPUT" \
-  --targets src/nplg_mcp/auth.py src/nplg_mcp/audit.py \
-  scripts/build_alpic_deploy_pack.py scripts/verify_deploy.py \
-  scripts/run_alpic_staging_proof.py
+  --output-dir "$METADATA_MUTATION_OUTPUT" \
+  --targets src/nplg_mcp/profiles.py
 .venv/bin/python scripts/verify_release.py local-gates \
   --worktree "$PWD" --output "$LOCAL_GATES" \
   --node-executable "$(command -v node)" --compare-branch origin/main
 .venv/bin/python -m build --outdir "$DIST_DIR"
-.venv/bin/python scripts/build_alpic_deploy_pack.py \
-  --worktree "$PWD" --candidate "$CANDIDATE_COMMIT" \
-  --output-dir "$DEPLOY_PACK"
 ```
 
 Expected: all receipts and artifacts bind the same clean commit/tree. Any drift
 returns the candidate to `do_not_release`.
 
-### Task 4: Use the Existing Protected Workflow and Obtain the Release Decision
+### Task 4: Use the Existing Protected Workflow for Anonymous Hosted Evidence
+
+Obtain the release decision without adding end-user authentication. Here,
+`protected` describes the external release-controller authority and custody
+boundary; the deployed MCP remains deliberately anonymous.
 
 No application or release-command code is added in this task.
 
@@ -553,45 +413,93 @@ No application or release-command code is added in this task.
 
 **External prerequisites:**
 
-- Signed `ProtectedControllerProvisioningReceipt` covering all existing 13
+- Signed `ProtectedControllerProvisioningReceipt.v2` covering all existing 13
   operations and four launcher commands.
-- Absolute digest-verified protected launcher, policy, trust root, credential
-  broker, network broker, and custody authority.
-- Authorized Auth0/Alpic staging configuration with exact project,
-  environment, callback, DCR pool, canonical base URL, and MCP URL.
+- Absolute digest-verified protected launcher, policy, trust root, both frozen
+  credential-broker class descriptors (`deployment_provider` and `mcp`),
+  network broker, and custody authority.
+- The provisioned controller's existing `StagingProofResult.v2` path accepts an
+  anonymous `alpic-metadata` operation request without requiring OAuth-specific
+  fields or changing the checked-in manifest, operation IDs, or schemas.
+- Signed controller evidence preserves both broker classes while the anonymous
+  operation requests, receives, and uses zero MCP credential handles. Provider
+  deployment credentials remain confined to the `deployment_provider` broker.
+  If the existing controller requires an MCP access-token handle, stop at
+  `do_not_release`.
+- Authorized Alpic staging configuration with exact project, environment,
+  canonical base URL, MCP URL, `transportType="streamablehttp"`, approved
+  runtime-secret injection, and `ALLOW_ANONYMOUS=true`.
 - Separate authorization for staging deployment, attestation commit, custody,
   cleanup, and any Production deployment.
 
 If any prerequisite is missing or mismatched, stop with
-`PROTECTED_RELEASE_CONTROLLER_UNAVAILABLE` or the exact provider blocker. Do
-not replace it with candidate code.
+`PROTECTED_RELEASE_CONTROLLER_UNAVAILABLE` or the exact signed
+controller/provider blocker. Do not replace it with candidate code or weaken
+the release manifest.
 
 - [ ] **Step 1: Run the existing candidate-to-staging DAG**
 
-Use the exact `initialize-run`, `run-through --through
-candidate-bundle-custody`, and descriptor-selected `resume-run` commands already
-specified in Phase 8 / Task 22. Do not change operation IDs or reconstruct a
-recovery action from shell state.
+Use only the checked-in launcher contracts:
 
-The protected staging proof must bind the exact deploy pack, environment,
-deployment, runtime, three-tool catalog, OAuth Protected classification,
-complete DCR authorization-code/PKCE flow, Host/Origin behavior, negative auth
-cases, Alpic audit/Beacon dispositions, privacy settings, and final environment
-recapture. A missing full `sourceCommitId` remains an explicit blocker unless
-the protected upload receipt and runtime identity independently bind the exact
-pack.
+- `initialize-run` requires `--provisioning-receipt`, `--controller-policy`,
+  `--repository-root`, `--candidate`, `--profile`,
+  `--profile-inputs-json`, `--network-broker-descriptor`,
+  `--custody-authority-descriptor`, `--run-parent`,
+  `--initialization-journal-json`, `--run-descriptor-json`, and
+  `--authorize-run-root`;
+- `run-through` requires `--provisioning-receipt`, `--run-descriptor-json`, and
+  `--range-request-json`;
+- descriptor-selected recovery through `resume-run` requires
+  `--provisioning-receipt`, `--run-descriptor-json`, and
+  `--resume-request-json`.
 
-The protected result must emit a supported `AlpicHostedOAuthVerdict` bound to
-the exact candidate, staging environment, callback, pool, public/backend issuer
-routes, and flow transcript. Eligibility joins that result with the pre-deploy
-`OAuthProviderCapabilityVerdict`; either unsupported branch preserves
-`OAUTH_END_TO_END_FLOW_UNPROVEN` and blocks recommendation.
+The protected controller must produce and validate each closed JSON request and
+bind it to the exact candidate, profile, manifest, and run descriptor. Unknown
+options, passthrough, shell reconstruction, the obsolete `--through` shorthand,
+and recovery inferred from shell state are forbidden. If the existing closed
+profile-input contract cannot express the approved anonymous mode, stop at
+`do_not_release`; do not change the command grammar or operation IDs here.
+
+The protected staging proof must bind the exact candidate, source tree, wheel,
+sdist, protected-workflow battery-built deploy pack, environment, deployment,
+runtime, canonical URLs, and a canonical `tools/list` digest covering the exact
+three names, schemas, and annotations. It must prove credential-free,
+sessionless Streamable HTTP behavior; the exact digest-bound client-workflow
+resource; absence of resource templates, prompts, subscriptions, private or
+dynamic resources, application-owned dynamic asset routes or private artifact
+bytes, custom application data APIs, and private-profile composition;
+Host/Origin, method,
+content-type, framing, and protocol admission; bounded
+malformed/unmatched-credential rejection; and enforcement of the exact
+configured request-size, body-time, application-deadline, global concurrency,
+and anonymous-principal concurrency limits through captured negative probes.
+It must also bind Alpic audit/Beacon dispositions, privacy settings, and final
+environment recapture.
+It must separately inventory provider-owned `/assets/*` and the application
+probe routes `/healthz`, `/readyz`, and `/metrics`, proving that each is either
+intentionally admitted or not publicly routed and that `/metrics` remains 404
+for this credential-free configuration. An unknown or unexpectedly public
+route blocks release. A missing full `sourceCommitId` remains an explicit
+blocker unless the protected upload receipt and runtime identity independently
+bind the exact pack.
+
+The protected result uses the existing `StagingProofResult.v2` envelope and
+must remain bound to the exact candidate and staging identity. The negative
+`OAuthProviderCapabilityVerdict` and other OAuth/Auth0/DCR capability records
+remain unchanged future-work evidence; they are neither support claims nor
+eligibility inputs for this anonymous release. If the external controller
+cannot preserve that separation, stop at `do_not_release` and require a
+separately authorized controller-owner plan.
 
 - [ ] **Step 2: Independently assess all 253 selected ASVS rows**
 
 Use `Pass` only with current candidate-bound evidence and governed `N/A` only
 with reviewed absence proof. `Not assessed`, `Fail`, `Partial`, expired
 evidence, or ungoverned `N/A` prevents a positive recommendation.
+Authentication requirements may be `N/A` only when reviewed evidence proves
+that the requirement does not apply to the deliberately public, read-only
+metadata surface and that no restricted data or action is exposed. Anonymous
+operation alone is not sufficient absence proof.
 
 Run after each review batch:
 
@@ -618,9 +526,10 @@ is not Production authority.
 
 The organizational release owner—not this repository—must deploy the exact
 custodied pack without rebuilding it and return signed evidence binding the
-Production project/environment/deployment, candidate/tree/pack, OAuth/DCR
-result, three-tool catalog, audit/privacy checks, post-deploy health, rollback
-target, and approval identity.
+Production project/environment/deployment, candidate/tree/pack, anonymous
+Streamable HTTP configuration, three-tool catalog, absent private surfaces,
+audit/privacy checks, post-deploy health, rollback target, and approval
+identity.
 
 If that authority or evidence contract is unavailable, stop at
 `release_recommended`; do not add controller operations here. Only a verified
@@ -632,8 +541,11 @@ small separate plan for the one authorized publication action and verification.
 
 ## Completion Gate
 
-The MCP is release-ready only when Tasks 1-3 pass for one immutable candidate
-and Task 4 produces a signed, custodied, blocker-free recommendation. It is
+The anonymous `alpic-metadata` MCP is release-ready only when Tasks 1-3 pass for
+one immutable candidate and Task 4 produces a signed, custodied, blocker-free
+recommendation for that exact anonymous profile. Deferred negative OAuth/Auth0/
+DCR capability records remain truthful future-work evidence; they are neither
+cleared nor joined into this profile's eligibility decision. The MCP is
 actually `released` only after the separate Production authority returns and
 the release owner verifies the positive Production receipt. Until then, report
 the exact truthful state—`do_not_release` or `release_recommended`—without

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 David Osipov
 """Unit tests for bounded repository parsers."""
 
+import re
 from collections.abc import Callable  # noqa: TC003 - runtime local annotation
 from dataclasses import replace
 from pathlib import Path
@@ -8,7 +9,7 @@ from types import SimpleNamespace
 from typing import NoReturn, Protocol, cast
 
 import pytest
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from defusedxml import ElementTree as DefusedElementTree
 from pydantic import ValidationError
 
@@ -64,6 +65,56 @@ _EXCESSIVE_TREE_DEPTH = 65
 _EXCESSIVE_HTML_ELEMENTS = 50_001
 _EXCESSIVE_XML_ELEMENTS = 50_001
 _EXCESSIVE_COLLECTIONS = 257
+_EXPECTED_NESTED_HTML_RAW_TEXT_CODE_POINTS = 37
+_EXPECTED_NESTED_HTML_SEMANTIC_TEXT_CODE_POINTS = 34
+
+
+class _WhitespaceRunProbe:
+    """Record canonicalization calls while retaining the compiled-regex behavior."""
+
+    def __init__(self, expression: re.Pattern[str]) -> None:
+        super().__init__()
+        self._expression = expression
+        self.calls: list[str] = []
+
+    def sub(self, replacement: str, value: str) -> str:
+        self.calls.append(value)
+        return self._expression.sub(replacement, value)
+
+    def search(self, value: str) -> re.Match[str] | None:
+        return self._expression.search(value)
+
+
+class _CanonicalTextCounterProtocol(Protocol):
+    code_points: int
+    semantic_code_points: int
+    in_whitespace: bool
+
+    def add(self, value: str | None) -> None: ...
+
+
+class _HtmlTextCountsProtocol(Protocol):
+    total_text_code_points: int
+    semantic_total_text_code_points: int
+
+
+class _HtmlTreeValidator(Protocol):
+    def __call__(
+        self,
+        soup: BeautifulSoup,
+        *,
+        source_url: str,
+    ) -> _HtmlTextCountsProtocol: ...
+
+
+class _TextBudgetValidator(Protocol):
+    def __call__(
+        self,
+        current: int,
+        value: str | None,
+        *,
+        source_url: str | None = None,
+    ) -> int: ...
 
 
 def fixture(name: str) -> str:
@@ -480,6 +531,36 @@ def test_html_parser_rejects_aggregate_text_only_recount_disagreement(
             expected_handle=_ITEM_HANDLE,
             source_url=_ITEM_SOURCE,
         )
+
+
+def test_html_tree_validation_counts_ordered_nested_text_without_second_recount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the validation walk owns the preflight-agreement text totals."""
+    soup = BeautifulSoup(
+        "<div data-note='alpha  beta'>top <span> middle\t</span> tail</div>",
+        "lxml",
+    )
+
+    def forbidden_second_recount(*_args: object, **_kwargs: object) -> NoReturn:
+        _forbidden("validated tree must not start a second text recount")
+
+    monkeypatch.setattr(
+        parser_module,
+        "_html_text_code_point_counts",
+        forbidden_second_recount,
+        raising=False,
+    )
+    parser_values = cast("dict[str, object]", vars(parser_module))
+    validate_tree = cast("_HtmlTreeValidator", parser_values["_validate_html_tree"])
+
+    counts = validate_tree(soup, source_url=_ITEM_SOURCE)
+
+    assert counts.total_text_code_points == _EXPECTED_NESTED_HTML_RAW_TEXT_CODE_POINTS
+    assert (
+        counts.semantic_total_text_code_points
+        == _EXPECTED_NESTED_HTML_SEMANTIC_TEXT_CODE_POINTS
+    )
 
 
 def test_search_parser_preserves_georgian_and_canonical_handles() -> None:
@@ -980,6 +1061,42 @@ def test_summary_item_parser_skips_short_and_empty_metadata_rows() -> None:
     )
 
     assert item.title == "Title"
+
+
+def test_metadata_rows_keeps_only_ordered_direct_cells_without_row_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: nested table cells cannot become outer metadata cells."""
+    soup = BeautifulSoup(
+        """\
+<table class='itemDisplayTable'><tr id='outer'>
+<td id='direct-key'>Title:</td>
+<td id='direct-value'>Title<table><tr><td id='nested-key'>Nested</td>
+<td id='nested-value'>Ignored</td></tr></table></td>
+<td id='direct-tail'>Tail</td></tr></table>""",
+        "html.parser",
+    )
+    outer = soup.find("tr", id="outer")
+    assert isinstance(outer, Tag)
+
+    def forbidden_row_search(*_args: object, **_kwargs: object) -> NoReturn:
+        _forbidden("metadata rows must iterate direct cells without Tag.find_all")
+
+    monkeypatch.setattr(outer, "find_all", forbidden_row_search)
+    parser_values = cast("dict[str, object]", vars(parser_module))
+    metadata_rows = cast(
+        "Callable[[BeautifulSoup], tuple[tuple[Tag, tuple[Tag, ...]], ...]]",
+        parser_values["_metadata_rows"],
+    )
+
+    rows = metadata_rows(soup)
+    outer_cells = next(cells for row, cells in rows if row is outer)
+
+    assert [cell.get("id") for cell in outer_cells] == [
+        "direct-key",
+        "direct-value",
+        "direct-tail",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1622,6 +1739,54 @@ def test_parser_counter_increment_saturates_at_one_past_the_limit() -> None:
         )
         == maximum + 1
     )
+
+
+def test_xml_text_budget_keeps_exact_boundary_without_generic_saturation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: XML text accounting has its own exact fail-closed boundary."""
+    parser_values = cast("dict[str, object]", vars(parser_module))
+    validate_text_budget = cast(
+        "_TextBudgetValidator", parser_values["_validate_text_budget"]
+    )
+
+    def forbidden_saturation(*_args: object, **_kwargs: object) -> int:
+        _forbidden("XML text accounting must not invoke generic saturation")
+
+    monkeypatch.setattr(parser_module, "_saturating_increment", forbidden_saturation)
+    maximum = parser_module.PARSER_LIMITS.max_total_text_code_points
+
+    assert validate_text_budget(0, None, source_url=_ITEM_SOURCE) == 0
+    assert validate_text_budget(maximum, "", source_url=_ITEM_SOURCE) == maximum
+    with pytest.raises(AppError, match="aggregate text limit") as raised:
+        _ = validate_text_budget(maximum, "x", source_url=_ITEM_SOURCE)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+    assert raised.value.safe_details == {"source_url": _ITEM_SOURCE}
+
+
+def test_canonical_text_counter_keeps_chunked_semantics_without_unneeded_substitutions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: whitespace-free chunks preserve exact canonical text semantics."""
+    parser_values = cast("dict[str, object]", vars(parser_module))
+    expression = cast("re.Pattern[str]", parser_values["_WHITESPACE_RUN_RE"])
+    counter_factory = cast(
+        "Callable[[], _CanonicalTextCounterProtocol]",
+        parser_values["_CanonicalTextCounter"],
+    )
+    probe = _WhitespaceRunProbe(expression)
+    monkeypatch.setattr(parser_module, "_WHITESPACE_RUN_RE", probe)
+    counter = counter_factory()
+
+    chunks = ("alpha", "  ", "beta", "\n\t", "gamma")
+    for chunk in chunks:
+        counter.add(chunk)
+
+    assert counter.code_points == sum(map(len, chunks))
+    assert counter.semantic_code_points == len("alpha beta gamma")
+    assert counter.in_whitespace is False
+    assert probe.calls == ["  ", "\n\t"]
 
 
 def test_dim_record_skips_invalid_fields_and_rejects_empty_metadata() -> None:

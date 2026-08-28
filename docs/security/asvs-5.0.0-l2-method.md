@@ -23,3 +23,11 @@ absence evidence and a reviewer/review date. Risk acceptance requires a risk
 identifier, owner, and approver. Local evidence is descriptor-bound and
 path-safe; custodial evidence requires an allowlisted authority and a signed
 versioned receipt in the later custody phase.
+
+Assessment has two separate strict modes. `bootstrap` accepts only the
+deterministic 759-row `Not assessed` inventory and empty evidence manifest.
+`candidate` accepts exactly the 253 `alpic-metadata` rows bound to one commit
+and tree: every row must be an independently evidenced `Pass` or a governed
+`N/A`. A governed `N/A` requires fresh, reviewed, custodied
+`claim_purpose="absence-proof"` evidence of an approved kind. Candidate mode
+never converts, enriches, or otherwise relaxes the bootstrap inventory.

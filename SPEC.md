@@ -32,10 +32,12 @@ not be generated from Python models or treated as evidence in this phase.
   moved behind a separately deployed, least-privilege OS authority boundary.
   A same-container child process is a development compatibility boundary, not
   a production sandbox.
-- Production API credentials are a closed, strict Pydantic principal registry.
-  Every authenticated MCP request consumes both a principal-specific zero-waiter
-  permit and the process-global emergency permit. Legacy shared bearer/API-key
-  environment variables are development-only compatibility inputs.
+- The production `alpic-metadata` profile is anonymous and rejects credential
+  configuration. Any future authenticated private production profile must use
+  a closed, strict Pydantic principal registry; each authenticated request must
+  consume both a principal-specific zero-waiter permit and the process-global
+  emergency permit. Legacy shared bearer/API-key environment variables remain
+  development-only compatibility inputs.
 - DNS resolution, metadata parsing, and local storage publication use separate
   bounded executors. Cancellation does not return a permit while underlying
   blocking work remains live; parser structure budgets are enforced before a
@@ -46,6 +48,30 @@ not be generated from Python models or treated as evidence in this phase.
   records state that limitation explicitly.
 - Secrets, bearer tokens, raw authorization headers, and untrusted archive
   content are excluded from fixtures and public errors.
+
+## Client-side PDF workflow resource
+
+The public `alpic-metadata` profile keeps its exact three-tool catalog and does
+not download, parse, render, cache, or delete PDFs. It additionally advertises
+one fixed, non-templated, read-only MCP resource at
+`nplg://skills/georgian-newspaper-visual-analysis`. The resource returns bounded
+`text/markdown` instructions for a client agent to select a public bitstream
+from `list_document_files`, retrieve only that returned `source_url`, and carry
+out PDF inspection in the client's own environment.
+
+The server's discovery instructions point clients to the resource. The profile
+registers only `resources/list` and `resources/read`: it registers no resource
+templates, prompts, subscriptions, asset route, downloader, content store,
+scanner, or PDF runtime. An unknown or private resource URI fails closed and
+never reaches a metadata service dependency.
+
+The workflow is instruction-only. It cannot override client or user policy,
+install software, grant filesystem or network authority, or guarantee that an
+arbitrary MCP host will load or follow it. A compatible client must explicitly
+support MCP resources and must keep downloaded documents and their contents in
+the untrusted-data boundary. If it cannot enforce a bounded local download and
+safe local PDF inspection, it stops at metadata rather than asking Alpic to do
+the PDF work.
 
 ## Evidence boundaries
 

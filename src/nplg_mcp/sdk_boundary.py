@@ -19,6 +19,14 @@ from mcp.shared.exceptions import MCPError
 from mcp_types import INTERNAL_ERROR, INVALID_PARAMS
 from pydantic import StringConstraints, ValidationError, field_validator
 
+from .agent_workflow import (
+    AGENT_WORKFLOW_DESCRIPTION,
+    AGENT_WORKFLOW_MARKDOWN,
+    AGENT_WORKFLOW_MIME_TYPE,
+    AGENT_WORKFLOW_NAME,
+    AGENT_WORKFLOW_TITLE,
+    AGENT_WORKFLOW_URI,
+)
 from .config import HARD_MAX_INLINE_RESOURCE_BYTES
 from .contracts import StrictModel
 from .contracts.tool_models import tool_model_bindings
@@ -262,6 +270,15 @@ def _resource_response_reservation_bytes(result: types.ReadResourceResult) -> in
     return inline_text_response_reservation_bytes(len(content.text.encode("utf-8")))
 
 
+def _resource_read_reservation_bytes(profile: DeploymentProfile) -> int:
+    """Return the exact pre-admission bound for one profile's resource read."""
+    if profile is DeploymentProfile.ALPIC_METADATA:
+        return inline_text_response_reservation_bytes(
+            len(AGENT_WORKFLOW_MARKDOWN.encode("utf-8"))
+        )
+    return INLINE_RESOURCE_RESPONSE_RESERVATION_BYTES
+
+
 @dataclass(frozen=True, slots=True)
 class SdkHandlers:
     """Closed constructor-bound official SDK handlers for one service composition."""
@@ -332,7 +349,20 @@ class SdkHandlers:
     ) -> types.ListResourcesResult:
         """Project available resources into explicit SDK resource models."""
         resources: list[types.Resource] = []
-        if self.profile is DeploymentProfile.PRIVATE_FULL:
+        if self.profile is DeploymentProfile.ALPIC_METADATA:
+            resources = [
+                types.Resource.model_validate(
+                    {
+                        "uri": AGENT_WORKFLOW_URI,
+                        "name": AGENT_WORKFLOW_NAME,
+                        "title": AGENT_WORKFLOW_TITLE,
+                        "description": AGENT_WORKFLOW_DESCRIPTION,
+                        "mimeType": AGENT_WORKFLOW_MIME_TYPE,
+                    },
+                    strict=True,
+                )
+            ]
+        elif self.profile is DeploymentProfile.PRIVATE_FULL:
             resources = [
                 types.Resource.model_validate(resource, strict=True)
                 for resource in self.services.tools.list_resources()
@@ -392,13 +422,16 @@ class SdkHandlers:
                 code=INVALID_PARAMS,
                 message="Invalid request parameters",
             ) from exc
-        if self.profile is not DeploymentProfile.PRIVATE_FULL:
+        if (
+            self.profile is DeploymentProfile.ALPIC_METADATA
+            and uri != AGENT_WORKFLOW_URI
+        ):
             raise MCPError(
                 code=INVALID_PARAMS,
                 message="Resource not found",
             )
         reservation = self.resource_admission.try_reserve(
-            INLINE_RESOURCE_RESPONSE_RESERVATION_BYTES
+            _resource_read_reservation_bytes(self.profile)
         )
         if reservation is None:
             raise MCPError(
@@ -406,7 +439,14 @@ class SdkHandlers:
                 message="Internal server error",
             )
         try:
-            resource = await self.services.tools.read_resource(uri)
+            if self.profile is DeploymentProfile.ALPIC_METADATA:
+                resource = {
+                    "uri": AGENT_WORKFLOW_URI,
+                    "mime_type": AGENT_WORKFLOW_MIME_TYPE,
+                    "text": AGENT_WORKFLOW_MARKDOWN,
+                }
+            else:
+                resource = await self.services.tools.read_resource(uri)
             result = _adapt_resource(uri, resource)
             reservation.shrink(_resource_response_reservation_bytes(result))
         except AppError as exc:

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import tokenize
@@ -45,7 +46,7 @@ EXPECTED_ROWS = L1_L2_COUNT * PROFILE_COUNT
 GIT_TIMEOUT_SECONDS = 30
 GIT_OUTPUT_BYTES = 4_096
 TASK2_SOURCE = Path("scripts/build_asvs_matrix.py")
-TASK2_S603_LINE = 3_192
+TASK2_S603_LINE = 3_475
 TASK2_S603_RATIONALE = (
     "        # Security rationale: argv[0] is the immutable reviewed /usr/bin/git.",
     "        # Tuple argv, cwd=/, closed env, no shell, output bounds, and timeout are",
@@ -104,6 +105,26 @@ def _valid_task2_s603_inventory(source: str) -> bool:
         lines[line_offset - len(TASK2_S603_RATIONALE) : line_offset]
     ) == TASK2_S603_RATIONALE and lines[line_offset].endswith(
         "subprocess.Popen(  # noqa: S603"
+    )
+
+
+def test_candidate_mutation_logic_is_nested_under_closed_function_inventory() -> None:
+    """Mutmut must group every candidate-only helper under a reviewed function."""
+    module = ast.parse(TASK2_SOURCE.read_text(encoding="utf-8"))
+    top_level_functions = {
+        node.name for node in module.body if isinstance(node, ast.FunctionDef)
+    }
+
+    assert top_level_functions.isdisjoint(
+        {
+            "_candidate_requirements",
+            "_candidate_requirement_ids",
+            "_candidate_reference_context",
+            "_candidate_reference_binding_blockers",
+            "_candidate_reference_is_independently_verified",
+            "_candidate_reference_governance_blockers",
+            "_candidate_required_evidence_blockers",
+        }
     )
 
 

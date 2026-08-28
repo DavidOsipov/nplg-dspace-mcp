@@ -415,6 +415,7 @@ _DECISION_MODULES = (
     "src/nplg_mcp/sdk_boundary.py",
     "src/nplg_mcp/security.py",
     "src/nplg_mcp/tokens.py",
+    "scripts/build_asvs_matrix.py",
     "scripts/delete_render.py",
     "scripts/run_live_nplg_canary.py",
     "scripts/smoke_live.py",

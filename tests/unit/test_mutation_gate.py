@@ -63,6 +63,13 @@ _TASK_SEVENTEEN_TARGETS = (
     "src/nplg_mcp/downloader.py",
     "scripts/run_live_nplg_canary.py",
 )
+_TASK_ONE_TARGETS = ("scripts/build_asvs_matrix.py",)
+_TASK_ONE_REQUIRED_FUNCTIONS = (
+    "scripts.build_asvs_matrix.x__bootstrap_profile_release",
+    "scripts.build_asvs_matrix.x__candidate_reference_blockers",
+    "scripts.build_asvs_matrix.x__candidate_profile_release",
+    "scripts.build_asvs_matrix.x_evaluate_profile_release",
+)
 _TASK_SIXTEEN_A_TARGETS = (
     "src/nplg_mcp/malware.py",
     "src/nplg_mcp/downloader.py",
@@ -615,13 +622,18 @@ def _git_command(root: Path, cache: Path, *arguments: str) -> bytes:
     return result.stdout
 
 
-def _initialize_mutation_repository(tmp_path: Path) -> tuple[Path, Path]:
+def _initialize_mutation_repository(
+    tmp_path: Path,
+    *,
+    policy: MutationPolicy | None = None,
+) -> tuple[Path, Path]:
     repository = tmp_path / "repository"
     cache = tmp_path / "git-cache"
     repository.mkdir()
     cache.mkdir(mode=0o700)
     _ = _git_command(repository, cache, "init", "-q", ".")
-    for relative in initial_mutation_policy().targets:
+    selected_policy = initial_mutation_policy() if policy is None else policy
+    for relative in selected_policy.targets:
         target = repository / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         _ = target.write_text("def covered() -> int:\n    return 1\n", encoding="utf-8")
@@ -650,9 +662,9 @@ def _initialize_mutation_repository(tmp_path: Path) -> tuple[Path, Path]:
         "-m",
         "base",
     )
-    security = repository / "src" / "nplg_mcp" / "security.py"
-    _ = security.write_text(
-        security.read_text(encoding="utf-8") + "\nDIRTY = True\n",
+    dirty_target = repository / selected_policy.targets[0]
+    _ = dirty_target.write_text(
+        dirty_target.read_text(encoding="utf-8") + "\nDIRTY = True\n",
         encoding="utf-8",
     )
     return repository.resolve(strict=True), cache.resolve(strict=True)
@@ -802,6 +814,107 @@ def test_initial_mutation_policy_matches_the_independent_literal_oracle() -> Non
     assert policy.accepted_exit_codes == frozenset({-24, 0, 1, 33})
     assert policy.minimum_killed_percent == _MINIMUM_KILLED_PERCENT
     assert policy.required_functions == expected_functions
+
+
+def test_task_one_mutation_policy_is_one_exact_asvs_target() -> None:
+    """Mutation caught: Task 1 accepts non-exact mutation targets."""
+    policy = mutation_policy_for_targets(_TASK_ONE_TARGETS)
+
+    assert policy.targets == _TASK_ONE_TARGETS
+    assert policy.test_paths == (
+        "tests/unit/test_build_asvs_matrix.py",
+        "tests/property/test_asvs_evidence.py",
+        "tests/static/test_asvs_evidence.py",
+    )
+    assert policy.deselected_tests == (
+        (
+            "tests/static/test_asvs_evidence.py::"
+            "test_task2_subprocess_suppression_has_exact_closed_inventory"
+        ),
+    )
+    assert policy.required_functions == (
+        ("scripts/build_asvs_matrix.py", _TASK_ONE_REQUIRED_FUNCTIONS),
+    )
+    for invalid in (
+        (),
+        ("scripts/*.py",),
+        (*_TASK_ONE_TARGETS, "scripts/run_mutation_gate.py"),
+    ):
+        with pytest.raises(MutationGateError, match="closed initial policy"):
+            _ = mutation_policy_for_targets(invalid)
+
+
+def test_task_one_execution_forwards_the_exact_required_function_filters(
+    tmp_path: Path,
+) -> None:
+    """Only the reviewed four candidate functions may be executed by mutmut."""
+    policy = mutation_policy_for_targets(_TASK_ONE_TARGETS)
+    repository, cache = _initialize_mutation_repository(tmp_path, policy=policy)
+    executor = _MutationExecutor(policy)
+
+    result = run_mutation_gate(
+        MutationGateRequest(
+            worktree=repository,
+            output_dir=(tmp_path / "external-output").resolve(),
+            targets=policy.targets,
+        ),
+        executor=executor,
+        clock=_Clock(),
+        filesystem=_Filesystem(),
+        git=_RealGit(cache),
+    )
+
+    assert result.summary.killed == len(_TASK_ONE_REQUIRED_FUNCTIONS)
+    assert len(executor.requests) == 1
+    assert executor.requests[0].argv[-7:] == (
+        "run",
+        "--max-children",
+        "8",
+        *(f"{function}__mutmut_*" for function in _TASK_ONE_REQUIRED_FUNCTIONS),
+    )
+
+
+def test_task_one_metadata_cannot_count_unrequested_generated_functions() -> None:
+    """Generation may see the module, but only selected functions may contribute."""
+    target = _TASK_ONE_TARGETS[0]
+    required_names = tuple(
+        f"{function}__mutmut_1" for function in _TASK_ONE_REQUIRED_FUNCTIONS
+    )
+    extra_name = "scripts.build_asvs_matrix.x_unrequested__mutmut_1"
+    exit_codes: dict[str, int | None] = dict(
+        zip(required_names, (1,) * len(required_names), strict=True)
+    )
+    exit_codes[extra_name] = None
+    function_names = tuple(
+        name.partition("__mutmut_")[0].rpartition(".")[2]
+        for name in (*required_names, extra_name)
+    )
+    durations: dict[str, float] = dict(
+        zip(required_names, (0.1,) * len(required_names), strict=True)
+    )
+    hashes: dict[str, str] = dict(
+        zip(function_names, ("0123456789ab",) * len(function_names), strict=True)
+    )
+    type_check_errors: dict[str, bool] = {}
+    document: dict[str, object] = {
+        "exit_code_by_key": exit_codes,
+        "hash_by_function_name": hashes,
+        "type_check_error_by_key": type_check_errors,
+        "durations_by_key": durations,
+        "estimated_durations_by_key": durations,
+    }
+    payload = json.dumps(document).encode()
+
+    summary = parse_mutation_results(((target, payload),))
+
+    assert summary.total == len(_TASK_ONE_REQUIRED_FUNCTIONS)
+    assert summary.killed == summary.total
+    executed_extra = payload.replace(
+        f'"{extra_name}": null'.encode(),
+        f'"{extra_name}": 1'.encode(),
+    )
+    with pytest.raises(MutationGateError, match="unrequested mutation function"):
+        _ = parse_mutation_results(((target, executed_extra),))
 
 
 def test_phase_two_mutation_policies_are_closed_and_test_selected() -> None:
@@ -1662,6 +1775,44 @@ def test_mutation_results_reject_malformed_fields(defect: str) -> None:
         _ = parse_mutation_results(tuple(payloads))
 
 
+def test_mutation_metadata_rejects_non_string_support_map_names() -> None:
+    """Parsed metadata remains fail-closed if a non-JSON adapter injects key types."""
+    hashes: dict[object, object] = {1: "0" * 64}
+    metadata = mutation_gate_module._TargetMetadata(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        exit_codes={},
+        hashes=hashes,
+        durations={},
+        estimates={},
+    )
+
+    with pytest.raises(MutationGateError, match="metadata names are malformed"):
+        mutation_gate_module._validate_target_support(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            metadata,
+            selected_mutants=frozenset(),
+            generated_local_functions=frozenset(),
+        )
+
+
+def test_mutation_metadata_rejects_non_string_result_names() -> None:
+    """Result-map names are checked again at the target parser trust boundary."""
+    exit_codes: dict[object, object] = {1: 1}
+    metadata = mutation_gate_module._TargetMetadata(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        exit_codes=exit_codes,
+        hashes={},
+        durations={},
+        estimates={},
+    )
+
+    with pytest.raises(MutationGateError, match="result name is malformed"):
+        _ = mutation_gate_module._parse_target_mutants(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            metadata,
+            target=_TASK_ONE_TARGETS[0],
+            policy=mutation_policy_for_targets(_TASK_ONE_TARGETS),
+            seen_mutants=set(),
+            function_counts={},
+        )
+
+
 def test_public_argument_parser_and_cli_reject_incomplete_policy(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -2011,6 +2162,7 @@ def test_run_mutation_gate_reaches_behavioral_red(tmp_path: Path) -> None:
     mutation_configuration = (output / "snapshot" / "setup.cfg").read_text()
     expected_copy_policy = """also_copy =
     contracts
+    docs
     pyproject.toml
     requirements.in
     src/nplg_mcp
@@ -2050,7 +2202,17 @@ def test_run_mutation_gate_reaches_behavioral_red(tmp_path: Path) -> None:
     assert command.argv[0] == sys.executable
     assert command.argv[1:4] == ("-I", "-B", "-c")
     assert command.argv[5] == "mutmut"
-    assert command.argv[-3:] == ("run", "--max-children", "8")
+    required_patterns = tuple(
+        f"{function}__mutmut_*"
+        for _target, functions in policy.required_functions
+        for function in functions
+    )
+    assert command.argv[-(len(required_patterns) + 3) :] == (
+        "run",
+        "--max-children",
+        "8",
+        *required_patterns,
+    )
     assert command.timeout_seconds == _MUTATION_TIMEOUT_SECONDS
     assert "PYTHONPATH" not in dict(command.environment)
     assert not (repository / "mutants").exists()

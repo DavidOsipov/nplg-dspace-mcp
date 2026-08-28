@@ -1176,6 +1176,7 @@ def _policy() -> CoveragePolicy:
             "src/nplg_mcp/sdk_boundary.py",
             "src/nplg_mcp/security.py",
             "src/nplg_mcp/tokens.py",
+            "scripts/build_asvs_matrix.py",
             "scripts/delete_render.py",
             "scripts/run_live_nplg_canary.py",
             "scripts/smoke_live.py",
@@ -1228,6 +1229,18 @@ def test_inline_resource_admission_is_registered_as_a_decision_module() -> None:
     assert branch_exits > 0
     assert policy.decision_module_branch_floor == _FULL_BRANCH_FLOOR
     assert relative in policy.decision_modules
+
+
+def test_checked_in_asvs_matrix_policy_module_matches_gate_inventory() -> None:
+    """ASVS candidate decisions stay covered by the gate's closed policy."""
+    root = Path(__file__).resolve().parents[2]
+    policy = parse_coverage_policy(
+        (root / "security" / "coverage-policy.json").read_bytes(),
+        root=root,
+    )
+
+    assert policy.decision_module_branch_floor == _FULL_BRANCH_FLOOR
+    assert "scripts/build_asvs_matrix.py" in policy.decision_modules
 
 
 def test_task_sixteen_a_decision_modules_are_registered_at_full_branch_floor() -> None:
@@ -1331,6 +1344,7 @@ def test_coverage_policy_parser_reaches_behavioral_red(tmp_path: Path) -> None:
                 b'"src/nplg_mcp/mcp_server.py",',
                 b'"src/nplg_mcp/sdk_boundary.py",',
                 b'"src/nplg_mcp/security.py","src/nplg_mcp/tokens.py",',
+                b'"scripts/build_asvs_matrix.py",',
                 b'"scripts/delete_render.py","scripts/run_live_nplg_canary.py",',
                 b'"scripts/smoke_live.py",',
                 b'"scripts/run_quality_gate.py","scripts/run_test_gate.py",',
@@ -2733,7 +2747,8 @@ def test_installed_manifest_rejects_file_record_and_inventory_faults(
 def test_installed_inventory_accepts_declared_nested_data_and_dist_packages(
     tmp_path: Path,
 ) -> None:
-    files = {"__init__.py": b"VALUE = 7\n", "data/schema.json": b"{}\n"}
+    workflow_path = "agent_skills/georgian-newspaper-visual-analysis/SKILL.md"
+    files = {"__init__.py": b"VALUE = 7\n", workflow_path: b"workflow\n"}
     source = tmp_path / "src" / "nplg_mcp"
     installed = tmp_path / "dist-packages" / "nplg_mcp"
     _write_package(source, files)
@@ -2744,15 +2759,37 @@ def test_installed_inventory_accepts_declared_nested_data_and_dist_packages(
         source_package_root=source,
         manifest_payload=_package_manifest(
             files,
-            declared_package_data=("data/schema.json",),
+            declared_package_data=(workflow_path,),
         ),
         discovered_package_roots=(installed,),
     )
 
     assert tuple(record.path for record in proof.files) == (
         "__init__.py",
-        "data/schema.json",
+        workflow_path,
     )
+
+
+def test_installed_manifest_rejects_duplicate_package_data_declaration(
+    tmp_path: Path,
+) -> None:
+    workflow_path = "agent_skills/georgian-newspaper-visual-analysis/SKILL.md"
+    files = {"__init__.py": b"VALUE = 7\n", workflow_path: b"workflow\n"}
+    source = tmp_path / "src" / "nplg_mcp"
+    installed = tmp_path / "site-packages" / "nplg_mcp"
+    _write_package(source, files)
+    _write_package(installed, files)
+
+    with pytest.raises(GateError, match="entries must be unique"):
+        _ = verify_installed_package(
+            installed_package_root=installed,
+            source_package_root=source,
+            manifest_payload=_package_manifest(
+                files,
+                declared_package_data=(workflow_path, workflow_path),
+            ),
+            discovered_package_roots=(installed,),
+        )
 
 
 @pytest.mark.parametrize(

@@ -29,6 +29,13 @@ _EXPECTED_TOOL_PROBE_COUNT = 3
 _EXPECTED_FAULT_CHECK_COUNT = 4
 _SHA256_HEX_LENGTH = 64
 _SECOND_IDENTITY_READ = 2
+_AGENT_WORKFLOW_PARTS = (
+    "agent_skills",
+    "georgian-newspaper-visual-analysis",
+    "SKILL.md",
+)
+_AGENT_WORKFLOW_POSIX = "/".join(_AGENT_WORKFLOW_PARTS)
+_AGENT_WORKFLOW_PAYLOAD = b"---\nname: georgian-newspaper-visual-analysis\n---\n"
 
 
 def test_source_snapshot_identity_ignores_atime_but_detects_mutation(
@@ -129,13 +136,25 @@ def _minimal_worktree(root: Path) -> Path:
     for name in ("LICENSE", "README.md", "THIRD_PARTY_NOTICES.md"):
         _ = (root / name).write_text(name, encoding="utf-8")
     _ = (root / "pyproject.toml").write_text(
-        "[build-system]\nrequires=[]\nbuild-backend='setuptools.build_meta'\n",
+        "\n".join(
+            (
+                "[build-system]",
+                "requires=[]",
+                "build-backend='setuptools.build_meta'",
+                "[tool.setuptools.package-data]",
+                f"nplg_mcp=['{_AGENT_WORKFLOW_POSIX}']",
+                "",
+            )
+        ),
         encoding="utf-8",
     )
     package = root / "src" / "nplg_mcp"
     package.mkdir(parents=True)
     _ = (package / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
     _ = (package / "py.typed").write_bytes(b"")
+    workflow = package.joinpath(*_AGENT_WORKFLOW_PARTS)
+    workflow.parent.mkdir(parents=True)
+    _ = workflow.write_bytes(_AGENT_WORKFLOW_PAYLOAD)
     return root
 
 
@@ -560,7 +579,7 @@ def test_subprocess_output_is_bounded(
         _ = gate._run(("fixture",), cwd=tmp_path, environment={})
 
 
-def test_source_snapshot_owns_only_python_and_exact_marker(tmp_path: Path) -> None:
+def test_source_snapshot_owns_python_marker_and_exact_workflow(tmp_path: Path) -> None:
     worktree = _minimal_worktree(tmp_path / "worktree")
     cache = worktree / "src" / "nplg_mcp" / "__pycache__"
     cache.mkdir()
@@ -569,6 +588,10 @@ def test_source_snapshot_owns_only_python_and_exact_marker(tmp_path: Path) -> No
     snapshot = gate._copy_source_snapshot(worktree, tmp_path / "snapshot")
 
     assert (snapshot / "src" / "nplg_mcp" / "py.typed").read_bytes() == b""
+    assert (
+        snapshot.joinpath("src", "nplg_mcp", *_AGENT_WORKFLOW_PARTS).read_bytes()
+        == _AGENT_WORKFLOW_PAYLOAD
+    )
     assert not (snapshot / "src" / "nplg_mcp" / "__pycache__").exists()
 
     _ = (worktree / "src" / "nplg_mcp" / "undeclared.bin").write_bytes(b"x")
@@ -579,6 +602,19 @@ def test_source_snapshot_owns_only_python_and_exact_marker(tmp_path: Path) -> No
     (worktree / "LICENSE").unlink()
     with pytest.raises(gate.Pep561GateError, match="required build input"):
         _ = gate._copy_source_snapshot(worktree, tmp_path / "missing-input")
+
+
+def test_source_snapshot_rejects_missing_or_misplaced_workflow(tmp_path: Path) -> None:
+    missing = _minimal_worktree(tmp_path / "missing-workflow")
+    missing.joinpath("src", "nplg_mcp", *_AGENT_WORKFLOW_PARTS).unlink()
+    with pytest.raises(gate.Pep561GateError, match="agent workflow"):
+        _ = gate._copy_source_snapshot(missing, tmp_path / "missing-snapshot")
+
+    misplaced = _minimal_worktree(tmp_path / "misplaced-workflow")
+    workflow = misplaced.joinpath("src", "nplg_mcp", *_AGENT_WORKFLOW_PARTS)
+    _ = workflow.rename(workflow.with_name("OTHER.md"))
+    with pytest.raises(gate.Pep561GateError, match="undeclared package data"):
+        _ = gate._copy_source_snapshot(misplaced, tmp_path / "misplaced-snapshot")
 
 
 def test_source_snapshot_rejects_symlinks_and_nonempty_marker(tmp_path: Path) -> None:
@@ -613,6 +649,10 @@ def test_source_snapshot_rejects_a_symlinked_package_ancestor(
     package = worktree / "src" / "nplg_mcp"
     (package / "__init__.py").unlink()
     (package / "py.typed").unlink()
+    workflow = package.joinpath(*_AGENT_WORKFLOW_PARTS)
+    workflow.unlink()
+    workflow.parent.rmdir()
+    workflow.parent.parent.rmdir()
     package.rmdir()
     external_package = tmp_path / "external-package"
     external_package.mkdir()
@@ -675,6 +715,41 @@ def test_archive_marker_validators_reject_misplacement(tmp_path: Path) -> None:
             archive.writestr("nplg_mcp/py.typed", b"")
     with pytest.raises(gate.Pep561GateError, match="duplicate archive"):
         gate._verify_wheel_marker(duplicate_wheel)
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected", "message"),
+    [
+        (b"", None, "empty or oversized"),
+        (b"x" * ((16 * 1024) + 1), None, "empty or oversized"),
+        (b"\xff", None, "not valid UTF-8"),
+        ("valid\u202einvalid".encode(), None, "forbidden control character"),
+        (b"valid", b"different", "does not match"),
+    ],
+)
+def test_agent_workflow_payload_validation_fails_closed(
+    payload: bytes,
+    expected: bytes | None,
+    message: str,
+) -> None:
+    with pytest.raises(gate.Pep561GateError, match=message):
+        gate._validate_agent_workflow_payload(payload, expected=expected)
+
+
+def test_archive_validators_require_the_exact_agent_workflow(tmp_path: Path) -> None:
+    sdist = tmp_path / "fixture-1.0.tar.gz"
+    with tarfile.open(sdist, mode="w:gz") as archive:
+        marker = tarfile.TarInfo("fixture-1.0/src/nplg_mcp/py.typed")
+        marker.size = 0
+        archive.addfile(marker)
+    with pytest.raises(gate.Pep561GateError, match="sdist agent workflow"):
+        gate._verify_sdist_marker(sdist)
+
+    wheel = tmp_path / "fixture-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, mode="w") as archive:
+        archive.writestr("nplg_mcp/py.typed", b"")
+    with pytest.raises(gate.Pep561GateError, match="wheel agent workflow"):
+        gate._verify_wheel_marker(wheel)
 
 
 @pytest.mark.parametrize(
@@ -748,6 +823,9 @@ def test_build_accepts_exact_bounded_artifacts(
 ) -> None:
     work = tmp_path / "work"
     work.mkdir()
+    source_workflow = tmp_path.joinpath("src", "nplg_mcp", *_AGENT_WORKFLOW_PARTS)
+    source_workflow.parent.mkdir(parents=True)
+    _ = source_workflow.write_bytes(_AGENT_WORKFLOW_PAYLOAD)
 
     def exact_build(
         command: Sequence[str],
@@ -763,9 +841,18 @@ def test_build_accepts_exact_bounded_artifacts(
             marker = tarfile.TarInfo("fixture-1.0/src/nplg_mcp/py.typed")
             marker.size = 0
             archive.addfile(marker)
+            workflow_path = f"fixture-1.0/src/nplg_mcp/{_AGENT_WORKFLOW_POSIX}"
+            workflow = tarfile.TarInfo(workflow_path)
+            workflow.size = len(_AGENT_WORKFLOW_PAYLOAD)
+            archive.addfile(workflow, io.BytesIO(_AGENT_WORKFLOW_PAYLOAD))
         wheel = distribution / "fixture-1.0-py3-none-any.whl"
         with zipfile.ZipFile(wheel, mode="w") as archive:
             archive.writestr("nplg_mcp/py.typed", b"")
+            workflow_path = f"nplg_mcp/{_AGENT_WORKFLOW_POSIX}"
+            archive.writestr(
+                workflow_path,
+                _AGENT_WORKFLOW_PAYLOAD,
+            )
         return _result(command)
 
     monkeypatch.setattr(gate, "_run", exact_build)

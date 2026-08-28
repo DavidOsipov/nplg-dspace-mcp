@@ -162,7 +162,9 @@ _TASK_EIGHTEEN_TARGETS = (
 _TASK_NINETEEN_TARGETS = ("src/nplg_mcp/profiles.py",)
 _TASK_TWENTY_ONE_A_TARGETS = ("src/nplg_mcp/capabilities.py",)
 _TASK_TWENTY_TWO_TARGETS = ("scripts/verify_release.py",)
+_TASK_ONE_TARGETS = ("scripts/build_asvs_matrix.py",)
 _TARGET_MODULES = {
+    "scripts/build_asvs_matrix.py": "scripts.build_asvs_matrix",
     "src/nplg_mcp/security.py": "nplg_mcp.security",
     "src/nplg_mcp/tokens.py": "nplg_mcp.tokens",
     "src/nplg_mcp/downloader.py": "nplg_mcp.downloader",
@@ -960,6 +962,14 @@ _TASK_TWENTY_TWO_REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
         "xǁSystemCommandRunnerǁ__call__",
     ),
 }
+_TASK_ONE_REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
+    "scripts/build_asvs_matrix.py": (
+        "x__bootstrap_profile_release",
+        "x__candidate_reference_blockers",
+        "x__candidate_profile_release",
+        "x_evaluate_profile_release",
+    ),
+}
 
 
 def _fail(message: str) -> NoReturn:
@@ -1171,7 +1181,20 @@ def _later_task_mutation_policy(targets: tuple[str, ...]) -> MutationPolicy:
     test_paths: tuple[str, ...]
     deselected_tests: tuple[str, ...]
     required_local_functions: dict[str, tuple[str, ...]] | None
-    if targets == _TASK_TWENTY_TWO_TARGETS:
+    if targets == _TASK_ONE_TARGETS:
+        test_paths = (
+            "tests/unit/test_build_asvs_matrix.py",
+            "tests/property/test_asvs_evidence.py",
+            "tests/static/test_asvs_evidence.py",
+        )
+        deselected_tests = (
+            (
+                "tests/static/test_asvs_evidence.py::"
+                "test_task2_subprocess_suppression_has_exact_closed_inventory"
+            ),
+        )
+        required_local_functions = _TASK_ONE_REQUIRED_LOCAL_FUNCTIONS
+    elif targets == _TASK_TWENTY_TWO_TARGETS:
         test_paths = ("tests/static/test_release_gate.py",)
         deselected_tests = ()
         required_local_functions = _TASK_TWENTY_TWO_REQUIRED_LOCAL_FUNCTIONS
@@ -1269,6 +1292,7 @@ def mutation_policy_for_targets(targets: tuple[str, ...]) -> MutationPolicy:
         _TASK_NINETEEN_TARGETS,
         _TASK_TWENTY_ONE_A_TARGETS,
         _TASK_TWENTY_TWO_TARGETS,
+        _TASK_ONE_TARGETS,
     }:
         return _later_task_mutation_policy(targets)
     _fail("mutation request does not match the closed initial policy")
@@ -1312,25 +1336,39 @@ def _validated_target_metadata(payload: bytes) -> _TargetMetadata:
     )
 
 
-def _validate_target_support(metadata: _TargetMetadata) -> None:
-    mutant_names = set(metadata.exit_codes)
-    unexecuted_mutants = {
+def _validate_target_support(
+    metadata: _TargetMetadata,
+    *,
+    selected_mutants: frozenset[str],
+    generated_local_functions: frozenset[str],
+) -> None:
+    duration_names_raw = set(metadata.durations)
+    estimate_names_raw = set(metadata.estimates)
+    hash_names_raw = set(metadata.hashes)
+    if any(
+        type(name) is not str
+        for name in (*duration_names_raw, *estimate_names_raw, *hash_names_raw)
+    ):
+        _fail("mutation metadata names are malformed")
+    duration_names = cast("set[str]", duration_names_raw)
+    estimate_names = cast("set[str]", estimate_names_raw)
+    hash_names = cast("set[str]", hash_names_raw)
+    unexecuted_mutants: set[str] = {
         name
         for name, status in metadata.exit_codes.items()
-        if status == _NO_TESTS_STATUS
+        if type(name) is str and name in selected_mutants and status == _NO_TESTS_STATUS
     }
-    if (
-        set(metadata.durations) != mutant_names - unexecuted_mutants
-        or set(metadata.estimates) != mutant_names
-    ):
+    if duration_names != set(
+        selected_mutants - unexecuted_mutants
+    ) or estimate_names != set(selected_mutants):
         _fail("mutation duration evidence is incomplete")
     if any(
-        type(key) is not str
-        or type(value) is not str
-        or _FUNCTION_HASH.fullmatch(value) is None
-        for key, value in metadata.hashes.items()
+        type(value) is not str or _FUNCTION_HASH.fullmatch(value) is None
+        for value in metadata.hashes.values()
     ):
         _fail("mutation function hashes are malformed")
+    if hash_names != set(generated_local_functions):
+        _fail("mutation function hash evidence is incomplete")
     for value in (*metadata.durations.values(), *metadata.estimates.values()):
         if (
             type(value) not in {int, float}
@@ -1344,16 +1382,22 @@ def _validate_target_support(metadata: _TargetMetadata) -> None:
 def _parse_target_mutants(
     metadata: _TargetMetadata,
     *,
-    target_module: str,
+    target: str,
     policy: MutationPolicy,
     seen_mutants: set[str],
     function_counts: dict[str, int],
 ) -> tuple[int, int, frozenset[str]]:
+    target_module = _TARGET_MODULES[target]
+    required_functions = frozenset(dict(policy.required_functions)[target])
     target_count = 0
     killed_count = 0
     target_functions: set[str] = set()
+    selected_mutants: set[str] = set()
+    generated_local_functions: set[str] = set()
     for name_value, exit_code in metadata.exit_codes.items():
-        name = cast("str", name_value)
+        if type(name_value) is not str:
+            _fail("mutation result name is malformed or duplicated")
+        name = name_value
         match = _MUTANT_NAME.fullmatch(name)
         if (
             match is None
@@ -1364,16 +1408,25 @@ def _parse_target_mutants(
         function = cast("str", match.group("function"))
         if not function.startswith(f"{target_module}."):
             _fail("mutation result does not belong to its declared target")
+        generated_local_functions.add(function.rpartition(".")[2])
+        seen_mutants.add(name)
+        if function not in required_functions:
+            if exit_code is not None:
+                _fail("unrequested mutation function; unexpected generated functions")
+            continue
         if type(exit_code) is not int or exit_code not in policy.accepted_exit_codes:
             _fail("mutation result has an unaccepted status")
-        seen_mutants.add(name)
+        selected_mutants.add(name)
         target_functions.add(function.removeprefix(f"{target_module}."))
         function_counts[function] = function_counts.get(function, 0) + 1
         target_count += 1
         if exit_code in policy.killed_exit_codes:
             killed_count += 1
-    if set(metadata.hashes) != target_functions:
-        _fail("mutation function hash evidence is incomplete")
+    _validate_target_support(
+        metadata,
+        selected_mutants=frozenset(selected_mutants),
+        generated_local_functions=frozenset(generated_local_functions),
+    )
     return (
         target_count,
         killed_count,
@@ -1395,15 +1448,15 @@ def parse_mutation_results(
     function_count_map: dict[str, int] = {}
     for target, payload in payloads:
         metadata = _validated_target_metadata(payload)
-        _validate_target_support(metadata)
+        target_required_functions = frozenset(required[target])
         target_count, target_killed, generated_functions = _parse_target_mutants(
             metadata,
-            target_module=_TARGET_MODULES[target],
+            target=target,
             policy=policy,
             seen_mutants=seen_mutants,
             function_counts=function_count_map,
         )
-        if generated_functions != frozenset(required[target]):
+        if generated_functions != target_required_functions:
             _fail(f"mutation target {target} has unexpected generated functions")
         total += target_count
         killed += target_killed
@@ -1485,6 +1538,7 @@ def _mutation_configuration(policy: MutationPolicy) -> bytes:
         f"{test_selection}"
         "also_copy =\n"
         "    contracts\n"
+        "    docs\n"
         "    pyproject.toml\n"
         "    requirements.in\n"
         "    src/nplg_mcp\n"
@@ -1537,11 +1591,29 @@ def _closed_environment(output: Path) -> tuple[tuple[str, str], ...]:
     )
 
 
-def _mutation_command(workspace: Path, output: Path) -> CommandRequest:
+def _required_mutant_patterns(policy: MutationPolicy) -> tuple[str, ...]:
+    """Select exactly the closed function inventory within each target module."""
+    return tuple(
+        f"{function}__mutmut_*"
+        for _target, functions in policy.required_functions
+        for function in functions
+    )
+
+
+def _mutation_command(
+    workspace: Path,
+    output: Path,
+    policy: MutationPolicy,
+) -> CommandRequest:
     return CommandRequest(
         argv=trusted_mutation_python_command(
             import_roots=(workspace / "src", workspace),
-            arguments=("run", "--max-children", "8"),
+            arguments=(
+                "run",
+                "--max-children",
+                "8",
+                *_required_mutant_patterns(policy),
+            ),
         ),
         cwd=workspace,
         environment=_closed_environment(output),
@@ -1874,7 +1946,7 @@ def _execute_external_mutation(
     ):
         _fail("external mutation policy does not match the closed configuration")
     _validate_workspace_inputs(workspace, source_snapshot)
-    command = _mutation_command(workspace, output)
+    command = _mutation_command(workspace, output, policy)
     output_identity = _bound_directory_identity(output)
     workspace_identity = _bound_directory_identity(workspace)
     output_layout = _bound_output_layout(output)

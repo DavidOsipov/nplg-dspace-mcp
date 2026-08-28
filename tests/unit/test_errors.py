@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, cast, override
 import pytest
 
 from nplg_mcp import errors as errors_module
+from nplg_mcp.agent_workflow import AGENT_WORKFLOW_URI
 from nplg_mcp.errors import (
     AppError,
     ErrorCode,
@@ -70,6 +71,13 @@ def test_resource_uri_rejects_values_outside_the_bounded_length(uri: str) -> Non
     """Empty and overlong resource URIs fail before grammar evaluation."""
     with pytest.raises(InvalidResourceUriError):
         _ = validate_resource_uri(uri)
+
+
+def test_resource_uri_accepts_only_the_exact_agent_workflow_uri() -> None:
+    assert validate_resource_uri(AGENT_WORKFLOW_URI) == AGENT_WORKFLOW_URI
+    for suffix in ("/", "?download=1", "#fragment", "\x00canary"):
+        with pytest.raises(InvalidResourceUriError):
+            _ = validate_resource_uri(f"{AGENT_WORKFLOW_URI}{suffix}")
 
 
 class _HostileMapping(Mapping[str, object]):

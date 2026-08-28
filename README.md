@@ -1,6 +1,6 @@
 # NPLG DSpace MCP
 
-Upstream-read-only Streamable HTTP MCP server for the National Parliamentary Library of Georgia's Iverieli repository (`dspace.nplg.gov.ge`). It lets an agent search the archive, read rich document metadata, list and download validated public PDF bitstreams, and inspect historical Georgian newspapers as full-page JPEGs plus overlapping crop-only tiles.
+Upstream-read-only Streamable HTTP MCP server for the National Parliamentary Library of Georgia's Iverieli repository (`dspace.nplg.gov.ge`). Its public Alpic profile searches the archive and returns metadata plus public bitstream URLs. The separate private profile can download validated PDFs and render historical Georgian newspapers as full-page JPEGs plus overlapping crop-only tiles.
 
 ## What is implemented
 
@@ -16,12 +16,22 @@ Upstream-read-only Streamable HTTP MCP server for the National Parliamentary Lib
 - JPEG pages with no post-render resize.
 - Default 2048×2048 crop-only tiles with 128-pixel overlap.
 - Shared upstream request pacing plus fail-fast MCP, asset-stream, server-wide, and PDF-job concurrency bounds.
-- Production activation fails closed until the governed Auth0/OIDC and Alpic DCR capability evidence supports an implemented verifier; static bearer/API-key fallback is forbidden.
+- The public `alpic-metadata` profile is anonymous and exposes only three metadata tools; static bearer/API-key configuration remains forbidden in production.
 - Docker Compose + Caddy deployment assets and post-deploy verification scripts.
 
-No OCR is performed. The companion skill tells agents to verify Georgian text visually and preserve page/tile provenance. No MCP tool mutates the upstream NPLG archive and render deletion remains operator-only. The three tools that populate the local download/render cache are accurately marked as cache-writing in their MCP annotations.
+The server performs no OCR. The public profile exposes the companion workflow
+as a static MCP resource; it tells resource-capable agents to retrieve an
+explicitly public PDF URL and preserve evidence while inspecting the document
+locally. MCP does not require every client to discover or execute that workflow.
+No MCP tool mutates the upstream NPLG archive and render deletion remains
+operator-only. The three private tools that populate the local download/render
+cache are accurately
+marked as cache-writing in their MCP annotations.
 
 ## MCP tools
+
+`alpic-metadata` exposes exactly the first three tools. The five PDF and render
+tools are available only in `private-full`.
 
 | Tool | Purpose |
 | --- | --- |
@@ -35,6 +45,14 @@ No OCR is performed. The companion skill tells agents to verify Georgian text vi
 | `get_render_manifest` | Refresh structured render metadata and signed links. |
 
 ## MCP resources
+
+The public `alpic-metadata` profile advertises exactly one non-templated,
+read-only `text/markdown` resource:
+
+- `nplg://skills/georgian-newspaper-visual-analysis` contains bounded
+  instructions for selecting a public bitstream and performing PDF inspection
+  in the client environment. It performs no server-side download, parsing,
+  rendering, caching, or deletion.
 
 The `private-full` profile advertises one fixed resource and two canonical
 templates:
@@ -52,7 +70,7 @@ calls put their strictly validated Pydantic result in `structuredContent`; the
 SDK `content` array is intentionally empty. Tool result `resource_uri` fields
 identify resources that may be read through the protocol after the same
 authorization and expiry checks. The `alpic-metadata` profile does not register
-resource routes or advertise local storage.
+resource templates or advertise local storage, PDF processing, or asset routes.
 
 ## Local development
 
@@ -142,25 +160,25 @@ Offline tests use pinned HTML/OAI fixtures and a synthetic PDF corpus. Live NPLG
 The phase 0–1 capability records under `contracts/` are negative evidence,
 not OAuth support: dynamic operation-scope 403, exact Alpic detector replay,
 route compatibility, provider selection, DCR issuer semantics, and the witnessed
-end-to-end flow remain explicit blockers. Production startup consumes that
-negative provider verdict before dependency construction and refuses all static
-bearer/API-key fallback.
+end-to-end flow remain deferred work. The public `alpic-metadata` profile does
+not consume that verdict; it still refuses all static bearer/API-key fallback.
 
 ## Production deployment
 
-The current candidate is `do_not_release`: production startup is intentionally blocked until the selected OAuth provider/DCR contract and verifier are implemented and evidenced. The Docker Compose + Caddy material in [`deploy/README.md`](deploy/README.md) is configuration scaffolding, not authorization to expose the service. Alpic users must read [`deploy/ALPIC.md`](deploy/ALPIC.md): even after the authentication blocker is closed, the platform's serverless runtime, 30-second tool limit, and static `/assets/` handling do not provide a full-fidelity target for the current multi-call rendering workflow.
+The current candidate remains `do_not_release` until its candidate and protected release gates are complete. The public `alpic-metadata` profile does not require OAuth, but Alpic's serverless runtime, 30-second tool limit, and static `/assets/` handling do not provide a full-fidelity target for the current multi-call rendering workflow. See [`deploy/ALPIC.md`](deploy/ALPIC.md) for the restricted metadata deployment.
 
-The minimum Docker/VPS operational sequence is:
+The checked-in Docker Compose path selects `private-full`; it is not a
+Docker/VPS substitute for the anonymous metadata deployment and correctly
+fails closed with the metadata profile's anonymous settings. Follow
+[`deploy/ALPIC.md`](deploy/ALPIC.md) for the restricted `alpic-metadata`
+deployment. A future authenticated full-profile deployment requires its own
+approved runtime and release contract.
+
+When reviewing that deferred Compose configuration, validate it without
+printing the rendered environment, which can contain secrets:
 
 ```bash
-cp .env.example .env
-# replace domain and both secrets
 docker compose --env-file .env config --quiet
-docker compose build --pull
-docker compose up -d
-set -a; . ./.env; set +a
-python scripts/verify_deploy.py --base-url https://mcp.example.com
-python scripts/smoke_live.py --base-url https://mcp.example.com --query 'ივერია'
 ```
 
 ## Design, review, and agent workflow

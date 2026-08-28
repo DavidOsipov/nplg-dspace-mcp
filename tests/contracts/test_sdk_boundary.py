@@ -17,10 +17,19 @@ from mcp.shared.exceptions import MCPError
 from pydantic import ValidationError
 
 from nplg_mcp import sdk_boundary
+from nplg_mcp.agent_workflow import (
+    AGENT_WORKFLOW_MARKDOWN,
+    AGENT_WORKFLOW_MIME_TYPE,
+    AGENT_WORKFLOW_URI,
+)
 from nplg_mcp.config import HARD_MAX_INLINE_RESOURCE_BYTES
 from nplg_mcp.errors import AppError, ErrorCode
 from nplg_mcp.mcp_server import create_mcp_server
 from nplg_mcp.profiles import DeploymentProfile
+from nplg_mcp.resource_admission import (
+    InlineResourceAdmission,
+    inline_text_response_reservation_bytes,
+)
 from nplg_mcp.sdk_boundary import SdkHandlers
 from nplg_mcp.services import FullServiceComposition, MetadataServiceComposition
 
@@ -44,6 +53,11 @@ def _call_log() -> list[tuple[str, JsonObject]]:
     return []
 
 
+def _resource_read_log() -> list[str]:
+    """Create one precisely typed empty resource-read log."""
+    return []
+
+
 def _resource_payload() -> dict[str, str]:
     """Create one precisely typed empty resource payload."""
     return {}
@@ -55,6 +69,7 @@ class RecordingTools:
 
     delegate: ToolSurface
     calls: list[tuple[str, JsonObject]] = field(default_factory=_call_log)
+    resource_reads: list[str] = field(default_factory=_resource_read_log)
 
     def list_tools(self) -> list[JsonObject]:
         """Return the delegate catalog unchanged."""
@@ -71,6 +86,7 @@ class RecordingTools:
 
     async def read_resource(self, uri: str) -> dict[str, str]:
         """Return the delegate resource unchanged."""
+        self.resource_reads.append(uri)
         return await self.delegate.read_resource(uri)
 
 
@@ -120,7 +136,7 @@ class ResourcePayloadTools(RecordingTools):
     @override
     async def read_resource(self, uri: str) -> dict[str, str]:
         """Return an owned copy so adaptation cannot mutate the fixture."""
-        _ = uri
+        self.resource_reads.append(uri)
         return dict(self.resource)
 
 
@@ -854,6 +870,80 @@ async def test_private_full_server_registers_resource_handlers(
 
 
 @pytest.mark.asyncio
+async def test_metadata_boundary_serves_static_workflow_without_service_entry(
+    tool_service: ToolService,
+) -> None:
+    """The metadata resource is immutable and independent of private services."""
+    tools = ResourcePayloadTools(
+        tool_service,
+        resource={"uri": AGENT_WORKFLOW_URI, "mime_type": "text/plain", "text": "bad"},
+    )
+    handlers = SdkHandlers(MetadataServiceComposition(tools=tools))
+
+    listed = await handlers.on_list_resources(_context(), None)
+    read = await handlers.on_read_resource(
+        _context(),
+        types.ReadResourceRequestParams(uri=AGENT_WORKFLOW_URI),
+    )
+
+    assert [resource.uri for resource in listed.resources] == [AGENT_WORKFLOW_URI]
+    assert len(read.contents) == 1
+    content = read.contents[0]
+    assert isinstance(content, types.TextResourceContents)
+    assert content.uri == AGENT_WORKFLOW_URI
+    assert content.mime_type == AGENT_WORKFLOW_MIME_TYPE
+    assert content.text == AGENT_WORKFLOW_MARKDOWN
+    assert tools.resource_reads == []
+
+
+@pytest.mark.asyncio
+async def test_metadata_workflow_reserves_only_its_fixed_response_bound(
+    tool_service: ToolService,
+) -> None:
+    """A small immutable workflow must not consume the 4 MiB blob headroom."""
+    required_bytes = inline_text_response_reservation_bytes(
+        len(AGENT_WORKFLOW_MARKDOWN.encode("utf-8"))
+    )
+    admission = InlineResourceAdmission(capacity_bytes=required_bytes)
+    handlers = SdkHandlers(
+        MetadataServiceComposition(tools=tool_service),
+        resource_admission=admission,
+    )
+
+    result = await handlers.on_read_resource(
+        _context(),
+        types.ReadResourceRequestParams(uri=AGENT_WORKFLOW_URI),
+    )
+
+    assert len(result.contents) == 1
+    assert admission.active_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_metadata_workflow_fails_closed_below_its_response_bound(
+    tool_service: ToolService,
+) -> None:
+    required_bytes = inline_text_response_reservation_bytes(
+        len(AGENT_WORKFLOW_MARKDOWN.encode("utf-8"))
+    )
+    admission = InlineResourceAdmission(capacity_bytes=required_bytes - 1)
+    handlers = SdkHandlers(
+        MetadataServiceComposition(tools=tool_service),
+        resource_admission=admission,
+    )
+
+    with pytest.raises(MCPError) as captured:
+        _ = await handlers.on_read_resource(
+            _context(),
+            types.ReadResourceRequestParams(uri=AGENT_WORKFLOW_URI),
+        )
+
+    assert captured.value.error.code == INTERNAL_ERROR
+    assert captured.value.error.message == "Internal server error"
+    assert admission.active_bytes == 0
+
+
+@pytest.mark.asyncio
 async def test_metadata_boundary_rejects_resource_reads_before_service_entry(
     tool_service: ToolService,
 ) -> None:
@@ -868,6 +958,7 @@ async def test_metadata_boundary_rejects_resource_reads_before_service_entry(
 
     assert captured.value.error.code == INVALID_PARAMS
     assert captured.value.error.message == "Resource not found"
+    assert tools.resource_reads == []
 
 
 def test_runtime_manifests_pin_the_official_sdk_transport_stack() -> None:

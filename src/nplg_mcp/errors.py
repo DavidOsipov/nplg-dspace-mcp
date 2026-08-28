@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, cast
 
+from .agent_workflow import AGENT_WORKFLOW_URI
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -73,7 +75,7 @@ def validate_resource_uri(uri: str) -> str:
     if any(unicodedata.category(character) in {"Cc", "Cf"} for character in uri):
         raise InvalidResourceUriError
     if (
-        uri == "nplg://about"
+        uri in {"nplg://about", AGENT_WORKFLOW_URI}
         or _CANONICAL_ARTIFACT_URI.fullmatch(uri) is not None
         or _CANONICAL_RENDER_MANIFEST_URI.fullmatch(uri) is not None
     ):

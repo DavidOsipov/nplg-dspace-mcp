@@ -11,7 +11,7 @@
     "contracts:lint": "eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs contracts/zod/models.ts contracts/zod/contract.test.ts tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs",
     "contracts:typecheck": "tsc --project tsconfig.contracts.json",
     "contracts:test": "node --test contracts/zod/contract.test.ts && npm run contracts:zod:all",
-    "docs:lint": "markdownlint-cli2 \"*.md\" \"docs/**/*.md\" \"deploy/**/*.md\" \"skills/**/*.md\"",
+    "docs:lint": "markdownlint-cli2 \"*.md\" \"docs/**/*.md\" \"deploy/**/*.md\" \"skills/**/*.md\" \"src/nplg_mcp/agent_skills/georgian-newspaper-visual-analysis/SKILL.md\"",
     "contracts:zod": "node --test tests/contracts/zod_contracts.test.mjs",
     "contracts:baseline-zod": "node --test tests/contracts/zod_baseline_contracts.test.mjs",
     "contracts:asvs-zod": "node --test tests/contracts/zod_asvs_evidence_contracts.test.mjs",

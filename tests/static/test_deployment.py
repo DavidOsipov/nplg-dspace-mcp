@@ -122,7 +122,7 @@ def test_environment_example_matches_strict_runtime_configuration() -> None:
         "NPLG_BASE_URL=https://dspace.nplg.gov.ge/",
         "HOST=0.0.0.0",
         "PORT=8000",
-        "ALLOW_ANONYMOUS=false",
+        "ALLOW_ANONYMOUS=true",
         "DEPLOYMENT_PROFILE=alpic-metadata",
         "CURSOR_SIGNING_SECRET=replace-with-at-least-32-random-characters",
         "UPSTREAM_RATE_PER_SECOND=1.0",
@@ -579,7 +579,7 @@ def test_operator_render_cleanup_requires_the_app_to_be_stopped() -> None:
 
 def test_public_tool_verifier_expects_a_read_only_catalog() -> None:
     text = (ROOT / "scripts" / "verify_deploy.py").read_text(encoding="utf-8")
-    assert '"delete_render"' not in text
+    assert "delete_render" not in ALPIC_METADATA_TOOLS
     assert "EXPECTED_TOOLS" in text
 
 
@@ -805,6 +805,7 @@ def test_alpic_declares_python_runtime_and_explicit_uv_commands() -> None:
     data = _read_json_object(ROOT / "alpic.json")
     assert data == {
         "$schema": "https://assets.alpic.ai/alpic.json",
+        "transportType": "streamablehttp",
         "installCommand": EXPECTED_ALPIC_INSTALL_COMMAND,
         "buildCommand": ".venv/bin/python -m compileall -q src scripts",
         "startCommand": "HOST=0.0.0.0 PYTHONPATH=src .venv/bin/python -m nplg_mcp",
@@ -820,17 +821,16 @@ def test_alpic_operator_guide_states_platform_limits_without_overclaiming() -> N
         "dynamic `/assets/`",
         "serverless",
         "not a supported full-fidelity deployment target",
-        "allow_anonymous=false",
-        "do not deploy",
-        "production oauth provider capability is unsupported",
-        "do_not_release",
+        "public, unauthenticated streamable http metadata mcp",
+        "allow_anonymous=true",
+        "oauth/auth0/dcr remains deferred work",
     ):
         assert phrase in guide
     for forbidden in ("api_principals_json=[", "read -rsp", "export api_key"):
         assert forbidden not in guide
 
 
-def test_alpic_documented_environment_parses_then_fails_oauth_activation() -> None:
+def test_alpic_documented_environment_starts_anonymous_metadata_profile() -> None:
     guide = (ROOT / "deploy" / "ALPIC.md").read_text(encoding="utf-8")
     match = re.search(
         r"Add these environment variables:\n\n```text\n(?P<block>.*?)\n```",
@@ -860,8 +860,11 @@ def test_alpic_documented_environment_parses_then_fails_oauth_activation() -> No
     assert config.cursor_signing_secret == b"c" * 32
     assert config.asset_signing_secret is None
     assert config.api_principals == ()
-    with pytest.raises(ValueError, match="OAuth provider capability is unsupported"):
-        _ = create_app(config)
+    assert config.allow_anonymous is True
+
+    application = create_app(config)
+
+    assert application.title == "NPLG DSpace MCP"
 
 
 def test_readme_routes_alpic_users_to_the_limited_profile() -> None:
@@ -870,7 +873,7 @@ def test_readme_routes_alpic_users_to_the_limited_profile() -> None:
     assert "Alpic" in readme
 
 
-def test_readme_describes_the_canonical_private_resource_protocol() -> None:
+def test_readme_describes_the_canonical_resource_protocols() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     heading, separator, remainder = readme.partition("## MCP resources\n")
     _ = heading
@@ -890,6 +893,10 @@ def test_readme_describes_the_canonical_private_resource_protocol() -> None:
         "`structuredContent`",
         "`content`",
         "`private-full`",
+        "`alpic-metadata`",
+        "`nplg://skills/georgian-newspaper-visual-analysis`",
+        "`text/markdown`",
+        "client environment",
     ):
         assert claim in section
     assert "resource_link" not in readme.lower()

@@ -53,6 +53,26 @@ def _local_reference_data() -> dict[str, object]:
     }
 
 
+CANDIDATE_CLAIM_PURPOSE_STRATEGY: SearchStrategy[str] = st.sampled_from(
+    ("implementation-proof", "absence-proof")
+)
+_GIVEN_CANDIDATE_CLAIM_PURPOSE = cast(
+    "Callable[[Callable[[str], None]], Callable[[], None]]",
+    given(purpose=CANDIDATE_CLAIM_PURPOSE_STRATEGY),
+)
+
+
+@_GIVEN_CANDIDATE_CLAIM_PURPOSE
+def test_candidate_claim_purpose_is_explicit_and_strict(purpose: str) -> None:
+    """Mutation caught: candidate evidence silently defaults its claim purpose."""
+    candidate = _local_reference_data() | {"claim_purpose": purpose}
+    assert LocalEvidenceReference.model_validate(candidate).claim_purpose == purpose
+    assert (
+        LocalEvidenceReference.model_validate(_local_reference_data()).claim_purpose
+        is None
+    )
+
+
 def _custodied_reference_data() -> dict[str, object]:
     local = _local_reference_data()
     _ = local.pop("artifact_path")

@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import math
 import os
 import sys
+import unicodedata
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -42,6 +44,52 @@ PRIVATE_FULL_TOOLS: frozenset[str] = frozenset(
     }
 )
 EXPECTED_TOOLS: frozenset[str] = ALPIC_METADATA_TOOLS
+AGENT_WORKFLOW_URI = "nplg://skills/georgian-newspaper-visual-analysis"
+AGENT_WORKFLOW_NAME = "Georgian newspaper visual analysis"
+AGENT_WORKFLOW_MIME_TYPE = "text/markdown"
+AGENT_WORKFLOW_TITLE = "Client-side Georgian newspaper visual analysis"
+AGENT_WORKFLOW_DESCRIPTION = (
+    "Bounded instructions for retrieving one public NPLG PDF and inspecting it "
+    "in the client environment."
+)
+AGENT_WORKFLOW_SHA256 = (
+    "dbd7f1df2f41e424e8bda6e55ea54bb65033beefc6bc7fecb7032a6519edb3d6"
+)
+METADATA_DISCOVERY_INSTRUCTIONS = (
+    "This anonymous server exposes three read-only NPLG metadata tools. "
+    f"Resource-capable clients should list and read {AGENT_WORKFLOW_URI} before "
+    "retrieving a public PDF URL; all PDF processing remains client-side."
+)
+METHOD_NOT_FOUND = -32601
+SERVER_NAME = "nplg-dspace-mcp"
+SERVER_TITLE = "NPLG DSpace MCP"
+SERVER_VERSION = "0.1.0"
+MAX_AGENT_WORKFLOW_BYTES = 16 * 1024
+_AGENT_WORKFLOW_REQUIRED_MARKERS: tuple[str, ...] = (
+    "name: georgian-newspaper-visual-analysis",
+    "`search_documents`",
+    "`get_document_metadata`",
+    "`list_document_files`",
+    "`access_status`",
+    "exactly `public`",
+    "exact returned `source_url`",
+    "bounded",
+    "client-controlled local",
+    "local SHA-256",
+    "untrusted data",
+    "prompt injection",
+    "OCR is not authoritative",
+    "stop at metadata",
+)
+_AGENT_WORKFLOW_FORBIDDEN_OPERATIONS: tuple[str, ...] = (
+    "download_document_file",
+    "inspect_pdf",
+    "render_pdf_pages",
+    "render_pdf_page_tiles",
+    "get_render_manifest",
+    "delete_render",
+)
+_ALLOWED_WORKFLOW_CONTROLS = frozenset({"\t", "\n", "\r"})
 CACHE_WRITING_TOOLS: frozenset[str] = frozenset(
     {
         "download_document_file",
@@ -59,6 +107,25 @@ type JsonPrimitive = bool | int | float | str | None
 type JsonValue = JsonPrimitive | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
 type DeploymentProfile = Literal["alpic-metadata", "private-full"]
+
+_EXPECTED_METADATA_CAPABILITIES: JsonObject = {
+    "resources": {"listChanged": False, "subscribe": False},
+    "tools": {"listChanged": False},
+}
+_EXPECTED_AGENT_WORKFLOW_DESCRIPTOR: JsonObject = {
+    "uri": AGENT_WORKFLOW_URI,
+    "name": AGENT_WORKFLOW_NAME,
+    "title": AGENT_WORKFLOW_TITLE,
+    "description": AGENT_WORKFLOW_DESCRIPTION,
+    "mimeType": AGENT_WORKFLOW_MIME_TYPE,
+}
+_EXPECTED_SERVER_META: JsonObject = {
+    "io.modelcontextprotocol/serverInfo": {
+        "name": SERVER_NAME,
+        "title": SERVER_TITLE,
+        "version": SERVER_VERSION,
+    }
+}
 
 DEPLOYMENT_PROFILES: tuple[DeploymentProfile, ...] = (
     "alpic-metadata",
@@ -267,14 +334,15 @@ class McpClient:
             raise VerificationError(msg)
         return _require_object(payload, context=f"GET {path}")
 
-    def rpc(
+    def _rpc_response(
         self,
         method: str,
         params: JsonObject | None = None,
         *,
+        allowed_statuses: tuple[HTTPStatus, ...],
         name: str | None = None,
-    ) -> tuple[JsonObject, dict[str, str]]:
-        """Call one modern MCP JSON-RPC method."""
+    ) -> tuple[int, JsonObject, dict[str, str]]:
+        """Call one bounded modern MCP method and validate its envelope."""
         self._request_id += 1
         values: JsonObject = dict(params or {})
         values["_meta"] = {
@@ -310,13 +378,29 @@ class McpClient:
             body=_dump_json(envelope).encode("utf-8"),
             headers=headers,
         )
-        if status != HTTPStatus.OK:
+        if status not in allowed_statuses:
             msg = f"{method} returned HTTP {status}"
             raise VerificationError(msg)
         response = _require_object(payload, context=method)
         if response.get("jsonrpc") != "2.0" or response.get("id") != self._request_id:
             msg = f"{method} returned an invalid JSON-RPC envelope"
             raise VerificationError(msg)
+        return status, response, response_headers
+
+    def rpc(
+        self,
+        method: str,
+        params: JsonObject | None = None,
+        *,
+        name: str | None = None,
+    ) -> tuple[JsonObject, dict[str, str]]:
+        """Call one modern MCP JSON-RPC method."""
+        _, response, response_headers = self._rpc_response(
+            method,
+            params,
+            allowed_statuses=(HTTPStatus.OK,),
+            name=name,
+        )
         if "error" in response:
             msg = f"{method} returned a JSON-RPC error"
             raise VerificationError(msg)
@@ -325,6 +409,35 @@ class McpClient:
             msg = f"{method} omitted the modern MCP result shape"
             raise VerificationError(msg)
         return result, response_headers
+
+    def rpc_error_code(
+        self,
+        method: str,
+        params: JsonObject | None = None,
+        *,
+        name: str | None = None,
+    ) -> tuple[int, dict[str, str]]:
+        """Call one method expected to return a bounded JSON-RPC error."""
+        _, response, response_headers = self._rpc_response(
+            method,
+            params,
+            allowed_statuses=(HTTPStatus.OK, HTTPStatus.NOT_FOUND),
+            name=name,
+        )
+        error = response.get("error")
+        if set(response) != {"jsonrpc", "id", "error"} or not isinstance(error, dict):
+            msg = f"{method} omitted the expected JSON-RPC error"
+            raise VerificationError(msg)
+        code = error.get("code")
+        message = error.get("message")
+        if (
+            not {"code", "message"} <= set(error) <= {"code", "message", "data"}
+            or type(code) is not int
+            or not isinstance(message, str)
+        ):
+            msg = f"{method} returned an invalid JSON-RPC error"
+            raise VerificationError(msg)
+        return code, response_headers
 
     def call_tool(self, name: str, arguments: JsonObject) -> JsonObject:
         """Call one MCP tool and return its structured content."""
@@ -356,6 +469,16 @@ class DeploymentClient(Protocol):
         name: str | None = None,
     ) -> tuple[JsonObject, dict[str, str]]:
         """Call one deployment JSON-RPC method."""
+        ...
+
+    def rpc_error_code(
+        self,
+        method: str,
+        params: JsonObject | None = None,
+        *,
+        name: str | None = None,
+    ) -> tuple[int, dict[str, str]]:
+        """Call one method that must return a JSON-RPC error code."""
         ...
 
 
@@ -441,38 +564,133 @@ def _require_nonempty_list(value: JsonValue | None, *, context: str) -> None:
         raise VerificationError(msg)
 
 
-def verify(
+def _verify_metadata_workflow_text(text: str) -> None:
+    """Bind one strict UTF-8 instruction payload to the reviewed digest."""
+    try:
+        encoded = text.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        message = "Metadata workflow resource text is invalid"
+        raise VerificationError(message) from exc
+    if not 0 < len(encoded) <= MAX_AGENT_WORKFLOW_BYTES or any(
+        unicodedata.category(character) in {"Cc", "Cf"}
+        and character not in _ALLOWED_WORKFLOW_CONTROLS
+        for character in text
+    ):
+        message = "Metadata workflow resource text is invalid"
+        raise VerificationError(message)
+    if any(marker not in text for marker in _AGENT_WORKFLOW_REQUIRED_MARKERS):
+        message = "Metadata workflow resource is missing required safety guidance"
+        raise VerificationError(message)
+    if any(operation in text for operation in _AGENT_WORKFLOW_FORBIDDEN_OPERATIONS):
+        message = "Metadata workflow resource advertises server-side PDF operations"
+        raise VerificationError(message)
+    if hashlib.sha256(encoded).hexdigest() != AGENT_WORKFLOW_SHA256:
+        message = "Metadata workflow resource digest is invalid"
+        raise VerificationError(message)
+
+
+def _verify_metadata_discovery(discover: JsonObject) -> None:
+    """Require only the reviewed tool/resource capability advertisement."""
+    expected: JsonObject = {
+        "cacheScope": "private",
+        "capabilities": _EXPECTED_METADATA_CAPABILITIES,
+        "instructions": METADATA_DISCOVERY_INSTRUCTIONS,
+        "resultType": "complete",
+        "supportedVersions": [PROTOCOL],
+        "ttlMs": 0,
+        "_meta": _EXPECTED_SERVER_META,
+    }
+    if _dump_json(discover) != _dump_json(expected):
+        message = "Metadata workflow resource discovery is invalid"
+        raise VerificationError(message)
+
+
+def _verify_metadata_resource_catalog(resources: JsonObject) -> None:
+    """Require one exact agent-visible descriptor and result envelope."""
+    expected: JsonObject = {
+        "resources": [_EXPECTED_AGENT_WORKFLOW_DESCRIPTOR],
+        "ttlMs": 0,
+        "cacheScope": "private",
+        "resultType": "complete",
+        "_meta": _EXPECTED_SERVER_META,
+    }
+    if _dump_json(resources) != _dump_json(expected):
+        message = "Metadata workflow resource catalog is invalid"
+        raise VerificationError(message)
+
+
+def _verify_metadata_resource_read(read_result: JsonObject) -> None:
+    """Require one exact text content envelope, then verify its reviewed bytes."""
+    contents = read_result.get("contents")
+    if (
+        not isinstance(contents, list)
+        or len(contents) != 1
+        or not isinstance(contents[0], dict)
+    ):
+        message = "Metadata workflow resource content is invalid"
+        raise VerificationError(message)
+    content = contents[0]
+    text = content.get("text")
+    if not isinstance(text, str):
+        message = "Metadata workflow resource content is invalid"
+        raise VerificationError(message)
+    expected: JsonObject = {
+        "contents": [
+            {
+                "uri": AGENT_WORKFLOW_URI,
+                "mimeType": AGENT_WORKFLOW_MIME_TYPE,
+                "text": text,
+            }
+        ],
+        "ttlMs": 0,
+        "cacheScope": "private",
+        "resultType": "complete",
+        "_meta": _EXPECTED_SERVER_META,
+    }
+    if _dump_json(read_result) != _dump_json(expected):
+        message = "Metadata workflow resource content is invalid"
+        raise VerificationError(message)
+    _verify_metadata_workflow_text(text)
+
+
+def _verify_metadata_workflow_resource(
+    discover: JsonObject,
+    resources: JsonObject,
+    read_result: JsonObject,
+) -> None:
+    """Verify one bounded client workflow without importing project code."""
+    _verify_metadata_discovery(discover)
+    _verify_metadata_resource_catalog(resources)
+    _verify_metadata_resource_read(read_result)
+
+
+def _verify_metadata_resource_surface(
     client: DeploymentClient,
-    *,
-    profile: DeploymentProfile = "alpic-metadata",
-) -> JsonObject:
-    """Verify the sessionless MCP contract for one explicit profile."""
-    expected_tools = EXPECTED_TOOLS_BY_PROFILE.get(profile)
-    if expected_tools is None:
-        msg = "Deployment profile is unsupported"
-        raise VerificationError(msg)
-    discover, discover_headers = client.rpc("server/discover")
-    listed, list_headers = client.rpc("tools/list")
-    resources, _ = client.rpc("resources/list")
-    about, _ = client.rpc(
+    discover: JsonObject,
+) -> tuple[dict[str, str], ...]:
+    """Probe the exact static resource surface and absent template method."""
+    resources, resources_headers = client.rpc("resources/list")
+    workflow, workflow_headers = client.rpc(
+        "resources/read",
+        {"uri": AGENT_WORKFLOW_URI},
+        name=AGENT_WORKFLOW_URI,
+    )
+    template_error, template_headers = client.rpc_error_code("resources/templates/list")
+    _verify_metadata_workflow_resource(discover, resources, workflow)
+    if template_error != METHOD_NOT_FOUND:
+        message = "Metadata resource templates are unexpectedly available"
+        raise VerificationError(message)
+    return resources_headers, workflow_headers, template_headers
+
+
+def _verify_private_resource_surface(
+    client: DeploymentClient,
+) -> tuple[dict[str, str], ...]:
+    """Retain the private profile's existing about-resource smoke check."""
+    resources, resources_headers = client.rpc("resources/list")
+    about, about_headers = client.rpc(
         "resources/read", {"uri": "nplg://about"}, name="nplg://about"
     )
-
-    versions = discover.get("supportedVersions")
-    if not isinstance(versions, list) or PROTOCOL not in versions:
-        msg = "server/discover did not advertise the requested protocol"
-        raise VerificationError(msg)
-    catalog = _tool_catalog(listed)
-    if frozenset(catalog) != expected_tools:
-        msg = "Tool catalog mismatch"
-        raise VerificationError(msg)
-    _verify_annotations(catalog)
-    if discover.get("cacheScope") != "private" or listed.get("cacheScope") != "private":
-        msg = "Modern list/discovery results must declare private cache scope"
-        raise VerificationError(msg)
-    if "mcp-session-id" in discover_headers or "mcp-session-id" in list_headers:
-        msg = "The stateless endpoint unexpectedly created a session"
-        raise VerificationError(msg)
     resource_items = resources.get("resources")
     _require_nonempty_list(resource_items, context="resources/list")
     if not isinstance(resource_items, list) or not any(
@@ -489,6 +707,47 @@ def verify(
         or contents[0].get("uri") != "nplg://about"
     ):
         msg = "nplg://about could not be read"
+        raise VerificationError(msg)
+    return resources_headers, about_headers
+
+
+def verify(
+    client: DeploymentClient,
+    *,
+    profile: DeploymentProfile = "alpic-metadata",
+) -> JsonObject:
+    """Verify the sessionless MCP contract for one explicit profile."""
+    expected_tools = EXPECTED_TOOLS_BY_PROFILE.get(profile)
+    if expected_tools is None:
+        msg = "Deployment profile is unsupported"
+        raise VerificationError(msg)
+    discover, discover_headers = client.rpc("server/discover")
+    listed, list_headers = client.rpc("tools/list")
+
+    versions = discover.get("supportedVersions")
+    if not isinstance(versions, list) or PROTOCOL not in versions:
+        msg = "server/discover did not advertise the requested protocol"
+        raise VerificationError(msg)
+    catalog = _tool_catalog(listed)
+    if frozenset(catalog) != expected_tools:
+        msg = "Tool catalog mismatch"
+        raise VerificationError(msg)
+    _verify_annotations(catalog)
+    if discover.get("cacheScope") != "private" or listed.get("cacheScope") != "private":
+        msg = "Modern list/discovery results must declare private cache scope"
+        raise VerificationError(msg)
+    if "mcp-session-id" in discover_headers or "mcp-session-id" in list_headers:
+        msg = "The stateless endpoint unexpectedly created a session"
+        raise VerificationError(msg)
+    if profile == "alpic-metadata":
+        resource_headers = _verify_metadata_resource_surface(
+            client,
+            discover,
+        )
+    else:
+        resource_headers = _verify_private_resource_surface(client)
+    if any("mcp-session-id" in headers for headers in resource_headers):
+        msg = "The stateless endpoint unexpectedly created a session"
         raise VerificationError(msg)
     return {
         "status": "pass",

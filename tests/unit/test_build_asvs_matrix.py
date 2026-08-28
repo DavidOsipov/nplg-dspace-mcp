@@ -6,11 +6,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import runpy
+import select
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal, Self, cast
 
 import pytest
@@ -23,6 +26,7 @@ from scripts.build_asvs_matrix import (
     AbuseCategory,
     ApplicableEvidenceRow,
     AsvsError,
+    AsvsRequirement,
     BoundedGitRunner,
     ClaimPolicyRecord,
     CustodiedEvidenceReference,
@@ -71,9 +75,19 @@ from scripts.build_asvs_matrix import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from typing import Protocol
+
+    class _UncheckedReleaseEvaluator(Protocol):
+        def __call__(self, **options: object) -> ReleaseDecision:
+            """Call the runtime boundary with deliberately malformed options."""
+            ...
+
 
 L2_LEVEL = 2
 MATRIX_RECORDS = 759
+CANDIDATE_RECORDS = 253
+CANDIDATE_AS_OF = datetime(2026, 8, 23, tzinfo=UTC)
+CANDIDATE_REVIEW_DUE = date(2026, 12, 31)
 GIT_TIMEOUT_SECONDS = 30
 GIT_OUTPUT_BYTES = 4_096
 OVERFLOW_OUTPUT_BYTES = 32
@@ -84,6 +98,8 @@ DIRECTORY_FSYNC_CALL = 4
 FIRST_TEMPORARY_FINAL_STAT_CALL = 3
 INVALID_CLI_USAGE = 2
 RECEIPT_EXPIRY = datetime(2026, 12, 31, tzinfo=UTC)
+CANDIDATE_REVISION = "a" * 40
+CANDIDATE_TREE_SHA256 = "b" * 64
 PROFILE_ORDER: dict[Profile, int] = {
     "alpic-metadata": 0,
     "private-full": 1,
@@ -240,6 +256,7 @@ def _evidence_policy() -> EvidencePolicy:
         asvs_source_commit=ASVS_COMMIT,
         evidence_revision="da5cc20e4f8bf3e1cacf74c49d5391487cb11cb0",
         candidate_tree_sha256="1" * 64,
+        attestation_allowlist=asvs_matrix.ATTESTATION_ALLOWLIST,
         profiles=PROFILES,
         claims=_claim_policy_records(),
         custody_authority_ids=(),
@@ -669,6 +686,7 @@ def test_policy_requires_exact_sorted_requirement_profile_product() -> None:
             asvs_source_commit=policy.asvs_source_commit,
             evidence_revision=policy.evidence_revision,
             candidate_tree_sha256=policy.candidate_tree_sha256,
+            attestation_allowlist=policy.attestation_allowlist,
             profiles=policy.profiles,
             claims=(*policy.claims[:-1], policy.claims[0]),
             custody_authority_ids=policy.custody_authority_ids,
@@ -686,11 +704,33 @@ def test_policy_authority_identifiers_must_be_canonically_sorted() -> None:
             asvs_source_commit=policy.asvs_source_commit,
             evidence_revision=policy.evidence_revision,
             candidate_tree_sha256=policy.candidate_tree_sha256,
+            attestation_allowlist=policy.attestation_allowlist,
             profiles=policy.profiles,
             claims=policy.claims,
             custody_authority_ids=("z-authority", "a-authority"),
             release_authority_ids=(),
         )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["missing", "reordered", "substituted", "extra"],
+)
+def test_policy_requires_the_explicit_exact_attestation_allowlist(fault: str) -> None:
+    """The protected path set is required input, not a Pydantic default."""
+    candidate: dict[str, object] = _evidence_policy().model_dump()
+    allowlist = asvs_matrix.ATTESTATION_ALLOWLIST
+    if fault == "missing":
+        _ = candidate.pop("attestation_allowlist")
+    elif fault == "reordered":
+        candidate["attestation_allowlist"] = tuple(reversed(allowlist))
+    elif fault == "substituted":
+        candidate["attestation_allowlist"] = (allowlist[0], "docs/security/other.json")
+    else:
+        candidate["attestation_allowlist"] = (*allowlist, "docs/security/extra.json")
+
+    with pytest.raises(ValidationError):
+        _ = EvidencePolicy.model_validate(candidate, strict=True)
 
 
 def test_policy_lookup_returns_exact_claim() -> None:
@@ -803,7 +843,7 @@ def test_no_release_authority_keeps_risk_acceptance_ineligible() -> None:
     )
 
 
-def test_risk_acceptance_can_only_produce_do_not_release() -> None:
+def test_bootstrap_rejects_a_risk_accepted_nonhistorical_product() -> None:
     row = ApplicableEvidenceRow.model_validate(
         _applicable_row()
         | {
@@ -830,7 +870,7 @@ def test_risk_acceptance_can_only_produce_do_not_release() -> None:
         profile="alpic-metadata",
         decision="do_not_release",
         eligible=False,
-        reason_codes=("risk-accepted",),
+        reason_codes=("bootstrap-product-mismatch",),
     )
 
 
@@ -1286,6 +1326,7 @@ def test_external_authority_can_verify_but_not_release_risk_acceptance() -> None
         asvs_source_commit=base_policy.asvs_source_commit,
         evidence_revision=base_policy.evidence_revision,
         candidate_tree_sha256=base_policy.candidate_tree_sha256,
+        attestation_allowlist=base_policy.attestation_allowlist,
         profiles=base_policy.profiles,
         claims=claims,
         custody_authority_ids=("ci.example",),
@@ -1302,16 +1343,13 @@ def test_external_authority_can_verify_but_not_release_risk_acceptance() -> None
     )
 
     assert verify_release_approval(row, reference, policy=policy, context=context)
-    assert (
-        evaluate_profile_release(
-            "alpic-metadata",
-            (row,),
-            (reference,),
-            policy=policy,
-            context=context,
-        ).decision
-        == "do_not_release"
-    )
+    assert evaluate_profile_release(
+        "alpic-metadata",
+        (row,),
+        (reference,),
+        policy=policy,
+        context=context,
+    ).reason_codes == ("bootstrap-product-mismatch",)
 
 
 def test_fetch_accepts_only_complete_exact_immutable_response(tmp_path: Path) -> None:
@@ -2496,6 +2534,7 @@ def test_evidence_policy_rejects_profile_order_claim_order_and_authority() -> No
             asvs_source_commit=policy.asvs_source_commit,
             evidence_revision=policy.evidence_revision,
             candidate_tree_sha256=policy.candidate_tree_sha256,
+            attestation_allowlist=policy.attestation_allowlist,
             profiles=("distributed-full", "private-full", "alpic-metadata"),
             claims=policy.claims,
             custody_authority_ids=(),
@@ -2511,6 +2550,7 @@ def test_evidence_policy_rejects_profile_order_claim_order_and_authority() -> No
             asvs_source_commit=policy.asvs_source_commit,
             evidence_revision=policy.evidence_revision,
             candidate_tree_sha256=policy.candidate_tree_sha256,
+            attestation_allowlist=policy.attestation_allowlist,
             profiles=policy.profiles,
             claims=tuple(claims),
             custody_authority_ids=(),
@@ -2524,6 +2564,7 @@ def test_evidence_policy_rejects_profile_order_claim_order_and_authority() -> No
             asvs_source_commit=policy.asvs_source_commit,
             evidence_revision=policy.evidence_revision,
             candidate_tree_sha256=policy.candidate_tree_sha256,
+            attestation_allowlist=policy.attestation_allowlist,
             profiles=policy.profiles,
             claims=policy.claims,
             custody_authority_ids=(),
@@ -2544,6 +2585,7 @@ def test_evidence_policy_rejects_profile_order_claim_order_and_authority() -> No
             asvs_source_commit=policy.asvs_source_commit,
             evidence_revision=policy.evidence_revision,
             candidate_tree_sha256=policy.candidate_tree_sha256,
+            attestation_allowlist=policy.attestation_allowlist,
             profiles=policy.profiles,
             claims=(amended, *policy.claims[1:]),
             custody_authority_ids=(),
@@ -2650,6 +2692,7 @@ def _applicable_with_verdict(
     verdict: Literal["Pass", "Fail", "Partial", "Not assessed"],
     *,
     evidence_id: str | None = None,
+    evidence_revision: str | None = None,
 ) -> ApplicableEvidenceRow:
     return ApplicableEvidenceRow(
         asvs_version=row.asvs_version,
@@ -2657,7 +2700,9 @@ def _applicable_with_verdict(
         level=row.level,
         requirement_text=row.requirement_text,
         profile=row.profile,
-        evidence_revision=row.evidence_revision,
+        evidence_revision=(
+            row.evidence_revision if evidence_revision is None else evidence_revision
+        ),
         invariant=row.invariant,
         threat_boundary=row.threat_boundary,
         evidence_ids=(evidence_id,) if evidence_id is not None else (),
@@ -2671,13 +2716,291 @@ def _applicable_with_verdict(
     )
 
 
+def _updated_applicable_row(
+    row: ApplicableEvidenceRow,
+    updates: dict[str, object],
+) -> ApplicableEvidenceRow:
+    return ApplicableEvidenceRow.model_validate(
+        cast("dict[str, object]", row.model_dump(exclude_none=True)) | updates
+    )
+
+
+def _updated_not_applicable_row(
+    row: ApplicableEvidenceRow,
+    updates: dict[str, object],
+) -> NotApplicableEvidenceRow:
+    return NotApplicableEvidenceRow.model_validate(
+        cast("dict[str, object]", row.model_dump(exclude_none=True)) | updates
+    )
+
+
+def _updated_custody_receipt(
+    receipt: CustodyReceipt,
+    updates: dict[str, object],
+) -> CustodyReceipt:
+    return CustodyReceipt.model_validate(
+        cast("dict[str, object]", receipt.model_dump()) | updates
+    )
+
+
+def _updated_custodied_evidence(
+    reference: CustodiedEvidenceReference,
+    updates: dict[str, object],
+) -> CustodiedEvidenceReference:
+    return CustodiedEvidenceReference.model_validate(
+        cast("dict[str, object]", reference.model_dump()) | updates
+    )
+
+
+def _updated_evidence(
+    reference: LocalEvidenceReference | CustodiedEvidenceReference,
+    updates: dict[str, object],
+) -> LocalEvidenceReference | CustodiedEvidenceReference:
+    if isinstance(reference, LocalEvidenceReference):
+        return LocalEvidenceReference.model_validate(
+            cast("dict[str, object]", reference.model_dump()) | updates
+        )
+    return _updated_custodied_evidence(reference, updates)
+
+
+def _candidate_pass_product(
+    *,
+    storage: Literal["local", "custodied-uri"] = "local",
+) -> tuple[
+    tuple[ApplicableEvidenceRow, ...],
+    tuple[LocalEvidenceReference | CustodiedEvidenceReference, ...],
+]:
+    selected = tuple(
+        row
+        for row in load_evidence_matrix()
+        if isinstance(row, ApplicableEvidenceRow) and row.profile == "alpic-metadata"
+    )
+    rows = tuple(
+        _applicable_with_verdict(
+            row,
+            "Pass",
+            evidence_id=f"ev.{index:03d}",
+            evidence_revision=CANDIDATE_REVISION,
+        )
+        for index, row in enumerate(selected)
+    )
+    evidence_data = tuple(
+        (_custodied_evidence() if storage == "custodied-uri" else _local_evidence())
+        | {
+            "candidate_tree_sha256": CANDIDATE_TREE_SHA256,
+            "claim_purpose": "implementation-proof",
+            "evidence_id": f"ev.{index:03d}",
+            "evidence_revision": CANDIDATE_REVISION,
+            "requirement_ids": (row.requirement_id,),
+            "asserted_invariant": row.invariant,
+        }
+        for index, row in enumerate(rows)
+    )
+    if storage == "custodied-uri":
+        evidence: tuple[LocalEvidenceReference | CustodiedEvidenceReference, ...] = (
+            tuple(
+                CustodiedEvidenceReference.model_validate(item)
+                for item in evidence_data
+            )
+        )
+    else:
+        evidence = tuple(
+            LocalEvidenceReference.model_validate(item) for item in evidence_data
+        )
+    return rows, evidence
+
+
+def _governed_candidate_na(
+    row: ApplicableEvidenceRow,
+    index: int,
+    *,
+    review_due: date = CANDIDATE_REVIEW_DUE,
+) -> NotApplicableEvidenceRow:
+    return _updated_not_applicable_row(
+        row,
+        {
+            "absence_evidence_ids": (f"absence.{index:03d}",),
+            "applicability": "not_applicable",
+            "applicability_rationale": (
+                "Independent review confirms the candidate omits this capability."
+            ),
+            "applicability_review_due": review_due,
+            "applicability_reviewer": "independent-security-reviewer",
+            "evidence_ids": (),
+            "required_evidence_kinds": (),
+            "verdict": "N/A",
+        },
+    )
+
+
+def _candidate_absence_evidence(
+    row: NotApplicableEvidenceRow,
+    index: int,
+) -> CustodiedEvidenceReference:
+    return CustodiedEvidenceReference.model_validate(
+        _custodied_evidence()
+        | {
+            "asserted_invariant": row.invariant,
+            "candidate_tree_sha256": CANDIDATE_TREE_SHA256,
+            "claim_purpose": "absence-proof",
+            "custody_receipt_id": f"receipt.absence.{index:03d}",
+            "evidence_id": f"absence.{index:03d}",
+            "evidence_revision": CANDIDATE_REVISION,
+            "kind": "design",
+            "requirement_ids": (row.requirement_id,),
+        }
+    )
+
+
+def _verified_candidate_release(
+    rows: tuple[ApplicableEvidenceRow | NotApplicableEvidenceRow, ...],
+    evidence: tuple[CustodiedEvidenceReference, ...],
+    *,
+    as_of: datetime = CANDIDATE_AS_OF,
+) -> ReleaseDecision:
+    receipts = {
+        reference.evidence_id: _updated_custody_receipt(
+            _custody_receipt(reference=reference),
+            {
+                "claim_purpose": (
+                    "absence-proof"
+                    if isinstance(row, NotApplicableEvidenceRow)
+                    else "positive-control"
+                ),
+                "nonce": f"nonce.{index}",
+                "requirement_id": row.requirement_id,
+            },
+        )
+        for index, (row, reference) in enumerate(zip(rows, evidence, strict=True))
+    }
+
+    class Authority:
+        authority_id = "ci.example"
+
+        def verify_receipt(
+            self, reference: CustodiedEvidenceReference
+        ) -> CustodyReceipt | None:
+            return receipts.get(reference.evidence_id)
+
+    class ReplayRegistry:
+        def accept(self, *, nonce: str, subject_sha256: str) -> bool:
+            return bool(nonce and subject_sha256)
+
+    return evaluate_profile_release(
+        profile="alpic-metadata",
+        candidate={
+            "revision": CANDIDATE_REVISION,
+            "tree_sha256": CANDIDATE_TREE_SHA256,
+        },
+        matrix=rows,
+        evidence=evidence,
+        assessment_mode="candidate",
+        as_of=as_of,
+        verification_context=replace(
+            _verification_context(),
+            authorities=(Authority(),),
+            replay_registry=ReplayRegistry(),
+        ),
+    )
+
+
+def test_release_assessment_rejects_closed_mode_boundary_faults() -> None:
+    """Every malformed mode tuple fails before candidate evidence is trusted."""
+    candidate_rows, candidate_evidence = _candidate_pass_product()
+    unchecked_evaluate = cast(
+        "_UncheckedReleaseEvaluator",
+        cast("object", evaluate_profile_release),
+    )
+    invalid_calls: tuple[tuple[str, Callable[[], ReleaseDecision]], ...] = (
+        (
+            "unknown option",
+            lambda: unchecked_evaluate(unknown_option=True),
+        ),
+        (
+            "complete legacy inputs",
+            evaluate_profile_release,
+        ),
+        (
+            "forbids candidate inputs",
+            lambda: evaluate_profile_release(
+                profile="alpic-metadata",
+                rows=load_evidence_matrix(),
+                manifest=load_evidence_manifest(),
+                policy=load_independent_evidence_policy(),
+                context=_verification_context(),
+                candidate={
+                    "revision": CANDIDATE_REVISION,
+                    "tree_sha256": CANDIDATE_TREE_SHA256,
+                },
+            ),
+        ),
+        (
+            "outside the closed inventory",
+            lambda: unchecked_evaluate(assessment_mode="preview"),
+        ),
+        (
+            "complete candidate inputs",
+            lambda: evaluate_profile_release(
+                profile="alpic-metadata",
+                assessment_mode="candidate",
+            ),
+        ),
+        (
+            "strict revision/tree binding",
+            lambda: unchecked_evaluate(
+                profile="alpic-metadata",
+                candidate={"revision": 7},
+                matrix=candidate_rows,
+                evidence=candidate_evidence,
+                assessment_mode="candidate",
+                as_of=CANDIDATE_AS_OF,
+            ),
+        ),
+    )
+
+    for expected, evaluate in invalid_calls:
+        with pytest.raises(AsvsError, match=expected):
+            _ = evaluate()
+
+
+def test_candidate_assessment_rejects_profile_and_nonpass_row() -> None:
+    """Unsupported profiles and non-Pass applicable rows remain release blockers."""
+    rows, evidence = _candidate_pass_product()
+    candidate = {
+        "revision": CANDIDATE_REVISION,
+        "tree_sha256": CANDIDATE_TREE_SHA256,
+    }
+
+    unsupported = evaluate_profile_release(
+        profile="private-full",
+        candidate=candidate,
+        matrix=rows,
+        evidence=evidence,
+        assessment_mode="candidate",
+        as_of=CANDIDATE_AS_OF,
+    )
+    failed = evaluate_profile_release(
+        profile="alpic-metadata",
+        candidate=candidate,
+        matrix=(
+            _updated_applicable_row(rows[0], {"verdict": "Fail"}),
+            *rows[1:],
+        ),
+        evidence=evidence,
+        assessment_mode="candidate",
+        as_of=CANDIDATE_AS_OF,
+    )
+
+    assert "candidate-profile-not-supported" in unsupported.reason_codes
+    assert "candidate-row-not-pass" in failed.reason_codes
+
+
 @pytest.mark.parametrize(
-    ("verdict", "reason"),
-    [("Not assessed", "not-assessed"), ("Fail", "failed"), ("Partial", "partial")],
+    "verdict",
+    ["Not assessed", "Fail", "Partial"],
 )
-def test_profile_release_reports_the_first_unresolved_product_state(
+def test_bootstrap_rejects_every_nonhistorical_status_product(
     verdict: Literal["Fail", "Partial", "Not assessed"],
-    reason: str,
 ) -> None:
     selected = tuple(
         row
@@ -2694,7 +3017,7 @@ def test_profile_release_reports_the_first_unresolved_product_state(
         context=_verification_context(),
     )
 
-    assert decision.reason_codes == (reason,)
+    assert decision.reason_codes == ("bootstrap-product-mismatch",)
 
 
 def test_profile_release_rejects_incomplete_and_unverified_pass_products() -> None:
@@ -2726,8 +3049,543 @@ def test_profile_release_rejects_incomplete_and_unverified_pass_products() -> No
         context=_verification_context(),
     )
 
-    assert incomplete.reason_codes == ("incomplete-product",)
-    assert unverified.reason_codes == ("evidence-unverified",)
+    assert incomplete.reason_codes == ("bootstrap-product-mismatch",)
+    assert unverified.reason_codes == ("bootstrap-product-mismatch",)
+
+
+def test_candidate_assessment_accepts_a_complete_independently_bound_pass_product() -> (
+    None
+):
+    """Mutation caught: candidate mode never permits an evidenced Pass product."""
+    rows, references = _candidate_pass_product(storage="custodied-uri")
+    evidence = tuple(cast("CustodiedEvidenceReference", item) for item in references)
+    receipts = {
+        reference.evidence_id: _updated_custody_receipt(
+            _custody_receipt(reference=reference),
+            {"nonce": f"nonce.{index}", "requirement_id": row.requirement_id},
+        )
+        for index, (row, reference) in enumerate(zip(rows, evidence, strict=True))
+    }
+
+    class Authority:
+        authority_id = "ci.example"
+
+        def verify_receipt(
+            self, reference: CustodiedEvidenceReference
+        ) -> CustodyReceipt | None:
+            return receipts[reference.evidence_id]
+
+    class ReplayRegistry:
+        def accept(self, *, nonce: str, subject_sha256: str) -> bool:
+            return bool(nonce and subject_sha256)
+
+    verdict = evaluate_profile_release(
+        profile="alpic-metadata",
+        candidate={
+            "revision": CANDIDATE_REVISION,
+            "tree_sha256": CANDIDATE_TREE_SHA256,
+        },
+        matrix=rows,
+        evidence=evidence,
+        assessment_mode="candidate",
+        as_of=datetime(2026, 8, 23, tzinfo=UTC),
+        verification_context=replace(
+            _verification_context(),
+            authorities=(Authority(),),
+            replay_registry=ReplayRegistry(),
+        ),
+    )
+
+    assert verdict.decision == "release"
+    assert verdict.reason_codes == ()
+
+
+def test_candidate_assessment_accepts_one_governed_na_in_the_exact_product() -> None:
+    """Mutation caught: governed N/A can never survive full-product evaluation."""
+    pass_rows, pass_references = _candidate_pass_product(storage="custodied-uri")
+    na_row = _governed_candidate_na(pass_rows[0], 0)
+    rows: tuple[ApplicableEvidenceRow | NotApplicableEvidenceRow, ...] = (
+        na_row,
+        *pass_rows[1:],
+    )
+    absence_reference = _candidate_absence_evidence(na_row, 0)
+    evidence = (
+        absence_reference,
+        *(cast("CustodiedEvidenceReference", item) for item in pass_references[1:]),
+    )
+    receipts = {
+        reference.evidence_id: _updated_custody_receipt(
+            _custody_receipt(reference=reference),
+            {
+                "claim_purpose": (
+                    "absence-proof"
+                    if isinstance(row, NotApplicableEvidenceRow)
+                    else "positive-control"
+                ),
+                "nonce": f"nonce.{index}",
+                "requirement_id": row.requirement_id,
+            },
+        )
+        for index, (row, reference) in enumerate(zip(rows, evidence, strict=True))
+    }
+
+    class Authority:
+        authority_id = "ci.example"
+
+        def verify_receipt(
+            self, reference: CustodiedEvidenceReference
+        ) -> CustodyReceipt | None:
+            return receipts[reference.evidence_id]
+
+    class ReplayRegistry:
+        def accept(self, *, nonce: str, subject_sha256: str) -> bool:
+            return bool(nonce and subject_sha256)
+
+    verdict = evaluate_profile_release(
+        profile="alpic-metadata",
+        candidate={
+            "revision": CANDIDATE_REVISION,
+            "tree_sha256": CANDIDATE_TREE_SHA256,
+        },
+        matrix=rows,
+        evidence=evidence,
+        assessment_mode="candidate",
+        as_of=datetime(2026, 8, 23, tzinfo=UTC),
+        verification_context=replace(
+            _verification_context(),
+            authorities=(Authority(),),
+            replay_registry=ReplayRegistry(),
+        ),
+    )
+
+    assert len({row.requirement_id for row in rows}) == CANDIDATE_RECORDS
+    assert verdict.decision == "release"
+    assert verdict.reason_codes == ()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["requirement-id", "level", "requirement-text"],
+)
+def test_candidate_assessment_rejects_pinned_source_semantic_substitutions(
+    fault: str,
+) -> None:
+    """Matching evidence and custody cannot rescue altered official controls."""
+    pass_rows, pass_references = _candidate_pass_product(storage="custodied-uri")
+    rows = list(pass_rows)
+    evidence = [cast("CustodiedEvidenceReference", item) for item in pass_references]
+    first = rows[0]
+    if fault == "requirement-id":
+        second = rows[1]
+        rows[0] = _updated_applicable_row(
+            first, {"requirement_id": second.requirement_id}
+        )
+        rows[1] = _updated_applicable_row(
+            second, {"requirement_id": first.requirement_id}
+        )
+        evidence[0] = _updated_custodied_evidence(
+            evidence[0], {"requirement_ids": (rows[0].requirement_id,)}
+        )
+        evidence[1] = _updated_custodied_evidence(
+            evidence[1], {"requirement_ids": (rows[1].requirement_id,)}
+        )
+    elif fault == "level":
+        rows[0] = _updated_applicable_row(
+            first, {"level": 2 if first.level == 1 else 1}
+        )
+    else:
+        rows[0] = _updated_applicable_row(
+            first, {"requirement_text": f"{first.requirement_text} Altered."}
+        )
+
+    verdict = _verified_candidate_release(tuple(rows), tuple(evidence))
+
+    assert "pinned-requirement-semantics-mismatch" in verdict.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("review_due", "eligible"),
+    [
+        (date(2026, 8, 22), False),
+        (date(2026, 8, 23), False),
+        (date(2026, 8, 24), True),
+    ],
+    ids=("before", "equal", "after"),
+)
+def test_candidate_na_review_must_outlive_the_full_assessment(
+    review_due: date,
+    *,
+    eligible: bool,
+) -> None:
+    """An otherwise valid 253-row product cannot use a stale N/A review."""
+    pass_rows, pass_references = _candidate_pass_product(storage="custodied-uri")
+    na_row = _governed_candidate_na(pass_rows[0], 0, review_due=review_due)
+    rows: tuple[ApplicableEvidenceRow | NotApplicableEvidenceRow, ...] = (
+        na_row,
+        *pass_rows[1:],
+    )
+    evidence = (
+        _candidate_absence_evidence(na_row, 0),
+        *(cast("CustodiedEvidenceReference", item) for item in pass_references[1:]),
+    )
+
+    verdict = _verified_candidate_release(rows, evidence)
+
+    assert verdict.eligible is eligible
+    if eligible:
+        assert verdict.reason_codes == ()
+    else:
+        assert "expired-na-review" in verdict.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("collected_at", "expires_at", "eligible"),
+    [
+        (
+            datetime(2026, 8, 23, tzinfo=UTC),
+            datetime(2026, 8, 24, tzinfo=UTC),
+            True,
+        ),
+        (
+            datetime(2026, 8, 23, 0, 1, tzinfo=UTC),
+            datetime(2026, 8, 24, tzinfo=UTC),
+            False,
+        ),
+        (
+            datetime(2026, 8, 16, tzinfo=UTC),
+            datetime(2026, 8, 23, tzinfo=UTC),
+            False,
+        ),
+    ],
+    ids=("collected-at-boundary", "future-collected", "expiry-boundary"),
+)
+def test_candidate_evidence_uses_the_same_instant_window_as_verification(
+    collected_at: datetime,
+    expires_at: datetime,
+    *,
+    eligible: bool,
+) -> None:
+    """Candidate evidence is current exactly when collected <= as_of < expiry."""
+    rows, pass_references = _candidate_pass_product(storage="custodied-uri")
+    evidence = tuple(
+        cast("CustodiedEvidenceReference", item) for item in pass_references
+    )
+    evidence = (
+        _updated_custodied_evidence(
+            evidence[0], {"collected_at": collected_at, "expires_at": expires_at}
+        ),
+        *evidence[1:],
+    )
+
+    verdict = _verified_candidate_release(rows, evidence)
+
+    assert verdict.eligible is eligible
+
+
+def test_candidate_assessment_rejects_substituted_and_extra_profile_rows() -> None:
+    """Mutation caught: candidate selection accepts arbitrary or ignored matrix rows."""
+    candidate = "a" * 40
+    tree = "b" * 64
+    selected = tuple(
+        row
+        for row in load_evidence_matrix()
+        if isinstance(row, ApplicableEvidenceRow) and row.profile == "alpic-metadata"
+    )
+    rows = tuple(
+        _applicable_with_verdict(
+            row,
+            "Pass",
+            evidence_id=f"ev.{index:03d}",
+            evidence_revision=candidate,
+        )
+        for index, row in enumerate(selected)
+    )
+    evidence = tuple(
+        LocalEvidenceReference.model_validate(
+            _local_evidence()
+            | {
+                "candidate_tree_sha256": tree,
+                "claim_purpose": "implementation-proof",
+                "evidence_id": f"ev.{index:03d}",
+                "evidence_revision": candidate,
+                "requirement_ids": (row.requirement_id,),
+                "asserted_invariant": row.invariant,
+            }
+        )
+        for index, row in enumerate(rows)
+    )
+    substituted = (
+        *rows[:-1],
+        _updated_applicable_row(rows[-1], {"requirement_id": "v5.0.0-V99.9.9"}),
+    )
+    extra = (*rows, load_evidence_matrix()[1])
+
+    matrices: tuple[
+        tuple[ApplicableEvidenceRow | NotApplicableEvidenceRow, ...], ...
+    ] = (substituted, rows[:-1], extra)
+    for matrix in matrices:
+        verdict = evaluate_profile_release(
+            profile="alpic-metadata",
+            candidate={"revision": candidate, "tree_sha256": tree},
+            matrix=matrix,
+            evidence=evidence,
+            assessment_mode="candidate",
+            as_of=datetime(2026, 8, 23, tzinfo=UTC),
+        )
+
+        assert "pinned-requirement-set-mismatch" in verdict.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected"),
+    [
+        ("revision-mismatch", "candidate-binding-mismatch"),
+        ("wrong-claim-purpose", "wrong-claim-purpose"),
+        ("missing-required-kind", "missing-required-evidence"),
+    ],
+)
+def test_candidate_assessment_rejects_complete_pass_product_faults(
+    fault: str,
+    expected: str,
+) -> None:
+    """Mutation caught: complete selected products can bypass claim governance."""
+    rows, evidence = _candidate_pass_product()
+    if fault == "revision-mismatch":
+        evidence = (
+            _updated_evidence(evidence[0], {"evidence_revision": "c" * 40}),
+            *evidence[1:],
+        )
+    elif fault == "wrong-claim-purpose":
+        evidence = (
+            _updated_evidence(evidence[0], {"claim_purpose": "absence-proof"}),
+            *evidence[1:],
+        )
+    else:
+        rows = (
+            _updated_applicable_row(rows[0], {"required_evidence_kinds": ("design",)}),
+            *rows[1:],
+        )
+
+    verdict = evaluate_profile_release(
+        profile="alpic-metadata",
+        candidate={
+            "revision": CANDIDATE_REVISION,
+            "tree_sha256": CANDIDATE_TREE_SHA256,
+        },
+        matrix=rows,
+        evidence=evidence,
+        assessment_mode="candidate",
+        as_of=datetime(2026, 8, 23, tzinfo=UTC),
+    )
+
+    assert "pinned-requirement-set-mismatch" not in verdict.reason_codes
+    assert expected in verdict.reason_codes
+
+
+def test_candidate_bulk_na_conversion_reaches_absence_governance() -> None:
+    """Mutation caught: bulk N/A conversion evades per-row absence governance."""
+    pass_rows, _ = _candidate_pass_product()
+    rows = tuple(
+        _governed_candidate_na(row, index) for index, row in enumerate(pass_rows)
+    )
+
+    verdict = evaluate_profile_release(
+        profile="alpic-metadata",
+        candidate={
+            "revision": CANDIDATE_REVISION,
+            "tree_sha256": CANDIDATE_TREE_SHA256,
+        },
+        matrix=rows,
+        evidence=(),
+        assessment_mode="candidate",
+        as_of=datetime(2026, 8, 23, tzinfo=UTC),
+    )
+
+    assert len({row.requirement_id for row in rows}) == CANDIDATE_RECORDS
+    assert "pinned-requirement-set-mismatch" not in verdict.reason_codes
+    assert verdict.reason_codes == ("missing-absence-proof",)
+
+
+def test_candidate_assessment_requires_independent_verification_context() -> None:
+    """Mutation caught: self-asserted candidate evidence can produce release."""
+    candidate = "a" * 40
+    tree = "b" * 64
+    selected = tuple(
+        row
+        for row in load_evidence_matrix()
+        if isinstance(row, ApplicableEvidenceRow) and row.profile == "alpic-metadata"
+    )
+    rows = tuple(
+        _applicable_with_verdict(
+            row,
+            "Pass",
+            evidence_id=f"ev.{index:03d}",
+            evidence_revision=candidate,
+        )
+        for index, row in enumerate(selected)
+    )
+    evidence = tuple(
+        LocalEvidenceReference.model_validate(
+            _local_evidence()
+            | {
+                "candidate_tree_sha256": tree,
+                "claim_purpose": "implementation-proof",
+                "evidence_id": f"ev.{index:03d}",
+                "evidence_revision": candidate,
+                "requirement_ids": (row.requirement_id,),
+                "asserted_invariant": row.invariant,
+            }
+        )
+        for index, row in enumerate(rows)
+    )
+
+    verdict = evaluate_profile_release(
+        profile="alpic-metadata",
+        candidate={"revision": candidate, "tree_sha256": tree},
+        matrix=rows,
+        evidence=evidence,
+        assessment_mode="candidate",
+        as_of=datetime(2026, 8, 23, tzinfo=UTC),
+    )
+
+    assert "independent-evidence-unverified" in verdict.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected"),
+    [
+        ("missing-absence-proof", "missing-absence-proof"),
+        ("wrong-candidate", "candidate-binding-mismatch"),
+        ("wrong-profile", "profile-binding-mismatch"),
+        ("expired", "expired-evidence"),
+        ("duplicate", "duplicate-evidence-id"),
+    ],
+)
+def test_candidate_assessment_rejects_governance_and_binding_faults(
+    fault: str,
+    expected: str,
+) -> None:
+    """Mutation caught: candidate mode omits N/A governance or binding checks."""
+    candidate = "a" * 40
+    tree = "b" * 64
+    row = NotApplicableEvidenceRow.model_validate(
+        _not_applicable_row()
+        | {
+            "evidence_revision": candidate,
+            "absence_evidence_ids": ("absence.001",),
+            "invariant": "The capability is absent from this profile.",
+        }
+    )
+    custodied_reference = CustodiedEvidenceReference.model_validate(
+        _custodied_evidence()
+        | {
+            "candidate_tree_sha256": tree,
+            "claim_purpose": "absence-proof",
+            "evidence_id": "absence.001",
+            "evidence_revision": candidate,
+            "kind": "design",
+            "requirement_ids": (row.requirement_id,),
+            "profiles": ("alpic-metadata",),
+            "asserted_invariant": row.invariant,
+        }
+    )
+    reference: LocalEvidenceReference | CustodiedEvidenceReference
+    if fault == "missing-absence-proof":
+        reference = LocalEvidenceReference.model_validate(
+            _local_evidence()
+            | {
+                "candidate_tree_sha256": tree,
+                "claim_purpose": "implementation-proof",
+                "evidence_id": "absence.001",
+                "evidence_revision": candidate,
+                "requirement_ids": (row.requirement_id,),
+                "asserted_invariant": row.invariant,
+            }
+        )
+    elif fault == "wrong-candidate":
+        reference = _updated_custodied_evidence(
+            custodied_reference, {"evidence_revision": "c" * 40}
+        )
+    elif fault == "wrong-profile":
+        reference = _updated_custodied_evidence(
+            custodied_reference, {"profiles": ("private-full",)}
+        )
+    elif fault == "expired":
+        reference = _updated_custodied_evidence(
+            custodied_reference,
+            {"expires_at": datetime(2026, 8, 22, tzinfo=UTC)},
+        )
+    else:
+        reference = custodied_reference
+    evidence = (reference, reference) if fault == "duplicate" else (reference,)
+
+    verdict = evaluate_profile_release(
+        profile="alpic-metadata",
+        candidate={"revision": candidate, "tree_sha256": tree},
+        matrix=(row,) * 253,
+        evidence=evidence,
+        assessment_mode="candidate",
+        as_of=datetime(2026, 8, 23, tzinfo=UTC),
+    )
+
+    assert expected in verdict.reason_codes
+
+
+def test_candidate_mode_preserves_bootstrap_rows_and_output() -> None:
+    """Mutation caught: candidate selection converts the bootstrap inventory."""
+    before = Path("docs/security/asvs-5.0.0-l2-matrix.jsonl").read_bytes()
+    bootstrap_rows = load_evidence_matrix()
+    bootstrap_manifest = load_evidence_manifest()
+    bootstrap = evaluate_profile_release(
+        "alpic-metadata",
+        bootstrap_rows,
+        bootstrap_manifest,
+        policy=load_independent_evidence_policy(),
+        context=_verification_context(),
+    )
+
+    assert len(bootstrap_rows) == MATRIX_RECORDS
+    assert bootstrap_manifest == ()
+    assert all(
+        isinstance(row, ApplicableEvidenceRow) and row.verdict == "Not assessed"
+        for row in bootstrap_rows
+    )
+    assert render_evidence_matrix(load_pinned_asvs_requirements()) == before
+    assert bootstrap.reason_codes == ("not-assessed",)
+    assert Path("docs/security/asvs-5.0.0-l2-matrix.jsonl").read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["missing-row", "changed-row", "nonempty-evidence"],
+)
+def test_direct_bootstrap_evaluation_requires_the_exact_historical_product(
+    fault: str,
+) -> None:
+    """Bootstrap accepts only 759 Not assessed rows and an empty manifest."""
+    rows = load_evidence_matrix()
+    evidence: tuple[LocalEvidenceReference | CustodiedEvidenceReference, ...] = ()
+    if fault == "missing-row":
+        rows = rows[:-1]
+    elif fault == "changed-row":
+        first = rows[0]
+        assert isinstance(first, ApplicableEvidenceRow)
+        rows = (
+            _applicable_with_verdict(first, "Pass", evidence_id="bootstrap.invalid"),
+            *rows[1:],
+        )
+    else:
+        evidence = (LocalEvidenceReference.model_validate(_local_evidence()),)
+
+    verdict = evaluate_profile_release(
+        "alpic-metadata",
+        rows,
+        evidence,
+        policy=load_independent_evidence_policy(),
+        context=_verification_context(),
+    )
+
+    assert verdict.reason_codes == ("bootstrap-product-mismatch",)
 
 
 def test_build_matrix_publishes_atomically_and_never_overwrites(tmp_path: Path) -> None:
@@ -3812,3 +4670,411 @@ def test_repository_inventory_rejects_inspection_races_and_io_failures(
 
     monkeypatch.setattr(os, "stat", fail_first_entry_stat)
     assert check_repository(failure_root) is False
+
+
+def test_internal_closed_inventory_and_shape_guards() -> None:
+    with pytest.raises(AsvsError, match="closed inventory"):
+        _ = asvs_matrix._profile_rank("unknown")  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(AsvsError, match="unsupported value"):
+        _ = asvs_matrix._validate_json_shape(object())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    assert asvs_matrix._safe_local_path("") is False  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    target = bytearray(b"full")
+    assert asvs_matrix._append_bounded_stream(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        target,
+        b"overflow",
+        len(target),
+    )
+    assert target == b"full"
+
+
+def test_threat_ledger_semantic_digest_is_independently_enforced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = load_threat_ledger()
+    monkeypatch.setattr(asvs_matrix, "REVIEWED_THREAT_LEDGER_SHA256", "0" * 64)
+
+    with pytest.raises(ValueError, match="security semantics"):
+        asvs_matrix._validate_threat_ledger_inventory(ledger)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("fault", ["provenance", "mapping"])
+def test_threat_ledger_loader_rejects_post_schema_trust_faults(
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    ledger = load_threat_ledger()
+    candidate: ThreatLedger = ledger.model_copy()
+    expected = "provenance or release status"
+    if fault == "provenance":
+        object.__setattr__(candidate, "evidence_revision", "f" * 40)
+    else:
+        threat: ThreatRecord = ledger.threats[0].model_copy()
+        object.__setattr__(
+            threat,
+            "asvs_requirement_ids",
+            ("v5.0.0-V99.9.9",),
+        )
+        remaining_threats: tuple[ThreatRecord, ...] = tuple(ledger.threats[1:])
+        replacement_threats: tuple[ThreatRecord, ...] = (
+            threat,
+            *remaining_threats,
+        )
+        object.__setattr__(candidate, "threats", replacement_threats)
+        expected = "unknown ASVS mapping"
+
+    def load_candidate(*_args: object, **_kwargs: object) -> ThreatLedger:
+        return candidate
+
+    monkeypatch.setattr(asvs_matrix, "_load_canonical_json", load_candidate)
+    with pytest.raises(AsvsError, match=expected):
+        _ = load_threat_ledger()
+
+
+def test_threat_markdown_rejects_rendered_size_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = load_threat_ledger()
+    monkeypatch.setattr(asvs_matrix, "THREAT_MARKDOWN_MAX_BYTES", 1)
+
+    with pytest.raises(AsvsError, match="configured byte bound"):
+        _ = render_threat_model_markdown(ledger)
+
+
+def test_descriptor_helpers_cover_zero_remaining_and_pre_dup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "artifact.bin"
+    _ = artifact.write_bytes(b"x")
+    descriptor = os.open(artifact, os.O_RDONLY)
+    try:
+        body, _before, _after = asvs_matrix._read_bounded_descriptor(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            descriptor,
+            max_bytes=1,
+        )
+    finally:
+        os.close(descriptor)
+    assert body == b"x"
+
+    early_eof_fd = os.open(artifact, os.O_RDONLY)
+
+    def early_eof(_descriptor: int, _amount: int) -> bytes:
+        return b""
+
+    monkeypatch.setattr(os, "read", early_eof)
+    try:
+        empty_body, _before, _after = asvs_matrix._read_bounded_descriptor(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            early_eof_fd,
+            max_bytes=1,
+        )
+    finally:
+        os.close(early_eof_fd)
+    assert empty_body == b""
+
+    root_descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+
+    def open_root(_path: Path) -> int:
+        return os.dup(root_descriptor)
+
+    def reject_fstat(_descriptor: int) -> os.stat_result:
+        msg = "injected root identity failure"
+        raise OSError(msg)
+
+    monkeypatch.setattr(asvs_matrix, "_open_directory_no_follow", open_root)
+    monkeypatch.setattr(os, "fstat", reject_fstat)
+    try:
+        with pytest.raises(AsvsError, match="opened beneath"):
+            _ = asvs_matrix._snapshot_bounded_beneath_root(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                tmp_path,
+                PurePosixPath("artifact.bin"),
+                max_bytes=1,
+            )
+    finally:
+        os.close(root_descriptor)
+
+
+def test_publication_cleanup_rejects_absent_lock_and_preserves_other_inode(
+    tmp_path: Path,
+) -> None:
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        artifact = tmp_path / "artifact"
+        _ = artifact.write_bytes(b"fixture")
+        identity = artifact.stat()
+        asvs_matrix._unlink_if_same_inode(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            directory_fd,
+            artifact.name,
+            identity.st_dev,
+            identity.st_ino + 1,
+        )
+        assert artifact.read_bytes() == b"fixture"
+
+        with pytest.raises(AsvsError, match="identity was not captured"):
+            asvs_matrix._remove_publication_lock(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                directory_fd,
+                asvs_matrix._AbsentPublicationLock(),  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                ".lock",
+            )
+    finally:
+        os.close(directory_fd)
+
+
+def test_atomic_publication_closes_directory_after_pre_identity_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+
+    def open_directory(_path: Path) -> int:
+        return os.dup(base_fd)
+
+    def reject_artifact_open(*_args: object, **_kwargs: object) -> int:
+        msg = "injected artifact open failure"
+        raise OSError(msg)
+
+    monkeypatch.setattr(asvs_matrix, "_open_directory_no_follow", open_directory)
+    monkeypatch.setattr(os, "open", reject_artifact_open)
+    try:
+        with pytest.raises(AsvsError, match="publication failed"):
+            asvs_matrix._atomic_write(tmp_path / "matrix.jsonl", b"fixture\n")  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.close(base_fd)
+
+
+@pytest.mark.parametrize("payload", [[], {"Version": "4.0.0"}])
+def test_fetch_rejects_post_digest_json_shape_faults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: object,
+) -> None:
+    body = Path("security/asvs/requirements-5.0.0.json").read_bytes()
+    result = HttpDownloadResult(
+        requested_url=asvs_matrix.ASVS_URL,
+        final_url=asvs_matrix.ASVS_URL,
+        status=200,
+        headers=(("content-length", str(len(body))),),
+        body=body,
+        redirect_count=0,
+        complete=True,
+    )
+
+    class Downloader:
+        def download(self, url: str, *, max_bytes: int) -> HttpDownloadResult:
+            assert url == asvs_matrix.ASVS_URL
+            assert max_bytes == len(body)
+            return result
+
+    class Publisher:
+        def publish_pair(
+            self,
+            first: tuple[Path, bytes],
+            second: tuple[Path, bytes],
+        ) -> None:
+            del first, second
+            pytest.fail("invalid ASVS JSON must not be published")
+
+    def parse_payload(_body: bytes) -> object:
+        return payload
+
+    monkeypatch.setattr(asvs_matrix, "_parse_json_bytes", parse_payload)
+    with pytest.raises(AsvsError, match=r"version is not 5\.0\.0"):
+        _ = fetch_asvs(
+            tmp_path / "requirements.json",
+            downloader=Downloader(),
+            publisher=Publisher(),
+        )
+
+
+@pytest.mark.parametrize(
+    "items",
+    [None, [1], [{"Description": "invalid", "L": "9", "Shortcode": "V1"}]],
+)
+def test_asvs_item_walk_rejects_malformed_recursive_shapes(items: object) -> None:
+    with pytest.raises(AsvsError):
+        _ = asvs_matrix._walk_items(items)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("fault", ["shape", "version", "count", "duplicate"])
+def test_pinned_asvs_loader_rejects_post_digest_semantic_faults(
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    body = Path("security/asvs/requirements-5.0.0.json").read_bytes()
+    reviewed = load_pinned_asvs_requirements()
+
+    def read_reviewed(_path: Path, *, max_bytes: int) -> bytes:
+        assert max_bytes == len(body)
+        return body
+
+    monkeypatch.setattr(asvs_matrix, "_read_bounded_regular_file", read_reviewed)
+    if fault in {"shape", "version"}:
+        payload: object = [] if fault == "shape" else {"Version": "4.0.0"}
+
+        def parse_payload(_body: bytes) -> object:
+            return payload
+
+        monkeypatch.setattr(asvs_matrix, "_parse_json_bytes", parse_payload)
+    else:
+        requirements = reviewed[:-1]
+        if fault == "duplicate":
+            last = reviewed[-1]
+            requirements = (
+                *reviewed[:-1],
+                AsvsRequirement(
+                    identifier=reviewed[-2].identifier,
+                    text=last.text,
+                    level=last.level,
+                ),
+            )
+
+        def walk_items(_items: object) -> list[AsvsRequirement]:
+            return list(requirements)
+
+        monkeypatch.setattr(asvs_matrix, "_walk_items", walk_items)
+
+    with pytest.raises(AsvsError):
+        _ = load_pinned_asvs_requirements()
+
+
+def _branch_git_request() -> GitCommandRequest:
+    return GitCommandRequest(
+        argv=("/usr/bin/git", "--version"),
+        timeout_seconds=1,
+        max_stdout_bytes=32,
+        max_stderr_bytes=32,
+        env=(("LANG", "C"),),
+        cwd=Path("/"),
+    )
+
+
+def test_git_event_consumer_ignores_unknown_and_temporarily_blocked_descriptors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    poller = select.poll()
+    capture = asvs_matrix._GitCaptureBuffers(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        descriptors={},
+        poller=poller,
+        streams={"stdout": bytearray(), "stderr": bytearray()},
+        overflow={"stdout": False, "stderr": False},
+    )
+    asvs_matrix._consume_git_event(999, capture, _branch_git_request())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+    read_fd, write_fd = os.pipe()
+    capture.descriptors[read_fd] = "stdout"
+
+    def temporarily_blocked(_descriptor: int, _amount: int) -> bytes:
+        raise BlockingIOError
+
+    monkeypatch.setattr(os, "read", temporarily_blocked)
+    try:
+        asvs_matrix._consume_git_event(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            read_fd,
+            capture,
+            _branch_git_request(),
+        )
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_git_capture_charges_an_expired_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Poller:
+        def register(self, descriptor: int, event_mask: int) -> None:
+            del descriptor, event_mask
+
+        def poll(self, timeout: int) -> list[tuple[int, int]]:
+            del timeout
+            pytest.fail("an expired deadline must not poll")
+
+    class Process:
+        pid = os.getpid()
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+    values = iter((0.0, 2.0))
+
+    def monotonic() -> float:
+        return next(values)
+
+    def terminate(_process: subprocess.Popen[bytes]) -> int:
+        return 0
+
+    monkeypatch.setattr(select, "poll", Poller)
+    monkeypatch.setattr(time, "monotonic", monotonic)
+    monkeypatch.setattr(asvs_matrix, "_terminate_git_process", terminate)
+    stdout_read, stdout_write = os.pipe()
+    stderr_read, stderr_write = os.pipe()
+    try:
+        result = asvs_matrix._capture_git_process(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            cast("subprocess.Popen[bytes]", cast("object", Process())),
+            stdout_read,
+            stderr_read,
+            _branch_git_request(),
+        )
+    finally:
+        os.close(stdout_write)
+        os.close(stderr_write)
+    assert result.timed_out is True
+
+
+def test_git_capture_terminates_if_polling_raises_before_a_returncode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Poller:
+        def register(self, descriptor: int, event_mask: int) -> None:
+            del descriptor, event_mask
+
+        def poll(self, timeout: int) -> list[tuple[int, int]]:
+            del timeout
+            msg = "injected poll failure"
+            raise RuntimeError(msg)
+
+    class Process:
+        pid = os.getpid()
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+    terminations = 0
+
+    def terminate(_process: subprocess.Popen[bytes]) -> int:
+        nonlocal terminations
+        terminations += 1
+        return 0
+
+    monkeypatch.setattr(select, "poll", Poller)
+    monkeypatch.setattr(asvs_matrix, "_terminate_git_process", terminate)
+    stdout_read, stdout_write = os.pipe()
+    stderr_read, stderr_write = os.pipe()
+    try:
+        with pytest.raises(RuntimeError, match="poll failure"):
+            _ = asvs_matrix._capture_git_process(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                cast("subprocess.Popen[bytes]", cast("object", Process())),
+                stdout_read,
+                stderr_read,
+                _branch_git_request(),
+            )
+    finally:
+        os.close(stdout_write)
+        os.close(stderr_write)
+    assert terminations == 1
+
+
+def test_script_main_guard_dispatches_the_real_check_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["build_asvs_matrix.py", "--check"])
+
+    with pytest.raises(SystemExit) as raised:
+        _ = cast(
+            "object",
+            runpy.run_path("scripts/build_asvs_matrix.py", run_name="__main__"),
+        )
+
+    assert raised.value.code == 0

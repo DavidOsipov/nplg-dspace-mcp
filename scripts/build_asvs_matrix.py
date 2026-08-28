@@ -18,8 +18,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
+from itertools import compress
 from pathlib import Path, PurePosixPath
 from typing import (
     TYPE_CHECKING,
@@ -28,7 +29,9 @@ from typing import (
     NoReturn,
     Protocol,
     Self,
+    TypedDict,
     TypeVar,
+    Unpack,
     cast,
     override,
 )
@@ -64,6 +67,9 @@ REVIEWED_THREAT_LEDGER_SHA256 = (
     "b9c996bdacb533df9ca94a032e6c5925b095d078dc91b7689d5d8de9fe8bfa45"
 )
 Profile = Literal["alpic-metadata", "private-full", "distributed-full"]
+DeploymentProfile = Profile
+AssessmentMode = Literal["bootstrap", "candidate"]
+ClaimPurpose = Literal["implementation-proof", "absence-proof"]
 EvidenceKind = Literal["design", "code_config", "test", "operational"]
 LocalVerifierName = Literal[
     "sha256-file-v1", "json-record-v1", "test-report-v1", "config-symbol-v1"
@@ -93,6 +99,10 @@ MAX_INVENTORY_ENTRIES = 16
 MAX_ARTIFACT_URI_LENGTH = 4_096
 EXPECTED_L1_REQUIREMENTS = 70
 EXPECTED_L2_REQUIREMENTS = 183
+ATTESTATION_ALLOWLIST = (
+    "docs/security/asvs-evidence-policy.json",
+    "docs/security/threat-model.json",
+)
 
 HexDigest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$", strict=True)]
 GitObjectId = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$", strict=True)]
@@ -128,6 +138,13 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid", frozen=True, strict=True, hide_input_in_errors=True
     )
+
+
+class GitCommit(StrictModel):
+    """Bind a candidate revision to the exact tree assessed for release."""
+
+    revision: GitObjectId
+    tree_sha256: HexDigest
 
 
 class AsvsRequirement(StrictModel):
@@ -180,6 +197,7 @@ class _EvidenceCommon(StrictModel):
     collected_at: AwareDatetime
     reviewer: NonEmpty
     expires_at: AwareDatetime
+    claim_purpose: ClaimPurpose | None = None
 
     @field_validator("requirement_ids", "profiles", "selectors")
     @classmethod
@@ -471,6 +489,7 @@ class EvidencePolicy(StrictModel):
     asvs_source_commit: GitObjectId
     evidence_revision: GitObjectId
     candidate_tree_sha256: HexDigest
+    attestation_allowlist: tuple[str, str]
     profiles: tuple[Profile, Profile, Profile]
     claims: Annotated[
         tuple[ClaimPolicyRecord, ...], Field(min_length=759, max_length=759)
@@ -483,6 +502,9 @@ class EvidencePolicy(StrictModel):
         """Validate the exact ordered claim product and authority bindings."""
         if self.profiles != PROFILES:
             msg = "policy profiles must equal the exact reviewed profile order"
+            raise ValueError(msg)
+        if self.attestation_allowlist != ATTESTATION_ALLOWLIST:
+            msg = "attestation allowlist must equal the exact reviewed path set"
             raise ValueError(msg)
         keys = tuple((claim.requirement_id, claim.profile) for claim in self.claims)
         expected_order = tuple(sorted(keys, key=_claim_subject_sort_key))
@@ -1653,54 +1675,324 @@ def verify_release_approval(
     return verify_evidence_reference(reference, context=context)
 
 
-def evaluate_profile_release(
+def _bootstrap_profile_release(
     profile: Profile,
     rows: tuple[ApplicableEvidenceRow | NotApplicableEvidenceRow, ...],
     manifest: tuple[LocalEvidenceReference | CustodiedEvidenceReference, ...],
-    *,
-    policy: EvidencePolicy,
-    context: EvidenceVerificationContext,
 ) -> ReleaseDecision:
-    """Return a bounded do-not-release decision for unresolved evidence."""
-    del manifest, policy, context
-    selected = tuple(row for row in rows if row.profile == profile)
-    if any(
-        isinstance(row, ApplicableEvidenceRow) and row.verdict == "Risk accepted"
-        for row in selected
-    ):
+    """Preserve the bootstrap verdict path without candidate interpretation."""
+    if manifest or rows != load_evidence_matrix():
         return ReleaseDecision(
             profile=profile,
             decision="do_not_release",
             eligible=False,
-            reason_codes=("risk-accepted",),
+            reason_codes=("bootstrap-product-mismatch",),
         )
-    if len(selected) != L1_L2_REQUIREMENT_COUNT:
-        return ReleaseDecision(
-            profile=profile,
-            decision="do_not_release",
-            eligible=False,
-            reason_codes=("incomplete-product",),
-        )
-    for verdict, reason in (
-        ("Not assessed", "not-assessed"),
-        ("Fail", "failed"),
-        ("Partial", "partial"),
-    ):
-        if any(
-            isinstance(row, ApplicableEvidenceRow) and row.verdict == verdict
-            for row in selected
-        ):
-            return ReleaseDecision(
-                profile=profile,
-                decision="do_not_release",
-                eligible=False,
-                reason_codes=(reason,),
-            )
     return ReleaseDecision(
         profile=profile,
         decision="do_not_release",
         eligible=False,
-        reason_codes=("evidence-unverified",),
+        reason_codes=("not-assessed",),
+    )
+
+
+_APPROVED_ABSENCE_EVIDENCE_KINDS = frozenset({"design", "code_config", "test"})
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateAssessment:
+    """Carry one immutable candidate and its independent verification inputs."""
+
+    candidate: GitCommit
+    as_of: datetime
+    verification_context: EvidenceVerificationContext | None
+    candidate_verifier: CandidateRepositoryVerifier | None
+
+
+def _candidate_reference_blockers(
+    row: ApplicableEvidenceRow | NotApplicableEvidenceRow,
+    references: tuple[LocalEvidenceReference | CustodiedEvidenceReference, ...],
+    assessment: _CandidateAssessment,
+) -> tuple[str, ...]:
+    """Return all independent-evidence failures for one candidate ASVS row."""
+
+    def _candidate_reference_context(
+        template: EvidenceVerificationContext,
+        reference: LocalEvidenceReference | CustodiedEvidenceReference,
+    ) -> EvidenceVerificationContext:
+        purpose: Literal["positive-control", "absence-proof"] = (
+            "absence-proof"
+            if isinstance(row, NotApplicableEvidenceRow)
+            else "positive-control"
+        )
+        return replace(
+            template,
+            evidence_revision=assessment.candidate.revision,
+            candidate_tree_sha256=assessment.candidate.tree_sha256,
+            requirement_id=row.requirement_id,
+            profile=row.profile,
+            asserted_invariant=row.invariant,
+            covered_surface=reference.covered_surface,
+            as_of=assessment.as_of,
+            claim_purpose=purpose,
+        )
+
+    def _candidate_reference_binding_blockers(
+        reference: LocalEvidenceReference | CustodiedEvidenceReference,
+    ) -> tuple[str, ...]:
+        reasons = (
+            "candidate-binding-mismatch",
+            "profile-binding-mismatch",
+            "claim-binding-mismatch",
+            "expired-evidence",
+            "missing-claim-purpose",
+        )
+        failures = (
+            reference.evidence_revision != assessment.candidate.revision
+            or row.evidence_revision != assessment.candidate.revision
+            or reference.candidate_tree_sha256 != assessment.candidate.tree_sha256,
+            row.profile not in reference.profiles,
+            row.requirement_id not in reference.requirement_ids
+            or row.invariant != reference.asserted_invariant,
+            reference.expires_at <= assessment.as_of,
+            reference.claim_purpose is None,
+        )
+        return tuple(compress(reasons, failures))
+
+    def _candidate_reference_is_independently_verified(
+        reference: LocalEvidenceReference | CustodiedEvidenceReference,
+    ) -> bool:
+        context = assessment.verification_context
+        return context is not None and verify_evidence_reference(
+            reference,
+            context=_candidate_reference_context(context, reference),
+            candidate_verifier=assessment.candidate_verifier,
+        )
+
+    def _candidate_reference_governance_blockers(
+        reference: LocalEvidenceReference | CustodiedEvidenceReference,
+    ) -> tuple[str, ...]:
+        absence_invalid = (
+            reference.claim_purpose != "absence-proof"
+            or not isinstance(reference, CustodiedEvidenceReference)
+            or reference.kind not in _APPROVED_ABSENCE_EVIDENCE_KINDS
+        )
+        absence_blockers = ((), ("missing-absence-proof",))[absence_invalid]
+        implementation_blockers = ((), ("wrong-claim-purpose",))[
+            reference.claim_purpose != "implementation-proof"
+        ]
+        return (implementation_blockers, absence_blockers)[
+            isinstance(row, NotApplicableEvidenceRow)
+        ]
+
+    def _candidate_required_evidence_blockers(
+        indexed: dict[
+            str,
+            LocalEvidenceReference | CustodiedEvidenceReference,
+        ],
+    ) -> tuple[str, ...]:
+        is_pass = isinstance(row, ApplicableEvidenceRow) and row.verdict == "Pass"
+        evidence_ids = row.evidence_ids if is_pass else ()
+        required_kinds = row.required_evidence_kinds if is_pass else ()
+        kinds = {
+            indexed[evidence_id].kind
+            for evidence_id in evidence_ids
+            if evidence_id in indexed
+        }
+        missing = (
+            not evidence_ids
+            or not required_kinds
+            or any(kind not in kinds for kind in required_kinds)
+        )
+        return ((), ("missing-required-evidence",))[is_pass and missing]
+
+    evidence_ids = (
+        row.absence_evidence_ids
+        if isinstance(row, NotApplicableEvidenceRow)
+        else row.evidence_ids
+    )
+    indexed = {reference.evidence_id: reference for reference in references}
+    blockers: list[str] = []
+    if (
+        isinstance(row, NotApplicableEvidenceRow)
+        and row.applicability_review_due <= assessment.as_of.date()
+    ):
+        blockers.append("expired-na-review")
+    for evidence_id in evidence_ids:
+        reference = indexed.get(evidence_id)
+        if reference is None:
+            blockers.append(
+                "missing-absence-proof"
+                if isinstance(row, NotApplicableEvidenceRow)
+                else "missing-evidence"
+            )
+            continue
+        blockers.extend(_candidate_reference_binding_blockers(reference))
+        if not _candidate_reference_is_independently_verified(reference):
+            blockers.append("independent-evidence-unverified")
+        blockers.extend(_candidate_reference_governance_blockers(reference))
+    blockers.extend(_candidate_required_evidence_blockers(indexed))
+    return tuple(blockers)
+
+
+def _candidate_profile_release(
+    profile: Profile,
+    matrix: tuple[ApplicableEvidenceRow | NotApplicableEvidenceRow, ...],
+    evidence: tuple[LocalEvidenceReference | CustodiedEvidenceReference, ...],
+    assessment: _CandidateAssessment,
+) -> ReleaseDecision:
+    """Assess one exact L1/L2 Alpic candidate without accepting bootstrap state."""
+
+    def _candidate_requirements() -> tuple[AsvsRequirement, ...]:
+        return tuple(
+            sorted(
+                (
+                    requirement
+                    for requirement in load_pinned_asvs_requirements()
+                    if requirement.level <= L2_MAX_LEVEL
+                ),
+                key=_requirement_sort_key,
+            )
+        )
+
+    blockers: list[str] = []
+    if profile != "alpic-metadata":
+        blockers.append("candidate-profile-not-supported")
+    selected = tuple(row for row in matrix if row.profile == profile)
+    pinned_requirements = _candidate_requirements()
+    pinned_by_id = {
+        requirement.identifier: requirement for requirement in pinned_requirements
+    }
+    pinned_ids = tuple(requirement.identifier for requirement in pinned_requirements)
+    selected_ids = tuple(row.requirement_id for row in selected)
+    if (
+        len(matrix) != L1_L2_REQUIREMENT_COUNT
+        or len(selected) != L1_L2_REQUIREMENT_COUNT
+        or frozenset(selected_ids) != frozenset(pinned_ids)
+    ):
+        blockers.append("pinned-requirement-set-mismatch")
+    if selected_ids != pinned_ids or any(
+        (expected := pinned_by_id.get(row.requirement_id)) is None
+        or row.level != expected.level
+        or row.requirement_text != expected.text
+        for row in selected
+    ):
+        blockers.append("pinned-requirement-semantics-mismatch")
+    evidence_ids = tuple(reference.evidence_id for reference in evidence)
+    if len(evidence_ids) != len(set(evidence_ids)):
+        blockers.append("duplicate-evidence-id")
+    for row in selected:
+        if isinstance(row, ApplicableEvidenceRow) and row.verdict != "Pass":
+            blockers.append("candidate-row-not-pass")
+        blockers.extend(
+            _candidate_reference_blockers(
+                row,
+                evidence,
+                assessment,
+            )
+        )
+    reason_codes = tuple(cast("dict[str, None]", dict.fromkeys(blockers)))
+    if reason_codes:
+        return ReleaseDecision(
+            profile=profile,
+            decision="do_not_release",
+            eligible=False,
+            reason_codes=reason_codes,
+        )
+    return ReleaseDecision(
+        profile=profile, decision="release", eligible=True, reason_codes=()
+    )
+
+
+class _ReleaseEvaluationOptions(TypedDict, total=False):
+    """Define the closed mode-specific keyword surface for release evaluation."""
+
+    policy: EvidencePolicy
+    context: EvidenceVerificationContext
+    assessment_mode: AssessmentMode
+    candidate: GitCommit | dict[str, str]
+    matrix: tuple[ApplicableEvidenceRow | NotApplicableEvidenceRow, ...]
+    evidence: tuple[LocalEvidenceReference | CustodiedEvidenceReference, ...]
+    as_of: datetime
+    verification_context: EvidenceVerificationContext
+    candidate_verifier: CandidateRepositoryVerifier
+
+
+_RELEASE_EVALUATION_OPTION_NAMES = frozenset(_ReleaseEvaluationOptions.__annotations__)
+
+
+def evaluate_profile_release(
+    profile: Profile | None = None,
+    rows: tuple[ApplicableEvidenceRow | NotApplicableEvidenceRow, ...] | None = None,
+    manifest: tuple[LocalEvidenceReference | CustodiedEvidenceReference, ...]
+    | None = None,
+    **options: Unpack[_ReleaseEvaluationOptions],
+) -> ReleaseDecision:
+    """Evaluate immutable bootstrap inventory or one independent candidate product."""
+    if not options.keys() <= _RELEASE_EVALUATION_OPTION_NAMES:
+        msg = "release assessment contains an unknown option"
+        raise AsvsError(msg)
+    policy = options.get("policy")
+    context = options.get("context")
+    assessment_mode: object = options.get("assessment_mode", "bootstrap")
+    candidate = options.get("candidate")
+    matrix = options.get("matrix")
+    evidence = options.get("evidence")
+    as_of = options.get("as_of")
+    verification_context = options.get("verification_context")
+    candidate_verifier = options.get("candidate_verifier")
+    if assessment_mode == "bootstrap":
+        if (
+            profile is None
+            or rows is None
+            or manifest is None
+            or policy is None
+            or context is None
+        ):
+            msg = "bootstrap assessment requires its complete legacy inputs"
+            raise AsvsError(msg)
+        if (
+            candidate is not None
+            or matrix is not None
+            or evidence is not None
+            or as_of is not None
+            or verification_context is not None
+            or candidate_verifier is not None
+        ):
+            msg = "bootstrap assessment forbids candidate inputs"
+            raise AsvsError(msg)
+        return _bootstrap_profile_release(profile, rows, manifest)
+    if assessment_mode != "candidate":
+        msg = "assessment mode is outside the closed inventory"
+        raise AsvsError(msg)
+    if (
+        profile is None
+        or candidate is None
+        or matrix is None
+        or evidence is None
+        or as_of is None
+        or rows is not None
+        or manifest is not None
+        or policy is not None
+        or context is not None
+    ):
+        msg = "candidate assessment requires only its complete candidate inputs"
+        raise AsvsError(msg)
+    try:
+        checked_candidate = GitCommit.model_validate(candidate, strict=True)
+    except ValidationError as exc:
+        msg = "candidate commit is not a strict revision/tree binding"
+        raise AsvsError(msg) from exc
+    return _candidate_profile_release(
+        profile,
+        matrix,
+        evidence,
+        _CandidateAssessment(
+            candidate=checked_candidate,
+            as_of=as_of,
+            verification_context=verification_context,
+            candidate_verifier=candidate_verifier,
+        ),
     )
 
 
@@ -2010,7 +2302,7 @@ def _read_bounded_descriptor(
         msg = "artifact exceeds the configured byte bound"
         raise AsvsError(msg)
     chunks: list[bytes] = []
-    remaining = max_bytes + 1
+    remaining = before.st_size
     while remaining > 0:
         chunk = os.read(descriptor, min(65_536, remaining))
         if not chunk:
@@ -2074,9 +2366,6 @@ def _snapshot_bounded_regular_file(
     if identity_before != identity_after or len(body) != before.st_size:
         msg = "artifact identity changed while it was read"
         raise AsvsError(msg)
-    if len(body) > max_bytes:
-        msg = "artifact exceeds the configured byte bound"
-        raise AsvsError(msg)
     return EvidenceFileSnapshot(
         body=body,
         complete=True,
@@ -2119,9 +2408,6 @@ class DescriptorEvidenceFileSystem:
 
 def _open_directory_no_follow(path: Path) -> int:
     components = path.absolute().parts
-    if not components or components[0] != os.sep:
-        msg = "publication directory is invalid"
-        raise AsvsError(msg)
     descriptor = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         for component in components[1:]:
@@ -2216,9 +2502,6 @@ def _snapshot_bounded_beneath_root(
         or len(body) != before.st_size
     ):
         msg = "evidence or reviewed-root identity changed while it was read"
-        raise AsvsError(msg)
-    if len(body) > max_bytes:
-        msg = "evidence exceeds the configured byte bound"
         raise AsvsError(msg)
     return EvidenceFileSnapshot(
         body=body,
@@ -3416,13 +3699,7 @@ def render_evidence_matrix(
     }
     rows: list[bytes] = []
     for requirement in selected_requirements:
-        if requirement.level == 1:
-            matrix_level: Literal[1, 2] = 1
-        elif requirement.level == L2_MAX_LEVEL:
-            matrix_level = L2_MAX_LEVEL
-        else:
-            msg = "matrix generation encountered an L3 requirement after filtering"
-            raise AsvsError(msg)
+        matrix_level = cast("Literal[1, 2]", requirement.level)
         for profile in PROFILES:
             row = ApplicableEvidenceRow(
                 asvs_version="5.0.0",
@@ -3456,9 +3733,6 @@ def render_evidence_matrix(
                     )
                 )
             )
-    if len(rows) != MATRIX_RECORDS:
-        msg = "matrix generation did not produce the exact 759-row product"
-        raise AsvsError(msg)
     return b"".join(rows)
 
 
@@ -3489,6 +3763,7 @@ def render_evidence_policy(
         asvs_source_commit=ASVS_COMMIT,
         evidence_revision=EVIDENCE_REVISION,
         candidate_tree_sha256=CANDIDATE_TREE_SHA256,
+        attestation_allowlist=ATTESTATION_ALLOWLIST,
         profiles=PROFILES,
         claims=claims,
         custody_authority_ids=(),
