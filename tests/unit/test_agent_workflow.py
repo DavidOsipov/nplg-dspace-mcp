@@ -46,6 +46,7 @@ def test_agent_workflow_has_one_canonical_bounded_identity() -> None:
         (b"valid\x00invalid", "forbidden control character"),
         ("valid\u202einvalid".encode(), "forbidden control character"),
     ],
+    ids=("empty", "oversized", "non-utf8", "nul", "bidi-control"),
 )
 def test_agent_workflow_loader_rejects_malformed_package_data(
     tmp_path: Path,

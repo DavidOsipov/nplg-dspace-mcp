@@ -726,6 +726,7 @@ def test_archive_marker_validators_reject_misplacement(tmp_path: Path) -> None:
         ("valid\u202einvalid".encode(), None, "forbidden control character"),
         (b"valid", b"different", "does not match"),
     ],
+    ids=("empty", "oversized", "non-utf8", "bidi-control", "digest-mismatch"),
 )
 def test_agent_workflow_payload_validation_fails_closed(
     payload: bytes,

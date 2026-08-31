@@ -1017,6 +1017,10 @@ def test_phase_three_mutation_policies_are_closed_and_test_selected() -> None:
         "tests/unit/test_config.py",
     )
     task_thirteen_functions = dict(task_thirteen.required_functions)
+    assert (
+        "nplg_mcp.http_security.xǁMcpSecurityMiddlewareǁ_try_acquire_admission"
+        in task_thirteen_functions["src/nplg_mcp/http_security.py"]
+    )
     assert {
         "nplg_mcp.app.x__reject_distributed_full",
         "nplg_mcp.app.x__reject_unavailable_production_oauth",

@@ -233,7 +233,7 @@ PHASE_TWO_NODE_PINS = {
     "markdownlint-cli2": "0.23.2",
     "typescript": "6.0.3",
     "typescript-eslint": "8.67.0",
-    "zod": "4.4.3",
+    "zod": "4.5.4",
 }
 PACKAGE_LOCK_EVIDENCE_JOBS = 2
 EXPECTED_SEMGREP_RULE_IDS = frozenset(

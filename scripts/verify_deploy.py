@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import hashlib
 import json
 import math
@@ -16,6 +17,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 from urllib.parse import urlsplit
 
@@ -102,6 +104,8 @@ MAX_CANONICAL_OUTPUT_BYTES = 65_536
 _HTTP_LOCAL_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
 _ASCII_PRINTABLE_MIN = 0x20
 _ASCII_PRINTABLE_MAX = 0x7E
+_SURROGATE_MIN = 0xD800
+_SURROGATE_MAX = 0xDFFF
 
 type JsonPrimitive = bool | int | float | str | None
 type JsonValue = JsonPrimitive | list[JsonValue] | dict[str, JsonValue]
@@ -135,6 +139,45 @@ EXPECTED_TOOLS_BY_PROFILE: dict[DeploymentProfile, frozenset[str]] = {
     "alpic-metadata": ALPIC_METADATA_TOOLS,
     "private-full": PRIVATE_FULL_TOOLS,
 }
+_REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+_BASELINE_TOOL_CATALOG = (
+    _REPOSITORY_ROOT / "contracts" / "baseline" / "tool-catalog.json"
+)
+_BASELINE_MANIFEST = _REPOSITORY_ROOT / "contracts" / "baseline" / "manifest.json"
+_GENERATED_CONTRACT_SCHEMA = (
+    _REPOSITORY_ROOT / "contracts" / "generated" / "tool-contracts.schema.json"
+)
+_GENERATED_CONTRACT_MANIFEST = (
+    _REPOSITORY_ROOT / "contracts" / "generated" / "schema-manifest.json"
+)
+_OUTPUT_SCHEMA_ROOTS_BY_TOOL: dict[str, str] = {
+    "download_document_file": "output.DownloadDocumentOutput",
+    "get_document_metadata": "output.DocumentMetadataOutput",
+    "get_render_manifest": "output.RenderManifestOutput",
+    "inspect_pdf": "output.PdfInspectionOutput",
+    "list_document_files": "output.DocumentFilesOutput",
+    "render_pdf_page_tiles": "output.RenderTilesOutput",
+    "render_pdf_pages": "output.RenderPagesOutput",
+    "search_documents": "output.SearchDocumentsOutput",
+}
+_INPUT_SCHEMA_ROOTS_BY_TOOL: dict[str, str] = {
+    "download_document_file": "input.DownloadDocumentInput",
+    "get_document_metadata": "input.HandleInput",
+    "get_render_manifest": "input.RenderIdInput",
+    "inspect_pdf": "input.ArtifactInput",
+    "list_document_files": "input.HandleInput",
+    "render_pdf_page_tiles": "input.RenderTilesInput",
+    "render_pdf_pages": "input.RenderPagesInput",
+    "search_documents": "input.SearchDocumentsInput",
+}
+_CONTRACT_SCHEMA_ID = "https://nplg-dspace-mcp.invalid/contracts/tool-contracts/v1"
+_CONTRACT_EXPORTER_VERSION = "1.0.0-title-strip-codepoint-v1"
+_CONTRACT_PYDANTIC_VERSION = "2.13.4"
+_CONTRACT_ZOD_VERSION = "4.5.4"
+_CONTRACT_MANIFEST_VERSION = 1
+_BASELINE_MANIFEST_VERSION = 3
+_BASELINE_CANONICALIZATION = "nplg-json-sort-utf8-lf-v1"
+_DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 
 
 class VerificationError(RuntimeError):
@@ -180,8 +223,13 @@ def _validate_probe_base_url(*, base_url: str, probe_base_url: str) -> None:
 
 
 def _is_json_value(value: object) -> TypeGuard[JsonValue]:
-    if value is None or type(value) in {bool, int, str}:
+    if value is None or type(value) in {bool, int}:
         return True
+    if type(value) is str:
+        return all(
+            not _SURROGATE_MIN <= ord(character) <= _SURROGATE_MAX
+            for character in value
+        )
     if type(value) is float:
         return math.isfinite(value)
     if isinstance(value, list):
@@ -189,14 +237,29 @@ def _is_json_value(value: object) -> TypeGuard[JsonValue]:
     if isinstance(value, dict):
         entries = cast("dict[object, object]", value)
         return all(
-            type(key) is str and _is_json_value(item) for key, item in entries.items()
+            type(key) is str and _is_json_value(key) and _is_json_value(item)
+            for key, item in entries.items()
         )
     return False
 
 
+def _strict_json_object(pairs: list[tuple[str, object]]) -> JsonObject:
+    """Reject duplicate members before constructing one JSON object."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            msg = "deployment returned duplicate JSON object members"
+            raise ValueError(msg)
+        result[key] = value
+    return cast("JsonObject", result)
+
+
 def _load_json_value(raw: bytes) -> JsonValue:
     try:
-        value: object = json.loads(raw.decode("utf-8"))
+        value: object = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_strict_json_object,
+        )
         if not _is_json_value(value):
             msg = "deployment returned an invalid JSON value"
             raise VerificationError(msg)
@@ -522,6 +585,314 @@ class CliDependencies:
     verifier: DeploymentVerifier
 
 
+def _artifact_object(path: Path) -> JsonObject:
+    """Load one checked-in contract artifact through the strict JSON boundary."""
+    try:
+        return _require_object(_load_json_value(path.read_bytes()), context="contract")
+    except (OSError, VerificationError) as exc:
+        message = "Local deployment contract authority is invalid"
+        raise VerificationError(message) from exc
+
+
+def _rewrite_output_schema(
+    value: JsonValue,
+    *,
+    definitions: JsonObject,
+    pending: list[str],
+) -> JsonValue:
+    """Restore root-local output-schema references from the aggregate artifact."""
+    if isinstance(value, list):
+        return [
+            _rewrite_output_schema(item, definitions=definitions, pending=pending)
+            for item in value
+        ]
+    if not isinstance(value, dict):
+        return value
+    rewritten: JsonObject = {}
+    for key, item in value.items():
+        if key != "$ref":
+            rewritten[key] = _rewrite_output_schema(
+                item,
+                definitions=definitions,
+                pending=pending,
+            )
+            continue
+        if type(item) is not str or not item.startswith("#/$defs/output."):
+            message = "Local deployment contract authority is invalid"
+            raise VerificationError(message)
+        name = item.removeprefix("#/$defs/output.")
+        source_key = f"output.{name}"
+        if source_key not in definitions:
+            message = "Local deployment contract authority is invalid"
+            raise VerificationError(message)
+        pending.append(source_key)
+        rewritten[key] = f"#/$defs/{name}"
+    return rewritten
+
+
+def _reconstruct_output_schema(
+    definitions: JsonObject,
+    *,
+    root_key: str,
+) -> JsonObject:
+    """Reconstruct one tool's local output schema from its aggregate authority."""
+    root = definitions.get(root_key)
+    if not isinstance(root, dict):
+        message = "Local deployment contract authority is invalid"
+        raise VerificationError(message)
+    pending = [root_key]
+    local_definitions: dict[str, JsonValue] = {}
+    root_schema: JsonObject | None = None
+    while pending:
+        source_key = pending.pop()
+        if source_key == root_key and root_schema is not None:
+            continue
+        if (
+            source_key != root_key
+            and source_key.removeprefix("output.") in local_definitions
+        ):
+            continue
+        source = definitions.get(source_key)
+        if not isinstance(source, dict) or not source_key.startswith("output."):
+            message = "Local deployment contract authority is invalid"
+            raise VerificationError(message)
+        rewritten = _rewrite_output_schema(
+            copy.deepcopy(source),
+            definitions=definitions,
+            pending=pending,
+        )
+        if not isinstance(rewritten, dict):
+            message = "Local deployment contract authority is invalid"
+            raise VerificationError(message)
+        if source_key == root_key:
+            root_schema = rewritten
+        else:
+            local_definitions[source_key.removeprefix("output.")] = rewritten
+    if root_schema is None:
+        message = "Local deployment contract authority is invalid"
+        raise VerificationError(message)
+    if local_definitions:
+        root_schema["$defs"] = {
+            name: local_definitions[name] for name in sorted(local_definitions)
+        }
+    return root_schema
+
+
+def _public_input_schema(
+    definitions: JsonObject,
+    *,
+    name: str,
+    root_key: str,
+) -> JsonObject:
+    """Project one generated input root onto the reviewed public wire schema."""
+    source = definitions.get(root_key)
+    if not isinstance(source, dict):
+        message = "Local deployment contract authority is invalid"
+        raise VerificationError(message)
+    schema = copy.deepcopy(source)
+    _ = schema.pop("title", None)
+    _ = schema.pop("description", None)
+    if name != "search_documents":
+        return schema
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        message = "Local deployment contract authority is invalid"
+        raise VerificationError(message)
+    query = properties.get("query")
+    cursor = properties.get("cursor")
+    if not isinstance(query, dict) or not isinstance(cursor, dict):
+        message = "Local deployment contract authority is invalid"
+        raise VerificationError(message)
+    if type(query.pop("pattern", None)) is not str:
+        message = "Local deployment contract authority is invalid"
+        raise VerificationError(message)
+    alternatives = cursor.get("anyOf")
+    if (
+        not isinstance(alternatives, list)
+        or not alternatives
+        or not isinstance(alternatives[0], dict)
+        or type(alternatives[0].pop("minLength", None)) is not int
+        or type(alternatives[0].pop("pattern", None)) is not str
+    ):
+        message = "Local deployment contract authority is invalid"
+        raise VerificationError(message)
+    return schema
+
+
+def _normalized_schema_digest(schema: JsonObject) -> str:
+    """Return the generated manifest's title-insensitive schema digest."""
+
+    def normalize(value: JsonValue) -> JsonValue:
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: normalize(item) for key, item in value.items() if key != "title"
+            }
+        return value
+
+    normalized = normalize(schema)
+    rendered = json.dumps(
+        normalized,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(f"{rendered}\n".encode()).hexdigest()
+
+
+def _canonical_json_digest(value: JsonValue) -> str:
+    """Return the canonical whole-artifact digest used by checked-in manifests."""
+    rendered = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(f"{rendered}\n".encode()).hexdigest()
+
+
+def _expected_schema_keys() -> frozenset[str]:
+    """Return the reviewed root-schema inventory for every public tool pair."""
+    return frozenset(_INPUT_SCHEMA_ROOTS_BY_TOOL.values()) | frozenset(
+        _OUTPUT_SCHEMA_ROOTS_BY_TOOL.values()
+    )
+
+
+def _validate_baseline_authority(baseline: JsonObject, manifest: JsonObject) -> None:
+    """Bind the baseline tool catalog to its reviewed canonical digest."""
+    entries = manifest.get("entries")
+    if (
+        manifest.get("schema_version") != _BASELINE_MANIFEST_VERSION
+        or manifest.get("canonicalization") != _BASELINE_CANONICALIZATION
+        or not isinstance(entries, list)
+    ):
+        message = "Local deployment contract authority is invalid"
+        raise VerificationError(message)
+    records = [
+        item
+        for item in entries
+        if isinstance(item, dict) and item.get("path") == "tool-catalog.json"
+    ]
+    if len(records) != 1 or set(records[0]) != {"path", "sha256"}:
+        message = "Local deployment contract authority is invalid"
+        raise VerificationError(message)
+    digest = records[0].get("sha256")
+    if type(digest) is not str or digest != _canonical_json_digest(baseline):
+        message = "Local deployment contract authority is invalid"
+        raise VerificationError(message)
+
+
+def _validate_generated_authority(
+    aggregate: JsonObject,
+    manifest: JsonObject,
+) -> tuple[JsonObject, dict[str, str]]:
+    """Validate generated-schema identity, inventory, and declared digests."""
+    definitions = aggregate.get("$defs")
+    records = manifest.get("schemas")
+    expected_keys = _expected_schema_keys()
+    if (
+        set(aggregate) != {"$defs", "$id", "$schema", "description"}
+        or aggregate.get("$id") != _CONTRACT_SCHEMA_ID
+        or aggregate.get("$schema") != _DRAFT_2020_12
+        or not isinstance(definitions, dict)
+        or set(manifest)
+        != {"aggregate_sha256", "exporter_version", "schema_id", "schemas", "version"}
+        or manifest.get("version") != _CONTRACT_MANIFEST_VERSION
+        or manifest.get("schema_id") != _CONTRACT_SCHEMA_ID
+        or manifest.get("exporter_version") != _CONTRACT_EXPORTER_VERSION
+        or manifest.get("aggregate_sha256") != _canonical_json_digest(aggregate)
+        or not isinstance(records, list)
+    ):
+        message = "Local deployment contract authority is invalid"
+        raise VerificationError(message)
+    manifest_digests: dict[str, str] = {}
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {
+            "$id",
+            "exporter_version",
+            "json_pointer",
+            "key",
+            "normalized_sha256",
+            "pydantic_version",
+            "zod_version",
+        }:
+            message = "Local deployment contract authority is invalid"
+            raise VerificationError(message)
+        key = record.get("key")
+        digest = record.get("normalized_sha256")
+        if (
+            type(key) is not str
+            or type(digest) is not str
+            or key in manifest_digests
+            or record.get("$id") != _CONTRACT_SCHEMA_ID
+            or record.get("exporter_version") != _CONTRACT_EXPORTER_VERSION
+            or record.get("json_pointer") != f"#/$defs/{key}"
+            or record.get("pydantic_version") != _CONTRACT_PYDANTIC_VERSION
+            or record.get("zod_version") != _CONTRACT_ZOD_VERSION
+        ):
+            message = "Local deployment contract authority is invalid"
+            raise VerificationError(message)
+        manifest_digests[key] = digest
+    if frozenset(manifest_digests) != expected_keys:
+        message = "Local deployment contract authority is invalid"
+        raise VerificationError(message)
+    for key in expected_keys:
+        source = definitions.get(key)
+        if not isinstance(source, dict):
+            message = "Local deployment contract authority is invalid"
+            raise VerificationError(message)
+        schema = (
+            _reconstruct_output_schema(definitions, root_key=key)
+            if key.startswith("output.")
+            else source
+        )
+        if manifest_digests[key] != _normalized_schema_digest(schema):
+            message = "Local deployment contract authority is invalid"
+            raise VerificationError(message)
+    return definitions, manifest_digests
+
+
+def _expected_tool_descriptors() -> dict[str, JsonObject]:
+    """Load exact public descriptors from the checked-in contract authority."""
+    baseline = _artifact_object(_BASELINE_TOOL_CATALOG)
+    aggregate = _artifact_object(_GENERATED_CONTRACT_SCHEMA)
+    manifest = _artifact_object(_GENERATED_CONTRACT_MANIFEST)
+    baseline_manifest = _artifact_object(_BASELINE_MANIFEST)
+    expected_names = ALPIC_METADATA_TOOLS | PRIVATE_FULL_TOOLS
+    if (
+        expected_names != frozenset(_INPUT_SCHEMA_ROOTS_BY_TOOL)
+        or expected_names != frozenset(_OUTPUT_SCHEMA_ROOTS_BY_TOOL)
+        or frozenset(baseline) != expected_names
+    ):
+        message = "Local deployment contract authority is invalid"
+        raise VerificationError(message)
+    _validate_baseline_authority(baseline, baseline_manifest)
+    definitions, _ = _validate_generated_authority(aggregate, manifest)
+    expected: dict[str, JsonObject] = {}
+    for name in expected_names:
+        descriptor = baseline.get(name)
+        root_key = _OUTPUT_SCHEMA_ROOTS_BY_TOOL[name]
+        if not isinstance(descriptor, dict):
+            message = "Local deployment contract authority is invalid"
+            raise VerificationError(message)
+        expected_descriptor = copy.deepcopy(descriptor)
+        input_schema = _public_input_schema(
+            definitions,
+            name=name,
+            root_key=_INPUT_SCHEMA_ROOTS_BY_TOOL[name],
+        )
+        output_schema = _reconstruct_output_schema(definitions, root_key=root_key)
+        _ = output_schema.pop("title", None)
+        _ = output_schema.pop("description", None)
+        expected_descriptor["inputSchema"] = input_schema
+        expected_descriptor["outputSchema"] = output_schema
+        expected[name] = expected_descriptor
+    return expected
+
+
 def _tool_catalog(listed: JsonObject) -> dict[str, JsonObject]:
     raw_items = listed.get("tools")
     if not isinstance(raw_items, list):
@@ -535,6 +906,9 @@ def _tool_catalog(listed: JsonObject) -> dict[str, JsonObject]:
         name = raw_item.get("name")
         if not isinstance(name, str):
             msg = "Tool catalog contains an unnamed entry"
+            raise VerificationError(msg)
+        if name in catalog:
+            msg = "Tool catalog contains duplicate names"
             raise VerificationError(msg)
         catalog[name] = raw_item
     return catalog
@@ -555,6 +929,24 @@ def _verify_annotations(catalog: Mapping[str, JsonObject]) -> None:
             mismatches.append(name)
     if mismatches:
         msg = f"Tool annotation mismatch: {sorted(mismatches)}"
+        raise VerificationError(msg)
+
+
+def _verify_tool_descriptors(
+    catalog: Mapping[str, JsonObject],
+    *,
+    expected_tools: frozenset[str],
+) -> None:
+    """Require exact profile-scoped public tool descriptor equality."""
+    expected = _expected_tool_descriptors()
+    mismatches = [
+        name
+        for name, descriptor in expected.items()
+        if name in expected_tools
+        if _dump_json(catalog[name]) != _dump_json(descriptor)
+    ]
+    if mismatches:
+        msg = f"Tool descriptor mismatch: {sorted(mismatches)}"
         raise VerificationError(msg)
 
 
@@ -733,6 +1125,7 @@ def verify(
         msg = "Tool catalog mismatch"
         raise VerificationError(msg)
     _verify_annotations(catalog)
+    _verify_tool_descriptors(catalog, expected_tools=expected_tools)
     if discover.get("cacheScope") != "private" or listed.get("cacheScope") != "private":
         msg = "Modern list/discovery results must declare private cache scope"
         raise VerificationError(msg)

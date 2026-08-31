@@ -534,6 +534,7 @@ _REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
         "xǁMcpSecurityMiddlewareǁ_send_with_policy",
         "xǁMcpSecurityMiddlewareǁshutdown",
         "xǁMcpSecurityMiddlewareǁstart",
+        "xǁMcpSecurityMiddlewareǁ_try_acquire_admission",
         "xǁ_JSONResponseǁ__init__",
     ),
     "src/nplg_mcp/json_preflight.py": (

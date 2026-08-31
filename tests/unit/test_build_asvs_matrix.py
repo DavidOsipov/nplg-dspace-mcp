@@ -3690,6 +3690,44 @@ def test_manifest_loader_rejects_bounded_json_shape_attacks(
         _ = load_evidence_manifest(path)
 
 
+def test_manifest_loader_rejects_an_escaped_lone_surrogate_as_bounded_error(
+    tmp_path: Path,
+) -> None:
+    """Catch mutation: remove lone-surrogate rejection from shape validation."""
+    payload = _local_evidence() | {"asserted_invariant": "\ud800"}
+    serializable = {
+        key: item.isoformat() if isinstance(item, date) else item
+        for key, item in payload.items()
+    }
+    body = (
+        json.dumps(
+            serializable,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("ascii")
+    path = tmp_path / "manifest.jsonl"
+    _ = path.write_bytes(body)
+
+    with pytest.raises(AsvsError) as captured:
+        _ = load_evidence_manifest(path)
+    assert str(captured.value) == "invalid UTF-8 JSON"
+
+
+def test_manifest_loader_preserves_canonical_astral_unicode(tmp_path: Path) -> None:
+    """Catch mutation: reject non-ASCII strings before UTF-8 byte accounting."""
+    payload = _local_evidence() | {"asserted_invariant": "Astral Unicode: \U0001f600"}
+    path = tmp_path / "manifest.jsonl"
+    _ = path.write_bytes(_canonical_json_line(payload))
+
+    references = load_evidence_manifest(path)
+
+    assert references[0].asserted_invariant == "Astral Unicode: \U0001f600"
+
+
 def test_manifest_loader_rejects_invalid_schema_line_and_record_bounds(
     tmp_path: Path,
 ) -> None:

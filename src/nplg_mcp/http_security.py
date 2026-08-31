@@ -111,8 +111,6 @@ class McpSecurityMiddleware:
             principal_ids.append("legacy-bearer")
         if config.api_key is not None:
             principal_ids.append("legacy-api-key")
-        if config.allow_anonymous:
-            principal_ids.append("anonymous")
         self._principal_admission = (
             PrincipalAdmission(
                 principal_ids,
@@ -235,6 +233,23 @@ class McpSecurityMiddleware:
                 matched = "legacy-bearer" if authorization else "legacy-api-key"
         return matched
 
+    def _try_acquire_admission(
+        self,
+        principal_id: str,
+    ) -> tuple[bool, PrincipalAdmission | None]:
+        """Acquire global capacity and, only for a stable identity, its fair share."""
+        if principal_id == "anonymous":
+            return self._admission.try_acquire(), None
+        principal_admission = self._principal_admission
+        if principal_admission is None or not principal_admission.try_acquire(
+            principal_id
+        ):
+            return False, None
+        if self._admission.try_acquire():
+            return True, principal_admission
+        principal_admission.release(principal_id)
+        return False, None
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Apply authenticated admission before the bounded security pipeline."""
         scope_values = cast("Mapping[str, object]", scope)
@@ -265,16 +280,14 @@ class McpSecurityMiddleware:
         """Apply principal/global limits and the application deadline."""
         headers = cast("list[tuple[bytes, bytes]]", scope_values.get("headers", []))
         principal_id = self._authenticated_principal(headers)
-        principal_admission = self._principal_admission
-        if principal_id is None or principal_admission is None:
+        if principal_id is None:
             await self._security_call(scope, receive, send)
             return
 
-        principal_acquired = principal_admission.try_acquire(principal_id)
-        globally_acquired = principal_acquired and self._admission.try_acquire()
+        globally_acquired, principal_admission = self._try_acquire_admission(
+            principal_id
+        )
         if not globally_acquired:
-            if principal_acquired:
-                principal_admission.release(principal_id)
             busy = AppError(
                 ErrorCode.RATE_LIMITED,
                 "The MCP server is at its concurrent request limit.",
@@ -331,7 +344,8 @@ class McpSecurityMiddleware:
                     await self._send_response(response, scope, receive, send)
         finally:
             self._admission.release()
-            principal_admission.release(principal_id)
+            if principal_admission is not None:
+                principal_admission.release(principal_id)
 
     async def _security_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self,

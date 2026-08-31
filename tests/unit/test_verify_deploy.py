@@ -7,7 +7,9 @@ import hashlib
 import io
 import json
 import runpy
+import subprocess
 import sys
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
@@ -17,9 +19,10 @@ import pytest
 import nplg_mcp.agent_workflow as agent_workflow_module
 import nplg_mcp.mcp_server as mcp_server_module
 import scripts.verify_deploy as verify_deploy_module
+from nplg_mcp.contracts.tool_models import tool_model_bindings
+from nplg_mcp.json_types import load_json_value
 from scripts.verify_deploy import (
     ALPIC_METADATA_TOOLS,
-    CACHE_WRITING_TOOLS,
     EXPECTED_TOOLS,
     MAX_RESPONSE_BYTES,
     PRIVATE_FULL_TOOLS,
@@ -34,10 +37,54 @@ from scripts.verify_deploy import (
     verify,
     verify_probes,
 )
+from tests.helpers.app_factory import make_tool_service
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from http.client import HTTPConnection
+    from typing import Protocol
+
+    class OutputSchemaRewriter(Protocol):
+        """Type one output-schema reference rewriting seam."""
+
+        def __call__(
+            self,
+            value: JsonValue,
+            *,
+            definitions: JsonObject,
+            pending: list[str],
+        ) -> JsonValue: ...
+
+    class OutputSchemaReconstructor(Protocol):
+        """Type one output-schema reconstruction seam."""
+
+        def __call__(self, definitions: JsonObject, *, root_key: str) -> JsonObject: ...
+
+    class PublicInputProjector(Protocol):
+        """Type one public input-schema projection seam."""
+
+        def __call__(
+            self,
+            definitions: JsonObject,
+            *,
+            name: str,
+            root_key: str,
+        ) -> JsonObject: ...
+
+    class BaselineAuthorityValidator(Protocol):
+        """Type one baseline-artifact validation seam."""
+
+        def __call__(self, baseline: JsonObject, manifest: JsonObject) -> None: ...
+
+    class GeneratedAuthorityValidator(Protocol):
+        """Type one generated-artifact validation seam."""
+
+        def __call__(
+            self,
+            aggregate: JsonObject,
+            manifest: JsonObject,
+        ) -> tuple[JsonObject, dict[str, str]]: ...
+
 
 ARGUMENT_ERROR_EXIT = 2
 CANCELLED_EXIT = 130
@@ -67,6 +114,12 @@ SERVER_NAME = "nplg-dspace-mcp"
 SERVER_TITLE = "NPLG DSpace MCP"
 SERVER_VERSION = "0.1.0"
 ROOT = Path(__file__).parents[2]
+BASELINE_TOOL_CATALOG = ROOT / "contracts" / "baseline" / "tool-catalog.json"
+BASELINE_MANIFEST = ROOT / "contracts" / "baseline" / "manifest.json"
+GENERATED_CONTRACT_SCHEMA = (
+    ROOT / "contracts" / "generated" / "tool-contracts.schema.json"
+)
+GENERATED_CONTRACT_MANIFEST = ROOT / "contracts" / "generated" / "schema-manifest.json"
 PACKAGED_AGENT_WORKFLOW = (
     ROOT
     / "src"
@@ -102,6 +155,135 @@ FORBIDDEN_AGENT_WORKFLOW_OPERATIONS = (
 )
 
 
+def _exact_tool_items(profile: DeploymentProfile) -> list[JsonValue]:
+    """Return descriptors independently derived from the canonical contracts."""
+    baseline = load_json_value(BASELINE_TOOL_CATALOG.read_bytes())
+    assert isinstance(baseline, dict)
+    expected_names = (
+        ALPIC_METADATA_TOOLS if profile == "alpic-metadata" else PRIVATE_FULL_TOOLS
+    )
+    bindings = {str(binding.name): binding for binding in tool_model_bindings()}
+    tools: list[JsonValue] = []
+    for name in sorted(expected_names):
+        binding = bindings[name]
+        input_schema = cast(
+            "JsonObject",
+            binding.input_model.model_json_schema(mode="validation"),
+        )
+        _ = input_schema.pop("title", None)
+        _ = input_schema.pop("description", None)
+        if name == "search_documents":
+            properties = input_schema["properties"]
+            assert isinstance(properties, dict)
+            query = properties["query"]
+            cursor = properties["cursor"]
+            assert isinstance(query, dict)
+            assert isinstance(cursor, dict)
+            _ = query.pop("pattern")
+            alternatives = cursor["anyOf"]
+            assert isinstance(alternatives, list)
+            assert isinstance(alternatives[0], dict)
+            _ = alternatives[0].pop("minLength")
+            _ = alternatives[0].pop("pattern")
+        output_schema = cast(
+            "JsonObject",
+            binding.output_model.model_json_schema(mode="serialization"),
+        )
+        _ = output_schema.pop("title", None)
+        _ = output_schema.pop("description", None)
+        tools.append(
+            {
+                **deepcopy(cast("JsonObject", baseline[name])),
+                "inputSchema": input_schema,
+                "outputSchema": output_schema,
+            }
+        )
+    return tools
+
+
+def _sdk_tool_items(tmp_path: Path, profile: DeploymentProfile) -> list[JsonValue]:
+    """Return the current public ToolService wire projection as an oracle."""
+    return cast(
+        "list[JsonValue]",
+        make_tool_service(tmp_path, deployment_profile=profile).list_tools(),
+    )
+
+
+def _patch_contract_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> dict[str, Path]:
+    """Redirect the verifier to isolated checked-in contract artifact copies."""
+    paths = {
+        "baseline": tmp_path / "tool-catalog.json",
+        "baseline_manifest": tmp_path / "baseline-manifest.json",
+        "schema": tmp_path / "tool-contracts.schema.json",
+        "schema_manifest": tmp_path / "schema-manifest.json",
+    }
+    sources = {
+        "baseline": BASELINE_TOOL_CATALOG,
+        "baseline_manifest": BASELINE_MANIFEST,
+        "schema": GENERATED_CONTRACT_SCHEMA,
+        "schema_manifest": GENERATED_CONTRACT_MANIFEST,
+    }
+    for name, source in sources.items():
+        _ = paths[name].write_bytes(source.read_bytes())
+    monkeypatch.setattr(
+        verify_deploy_module,
+        "_BASELINE_TOOL_CATALOG",
+        paths["baseline"],
+    )
+    monkeypatch.setattr(
+        verify_deploy_module,
+        "_BASELINE_MANIFEST",
+        paths["baseline_manifest"],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        verify_deploy_module,
+        "_GENERATED_CONTRACT_SCHEMA",
+        paths["schema"],
+    )
+    monkeypatch.setattr(
+        verify_deploy_module,
+        "_GENERATED_CONTRACT_MANIFEST",
+        paths["schema_manifest"],
+    )
+    return paths
+
+
+def _remove_test_file(path: Path) -> None:
+    """Remove one isolated test artifact before its subprocess load."""
+    path.unlink()
+
+
+def _canonical_test_digest(value: JsonValue) -> str:
+    """Compute one checked-in artifact's canonical manifest digest."""
+    rendered = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(f"{rendered}\n".encode()).hexdigest()
+
+
+def _private_name(name: str) -> str:
+    """Build a private verifier attribute name for adversarial test resolution."""
+    return f"_{name}"
+
+
+def _make_test_directory(path: Path, *, parents: bool = False) -> None:
+    """Create one isolated directory for a package-independent subprocess."""
+    path.mkdir(parents=parents)
+
+
+def _copy_test_file(source: Path, destination: Path) -> None:
+    """Copy one local artifact without inheriting package import state."""
+    _ = destination.write_bytes(source.read_bytes())
+
+
 def _server_meta(*, title: str = SERVER_TITLE) -> JsonObject:
     return {
         "io.modelcontextprotocol/serverInfo": {
@@ -118,6 +300,7 @@ class FakeClient:
 
     read_only: bool | None
     tool_names: frozenset[str] = ALPIC_METADATA_TOOLS
+    tool_items: list[JsonValue] | None = None
     workflow_text: str = VALID_AGENT_WORKFLOW_TEXT
     get_paths: list[str] = field(default_factory=list[str])
     rpc_methods: list[str] = field(default_factory=list[str])
@@ -151,20 +334,21 @@ class FakeClient:
                 "_meta": _server_meta(),
             }, headers
         if method == "tools/list":
-            tools: list[JsonValue] = [
-                {
-                    "name": tool_name,
-                    "annotations": {
-                        "readOnlyHint": (
-                            tool_name not in CACHE_WRITING_TOOLS
-                            if self.read_only is None
-                            else self.read_only
-                        ),
-                        "destructiveHint": False,
-                    },
-                }
-                for tool_name in sorted(self.tool_names)
-            ]
+            tools = (
+                deepcopy(self.tool_items)
+                if self.tool_items is not None
+                else _exact_tool_items(
+                    "alpic-metadata"
+                    if self.tool_names == ALPIC_METADATA_TOOLS
+                    else "private-full"
+                )
+            )
+            if self.read_only is not None:
+                for tool in tools:
+                    assert isinstance(tool, dict)
+                    annotations = tool.get("annotations")
+                    assert isinstance(annotations, dict)
+                    annotations["readOnlyHint"] = self.read_only
             return {"tools": tools, "cacheScope": "private"}, headers
         if method == "resources/list":
             if self.tool_names == ALPIC_METADATA_TOOLS:
@@ -507,6 +691,622 @@ def test_private_probe_verification_is_explicit() -> None:
 def test_deployment_verifier_rejects_misclassified_tool_catalog() -> None:
     with pytest.raises(VerificationError, match="annotation mismatch"):
         _ = verify(FakeClient(read_only=False))
+
+
+def test_deployment_verifier_rejects_duplicate_tool_names() -> None:
+    tools = _exact_tool_items("alpic-metadata")
+    tools.append(deepcopy(tools[0]))
+
+    with pytest.raises(VerificationError, match="duplicate names"):
+        _ = verify(FakeClient(read_only=None, tool_items=tools))
+
+
+@pytest.mark.parametrize("field", ["inputSchema", "outputSchema"])
+def test_deployment_verifier_rejects_missing_tool_schema(field: str) -> None:
+    tools = _exact_tool_items("alpic-metadata")
+    assert isinstance(tools[0], dict)
+    _ = tools[0].pop(field)
+
+    with pytest.raises(VerificationError, match="descriptor mismatch"):
+        _ = verify(FakeClient(read_only=None, tool_items=tools))
+
+
+@pytest.mark.parametrize("field", ["inputSchema", "outputSchema"])
+def test_deployment_verifier_rejects_drifted_tool_schema(field: str) -> None:
+    tools = _exact_tool_items("alpic-metadata")
+    assert isinstance(tools[0], dict)
+    schema = tools[0][field]
+    assert isinstance(schema, dict)
+    schema["additionalProperties"] = True
+
+    with pytest.raises(VerificationError, match="descriptor mismatch"):
+        _ = verify(FakeClient(read_only=None, tool_items=tools))
+
+
+def test_deployment_verifier_accepts_exact_canonical_tool_catalog() -> None:
+    result = verify(
+        FakeClient(
+            read_only=None,
+            tool_items=_exact_tool_items("alpic-metadata"),
+        )
+    )
+
+    assert result["tool_count"] == len(ALPIC_METADATA_TOOLS)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "title",
+        "description",
+        "idempotentHint",
+        "openWorldHint",
+        "extra-member",
+    ],
+)
+def test_deployment_verifier_rejects_descriptor_drift_not_covered_by_schema_checks(
+    mutation: str,
+) -> None:
+    tools = _exact_tool_items("alpic-metadata")
+    assert isinstance(tools[0], dict)
+    descriptor = tools[0]
+    if mutation in {"title", "description"}:
+        descriptor[mutation] = "forged"
+    elif mutation == "extra-member":
+        descriptor["unexpected"] = True
+    else:
+        annotations = descriptor.get("annotations")
+        assert isinstance(annotations, dict)
+        annotations[mutation] = False
+
+    with pytest.raises(VerificationError, match="descriptor mismatch"):
+        _ = verify(FakeClient(read_only=None, tool_items=tools))
+
+
+@pytest.mark.parametrize(
+    ("profile", "tool_names"),
+    [
+        ("alpic-metadata", ALPIC_METADATA_TOOLS),
+        ("private-full", PRIVATE_FULL_TOOLS),
+    ],
+)
+def test_deployment_verifier_accepts_current_tool_service_wire_projection(
+    tmp_path: Path,
+    profile: DeploymentProfile,
+    tool_names: frozenset[str],
+) -> None:
+    result = verify(
+        FakeClient(
+            read_only=None,
+            tool_names=tool_names,
+            tool_items=_sdk_tool_items(tmp_path, profile),
+        ),
+        profile=profile,
+    )
+
+    assert result["profile"] == profile
+
+
+@pytest.mark.parametrize("body", [b'{"ignored":"\\udc00"}', b'{"\\ud800":"ok"}'])
+def test_default_adapter_rejects_low_surrogates_and_surrogate_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    body: bytes,
+) -> None:
+    response = RecordingResponse(body)
+    _ = _install_https(monkeypatch, response)
+
+    with pytest.raises(VerificationError, match="invalid JSON value"):
+        _ = McpClient("https://mcp.example").get("/healthz")
+
+
+def _authority_bundle(
+    paths: dict[str, Path],
+) -> tuple[JsonObject, JsonObject, JsonObject, JsonObject]:
+    """Load one isolated mutable authority bundle."""
+    baseline = load_json_value(paths["baseline"].read_bytes())
+    baseline_manifest = load_json_value(paths["baseline_manifest"].read_bytes())
+    aggregate = load_json_value(paths["schema"].read_bytes())
+    manifest = load_json_value(paths["schema_manifest"].read_bytes())
+    assert isinstance(baseline, dict)
+    assert isinstance(baseline_manifest, dict)
+    assert isinstance(aggregate, dict)
+    assert isinstance(manifest, dict)
+    return baseline, baseline_manifest, aggregate, manifest
+
+
+def _write_authority_bundle(
+    paths: dict[str, Path],
+    baseline: JsonObject,
+    baseline_manifest: JsonObject,
+    aggregate: JsonObject,
+    manifest: JsonObject,
+) -> None:
+    """Persist one isolated mutated authority bundle."""
+    _ = paths["baseline"].write_text(json.dumps(baseline), encoding="utf-8")
+    _ = paths["baseline_manifest"].write_text(
+        json.dumps(baseline_manifest), encoding="utf-8"
+    )
+    _ = paths["schema"].write_text(json.dumps(aggregate), encoding="utf-8")
+    _ = paths["schema_manifest"].write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _assert_authority_rejected() -> None:
+    """Exercise artifact loading through the public deployment verifier boundary."""
+    with pytest.raises(VerificationError, match="contract authority"):
+        _ = verify(
+            FakeClient(read_only=None, tool_items=_exact_tool_items("alpic-metadata"))
+        )
+
+
+@pytest.mark.parametrize(
+    ("target", "field", "value"),
+    [
+        ("baseline-manifest", "canonicalization", "forged"),
+        ("baseline-record", "unexpected", True),
+        ("baseline-record", "sha256", None),
+        ("baseline", "search_documents", []),
+        ("baseline-manifest", "entries", {}),
+    ],
+)
+def test_expected_tool_contract_authority_rejects_exact_baseline_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    target: str,
+    field: str,
+    value: JsonValue,
+) -> None:
+    paths = _patch_contract_artifacts(monkeypatch, tmp_path)
+    baseline, baseline_manifest, aggregate, manifest = _authority_bundle(paths)
+    baseline_entries = baseline_manifest["entries"]
+    assert isinstance(baseline_entries, list)
+    baseline_record = next(
+        item
+        for item in baseline_entries
+        if isinstance(item, dict) and item.get("path") == "tool-catalog.json"
+    )
+    assert isinstance(baseline_record, dict)
+    target_value = {
+        "baseline": baseline,
+        "baseline-manifest": baseline_manifest,
+        "baseline-record": baseline_record,
+    }[target]
+    if value is None:
+        _ = target_value.pop(field)
+    else:
+        target_value[field] = value
+    if target == "baseline":
+        baseline_record["sha256"] = _canonical_test_digest(baseline)
+    _write_authority_bundle(paths, baseline, baseline_manifest, aggregate, manifest)
+    _assert_authority_rejected()
+
+
+def test_expected_tool_contract_authority_rejects_missing_baseline_catalog_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    paths = _patch_contract_artifacts(monkeypatch, tmp_path)
+    baseline, baseline_manifest, aggregate, manifest = _authority_bundle(paths)
+    entries = baseline_manifest["entries"]
+    assert isinstance(entries, list)
+    entries[:] = [
+        entry
+        for entry in entries
+        if not isinstance(entry, dict) or entry.get("path") != "tool-catalog.json"
+    ]
+    _write_authority_bundle(paths, baseline, baseline_manifest, aggregate, manifest)
+    _assert_authority_rejected()
+
+
+@dataclass(frozen=True, slots=True)
+class GeneratedEnvelopeMutation:
+    """One generated-authority envelope mutation and whether to re-sign it."""
+
+    target: str
+    field: str
+    value: JsonValue
+    resign: bool
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        GeneratedEnvelopeMutation("aggregate", "unexpected", value=True, resign=True),
+        GeneratedEnvelopeMutation(
+            "aggregate", "$id", "https://forged.invalid/contracts", resign=True
+        ),
+        GeneratedEnvelopeMutation(
+            "aggregate", "$schema", "https://forged.invalid/schema", resign=True
+        ),
+        GeneratedEnvelopeMutation("aggregate", "$defs", [], resign=True),
+        GeneratedEnvelopeMutation("manifest", "unexpected", value=True, resign=False),
+        GeneratedEnvelopeMutation("manifest", "schemas", {}, resign=False),
+        GeneratedEnvelopeMutation("manifest", "version", 0, resign=False),
+        GeneratedEnvelopeMutation(
+            "manifest", "schema_id", "https://forged.invalid/contracts", resign=False
+        ),
+        GeneratedEnvelopeMutation(
+            "manifest", "exporter_version", "forged", resign=False
+        ),
+        GeneratedEnvelopeMutation("aggregate", "description", "forged", resign=False),
+    ],
+)
+def test_expected_tool_contract_authority_rejects_exact_generated_envelope_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: GeneratedEnvelopeMutation,
+) -> None:
+    paths = _patch_contract_artifacts(monkeypatch, tmp_path)
+    baseline, baseline_manifest, aggregate, manifest = _authority_bundle(paths)
+    target_value = {"aggregate": aggregate, "manifest": manifest}[mutation.target]
+    target_value[mutation.field] = mutation.value
+    if mutation.resign:
+        manifest["aggregate_sha256"] = _canonical_test_digest(aggregate)
+    _write_authority_bundle(paths, baseline, baseline_manifest, aggregate, manifest)
+    _assert_authority_rejected()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("unexpected", True),
+        ("zod_version", None),
+        ("$id", "https://forged.invalid/contracts"),
+        ("exporter_version", "forged"),
+        ("json_pointer", "#/$defs/input.Forged"),
+        ("pydantic_version", "0"),
+        ("zod_version", "0"),
+        ("normalized_sha256", "0" * 64),
+    ],
+)
+def test_expected_tool_contract_authority_rejects_exact_generated_record_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    field: str,
+    value: JsonValue,
+) -> None:
+    paths = _patch_contract_artifacts(monkeypatch, tmp_path)
+    baseline, baseline_manifest, aggregate, manifest = _authority_bundle(paths)
+    records = manifest["schemas"]
+    assert isinstance(records, list)
+    record = next(
+        item
+        for item in records
+        if isinstance(item, dict) and item.get("key") == "input.ArtifactInput"
+    )
+    assert isinstance(record, dict)
+    if value is None:
+        _ = record.pop(field)
+    else:
+        record[field] = value
+    _write_authority_bundle(paths, baseline, baseline_manifest, aggregate, manifest)
+    _assert_authority_rejected()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["duplicate", "missing", "extra", "name-direction", "definition-missing"],
+)
+def test_expected_tool_contract_authority_rejects_exact_generated_inventory_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    paths = _patch_contract_artifacts(monkeypatch, tmp_path)
+    baseline, baseline_manifest, aggregate, manifest = _authority_bundle(paths)
+    records = manifest["schemas"]
+    definitions = aggregate["$defs"]
+    assert isinstance(records, list)
+    assert isinstance(definitions, dict)
+    record = next(
+        item
+        for item in records
+        if isinstance(item, dict) and item.get("key") == "input.ArtifactInput"
+    )
+    assert isinstance(record, dict)
+    if mutation == "duplicate":
+        records.append(deepcopy(record))
+    elif mutation == "missing":
+        records.remove(record)
+    elif mutation == "extra":
+        extra = deepcopy(record)
+        extra["key"] = "input.Forged"
+        extra["json_pointer"] = "#/$defs/input.Forged"
+        records.append(extra)
+    elif mutation == "name-direction":
+        record["key"] = "output.ArtifactInput"
+        record["json_pointer"] = "#/$defs/output.ArtifactInput"
+    else:
+        _ = definitions.pop("input.ArtifactInput")
+        manifest["aggregate_sha256"] = _canonical_test_digest(aggregate)
+    _write_authority_bundle(paths, baseline, baseline_manifest, aggregate, manifest)
+    _assert_authority_rejected()
+
+
+def test_contract_authority_loads_without_project_package_and_fails_closed_when_absent(
+    tmp_path: Path,
+) -> None:
+    script_dir = tmp_path / "scripts"
+    contracts_dir = tmp_path / "contracts"
+    script_dir.mkdir()
+    _make_test_directory(contracts_dir / "baseline", parents=True)
+    _make_test_directory(contracts_dir / "generated")
+    _copy_test_file(
+        ROOT / "scripts" / "verify_deploy.py",
+        script_dir / "verify_deploy.py",
+    )
+    _copy_test_file(
+        BASELINE_TOOL_CATALOG,
+        contracts_dir / "baseline" / "tool-catalog.json",
+    )
+    _copy_test_file(
+        BASELINE_MANIFEST,
+        contracts_dir / "baseline" / "manifest.json",
+    )
+    _copy_test_file(
+        GENERATED_CONTRACT_SCHEMA,
+        contracts_dir / "generated" / "tool-contracts.schema.json",
+    )
+    _copy_test_file(
+        GENERATED_CONTRACT_MANIFEST,
+        contracts_dir / "generated" / "schema-manifest.json",
+    )
+    loader = (
+        "import importlib.util, sys; "
+        "spec = importlib.util.spec_from_file_location("
+        "'verify_deploy', 'scripts/verify_deploy.py'); "
+        "module = importlib.util.module_from_spec(spec); "
+        "sys.modules['verify_deploy'] = module; "
+        "spec.loader.exec_module(module); "
+        "assert len(module._expected_tool_descriptors()) == 8"
+    )
+    loaded = subprocess.run(  # noqa: S603
+        [sys.executable, "-I", "-c", loader],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert loaded.returncode == 0, loaded.stderr
+    _remove_test_file(contracts_dir / "generated" / "tool-contracts.schema.json")
+    absent_loader = loader.replace(
+        "assert len(module._expected_tool_descriptors()) == 8",
+        "module._expected_tool_descriptors()",
+    )
+    absent_code = (
+        "try:\n"
+        f"    {absent_loader}\n"
+        "    raise AssertionError('authority unexpectedly loaded')\n"
+        "except module.VerificationError as error:\n"
+        "    print(error)\n"
+    )
+    absent = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            absent_code,
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert absent.returncode == 0, absent.stderr
+    assert "Local deployment contract authority is invalid" in absent.stdout
+
+
+def test_deployment_verifier_fails_closed_when_a_contract_artifact_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    paths = _patch_contract_artifacts(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        verify_deploy_module,
+        "_BASELINE_TOOL_CATALOG",
+        paths["baseline"].with_name("missing-tool-catalog.json"),
+    )
+
+    with pytest.raises(VerificationError, match="contract authority"):
+        _ = verify(
+            FakeClient(read_only=None, tool_items=_exact_tool_items("alpic-metadata"))
+        )
+
+
+@pytest.mark.parametrize(
+    ("value", "definitions"),
+    [
+        ({"$ref": "#/$defs/input.Bad"}, {}),
+        ({"$ref": "#/$defs/output.Bad"}, {}),
+    ],
+)
+def test_output_schema_reconstruction_rejects_unreviewed_references(
+    value: JsonValue,
+    definitions: JsonObject,
+) -> None:
+    rewrite = cast(
+        "OutputSchemaRewriter",
+        getattr(verify_deploy_module, _private_name("rewrite_output_schema")),
+    )
+
+    with pytest.raises(VerificationError, match="contract authority"):
+        _ = rewrite(value, definitions=definitions, pending=[])
+
+
+@pytest.mark.parametrize(
+    ("definitions", "root_key"),
+    [
+        ({}, "output.Missing"),
+        ({"input.NotOutput": {"type": "object"}}, "input.NotOutput"),
+    ],
+)
+def test_output_schema_reconstruction_rejects_missing_or_nonoutput_roots(
+    definitions: JsonObject,
+    root_key: str,
+) -> None:
+    reconstruct = cast(
+        "OutputSchemaReconstructor",
+        getattr(verify_deploy_module, _private_name("reconstruct_output_schema")),
+    )
+
+    with pytest.raises(VerificationError, match="contract authority"):
+        _ = reconstruct(definitions, root_key=root_key)
+
+
+@pytest.mark.parametrize(
+    ("schema", "reason"),
+    [
+        ({}, "missing-root"),
+        ({"properties": {}}, "missing-search-fields"),
+        (
+            {
+                "properties": {
+                    "query": {},
+                    "cursor": {"anyOf": [{"minLength": 1, "pattern": "x"}]},
+                }
+            },
+            "missing-query-pattern",
+        ),
+        (
+            {
+                "properties": {
+                    "query": {"pattern": "x"},
+                    "cursor": {"anyOf": []},
+                }
+            },
+            "invalid-cursor-alternatives",
+        ),
+    ],
+)
+def test_public_input_projection_rejects_incomplete_search_authority(
+    schema: JsonObject,
+    reason: str,
+) -> None:
+    project = cast(
+        "PublicInputProjector",
+        getattr(verify_deploy_module, _private_name("public_input_schema")),
+    )
+    definitions: JsonObject = (
+        {} if reason == "missing-root" else {"input.Search": schema}
+    )
+
+    with pytest.raises(VerificationError, match="contract authority"):
+        _ = project(definitions, name="search_documents", root_key="input.Search")
+
+
+def test_baseline_authority_rejects_bad_metadata_record_shape_and_digest() -> None:
+    validate = cast(
+        "BaselineAuthorityValidator",
+        getattr(verify_deploy_module, _private_name("validate_baseline_authority")),
+    )
+    baseline = load_json_value(BASELINE_TOOL_CATALOG.read_bytes())
+    manifest = load_json_value(BASELINE_MANIFEST.read_bytes())
+    assert isinstance(baseline, dict)
+    assert isinstance(manifest, dict)
+    entries = manifest["entries"]
+    assert isinstance(entries, list)
+
+    for mutation in ("metadata", "duplicate", "digest"):
+        mutated = deepcopy(manifest)
+        mutated_entries = mutated["entries"]
+        assert isinstance(mutated_entries, list)
+        if mutation == "metadata":
+            mutated["schema_version"] = 0
+        elif mutation == "duplicate":
+            record = next(
+                item
+                for item in mutated_entries
+                if isinstance(item, dict) and item.get("path") == "tool-catalog.json"
+            )
+            mutated_entries.append(deepcopy(record))
+        else:
+            record = next(
+                item
+                for item in mutated_entries
+                if isinstance(item, dict) and item.get("path") == "tool-catalog.json"
+            )
+            assert isinstance(record, dict)
+            record["sha256"] = "0" * 64
+        with pytest.raises(VerificationError, match="contract authority"):
+            validate(baseline, mutated)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["invalid-record", "missing-definition", "stale-schema-digest"],
+)
+def test_generated_authority_rejects_invalid_record_definition_and_digest(
+    mutation: str,
+) -> None:
+    validate = cast(
+        "GeneratedAuthorityValidator",
+        getattr(verify_deploy_module, _private_name("validate_generated_authority")),
+    )
+    aggregate = load_json_value(GENERATED_CONTRACT_SCHEMA.read_bytes())
+    manifest = load_json_value(GENERATED_CONTRACT_MANIFEST.read_bytes())
+    assert isinstance(aggregate, dict)
+    assert isinstance(manifest, dict)
+    definitions = aggregate["$defs"]
+    records = manifest["schemas"]
+    assert isinstance(definitions, dict)
+    assert isinstance(records, list)
+    if mutation == "invalid-record":
+        records[0] = None
+    elif mutation == "missing-definition":
+        _ = definitions.pop("input.ArtifactInput")
+        manifest["aggregate_sha256"] = _canonical_test_digest(aggregate)
+    else:
+        record = next(
+            item
+            for item in records
+            if isinstance(item, dict) and item.get("key") == "input.ArtifactInput"
+        )
+        assert isinstance(record, dict)
+        record["normalized_sha256"] = "0" * 64
+
+    with pytest.raises(VerificationError, match="contract authority"):
+        _ = validate(aggregate, manifest)
+
+
+def test_descriptor_authority_rejects_map_and_descriptor_inconsistencies(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    paths = _patch_contract_artifacts(monkeypatch, tmp_path)
+    input_roots_name = "_INPUT_SCHEMA_ROOTS_BY_TOOL"
+    input_roots = cast(
+        "dict[str, str]",
+        getattr(verify_deploy_module, input_roots_name),
+    )
+    monkeypatch.setattr(verify_deploy_module, "_INPUT_SCHEMA_ROOTS_BY_TOOL", {})
+    with pytest.raises(VerificationError, match="contract authority"):
+        _ = verify(
+            FakeClient(read_only=None, tool_items=_exact_tool_items("alpic-metadata"))
+        )
+
+    monkeypatch.setattr(
+        verify_deploy_module, "_INPUT_SCHEMA_ROOTS_BY_TOOL", input_roots
+    )
+    paths = _patch_contract_artifacts(monkeypatch, tmp_path)
+    baseline = load_json_value(paths["baseline"].read_bytes())
+    manifest = load_json_value(paths["baseline_manifest"].read_bytes())
+    assert isinstance(baseline, dict)
+    assert isinstance(manifest, dict)
+    baseline["search_documents"] = None
+    entries = manifest["entries"]
+    assert isinstance(entries, list)
+    record = next(
+        item
+        for item in entries
+        if isinstance(item, dict) and item.get("path") == "tool-catalog.json"
+    )
+    assert isinstance(record, dict)
+    record["sha256"] = _canonical_test_digest(baseline)
+    _ = paths["baseline"].write_text(json.dumps(baseline), encoding="utf-8")
+    _ = paths["baseline_manifest"].write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(VerificationError, match="contract authority"):
+        _ = verify(
+            FakeClient(read_only=None, tool_items=_exact_tool_items("alpic-metadata"))
+        )
 
 
 @pytest.mark.parametrize(
@@ -1157,19 +1957,7 @@ def _rpc_body(result: JsonObject, *, request_id: int = 1) -> bytes:
 
 
 def _valid_tool_items(profile: DeploymentProfile) -> list[JsonValue]:
-    tool_names = (
-        ALPIC_METADATA_TOOLS if profile == "alpic-metadata" else PRIVATE_FULL_TOOLS
-    )
-    return [
-        {
-            "name": tool_name,
-            "annotations": {
-                "readOnlyHint": tool_name not in CACHE_WRITING_TOOLS,
-                "destructiveHint": False,
-            },
-        }
-        for tool_name in sorted(tool_names)
-    ]
+    return _exact_tool_items(profile)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1663,6 +2451,51 @@ def test_default_adapter_accepts_finite_json_float_and_rejects_nonfinite(
 
     nonfinite = RecordingResponse(b'{"latency":NaN}')
     _ = _install_https(monkeypatch, nonfinite)
+    with pytest.raises(VerificationError, match="invalid JSON value"):
+        _ = McpClient("https://mcp.example").get("/healthz")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(
+            b"".join(
+                (
+                    b'{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete",',
+                    b'"cacheScope":"private"},"result":{"resultType":"complete",',
+                    b'"cacheScope":"private"}}',
+                )
+            ),
+            id="duplicate-envelope-member",
+        ),
+        pytest.param(
+            b"".join(
+                (
+                    b'{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete",',
+                    b'"cacheScope":"private","cacheScope":"private"}}',
+                )
+            ),
+            id="duplicate-nested-member",
+        ),
+    ],
+)
+def test_default_adapter_rejects_duplicate_json_members(
+    monkeypatch: pytest.MonkeyPatch,
+    body: bytes,
+) -> None:
+    response = RecordingResponse(body)
+    _ = _install_https(monkeypatch, response)
+
+    with pytest.raises(VerificationError, match="malformed JSON"):
+        _ = McpClient("https://mcp.example").rpc("tools/list")
+
+
+def test_default_adapter_rejects_lone_surrogate_in_ignored_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = RecordingResponse(b'{"status":"ok","ignored":"\\ud800"}')
+    _ = _install_https(monkeypatch, response)
+
     with pytest.raises(VerificationError, match="invalid JSON value"):
         _ = McpClient("https://mcp.example").get("/healthz")
 

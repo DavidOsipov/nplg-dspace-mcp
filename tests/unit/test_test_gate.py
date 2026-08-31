@@ -14,6 +14,7 @@ import os
 import runpy
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -279,6 +280,35 @@ class _RealGit:
         result = run_bounded_command(argv, root=cwd, cache_dir=self._cache)
         return CommandResult(
             argv=result.argv,
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
+
+
+class _EnvironmentGit:
+    def __init__(self) -> None:
+        super().__init__()
+        self.environments: list[dict[str, str]] = []
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        cwd: Path,
+        environment: Mapping[str, str],
+    ) -> CommandResult:
+        self.environments.append(dict(environment))
+        result = subprocess.run(  # noqa: S603
+            argv,
+            cwd=cwd,
+            env=environment,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+        )
+        return CommandResult(
+            argv=argv,
             returncode=result.returncode,
             stdout=result.stdout,
             stderr=result.stderr,
@@ -3012,6 +3042,26 @@ markers =
             "if False:\n    pass\n",
             encoding="utf-8",
         )
+    else:
+        _ = (repository / "src" / "nplg_mcp" / "errors.py").write_text(
+            "if False:\n    pass\n",
+            encoding="utf-8",
+        )
+        _ = _git_command(repository, cache, "add", "src/nplg_mcp/errors.py")
+        _ = _git_command(
+            repository,
+            cache,
+            "-c",
+            "user.name=NPLG Test Gate",
+            "-c",
+            "user.email=nplg-test-gate.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "candidate",
+        )
     return repository.resolve(strict=True), cache.resolve(strict=True)
 
 
@@ -4027,6 +4077,260 @@ def test_snapshot_includes_ignored_regular_owned_inputs(tmp_path: Path) -> None:
         ignored.read_bytes()
     )
     assert not (output / "snapshot" / "tests" / ".pytest_cache").exists()
+
+
+def test_reviewed_snapshot_excludes_only_generated_egg_info_directories(
+    tmp_path: Path,
+) -> None:
+    repository, git_cache = _initialize_gate_repository(tmp_path)
+    _ = (repository / ".gitignore").write_text("*.egg-info/\n", encoding="utf-8")
+    generated = repository / "src" / "nplg_dspace_mcp.egg-info"
+    generated.mkdir(parents=True)
+    _ = generated.joinpath("PKG-INFO").write_text("generated\n", encoding="utf-8")
+    ordinary_file = repository / "src" / "ordinary.egg-info"
+    _ = ordinary_file.write_text("ordinary file\n", encoding="utf-8")
+    ordinary_directory = repository / "src" / "ordinary.egg-info.backup"
+    ordinary_directory.mkdir()
+    _ = ordinary_directory.joinpath("module.py").write_text(
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    output = (tmp_path / "external-output").resolve()
+
+    _ = run_test_gate(
+        GateRequest(
+            worktree=repository,
+            compare_branch="refs/heads/base",
+            output_dir=output,
+        ),
+        executor=_CoverageExecutor(),
+        clock=_Clock(),
+        filesystem=_Filesystem(),
+        git=_RealGit(git_cache),
+    )
+
+    assert not (output / "snapshot" / "src" / "nplg_dspace_mcp.egg-info").exists()
+    assert (output / "snapshot" / "src" / "ordinary.egg-info").is_file()
+    assert (
+        output / "snapshot" / "src" / "ordinary.egg-info.backup/module.py"
+    ).is_file()
+
+
+@pytest.mark.parametrize("tracked", [False, True], ids=("unignored", "tracked"))
+def test_snapshot_excludes_generated_egg_info_from_every_inventory_source(
+    tmp_path: Path,
+    *,
+    tracked: bool,
+) -> None:
+    relative = "src/nplg_dspace_mcp.egg-info/PKG-INFO"
+    repository, git_cache = _initialize_gate_repository(
+        tmp_path,
+        extra_files={relative: b"generated\n"} if tracked else None,
+    )
+    generated = repository / "src" / "nplg_dspace_mcp.egg-info"
+    if not tracked:
+        generated.mkdir()
+        _ = generated.joinpath("PKG-INFO").write_text("generated\n", encoding="utf-8")
+    ordinary_file = repository / "src" / "ordinary.egg-info"
+    _ = ordinary_file.write_text("ordinary file\n", encoding="utf-8")
+    ordinary_directory = repository / "src" / "ordinary.egg-info-backup"
+    ordinary_directory.mkdir()
+    _ = ordinary_directory.joinpath("module.py").write_text(
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    output = (tmp_path / "external-output").resolve()
+
+    _ = run_test_gate(
+        GateRequest(
+            worktree=repository,
+            compare_branch="refs/heads/base",
+            output_dir=output,
+        ),
+        executor=_CoverageExecutor(),
+        clock=_Clock(),
+        filesystem=_Filesystem(),
+        git=_RealGit(git_cache),
+    )
+
+    assert not (output / "snapshot" / relative).exists()
+    assert (output / "snapshot" / "src" / "ordinary.egg-info").is_file()
+    assert (
+        output / "snapshot" / "src" / "ordinary.egg-info-backup/module.py"
+    ).is_file()
+
+
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    [
+        ("leaf-stat-race", "generated repository input changed during scan"),
+        ("symlink", "generated repository input is not a single-link regular file"),
+    ],
+)
+def test_generated_egg_info_inventory_fails_closed_on_leaf_faults(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+    message: str,
+) -> None:
+    repository, git_cache = _initialize_gate_repository(tmp_path)
+    generated = repository / "src" / "nplg_dspace_mcp.egg-info"
+    generated.mkdir()
+    leaf = generated / "PKG-INFO"
+    _ = leaf.write_text("generated\n", encoding="utf-8")
+    if fault == "leaf-stat-race":
+        original_stat = os.stat
+
+        def fail_leaf_stat(
+            path: int | str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            *,
+            dir_fd: int | None = None,
+            follow_symlinks: bool = True,
+        ) -> os.stat_result:
+            if (
+                path == leaf.name
+                and dir_fd is not None
+                and Path(f"/proc/self/fd/{dir_fd}").resolve(strict=True) == generated
+            ):
+                raise OSError(message)
+            return original_stat(
+                path,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+        monkeypatch.setattr("scripts.run_test_gate.os.stat", fail_leaf_stat)
+    else:
+        leaf.unlink()
+        leaf.symlink_to(repository / "src" / "nplg_mcp" / "errors.py")
+
+    with pytest.raises(GateError, match=message):
+        _ = run_test_gate(
+            GateRequest(
+                worktree=repository,
+                compare_branch="refs/heads/base",
+                output_dir=(tmp_path / "external-output").resolve(),
+            ),
+            executor=_CoverageExecutor(),
+            clock=_Clock(),
+            filesystem=_Filesystem(),
+            git=_RealGit(git_cache),
+        )
+
+
+def test_release_gate_rejects_a_comparison_ref_that_resolves_to_the_candidate(
+    tmp_path: Path,
+) -> None:
+    repository, git_cache = _initialize_gate_repository(tmp_path, dirty=False)
+    head = _git_command(repository, git_cache, "rev-parse", "HEAD").decode().strip()
+
+    with pytest.raises(GateError, match="comparison ref resolves to the candidate"):
+        _ = run_test_gate(
+            GateRequest(
+                worktree=repository,
+                compare_branch="HEAD",
+                output_dir=(tmp_path / "external-output").resolve(),
+                require_clean=True,
+                candidate=head,
+            ),
+            executor=_CoverageExecutor(),
+            clock=_Clock(),
+            filesystem=_Filesystem(),
+            git=_RealGit(git_cache),
+        )
+
+
+def test_release_gate_rejects_a_descendant_comparison_ref(
+    tmp_path: Path,
+) -> None:
+    repository, git_cache = _initialize_gate_repository(tmp_path, dirty=False)
+    head = _git_command(repository, git_cache, "rev-parse", "HEAD").decode().strip()
+    branch = (
+        _git_command(repository, git_cache, "branch", "--show-current").decode().strip()
+    )
+    _ = _git_command(repository, git_cache, "branch", "descendant")
+    _ = _git_command(repository, git_cache, "checkout", "-q", "descendant")
+    descendant = repository / "docs" / "descendant.md"
+    descendant.parent.mkdir()
+    _ = descendant.write_text("descendant\n", encoding="utf-8")
+    _ = _git_command(repository, git_cache, "add", "docs/descendant.md")
+    _ = _git_command(
+        repository,
+        git_cache,
+        "-c",
+        "user.name=NPLG Test Gate",
+        "-c",
+        "user.email=nplg-test-gate.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "-m",
+        "descendant",
+    )
+    _ = _git_command(repository, git_cache, "checkout", "-q", branch)
+
+    with pytest.raises(GateError, match="comparison ref resolves to the candidate"):
+        _ = run_test_gate(
+            GateRequest(
+                worktree=repository,
+                compare_branch="refs/heads/descendant",
+                output_dir=(tmp_path / "external-output").resolve(),
+                require_clean=True,
+                candidate=head,
+            ),
+            executor=_CoverageExecutor(),
+            clock=_Clock(),
+            filesystem=_Filesystem(),
+            git=_RealGit(git_cache),
+        )
+
+
+def test_release_gate_ignores_replace_refs_with_exact_closed_git_environments(
+    tmp_path: Path,
+) -> None:
+    repository, git_cache = _initialize_gate_repository(tmp_path, dirty=False)
+    candidate = (
+        _git_command(repository, git_cache, "rev-parse", "HEAD").decode().strip()
+    )
+    comparison = (
+        _git_command(repository, git_cache, "rev-parse", "refs/heads/base")
+        .decode()
+        .strip()
+    )
+    _ = _git_command(repository, git_cache, "replace", candidate, comparison)
+    git = _EnvironmentGit()
+
+    result = run_test_gate(
+        GateRequest(
+            worktree=repository,
+            compare_branch="refs/heads/base",
+            output_dir=(tmp_path / "external-output").resolve(),
+            require_clean=True,
+            candidate=candidate,
+        ),
+        executor=_CoverageExecutor(),
+        clock=_Clock(),
+        filesystem=_Filesystem(),
+        git=git,
+    )
+
+    assert result.measurements.project_branch_percent == _FULL_PERCENT
+    assert git.environments
+    for environment in git.environments:
+        assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+        assert environment["GIT_OPTIONAL_LOCKS"] == "0"
+        assert frozenset(environment) in {
+            frozenset({"GIT_NO_REPLACE_OBJECTS", "GIT_OPTIONAL_LOCKS"}),
+            frozenset(
+                {
+                    "GIT_AUTHOR_DATE",
+                    "GIT_COMMITTER_DATE",
+                    "GIT_NO_REPLACE_OBJECTS",
+                    "GIT_OPTIONAL_LOCKS",
+                }
+            ),
+        }
 
 
 @pytest.mark.parametrize(

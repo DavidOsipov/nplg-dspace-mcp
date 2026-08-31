@@ -145,13 +145,16 @@ export PUBLIC_BASE_URL=http://127.0.0.1:8000
 In another shell:
 
 ```bash
-.venv/bin/python scripts/verify_deploy.py --base-url http://127.0.0.1:8000
+.venv/bin/python scripts/verify_deploy.py \
+  --base-url http://127.0.0.1:8000 \
+  --profile private-full
 ```
 
-Run tests:
+From the shell where the reviewed toolchain variables above were set, run
+tests:
 
 ```bash
-.venv/bin/python -m pytest -q
+NPLG_REVIEWED_NODE="$NODE_BIN/node" .venv/bin/python -m pytest -q
 .venv/bin/python -m compileall -q src scripts
 ```
 
@@ -193,8 +196,11 @@ docker compose --env-file .env config --quiet
 ## Explicit limitations
 
 - Live XMLUI/OAI compatibility must be rechecked after deployment because upstream HTML can change.
-- The custom MCP wire layer covers only this server's methods; it is not a replacement for the full official SDK.
-- The build environment used for this release could not install or run the official MCP SDK/Inspector, so those remain external post-deploy checks.
+- The server uses the official MCP Python SDK behind project-owned HTTP admission
+  and bounded JSON preflight controls; those controls cover only this server's
+  supported profiles.
+- Hosted SDK interoperability and Inspector checks remain part of the
+  separately governed post-deploy evidence, not local release authority.
 - PDF work is bounded inside a hardened container but not inside a separately verified nested sandbox.
 - The cache is single-node filesystem storage and is not horizontally coordinated or automatically pruned. A process-local logical-byte quota rejects new cache writes at `CACHE_MAX_BYTES`; retain a filesystem/inode limit and disk alerts as independent controls.
 - Process-local admission limits bound work inside one server process; they are not per-client rate limits. Internet deployments still need a trusted edge policy for client-aware abuse controls.

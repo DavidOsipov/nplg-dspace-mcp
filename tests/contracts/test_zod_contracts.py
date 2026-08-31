@@ -661,7 +661,7 @@ def _zod_results(document: JsonObject) -> dict[str, AuthorityVerdict]:
     ):
         msg = "Zod oracle result fields do not match the protocol"
         raise ValueError(msg)
-    if document["protocol_version"] != 1 or document["zod_version"] != "4.4.3":
+    if document["protocol_version"] != 1 or document["zod_version"] != "4.5.4":
         msg = "Zod oracle protocol or dependency version is unexpected"
         raise ValueError(msg)
     _ = _validated_zod_schemas(document)

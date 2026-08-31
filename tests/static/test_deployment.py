@@ -112,7 +112,7 @@ def test_obsolete_typescript_scaffold_is_removed() -> None:
         "pyright": "1.1.413",
         "typescript": "6.0.3",
         "typescript-eslint": "8.67.0",
-        "zod": "4.4.3",
+        "zod": "4.5.4",
     }
 
 

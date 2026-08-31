@@ -46,7 +46,7 @@ EXPECTED_ROWS = L1_L2_COUNT * PROFILE_COUNT
 GIT_TIMEOUT_SECONDS = 30
 GIT_OUTPUT_BYTES = 4_096
 TASK2_SOURCE = Path("scripts/build_asvs_matrix.py")
-TASK2_S603_LINE = 3_475
+TASK2_S603_LINE = 3_479
 TASK2_S603_RATIONALE = (
     "        # Security rationale: argv[0] is the immutable reviewed /usr/bin/git.",
     "        # Tuple argv, cwd=/, closed env, no shell, output bounds, and timeout are",

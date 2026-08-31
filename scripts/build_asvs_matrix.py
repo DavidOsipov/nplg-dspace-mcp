@@ -2267,7 +2267,11 @@ def _parse_json_bytes(body: bytes) -> object:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         msg = "invalid UTF-8 JSON"
         raise AsvsError(msg) from exc
-    _ = _validate_json_shape(value)
+    try:
+        _ = _validate_json_shape(value)
+    except UnicodeEncodeError as exc:
+        msg = "invalid UTF-8 JSON"
+        raise AsvsError(msg) from exc
     return value
 
 

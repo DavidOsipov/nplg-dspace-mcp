@@ -80,7 +80,7 @@ const taskOnePackageScriptsSchema = z.strictObject({
     "node --test contracts/zod/contract.test.ts && npm run contracts:zod:all",
   ),
   "docs:lint": z.literal(
-    "markdownlint-cli2 \"*.md\" \"docs/**/*.md\" \"deploy/**/*.md\" \"skills/**/*.md\"",
+    "markdownlint-cli2 \"*.md\" \"docs/**/*.md\" \"deploy/**/*.md\" \"skills/**/*.md\" \"src/nplg_mcp/agent_skills/georgian-newspaper-visual-analysis/SKILL.md\"",
   ),
   "contracts:baseline-static": z.literal(
     "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs",
@@ -157,8 +157,9 @@ const contractFilePaths = [
   "tests/contracts/zod_contracts.test.mjs",
   "tests/contracts/zod_recovery_contracts.test.mjs",
 ];
-/** @type {readonly ["contracts/zod/contract.test.ts", "contracts/zod/models.ts"]} */
-const contractTypeScriptFilePaths = [
+/** @type {readonly ["contracts/zod/asvs-evidence-contracts.mjs", "contracts/zod/contract.test.ts", "contracts/zod/models.ts"]} */
+const zodLengthGovernedFilePaths = [
+  "contracts/zod/asvs-evidence-contracts.mjs",
   "contracts/zod/contract.test.ts",
   "contracts/zod/models.ts",
 ];
@@ -1004,7 +1005,7 @@ void test("package scripts preserve capability and baseline Zod entrypoints", as
   );
   assert.equal(
     packageJson.scripts["docs:lint"],
-    "markdownlint-cli2 \"*.md\" \"docs/**/*.md\" \"deploy/**/*.md\" \"skills/**/*.md\"",
+    "markdownlint-cli2 \"*.md\" \"docs/**/*.md\" \"deploy/**/*.md\" \"skills/**/*.md\" \"src/nplg_mcp/agent_skills/georgian-newspaper-visual-analysis/SKILL.md\"",
   );
   assert.equal(
     packageJson.scripts["contracts:baseline-static"],
@@ -1042,7 +1043,7 @@ void test("package policy model rejects missing or weakened static commands", ()
     "contracts:test":
       "node --test contracts/zod/contract.test.ts && npm run contracts:zod:all",
     "docs:lint":
-      "markdownlint-cli2 \"*.md\" \"docs/**/*.md\" \"deploy/**/*.md\" \"skills/**/*.md\"",
+      "markdownlint-cli2 \"*.md\" \"docs/**/*.md\" \"deploy/**/*.md\" \"skills/**/*.md\" \"src/nplg_mcp/agent_skills/georgian-newspaper-visual-analysis/SKILL.md\"",
     "contracts:baseline-static":
       "tsc --project tsconfig.contracts.json && eslint --max-warnings 0 contracts/zod/baseline-contracts.mjs contracts/zod/asvs-evidence-contracts.mjs contracts/zod/capability-contracts.mjs contracts/zod/recovery-contracts.mjs tests/contracts/zod_baseline_contracts.test.mjs tests/contracts/zod_asvs_evidence_contracts.test.mjs tests/contracts/zod_contracts.test.mjs tests/contracts/zod_recovery_contracts.test.mjs",
     "test:contracts:asvs":
@@ -1172,13 +1173,14 @@ void test("configured TypeScript ESLint rejects adversarial type escapes", async
 });
 
 void test("configured ESLint forbids native Zod string length semantics", async (t) => {
+  // Mutation caught: omit the JavaScript ASVS oracle from the length-policy file filter.
   const lintEngine = new ESLint({ cwd: rootPath });
   const discoveredTypeScriptSources = (await readdir(join(rootPath, "contracts/zod")))
     .filter((name) => name.endsWith(".ts"))
     .map((name) => `contracts/zod/${name}`)
     .sort();
-  assert.deepEqual(discoveredTypeScriptSources, contractTypeScriptFilePaths);
-  for (const filePath of contractTypeScriptFilePaths) {
+  assert.deepEqual(discoveredTypeScriptSources, zodLengthGovernedFilePaths.slice(1));
+  for (const filePath of zodLengthGovernedFilePaths) {
     for (const method of ["min", "max", "length"]) {
       await t.test(`${filePath} ${method}`, async () => {
         const results = await lintEngine.lintText(
@@ -1196,6 +1198,101 @@ void test("configured ESLint forbids native Zod string length semantics", async 
       });
     }
   }
+});
+
+void test("configured ESLint rejects native Zod check factories and bound string methods", async (t) => {
+  const lintEngine = new ESLint({ cwd: rootPath });
+  const filePath = "contracts/zod/asvs-evidence-contracts.mjs";
+  /** @type {ReadonlyArray<readonly [string, string]>} */
+  const mutants = [
+    [
+      "direct native ZodString min call",
+      'import { z } from "zod";\nexport const s = z.string().min(1);\n',
+    ],
+    [
+      "direct native ZodString max call",
+      'import { z } from "zod";\nexport const s = z.string().max(1);\n',
+    ],
+    [
+      "direct native ZodString length call",
+      'import { z } from "zod";\nexport const s = z.string().length(1);\n',
+    ],
+    [
+      "namespace minLength check factory",
+      'import { z } from "zod";\nexport const s = z.string().check(z.minLength(1));\n',
+    ],
+    [
+      "namespace maxLength check factory",
+      'import { z } from "zod";\nexport const s = z.string().check(z.maxLength(1));\n',
+    ],
+    [
+      "namespace exact length check factory",
+      'import { z } from "zod";\nexport const s = z.string().check(z.length(1));\n',
+    ],
+    [
+      "direct named maxLength check factory",
+      'import { maxLength, z } from "zod";\nexport const s = z.string().check(maxLength(1));\n',
+    ],
+    [
+      "aliased named maxLength check factory",
+      'import { maxLength as nativeMax, z } from "zod";\nexport const s = z.string().check(nativeMax(1));\n',
+    ],
+    [
+      "destructured factory through namespace and API aliases",
+      'import * as Zod from "zod";\nconst ZodAlias = Zod;\nconst { z: api } = ZodAlias;\nconst { length: nativeLength } = api;\nexport const s = api.string().check(nativeLength(1));\n',
+    ],
+    [
+      "bound native ZodString max method",
+      'import { z } from "zod";\nconst schema = z.string();\nexport const s = schema.max.bind(schema)(1);\n',
+    ],
+    [
+      "deferred bound native ZodString max method",
+      'import { z } from "zod";\nconst schema = z.string();\nconst nativeMax = schema.max.bind(schema);\nexport const s = nativeMax(1);\n',
+    ],
+    [
+      "native ZodString max via call",
+      'import { z } from "zod";\nconst schema = z.string();\nexport const s = schema.max.call(schema, 1);\n',
+    ],
+    [
+      "native ZodString max via apply",
+      'import { z } from "zod";\nconst schema = z.string();\nexport const s = schema.max.apply(schema, [1]);\n',
+    ],
+  ];
+
+  for (const [name, source] of mutants) {
+    await t.test(name, async () => {
+      const results = await lintEngine.lintText(source, { filePath });
+      const result = results[0];
+      assert.ok(result !== undefined);
+      const policyMessages = result.messages.filter(
+        ({ ruleId }) => ruleId === "task1/no-native-zod-string-length",
+      );
+      assert.equal(
+        policyMessages.length,
+        1,
+        `${name} must produce one native Zod length diagnostic: ${JSON.stringify(result.messages)}`,
+      );
+    });
+  }
+});
+
+void test("configured ESLint permits non-string bounds and codePointString", async () => {
+  const lintEngine = new ESLint({ cwd: rootPath });
+  const results = await lintEngine.lintText(
+    'import { z } from "zod";\n' +
+      'function codePointString() { return z.string().superRefine(() => undefined); }\n' +
+      'export const arrayBound = z.array(z.string()).max(1);\n' +
+      'export const arrayCheckBound = z.array(z.string()).check(z.maxLength(1));\n' +
+      'export const setBound = z.set(z.string()).min(1).max(2);\n' +
+      'export const stringBound = codePointString();\n',
+    { filePath: "contracts/zod/asvs-evidence-contracts.mjs" },
+  );
+  const result = results[0];
+  assert.ok(result !== undefined);
+  assert.ok(
+    result.messages.every(({ ruleId }) => ruleId !== "task1/no-native-zod-string-length"),
+    JSON.stringify(result.messages),
+  );
 });
 
 void test("configured ESLint permits non-type JSDoc text containing any", async (t) => {

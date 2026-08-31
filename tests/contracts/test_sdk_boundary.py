@@ -9,7 +9,7 @@ import base64
 import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, Literal, Never, cast, override
 
 import pytest
 from mcp import Client, types
@@ -58,6 +58,11 @@ def _resource_read_log() -> list[str]:
     return []
 
 
+def _resource_list_log() -> list[None]:
+    """Create one precisely typed empty resource-list log."""
+    return []
+
+
 def _resource_payload() -> dict[str, str]:
     """Create one precisely typed empty resource payload."""
     return {}
@@ -70,6 +75,7 @@ class RecordingTools:
     delegate: ToolSurface
     calls: list[tuple[str, JsonObject]] = field(default_factory=_call_log)
     resource_reads: list[str] = field(default_factory=_resource_read_log)
+    resource_lists: list[None] = field(default_factory=_resource_list_log)
 
     def list_tools(self) -> list[JsonObject]:
         """Return the delegate catalog unchanged."""
@@ -82,6 +88,7 @@ class RecordingTools:
 
     def list_resources(self) -> list[JsonObject]:
         """Return the delegate resources unchanged."""
+        self.resource_lists.append(None)
         return self.delegate.list_resources()
 
     async def read_resource(self, uri: str) -> dict[str, str]:
@@ -893,6 +900,52 @@ async def test_metadata_boundary_serves_static_workflow_without_service_entry(
     assert content.uri == AGENT_WORKFLOW_URI
     assert content.mime_type == AGENT_WORKFLOW_MIME_TYPE
     assert content.text == AGENT_WORKFLOW_MARKDOWN
+    assert tools.resource_reads == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler", ["list", "templates", "read"])
+async def test_sdk_boundary_rejects_disabled_resource_profile_before_dispatch(
+    tool_service: ToolService,
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Literal["list", "templates", "read"],
+) -> None:
+    """Disabled profiles cannot list or read resources through any SDK handler."""
+    tools = RecordingTools(tool_service)
+    handlers = SdkHandlers(
+        FullServiceComposition(tools=tools, store=tool_service.store),
+        DeploymentProfile.DISTRIBUTED_FULL,
+    )
+
+    def reject_resource_admission(
+        _admission: InlineResourceAdmission,
+        _requested_bytes: int,
+    ) -> Never:
+        message = "resource admission must not start"
+        raise AssertionError(message)
+
+    async def invoke_resource_handler() -> None:
+        if handler == "list":
+            _ = await handlers.on_list_resources(_context(), None)
+        elif handler == "templates":
+            _ = await handlers.on_list_resource_templates(_context(), None)
+        else:
+            _ = await handlers.on_read_resource(
+                _context(),
+                types.ReadResourceRequestParams(uri="nplg://about"),
+            )
+
+    monkeypatch.setattr(
+        InlineResourceAdmission,
+        "try_reserve",
+        reject_resource_admission,
+    )
+
+    with pytest.raises(RuntimeError, match=r"^Invalid deployment profile\.$"):
+        await invoke_resource_handler()
+
+    assert tools.calls == []
+    assert tools.resource_lists == []
     assert tools.resource_reads == []
 
 

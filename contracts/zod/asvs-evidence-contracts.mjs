@@ -195,18 +195,33 @@ const requiredReviewedThreatMappings = {
   ],
 };
 
+/**
+ * Build a string schema whose bounds use Unicode code points, matching
+ * Python and Pydantic independently of Zod release-specific length semantics.
+ * @param {number} minimum
+ * @param {number} maximum
+ * @returns {import("zod").ZodString}
+ */
+function codePointString(minimum, maximum) {
+  return z.string().superRefine((value, context) => {
+    const length = Array.from(value).length;
+    if (length < minimum || length > maximum) {
+      issue(
+        context,
+        [],
+        `string must contain between ${String(minimum)} and ${String(maximum)} Unicode code points`,
+      );
+    }
+  });
+}
+
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/u);
-const caseIdSchema = z.string()
-  .min(1)
-  .max(128)
+const caseIdSchema = codePointString(1, 128)
   .regex(/^[a-z0-9][a-z0-9._-]{0,127}$/u);
 const gitRevisionSchema = z.string().regex(/^[0-9a-f]{40}$/u);
-const requirementIdSchema = z.string()
-  .max(256)
+const requirementIdSchema = codePointString(0, 256)
   .regex(/^v5\.0\.0-[A-Za-z0-9._-]+$/u);
-const nonEmptySchema = z.string()
-  .min(1)
-  .max(8192)
+const nonEmptySchema = codePointString(1, 8192)
   .refine((value) => {
     for (const character of value) {
       const codePoint = character.codePointAt(0);
@@ -224,8 +239,7 @@ const dateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u).refine((value) => {
     && parsed.toISOString().slice(0, 10) === value;
 }, "date must be a real canonical calendar date");
 const awareDatetimePattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?(?:Z|[+-](\d{2}):(\d{2}))$/u;
-const awareDatetimeSchema = z.string()
-  .max(64)
+const awareDatetimeSchema = codePointString(0, 64)
   .regex(awareDatetimePattern)
   .refine((value) => {
     const match = awareDatetimePattern.exec(value);

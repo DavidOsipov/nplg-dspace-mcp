@@ -279,6 +279,16 @@ def _resource_read_reservation_bytes(profile: DeploymentProfile) -> int:
     return INLINE_RESOURCE_RESPONSE_RESERVATION_BYTES
 
 
+def _require_supported_resource_profile(profile: DeploymentProfile) -> None:
+    """Reject profiles that have no reviewed resource capability."""
+    if profile is DeploymentProfile.ALPIC_METADATA:
+        return
+    if profile is DeploymentProfile.PRIVATE_FULL:
+        return
+    message = "Invalid deployment profile."
+    raise RuntimeError(message)
+
+
 @dataclass(frozen=True, slots=True)
 class SdkHandlers:
     """Closed constructor-bound official SDK handlers for one service composition."""
@@ -348,6 +358,7 @@ class SdkHandlers:
         __: types.PaginatedRequestParams | None,
     ) -> types.ListResourcesResult:
         """Project available resources into explicit SDK resource models."""
+        _require_supported_resource_profile(self.profile)
         resources: list[types.Resource] = []
         if self.profile is DeploymentProfile.ALPIC_METADATA:
             resources = [
@@ -362,7 +373,7 @@ class SdkHandlers:
                     strict=True,
                 )
             ]
-        elif self.profile is DeploymentProfile.PRIVATE_FULL:
+        else:
             resources = [
                 types.Resource.model_validate(resource, strict=True)
                 for resource in self.services.tools.list_resources()
@@ -379,6 +390,7 @@ class SdkHandlers:
         __: types.PaginatedRequestParams | None,
     ) -> types.ListResourceTemplatesResult:
         """Advertise only canonical local-resource templates in full profiles."""
+        _require_supported_resource_profile(self.profile)
         templates: list[types.ResourceTemplate] = []
         if self.profile is DeploymentProfile.PRIVATE_FULL:
             templates = [
@@ -415,6 +427,7 @@ class SdkHandlers:
         params: types.ReadResourceRequestParams,
     ) -> types.ReadResourceResult:
         """Validate and adapt one resource without leaking lookup failures."""
+        _require_supported_resource_profile(self.profile)
         try:
             uri = validate_resource_uri(params.uri)
         except InvalidResourceUriError as exc:

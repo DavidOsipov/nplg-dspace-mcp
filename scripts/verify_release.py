@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, cast
+from typing import TYPE_CHECKING, Annotated, Literal, NoReturn, Protocol, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -28,9 +28,16 @@ if __name__ == "__main__" and not __package__:
     sys.path.insert(0, script_package_root.as_posix())
     __package__ = "scripts"
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    ValidationError,
+    model_validator,
+)
 
-from nplg_mcp.json_types import dataclass_to_json, load_json_value
+from nplg_mcp.json_types import JsonValue, dataclass_to_json, load_json_value
 from scripts.baseline_capture_io import (
     BaselineCaptureError,
     ChildResult,
@@ -74,7 +81,9 @@ type GateVerdict = Literal["passed", "findings", "tool_error"]
 
 
 _MAX_PROCESS_EXIT_CODE = 255
+_MAX_RELEASE_ARTIFACT_BYTES = 256 * 1024 * 1024
 _GIT_EXECUTABLE = "/usr/bin/git"
+_GIT_SHA1_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _EXACT_VERSION_PATTERN = re.compile(r"v?\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?\Z")
 _EXPECTED_PRIVATE_RECOVERY_POLICY_SHA256 = (
@@ -624,6 +633,44 @@ class _PyrightSuccess(_StrictModel):
         max_length=0,
     )
     summary: _PyrightSummary
+
+
+def _require_coverage_float(value: object) -> object:
+    if type(value) is not float:
+        msg = "test-gate coverage percentage must be a JSON float"
+        raise ValueError(msg)
+    return value
+
+
+type _CoveragePercent = Annotated[
+    float,
+    BeforeValidator(_require_coverage_float),
+    Field(ge=0.0, le=100.0, allow_inf_nan=False),
+]
+type _DecisionModuleCoverage = tuple[
+    Annotated[str, Field(min_length=1, max_length=4096)],
+    _CoveragePercent,
+]
+
+
+class _TestGateSuccess(_StrictModel):
+    """Exact four-field success document emitted by ``run_test_gate``."""
+
+    decision_module_branch_percent: tuple[
+        _DecisionModuleCoverage,
+        ...,
+    ] = Field(min_length=1, max_length=10_000)
+    diff_branch_arc_percent: _CoveragePercent
+    diff_line_percent: _CoveragePercent
+    project_branch_percent: _CoveragePercent
+
+    @model_validator(mode="after")
+    def _unique_decision_modules(self) -> _TestGateSuccess:
+        paths = tuple(path for path, _percentage in self.decision_module_branch_percent)
+        if len(paths) != len(set(paths)):
+            msg = "test-gate decision module evidence is duplicated"
+            raise ValueError(msg)
+        return self
 
 
 class _BanditMetric(_StrictModel):
@@ -1445,6 +1492,10 @@ class LocalGatesRequest:
     output: Path
     node_executable: Path
     compare_branch: str
+    candidate: str
+    candidate_tree: str
+    wheel: Path
+    sdist: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -1458,10 +1509,23 @@ class ExternalRequirementResult:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalArtifactEvidence:
+    """Immutable bounded identity for one exact local distribution artifact."""
+
+    kind: Literal["python-wheel", "python-sdist"]
+    path: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class LocalGatesReport:
     """Closed local result plus explicitly unfulfilled external requirements."""
 
     local_status: Literal["passed", "failed"]
+    candidate_commit: str
+    candidate_tree: str
+    artifacts: tuple[LocalArtifactEvidence, LocalArtifactEvidence]
     results: tuple[GateResult, ...]
     external_requirements: tuple[ExternalRequirementResult, ...]
     terminal_verdict: Literal["do_not_release"]
@@ -1546,13 +1610,13 @@ class ReleasePolicies:
     commands: ReleaseCommandManifest
 
 
-def _duplicate_json_name(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    value: dict[str, object] = {}
+def _duplicate_json_name(pairs: list[tuple[str, object]]) -> dict[str, JsonValue]:
+    value: dict[str, JsonValue] = {}
     for name, item in pairs:
         if name in value:
             msg = f"duplicate release-policy JSON name: {name}"
             raise ReleaseVerificationError(msg)
-        value[name] = item
+        value[name] = cast("JsonValue", item)
     return value
 
 
@@ -2463,6 +2527,9 @@ def local_gate_commands(
                 "scripts.run_test_gate",
                 "--worktree",
                 root.as_posix(),
+                "--require-clean",
+                "--candidate",
+                request.candidate,
                 "--compare-branch",
                 request.compare_branch,
                 "--output-dir",
@@ -2595,6 +2662,173 @@ class _PyrightIdentityBoundRunner:
         return completed
 
 
+@dataclass(frozen=True, slots=True)
+class _CandidateBinding:
+    commit: str
+    tree: str
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundLocalArtifact:
+    evidence: LocalArtifactEvidence
+    identity: tuple[int, ...]
+
+
+def _local_git_stdout(root: Path, *arguments: str) -> bytes:
+    result = SystemGit().run(
+        (_GIT_EXECUTABLE, *arguments),
+        cwd=root,
+        environment={
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+        },
+    )
+    if result.returncode != 0 or result.stderr:
+        _fail("Git candidate evidence is unavailable")
+    return result.stdout
+
+
+def _local_git_object(payload: bytes, *, field: str) -> str:
+    try:
+        value = payload.decode("ascii", errors="strict")
+    except UnicodeDecodeError as exc:
+        _fail_from(f"Git candidate {field} is malformed", exc)
+    if not value.endswith("\n") or _GIT_SHA1_PATTERN.fullmatch(value[:-1]) is None:
+        _fail(f"Git candidate {field} is malformed")
+    return value[:-1]
+
+
+def _capture_candidate_binding(
+    request: LocalGatesRequest,
+    *,
+    root: Path,
+) -> _CandidateBinding:
+    if (
+        type(request.candidate) is not str
+        or _GIT_SHA1_PATTERN.fullmatch(request.candidate) is None
+        or type(request.candidate_tree) is not str
+        or _GIT_SHA1_PATTERN.fullmatch(request.candidate_tree) is None
+    ):
+        _fail("Git candidate commit or tree binding is malformed")
+    raw_head = _local_git_object(
+        _local_git_stdout(root, "rev-parse", "--verify", "HEAD"),
+        field="HEAD",
+    )
+    commit = _local_git_object(
+        _local_git_stdout(root, "rev-parse", "--verify", "HEAD^{commit}"),
+        field="commit",
+    )
+    tree = _local_git_object(
+        _local_git_stdout(root, "rev-parse", "--verify", "HEAD^{tree}"),
+        field="tree",
+    )
+    status = _local_git_stdout(
+        root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+    )
+    if status:
+        _fail("local-gates requires a clean Git candidate")
+    if (
+        raw_head != commit
+        or commit != request.candidate
+        or tree != request.candidate_tree
+    ):
+        _fail("Git candidate commit or tree does not match the requested binding")
+    return _CandidateBinding(commit=commit, tree=tree)
+
+
+def _artifact_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _capture_local_artifact(
+    path: Path,
+    *,
+    kind: Literal["python-wheel", "python-sdist"],
+    root: Path,
+    output: Path,
+) -> _BoundLocalArtifact:
+    if not path.is_absolute():
+        _fail("release artifact path must be absolute")
+    try:
+        resolved = path.resolve(strict=True)
+        before = path.lstat()
+    except OSError as exc:
+        _fail_from("release artifact is unavailable", exc)
+    if (
+        resolved != path
+        or path in (root, output)
+        or root in path.parents
+        or output in path.parents
+    ):
+        _fail("release artifact path is outside its safe external scope")
+    expected_suffix = ".whl" if kind == "python-wheel" else ".tar.gz"
+    if not path.name.endswith(expected_suffix):
+        _fail("release artifact type does not match its path")
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or not 0 < before.st_size <= _MAX_RELEASE_ARTIFACT_BYTES
+    ):
+        _fail("release artifact must be one bounded single-link regular file")
+    try:
+        digest = stable_regular_file_sha256(
+            path,
+            max_bytes=_MAX_RELEASE_ARTIFACT_BYTES,
+        )
+        after = path.lstat()
+    except (OSError, PyrightIdentityError) as exc:
+        _fail_from("release artifact identity is unavailable", exc)
+    identity = _artifact_identity(before)
+    if _artifact_identity(after) != identity:
+        _fail("release artifact changed while its identity was captured")
+    return _BoundLocalArtifact(
+        evidence=LocalArtifactEvidence(
+            kind=kind,
+            path=path.as_posix(),
+            size=before.st_size,
+            sha256=digest,
+        ),
+        identity=identity,
+    )
+
+
+def _capture_local_artifacts(
+    request: LocalGatesRequest,
+    *,
+    root: Path,
+) -> tuple[_BoundLocalArtifact, _BoundLocalArtifact]:
+    artifacts = (
+        _capture_local_artifact(
+            request.wheel,
+            kind="python-wheel",
+            root=root,
+            output=request.output,
+        ),
+        _capture_local_artifact(
+            request.sdist,
+            kind="python-sdist",
+            root=root,
+            output=request.output,
+        ),
+    )
+    if artifacts[0].evidence.path == artifacts[1].evidence.path:
+        _fail("release artifact paths must identify exactly one wheel and one sdist")
+    return artifacts
+
+
 def run_local_gates(
     request: LocalGatesRequest,
     *,
@@ -2602,14 +2836,21 @@ def run_local_gates(
     monotonic: Callable[[], float],
 ) -> LocalGatesReport:
     """Run local commands and record external requirements without fabricating PASS."""
-    before = capture_source_descriptor_snapshot(request.worktree)
+    try:
+        root = request.worktree.resolve(strict=True)
+    except OSError as exc:
+        _fail_from("Git candidate worktree is unavailable", exc)
+    if root != request.worktree or not root.is_dir():
+        _fail("Git candidate worktree must be a canonical directory")
+    candidate_before = _capture_candidate_binding(request, root=root)
+    artifacts_before = _capture_local_artifacts(request, root=root)
+    before = capture_source_descriptor_snapshot(root)
     output, _temporary = create_external_output(
         request.output,
-        registered_worktrees=(request.worktree.resolve(strict=True),),
+        registered_worktrees=(root,),
     )
     identity_cache = output / "pyright-identity-cache"
     identity_cache.mkdir(mode=0o700)
-    root = request.worktree.resolve(strict=True)
     identity = _validate_pyright_runtime_identity(
         root,
         request.node_executable,
@@ -2636,17 +2877,27 @@ def run_local_gates(
     )
     report = LocalGatesReport(
         local_status=local_status,
+        candidate_commit=candidate_before.commit,
+        candidate_tree=candidate_before.tree,
+        artifacts=(
+            artifacts_before[0].evidence,
+            artifacts_before[1].evidence,
+        ),
         results=results,
         external_requirements=_external_requirements(),
         terminal_verdict="do_not_release",
         eligibility_reason="external_authority_required",
     )
+    if capture_source_descriptor_snapshot(root) != before:
+        _fail("source changed while local gates ran")
+    if _capture_candidate_binding(request, root=root) != candidate_before:
+        _fail("Git candidate changed while local gates ran")
+    if _capture_local_artifacts(request, root=root) != artifacts_before:
+        _fail("release artifact identity changed while local gates ran")
     write_private_file(
         output / "release-gate-results.json",
         canonical_json_bytes(dataclass_to_json(report, context="local gate report")),
     )
-    if capture_source_descriptor_snapshot(request.worktree) != before:
-        _fail("source changed while local gates ran")
     return report
 
 
@@ -2665,6 +2916,10 @@ def _parser() -> argparse.ArgumentParser:
     _ = local.add_argument("--output", type=Path, required=True)
     _ = local.add_argument("--node-executable", type=Path, required=True)
     _ = local.add_argument("--compare-branch", required=True)
+    _ = local.add_argument("--candidate", required=True)
+    _ = local.add_argument("--candidate-tree", required=True)
+    _ = local.add_argument("--wheel", type=Path, required=True)
+    _ = local.add_argument("--sdist", type=Path, required=True)
     for name in ("prepare", "finalize", "draft-attestation", "attest", "eligibility"):
         _ = subparsers.add_parser(name, allow_abbrev=False)
     return parser
@@ -2693,6 +2948,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             output=cast("Path", values["output"]),
             node_executable=cast("Path", values["node_executable"]),
             compare_branch=cast("str", values["compare_branch"]),
+            candidate=cast("str", values["candidate"]),
+            candidate_tree=cast("str", values["candidate_tree"]),
+            wheel=cast("Path", values["wheel"]),
+            sdist=cast("Path", values["sdist"]),
         ),
         runner=SystemCommandRunner(),
         monotonic=time.monotonic,
@@ -2917,26 +3176,54 @@ def _valid_closed_python_tool_success(
     return False
 
 
+def _valid_test_gate_success(completed: ChildResult) -> bool:
+    """Validate the complete successful ``run_test_gate`` process contract."""
+    if completed.stderr:
+        return False
+    try:
+        _ = load_json_value(
+            completed.stdout,
+            object_pairs_hook=_duplicate_json_name,
+            parse_constant=_reject_json_number,
+        )
+        _ = _TestGateSuccess.model_validate_json(
+            completed.stdout,
+            strict=True,
+        )
+    except (
+        ReleaseVerificationError,
+        TypeError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValidationError,
+    ):
+        return False
+    return True
+
+
+def _valid_pyright_success(completed: ChildResult) -> bool:
+    if completed.stderr:
+        return False
+    try:
+        _ = _PyrightSuccess.model_validate_json(
+            completed.stdout,
+            strict=True,
+        )
+    except ValidationError:
+        return False
+    return True
+
+
 def _valid_success_evidence(command: GateCommand, completed: ChildResult) -> bool:
     """Validate a zero-exit tool result against its exact success contract."""
     if command.name in {"bandit", "cyclonedx", "pip-audit", "ruff"}:
         valid = _valid_closed_python_tool_success(command, completed)
+    elif command.name == "test-gate":
+        valid = _valid_test_gate_success(completed)
     elif command.name == "mypy":
         valid = completed.stdout in (b"", b"\n") and completed.stderr == b""
     elif command.name == "pyright":
-        valid = False
-        if completed.stderr != b"":
-            valid = False
-        else:
-            try:
-                _ = _PyrightSuccess.model_validate_json(
-                    completed.stdout,
-                    strict=True,
-                )
-            except ValidationError:
-                valid = False
-            else:
-                valid = True
+        valid = _valid_pyright_success(completed)
     elif not completed.stdout:
         valid = False
     else:

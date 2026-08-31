@@ -14,7 +14,8 @@ const contractFiles = [
   "tests/contracts/zod_contracts.test.mjs",
   "tests/contracts/zod_recovery_contracts.test.mjs",
 ];
-const zodContractTypeScriptSources = new Set([
+const zodLengthGovernedSources = new Set([
+  "/contracts/zod/asvs-evidence-contracts.mjs",
   "/contracts/zod/contract.test.ts",
   "/contracts/zod/models.ts",
 ]);
@@ -43,34 +44,49 @@ const taskOnePolicyPlugin = {
               );
             }
             if (
-              ![...zodContractTypeScriptSources].some((suffix) =>
+              ![...zodLengthGovernedSources].some((suffix) =>
                 sourceFile.fileName.endsWith(suffix)
               )
             ) {
               return;
             }
             const forbiddenMethods = new Set(["length", "max", "min"]);
+            const forbiddenCheckTypes = new Set([
+              "$ZodCheckLengthEquals",
+              "$ZodCheckMaxLength",
+              "$ZodCheckMinLength",
+            ]);
+            const isZodString = (node) =>
+              typeChecker.getTypeAtLocation(node).getSymbol()?.getName() === "ZodString";
+            const reportNativeLength = (node) => {
+              context.report({
+                loc: {
+                  start: context.sourceCode.getLocFromIndex(
+                    node.getStart(sourceFile),
+                  ),
+                  end: context.sourceCode.getLocFromIndex(node.end),
+                },
+                messageId: "native",
+              });
+            };
             const inspectTypeScriptNode = (node) => {
               if (
+                typescript.isPropertyAccessExpression(node)
+                && forbiddenMethods.has(node.name.text)
+                && isZodString(node.expression)
+              ) {
+                reportNativeLength(node.name);
+              } else if (
                 typescript.isCallExpression(node)
                 && typescript.isPropertyAccessExpression(node.expression)
-                && forbiddenMethods.has(node.expression.name.text)
+                && node.expression.name.text === "check"
+                && isZodString(node.expression.expression)
               ) {
-                const receiverType = typeChecker.getTypeAtLocation(
-                  node.expression.expression,
-                );
-                if (receiverType.getSymbol()?.getName() === "ZodString") {
-                  context.report({
-                    loc: {
-                      start: context.sourceCode.getLocFromIndex(
-                        node.expression.name.getStart(sourceFile),
-                      ),
-                      end: context.sourceCode.getLocFromIndex(
-                        node.expression.name.end,
-                      ),
-                    },
-                    messageId: "native",
-                  });
+                for (const argument of node.arguments) {
+                  const checkType = typeChecker.getTypeAtLocation(argument);
+                  if (forbiddenCheckTypes.has(checkType.getSymbol()?.getName() ?? "")) {
+                    reportNativeLength(argument);
+                  }
                 }
               }
               typescript.forEachChild(node, inspectTypeScriptNode);
@@ -83,11 +99,11 @@ const taskOnePolicyPlugin = {
       meta: {
         docs: {
           description:
-            "Require codePointString instead of UTF-16 Zod string length methods",
+            "Require codePointString for stable Python/Pydantic string-length parity",
         },
         messages: {
           native:
-            "Zod string min/max/length uses UTF-16 units; use codePointString.",
+            "Use codePointString for explicit Python/Pydantic parity across Zod versions.",
         },
         schema: [],
         type: "problem",

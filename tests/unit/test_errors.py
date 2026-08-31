@@ -506,7 +506,7 @@ def test_detail_mapping_growth_during_copy_fails_closed() -> None:
 
     public = _serialize_with_interleaved_mutation(
         error,
-        trigger_line=111,
+        trigger_line=113,
         mutate=lambda: details.__setitem__("late", None),
     )
 
@@ -526,7 +526,7 @@ def test_detail_list_growth_during_copy_fails_closed() -> None:
 
     public = _serialize_with_interleaved_mutation(
         error,
-        trigger_line=120,
+        trigger_line=122,
         mutate=lambda: items.append(0),
     )
 

@@ -46,7 +46,7 @@ __all__ = (
 DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 CONTRACT_SCHEMA_ID = "https://nplg-dspace-mcp.invalid/contracts/tool-contracts/v1"
 EXPORTER_VERSION = "1.0.0-title-strip-codepoint-v1"
-ZOD_VERSION = "4.4.3"
+ZOD_VERSION = "4.5.4"
 
 _SUPPORTED_SCHEMA_KEYWORDS = frozenset(
     {

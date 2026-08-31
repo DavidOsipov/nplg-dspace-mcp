@@ -84,6 +84,10 @@ _PRIVATE_DIRECTORY_MODE = 0o700
 _MAX_PROCESS_ARGUMENT_BYTES = 1024 * 1024
 _MAX_PROCESS_TIMEOUT_SECONDS = 86_400.0
 _MAX_PROCESS_STREAM_BYTES = 64 * 1024 * 1024
+_CLOSED_GIT_ENVIRONMENT = {
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+}
 _PYTEST_NO_TESTS_COLLECTED = 5
 _SUCCESS_RETURN_CODES = frozenset({0})
 _GIT_EXECUTABLE = "/usr/bin/git"
@@ -2338,11 +2342,13 @@ def _checked_git(
     environment: dict[str, str] | None = None,
 ) -> CommandResult:
     argv = (_GIT_EXECUTABLE, *arguments)
+    closed_environment = dict(environment or {})
+    closed_environment.update(_CLOSED_GIT_ENVIRONMENT)
     try:
         result = git.run(
             argv,
             cwd=cwd,
-            environment=environment or {"GIT_OPTIONAL_LOCKS": "0"},
+            environment=closed_environment,
         )
     except QualityGateError as exc:
         _fail_from("Git evidence or external snapshot command failed", exc)
@@ -2544,7 +2550,14 @@ def _registered_worktrees(git: Git, *, root: Path) -> tuple[Path, ...]:
         _fail_from("registered Git worktree evidence is malformed", exc)
 
 
-def _comparison_base(git: Git, *, root: Path, ref: str, head: str) -> str:
+def _comparison_base(
+    git: Git,
+    *,
+    root: Path,
+    ref: str,
+    head: str,
+    reject_candidate: bool,
+) -> str:
     shallow = _checked_git(
         git,
         ("rev-parse", "--is-shallow-repository"),
@@ -2560,10 +2573,13 @@ def _comparison_base(git: Git, *, root: Path, ref: str, head: str) -> str:
         ).stdout,
         boundary="comparison ref",
     )
-    return _git_object(
+    merge_base = _git_object(
         _checked_git(git, ("merge-base", comparison, head), cwd=root).stdout,
         boundary="comparison merge base",
     )
+    if reject_candidate and merge_base == head:
+        _fail("comparison ref resolves to the candidate")
+    return merge_base
 
 
 def _canonical_repository_path(payload: bytes, *, boundary: str) -> str:
@@ -2800,6 +2816,33 @@ def _snapshot_digest(
     return digest.hexdigest()
 
 
+def _has_generated_egg_info_ancestor(root: Path, relative: str) -> bool:
+    parts = PurePosixPath(relative).parts
+    descriptor = _open_root_directory(root)
+    generated = False
+    try:
+        for part in parts[:-1]:
+            child = _open_child_directory(descriptor, part)
+            os.close(descriptor)
+            descriptor = child
+            generated = generated or part.endswith(".egg-info")
+        if not generated:
+            return False
+        try:
+            leaf = os.stat(parts[-1], dir_fd=descriptor, follow_symlinks=False)
+        except OSError as exc:
+            _fail_from("generated repository input changed during scan", exc)
+        if (
+            stat.S_ISLNK(leaf.st_mode)
+            or not stat.S_ISREG(leaf.st_mode)
+            or leaf.st_nlink != 1
+        ):
+            _fail("generated repository input is not a single-link regular file")
+        return True
+    finally:
+        os.close(descriptor)
+
+
 def _capture_source_snapshot(git: Git, *, root: Path) -> _SourceSnapshot:
     reviewed = _reviewed_source_paths(root)
     tracked = _tracked_paths(
@@ -2822,6 +2865,8 @@ def _capture_source_snapshot(git: Git, *, root: Path) -> _SourceSnapshot:
         path = root.joinpath(*PurePosixPath(relative).parts)
         if relative in tracked and not os.path.lexists(path):
             deleted.append(relative)
+            continue
+        if _has_generated_egg_info_ancestor(root, relative):
             continue
         record = _stable_snapshot_file(root, relative)
         total_bytes += len(record.payload)
@@ -2899,7 +2944,10 @@ def _scan_reviewed_directories(root: Path) -> set[str]:
                     relative = f"{prefix}/{entry.name}"
                     if stat.S_ISREG(metadata.st_mode):
                         files.add(relative)
-                    elif entry.name not in _GENERATED_DIRECTORY_NAMES:
+                    elif (
+                        entry.name not in _GENERATED_DIRECTORY_NAMES
+                        and not entry.name.endswith(".egg-info")
+                    ):
                         pending.append(
                             (
                                 _open_child_directory(
@@ -3105,7 +3153,6 @@ def _materialize_snapshot(
     commit_environment = {
         "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+00:00",
         "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+00:00",
-        "GIT_OPTIONAL_LOCKS": "0",
     }
     candidate = _git_object(
         _checked_git(
@@ -4317,6 +4364,7 @@ def _execute_test_gate(execution: _GateExecution) -> TestGateResult:
         root=execution.root,
         ref=execution.comparison_ref,
         head=execution.before.head,
+        reject_candidate=execution.request.require_clean,
     )
     materialized = _materialize_snapshot(
         execution.root,

@@ -2722,6 +2722,236 @@ async def test_mcp_admission_rejects_excess_work_without_queueing(
 
 
 @pytest.mark.asyncio
+async def test_anonymous_bodies_consume_available_global_capacity_and_recover(
+    tmp_path: Path,
+) -> None:
+    """Mutation caught: registering anonymous callers in PrincipalAdmission."""
+    entered = [asyncio.Event() for _ in range(5)]
+    release = asyncio.Event()
+
+    async def stalled_body(slot: int) -> AsyncIterator[bytes]:
+        entered[slot].set()
+        yield b"{"
+        _ = await release.wait()
+
+    async def accepting_sdk(scope: Scope, receive: Receive, send: Send) -> None:
+        del scope, receive
+        await _send_ok_json(send)
+
+    cfg = replace(
+        config(tmp_path),
+        max_concurrent_mcp_requests=5,
+        max_concurrent_mcp_requests_per_principal=4,
+        mcp_allowed_hosts=(CanonicalHost("mcp.example.test"),),
+        mcp_allowed_origins=(CanonicalOrigin("https://mcp.example.test"),),
+    )
+    application = McpSecurityMiddleware(accepting_sdk, config=cfg)
+    application.start()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="https://mcp.example.test",
+    ) as client:
+        stalled: list[asyncio.Task[httpx.Response]] = []
+        try:
+            for slot, entered_body in enumerate(entered):
+                stalled.append(
+                    asyncio.create_task(
+                        client.post(
+                            "/mcp",
+                            headers=modern_headers("server/discover"),
+                            content=stalled_body(slot),
+                        )
+                    )
+                )
+                async with asyncio.timeout(1):
+                    _ = await entered_body.wait()
+
+            exhausted = await client.post(
+                "/mcp",
+                headers=modern_headers("server/discover"),
+                content=b"{}",
+            )
+            assert exhausted.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+            assert _response_value(exhausted, "error", "code") == "RATE_LIMITED"
+        finally:
+            release.set()
+            for stalled_request in stalled:
+                _ = await stalled_request
+
+        recovered = await client.post(
+            "/mcp",
+            headers=modern_headers("server/discover"),
+            content=b"{}",
+        )
+
+    assert recovered.status_code == HTTPStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_cancelled_anonymous_body_releases_global_admission(
+    tmp_path: Path,
+) -> None:
+    """Cancellation cannot strand the global permit held by an anonymous body."""
+    entered = asyncio.Event()
+
+    async def stalled_body() -> AsyncIterator[bytes]:
+        entered.set()
+        yield b"{"
+        _ = await asyncio.Event().wait()
+
+    async def accepting_sdk(scope: Scope, receive: Receive, send: Send) -> None:
+        del scope, receive
+        await _send_ok_json(send)
+
+    cfg = replace(
+        config(tmp_path),
+        max_concurrent_mcp_requests=1,
+        mcp_allowed_hosts=(CanonicalHost("mcp.example.test"),),
+        mcp_allowed_origins=(CanonicalOrigin("https://mcp.example.test"),),
+    )
+    application = McpSecurityMiddleware(accepting_sdk, config=cfg)
+    application.start()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="https://mcp.example.test",
+    ) as client:
+        cancelled = asyncio.create_task(
+            client.post(
+                "/mcp",
+                headers=modern_headers("server/discover"),
+                content=stalled_body(),
+            )
+        )
+        async with asyncio.timeout(1):
+            _ = await entered.wait()
+        _ = cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            _ = await cancelled
+        recovered = await client.post(
+            "/mcp",
+            headers=modern_headers("server/discover"),
+            content=b"{}",
+        )
+
+    assert recovered.status_code == HTTPStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_anonymous_handler_error_releases_global_admission(
+    tmp_path: Path,
+) -> None:
+    """A downstream error cannot strand the global permit for anonymous traffic."""
+    calls = 0
+
+    async def fail_once(scope: Scope, receive: Receive, send: Send) -> None:
+        nonlocal calls
+        del scope, receive
+        calls += 1
+        if calls == 1:
+            msg = "test downstream failure"
+            raise RuntimeError(msg)
+        await _send_ok_json(send)
+
+    cfg = replace(
+        config(tmp_path),
+        max_concurrent_mcp_requests=1,
+        mcp_allowed_hosts=(CanonicalHost("mcp.example.test"),),
+        mcp_allowed_origins=(CanonicalOrigin("https://mcp.example.test"),),
+    )
+    application = McpSecurityMiddleware(fail_once, config=cfg)
+    application.start()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="https://mcp.example.test",
+    ) as client:
+        with pytest.raises(RuntimeError, match="test downstream failure"):
+            _ = await client.post(
+                "/mcp",
+                headers=modern_headers("server/discover"),
+                content=b"{}",
+            )
+        recovered = await client.post(
+            "/mcp",
+            headers=modern_headers("server/discover"),
+            content=b"{}",
+        )
+
+    assert recovered.status_code == HTTPStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_global_exhaustion_rolls_back_authenticated_principal_admission(
+    tmp_path: Path,
+) -> None:
+    """A failed global acquisition cannot strand an authenticated permit."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stalled_body() -> AsyncIterator[bytes]:
+        entered.set()
+        yield b"{"
+        _ = await release.wait()
+        yield b"}"
+
+    async def accepting_sdk(scope: Scope, receive: Receive, send: Send) -> None:
+        del scope, receive
+        await _send_ok_json(send)
+
+    token = "a" * 32
+    cfg = replace(
+        config(tmp_path),
+        api_principals=(
+            ApiPrincipalCredential(
+                principal_id="researcher-a",
+                bearer_token=SecretStr(token),
+            ),
+        ),
+        max_concurrent_mcp_requests=1,
+        max_concurrent_mcp_requests_per_principal=1,
+        mcp_allowed_hosts=(CanonicalHost("mcp.example.test"),),
+        mcp_allowed_origins=(CanonicalOrigin("https://mcp.example.test"),),
+    )
+    application = McpSecurityMiddleware(accepting_sdk, config=cfg)
+    application.start()
+    authenticated_headers = {
+        **modern_headers("server/discover"),
+        "Authorization": f"Bearer {token}",
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="https://mcp.example.test",
+    ) as client:
+        anonymous = asyncio.create_task(
+            client.post(
+                "/mcp",
+                headers=modern_headers("server/discover"),
+                content=stalled_body(),
+            )
+        )
+        try:
+            async with asyncio.timeout(1):
+                _ = await entered.wait()
+            globally_exhausted = await client.post(
+                "/mcp",
+                headers=authenticated_headers,
+                content=b"{}",
+            )
+        finally:
+            release.set()
+            anonymous_response = await anonymous
+        recovered = await client.post(
+            "/mcp",
+            headers=authenticated_headers,
+            content=b"{}",
+        )
+
+    assert globally_exhausted.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert _response_value(globally_exhausted, "error", "code") == "RATE_LIMITED"
+    assert anonymous_response.status_code == HTTPStatus.OK
+    assert recovered.status_code == HTTPStatus.OK
+
+
+@pytest.mark.asyncio
 async def test_principal_admission_prevents_one_credential_from_starving_another(
     tmp_path: Path,
 ) -> None:

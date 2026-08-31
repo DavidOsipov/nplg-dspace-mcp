@@ -351,8 +351,14 @@ digests. Stage and commit only the approved paths after explicit authorization.
 
 ```bash
 set -euo pipefail
-CANDIDATE_COMMIT="$(git rev-parse HEAD)"
-test -z "$(git status --porcelain=v1)"
+export GIT_NO_REPLACE_OBJECTS=1
+CANDIDATE_HEAD="$(git rev-parse --verify HEAD)"
+CANDIDATE_COMMIT="$(git rev-parse --verify 'HEAD^{commit}')"
+CANDIDATE_TREE="$(git rev-parse --verify 'HEAD^{tree}')"
+test "$CANDIDATE_HEAD" = "$CANDIDATE_COMMIT"
+test -z "$(
+  git status --porcelain=v1 --untracked-files=all --ignore-submodules=none
+)"
 NPLG_CANDIDATE_TMP_DIR="$(mktemp -d)"
 test "$NPLG_CANDIDATE_TMP_DIR" != "${NPLG_CANDIDATE_TMP_DIR#/}"
 QUALITY_CACHE="$NPLG_CANDIDATE_TMP_DIR/quality-cache"
@@ -382,10 +388,20 @@ test ! -e "$DIST_DIR"
   --worktree "$PWD" --require-clean --candidate "$CANDIDATE_COMMIT" \
   --output-dir "$METADATA_MUTATION_OUTPUT" \
   --targets src/nplg_mcp/profiles.py
+.venv/bin/python -m build --outdir "$DIST_DIR"
+mapfile -d '' -t WHEELS < <(
+  find "$DIST_DIR" -maxdepth 1 -type f -name '*.whl' -print0
+)
+mapfile -d '' -t SDISTS < <(
+  find "$DIST_DIR" -maxdepth 1 -type f -name '*.tar.gz' -print0
+)
+test "${#WHEELS[@]}" -eq 1
+test "${#SDISTS[@]}" -eq 1
 .venv/bin/python scripts/verify_release.py local-gates \
   --worktree "$PWD" --output "$LOCAL_GATES" \
-  --node-executable "$(command -v node)" --compare-branch origin/main
-.venv/bin/python -m build --outdir "$DIST_DIR"
+  --node-executable "$(command -v node)" --compare-branch origin/main \
+  --candidate "$CANDIDATE_COMMIT" --candidate-tree "$CANDIDATE_TREE" \
+  --wheel "${WHEELS[0]}" --sdist "${SDISTS[0]}"
 ```
 
 Expected: all receipts and artifacts bind the same clean commit/tree. Any drift

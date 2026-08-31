@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import { z } from "zod";
 import {
   parseCanonicalAsvsArtifactSet,
   parseCanonicalAsvsMatrix,
@@ -209,6 +210,49 @@ void test("candidate Zod parser accepts a complete non-historical Pass product",
   assert.equal(parsed.matrix.length, 253);
   assert.equal(parsed.evidence.length, 253);
   assert.ok(parsed.matrix.every((row) => row.verdict === "Pass"));
+});
+
+void test("candidate Zod parser counts bounded text in Unicode code points", () => {
+  const product = candidateArtifacts();
+  const first = product.evidence.at(0);
+  assert.ok(first !== undefined);
+  /** @type {ReadonlyArray<readonly [string, string, boolean]>} */
+  const cases = [
+    // Mutations caught: remove the lower bound or shift it from one to zero.
+    ["empty", "", false],
+    ["minimum", "x", true],
+    // Mutations caught: count UTF-16 units or shift the inclusive maximum down by one.
+    ["maximum astral", "\u{1F600}".repeat(8_192), true],
+    // Mutations caught: remove the upper bound or shift it up by one.
+    ["over maximum astral", "\u{1F600}".repeat(8_193), false],
+  ];
+
+  for (const [name, covered_surface, accepted] of cases) {
+    const candidate = {
+      ...product.artifact,
+      manifest: canonicalLines([
+        { ...first, covered_surface },
+        ...product.evidence.slice(1),
+      ]),
+    };
+    if (accepted) {
+      assert.doesNotThrow(
+        () => parseCanonicalCandidateAsvsArtifactSet(candidate),
+        name,
+      );
+    } else {
+      assert.throws(
+        () => parseCanonicalCandidateAsvsArtifactSet(candidate),
+        name,
+      );
+    }
+  }
+});
+
+void test("candidate Zod parser runs under the exact required Zod release", () => {
+  // Mutation caught: downgrade the installed direct Zod dependency while leaving tests runnable.
+  assert.deepEqual(z.core.version, { major: 4, minor: 5, patch: 4 });
+  assert.doesNotThrow(() => parseCanonicalCandidateAsvsArtifactSet(candidateArtifacts().artifact));
 });
 
 void test("candidate Zod parser accepts one governed N/A in the exact selected product", () => {
