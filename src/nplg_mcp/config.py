@@ -53,6 +53,7 @@ _MAX_CREDENTIAL_BYTES = 512
 _MAX_API_PRINCIPALS = 64
 PdfExecutor = Literal["serialized", "unix-worker"]
 DeploymentProfile = Literal["alpic-metadata", "distributed-full", "private-full"]
+McpAuthorityMode = Literal["direct", "alpic-gateway"]
 CanonicalHost = NewType("CanonicalHost", str)
 CanonicalOrigin = NewType("CanonicalOrigin", str)
 PrincipalId = Annotated[
@@ -183,6 +184,8 @@ class AppConfig:
     max_concurrent_mcp_requests_per_principal: int = 4
     mcp_allowed_hosts: tuple[CanonicalHost, ...] = (CanonicalHost("127.0.0.1:8000"),)
     mcp_allowed_origins: tuple[CanonicalOrigin, ...] = ()
+    mcp_authority_mode: McpAuthorityMode = "direct"
+    alpic_gateway_host: CanonicalHost | None = None
     mcp_application_deadline_seconds: float = 20.0
 
     @property
@@ -285,6 +288,9 @@ def _canonical_host(  # noqa: C901, PLR0912, PLR0915
             msg = "MCP allowed host port is not canonical"
             raise ValueError(msg)
     return CanonicalHost(value)
+
+
+canonicalize_mcp_host = _canonical_host
 
 
 def _canonical_origin(value: object, *, production: bool) -> CanonicalOrigin:
@@ -462,6 +468,27 @@ def _normalize_public_base_url(value: str, *, production: bool) -> str:
         msg = "PUBLIC_BASE_URL must be an origin without a path"
         raise ValueError(msg)
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _canonical_alpic_gateway_host(value: str) -> CanonicalHost:
+    """Return the provider-supplied canonical HTTPS authority."""
+    try:
+        if "://" in value:
+            origin = _canonical_origin(value, production=True)
+            authority = urlsplit(origin).netloc
+        else:
+            authority = value
+        canonical = _canonical_host(authority, default_port=443)
+    except ValueError as exc:
+        msg = "ALPIC_HOST must be a canonical HTTPS authority"
+        raise ValueError(msg) from exc
+    if not canonical.endswith(".alpic.live"):
+        msg = "ALPIC_HOST must be a provider-managed .alpic.live authority"
+        raise ValueError(msg)
+    return canonical
+
+
+canonicalize_alpic_gateway_host = _canonical_alpic_gateway_host
 
 
 def _environment(env: Mapping[str, str]) -> str:
@@ -768,10 +795,11 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
     if alpic_host and not production:
         msg = "ALPIC_HOST requires explicit NODE_ENV=production"
         raise ValueError(msg)
-    if configured_public_base_url is None and alpic_host:
-        configured_public_base_url = (
-            alpic_host if "://" in alpic_host else f"https://{alpic_host}"
-        )
+    alpic_gateway_host = (
+        _canonical_alpic_gateway_host(alpic_host) if alpic_host else None
+    )
+    if configured_public_base_url is None and alpic_gateway_host is not None:
+        configured_public_base_url = f"https://{alpic_gateway_host}"
     public_base_url = _normalize_public_base_url(
         configured_public_base_url or "http://127.0.0.1:8000",
         production=production,
@@ -785,6 +813,23 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
         env,
         public_base_url=public_base_url,
         production=production,
+    )
+    explicit_mcp_authority_policy = any(
+        name in env
+        for name in (
+            "NPLG_MCP_ALLOWED_HOSTS_JSON",
+            "NPLG_MCP_ALLOWED_ORIGINS_JSON",
+        )
+    )
+    mcp_authority_mode: McpAuthorityMode = (
+        "alpic-gateway"
+        if (
+            alpic_gateway_host is not None
+            and deployment_profile == "alpic-metadata"
+            and allow_anonymous
+            and not explicit_mcp_authority_policy
+        )
+        else "direct"
     )
     _validate_anonymous_scope(
         env,
@@ -1045,4 +1090,6 @@ def load_config(env: Mapping[str, str]) -> AppConfig:
         deployment_profile=deployment_profile,
         mcp_allowed_hosts=mcp_allowed_hosts,
         mcp_allowed_origins=mcp_allowed_origins,
+        mcp_authority_mode=mcp_authority_mode,
+        alpic_gateway_host=alpic_gateway_host,
     )

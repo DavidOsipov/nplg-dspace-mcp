@@ -31,6 +31,7 @@ from nplg_mcp.config import (
     AppConfig,
     CanonicalHost,
     CanonicalOrigin,
+    load_config,
 )
 from nplg_mcp.contracts import MonotonicDeadline
 from nplg_mcp.errors import AppError, ErrorCode
@@ -748,6 +749,215 @@ async def test_outer_and_sdk_host_origin_decisions_agree(app: FastAPI) -> None:
 
 
 @pytest.mark.asyncio
+async def test_alpic_gateway_rewritten_upstream_host_reaches_mcp() -> None:
+    """A gateway-selected upstream Host may differ from the public authority."""
+    configured = load_config(
+        {
+            "NODE_ENV": "production",
+            "ALPIC_HOST": "public.example.alpic.live",
+            "CURSOR_SIGNING_SECRET": "c" * 32,
+            "ALLOW_ANONYMOUS": "true",
+            "DEPLOYMENT_PROFILE": "alpic-metadata",
+        }
+    )
+    application = create_app(
+        configured,
+        services=MetadataServiceComposition(tools=StubTools()),
+    )
+    headers = modern_headers("server/discover")
+    del headers["Origin"]
+    public_origin_headers = {
+        **headers,
+        "Origin": "https://public.example.alpic.live",
+    }
+    hostile_origin_headers = {**headers, "Origin": "https://evil.example"}
+    duplicate_host_headers = [
+        *headers.items(),
+        ("Host", "gateway-upstream.example:8080"),
+        ("Host", "evil.example"),
+    ]
+    duplicate_origin_headers = [
+        *headers.items(),
+        ("Origin", "https://public.example.alpic.live"),
+        ("Origin", "https://evil.example"),
+    ]
+
+    async with (
+        application.router.lifespan_context(application),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application),
+            base_url="http://gateway-upstream.example:8080",
+        ) as client,
+    ):
+        response = await client.post(
+            "/mcp",
+            headers=headers,
+            json=modern_body("server/discover"),
+        )
+        public_origin = await client.post(
+            "/mcp",
+            headers=public_origin_headers,
+            json=modern_body("server/discover", request_id=2),
+        )
+        hostile_origin = await client.post(
+            "/mcp",
+            headers=hostile_origin_headers,
+            json=modern_body("server/discover", request_id=3),
+        )
+        duplicate_host = await client.post(
+            "/mcp",
+            headers=duplicate_host_headers,
+            json=modern_body("server/discover", request_id=4),
+        )
+        duplicate_origin = await client.post(
+            "/mcp",
+            headers=duplicate_origin_headers,
+            json=modern_body("server/discover", request_id=5),
+        )
+        userinfo_host = await client.post(
+            "/mcp",
+            headers={**headers, "Host": "user@evil.example"},
+            json=modern_body("server/discover", request_id=6),
+        )
+
+    assert response.status_code == HTTPStatus.OK
+    assert _response_value(response, "result", "supportedVersions") == [MODERN]
+    assert public_origin.status_code == HTTPStatus.OK
+    for rejected in (
+        hostile_origin,
+        duplicate_host,
+        duplicate_origin,
+        userinfo_host,
+    ):
+        assert rejected.status_code == HTTPStatus.FORBIDDEN
+        assert _response_object(rejected) == {"error": "Host or Origin is not allowed"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe_host",
+    [
+        b"",
+        b"bad host",
+        b"user@evil.example",
+        b"evil.example%",
+        b"evil.example\\path",
+        b"evil.example:bad",
+        b"evil.example:443",
+        b"EVIL.example",
+        b"evil\x7f.example",
+        b"\xff",
+    ],
+    ids=[
+        "empty",
+        "space",
+        "userinfo",
+        "percent",
+        "backslash",
+        "invalid-port",
+        "explicit-default-port",
+        "uppercase",
+        "control",
+        "non-ascii",
+    ],
+)
+async def test_alpic_gateway_rejects_noncanonical_host_bytes(
+    tmp_path: Path,
+    unsafe_host: bytes,
+) -> None:
+    """Delegated authority still requires one exact canonical Host value."""
+    calls = 0
+
+    async def recording_sdk(scope: Scope, receive: Receive, send: Send) -> None:
+        nonlocal calls
+        del scope, receive
+        calls += 1
+        await _send_ok_json(send)
+
+    configured = replace(
+        config(tmp_path),
+        environment="production",
+        deployment_profile="alpic-metadata",
+        asset_signing_secret=None,
+        allow_anonymous=True,
+        mcp_authority_mode="alpic-gateway",
+        alpic_gateway_host=CanonicalHost("public.example.alpic.live"),
+        mcp_allowed_hosts=(CanonicalHost("public.example.alpic.live"),),
+        mcp_allowed_origins=(CanonicalOrigin("https://public.example.alpic.live"),),
+    )
+    application = McpSecurityMiddleware(recording_sdk, config=configured)
+    application.start()
+    raw_headers = tuple(
+        (name.lower().encode(), value.encode())
+        for name, value in modern_headers("server/discover").items()
+        if name != "Origin"
+    )
+    scope_values = _http_scope("/mcp", method="POST", headers=raw_headers)
+    scope_values["headers"] = [(b"host", unsafe_host), *raw_headers]
+    scope = cast("Scope", scope_values)
+    received = False
+
+    async def receive() -> Message:
+        nonlocal received
+        if received:
+            return {"type": "http.disconnect"}
+        received = True
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    sent: list[Message] = []
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    await application(scope, receive, send)
+
+    starts = [
+        cast("dict[str, object]", message)
+        for message in sent
+        if cast("Mapping[str, object]", message).get("type") == "http.response.start"
+    ]
+    assert [message.get("status") for message in starts] == [HTTPStatus.FORBIDDEN]
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_explicit_alpic_host_policy_keeps_direct_enforcement() -> None:
+    """An explicit authority policy is never overridden by provider detection."""
+    configured = load_config(
+        {
+            "NODE_ENV": "production",
+            "ALPIC_HOST": "public.example.alpic.live",
+            "CURSOR_SIGNING_SECRET": "c" * 32,
+            "ALLOW_ANONYMOUS": "true",
+            "DEPLOYMENT_PROFILE": "alpic-metadata",
+            "NPLG_MCP_ALLOWED_HOSTS_JSON": '["public.example.alpic.live"]',
+        }
+    )
+    application = create_app(
+        configured,
+        services=MetadataServiceComposition(tools=StubTools()),
+    )
+    headers = modern_headers("server/discover")
+    del headers["Origin"]
+
+    async with (
+        application.router.lifespan_context(application),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=application),
+            base_url="http://gateway-upstream.example:8080",
+        ) as client,
+    ):
+        response = await client.post(
+            "/mcp",
+            headers=headers,
+            json=modern_body("server/discover"),
+        )
+
+    assert response.status_code == HTTPStatus.FORBIDDEN
+    assert _response_object(response) == {"error": "Host or Origin is not allowed"}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "encoding_headers",
     [
@@ -1117,6 +1327,73 @@ async def test_protected_mcp_retains_auth_admission_until_sdk_oauth_task(
     assert missing.status_code == HTTPStatus.UNAUTHORIZED
     assert _response_object(missing) == {"error": "API authentication is required"}
     assert admitted.status_code == HTTPStatus.OK
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["environment", "profile", "authentication", "provider", "provider-host"],
+)
+def test_alpic_gateway_authority_rejects_forged_activation(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    """Only anonymous production metadata may delegate Host authority to Alpic."""
+    base = config(tmp_path)
+    if case == "environment":
+        configured = replace(
+            base,
+            deployment_profile="alpic-metadata",
+            asset_signing_secret=None,
+            mcp_authority_mode="alpic-gateway",
+        )
+        services: AppServices = MetadataServiceComposition(tools=StubTools())
+    elif case == "profile":
+        configured = replace(
+            base,
+            environment="production",
+            allow_anonymous=False,
+            pdf_executor="unix-worker",
+            private_edge_tls=True,
+            mcp_authority_mode="alpic-gateway",
+        )
+        services = FullServiceComposition(
+            tools=StubTools(),
+            store=ContentAddressedStore(tmp_path),
+        )
+    elif case == "authentication":
+        configured = replace(
+            base,
+            environment="production",
+            deployment_profile="alpic-metadata",
+            asset_signing_secret=None,
+            allow_anonymous=False,
+            mcp_authority_mode="alpic-gateway",
+        )
+        services = MetadataServiceComposition(tools=StubTools())
+    elif case == "provider":
+        configured = replace(
+            base,
+            environment="production",
+            deployment_profile="alpic-metadata",
+            asset_signing_secret=None,
+            allow_anonymous=True,
+            mcp_authority_mode="alpic-gateway",
+        )
+        services = MetadataServiceComposition(tools=StubTools())
+    else:
+        configured = replace(
+            base,
+            environment="production",
+            deployment_profile="alpic-metadata",
+            asset_signing_secret=None,
+            allow_anonymous=True,
+            mcp_authority_mode="alpic-gateway",
+            alpic_gateway_host=CanonicalHost("127.0.0.1"),
+        )
+        services = MetadataServiceComposition(tools=StubTools())
+
+    with pytest.raises(ValueError, match="Alpic gateway authority"):
+        _ = create_app(configured, services=services)
 
 
 @pytest.mark.asyncio

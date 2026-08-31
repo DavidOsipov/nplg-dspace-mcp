@@ -571,6 +571,7 @@ _REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
         "x__api_principal_registry",
         "x__authorization",
         "x__bool",
+        "x__canonical_alpic_gateway_host",
         "x__canonical_host",
         "x__canonical_origin",
         "x__deployment_profile",

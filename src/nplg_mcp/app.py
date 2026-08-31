@@ -30,7 +30,12 @@ from .capabilities import (
     probe_alpic_tasks_capability,
     probe_oauth_provider,
 )
-from .config import AppConfig, load_config, validate_deployment_profile
+from .config import (
+    AppConfig,
+    canonicalize_alpic_gateway_host,
+    load_config,
+    validate_deployment_profile,
+)
 from .errors import AppError, ErrorCode, to_public_error
 from .http_security import McpSecurityMiddleware, build_transport_security_settings
 from .mcp_server import create_mcp_server
@@ -571,6 +576,23 @@ def _asset_response(
 def _validate_startup_config(config: AppConfig) -> None:
     """Reject unsafe or unavailable profiles before constructing services."""
     profile = validate_deployment_profile(config.deployment_profile)
+    gateway_host_is_valid = False
+    if config.alpic_gateway_host is not None:
+        try:
+            gateway_host_is_valid = (
+                canonicalize_alpic_gateway_host(config.alpic_gateway_host)
+                == config.alpic_gateway_host
+            )
+        except ValueError:
+            gateway_host_is_valid = False
+    if config.mcp_authority_mode == "alpic-gateway" and (
+        config.environment != "production"
+        or profile != "alpic-metadata"
+        or not config.allow_anonymous
+        or not gateway_host_is_valid
+    ):
+        msg = "Alpic gateway authority requires anonymous production alpic-metadata"
+        raise ValueError(msg)
     if (
         config.environment == "production"
         and config.allow_anonymous

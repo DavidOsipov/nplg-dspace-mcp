@@ -15,6 +15,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse as StarletteJSONResponse
 
 from .admission import AdmissionGate, PrincipalAdmission
+from .config import canonicalize_mcp_host
 from .errors import AppError, ErrorCode, to_public_error
 from .json_preflight import JsonPreflightError, JsonPreflightLimits, preflight_json
 from .resource_admission import InlineResourceAdmission
@@ -75,7 +76,7 @@ def build_transport_security_settings(
 ) -> TransportSecuritySettings:
     """Build the SDK policy from the exact immutable project allowlists."""
     return TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
+        enable_dns_rebinding_protection=(config.mcp_authority_mode != "alpic-gateway"),
         allowed_hosts=list(config.mcp_allowed_hosts),
         allowed_origins=list(config.mcp_allowed_origins),
     )
@@ -369,9 +370,24 @@ class McpSecurityMiddleware:
             allowed_origins = {
                 value.encode("ascii") for value in self._config.mcp_allowed_origins
             }
+            gateway_authority = self._config.mcp_authority_mode == "alpic-gateway"
+            default_port = 443 if scope_values.get("scheme") == "https" else 80
+            canonical_gateway_host = False
+            if len(host_values) == 1:
+                try:
+                    decoded_host = host_values[0].decode("ascii", errors="strict")
+                    canonical_host = canonicalize_mcp_host(
+                        decoded_host,
+                        default_port=default_port,
+                    )
+                except (UnicodeDecodeError, ValueError):
+                    canonical_gateway_host = False
+                else:
+                    canonical_gateway_host = decoded_host == canonical_host
             invalid_authority = (
                 len(host_values) != 1
-                or host_values[0] not in allowed_hosts
+                or (gateway_authority and not canonical_gateway_host)
+                or (not gateway_authority and host_values[0] not in allowed_hosts)
                 or len(origin_values) > 1
                 or bool(origin_values and origin_values[0] not in allowed_origins)
             )

@@ -1,13 +1,13 @@
 # Alpic deployment profile
 
-This repository contains enough build metadata for Alpic to identify and install the project as **Python 3.13** instead of Node.js. The initial Alpic deployment is a public, unauthenticated Streamable HTTP metadata MCP; it is not authorization to enable the private rendering profile.
+This repository contains enough build metadata for Alpic to identify and install the project as **Python 3.14** instead of Node.js. The initial Alpic deployment is a public, unauthenticated Streamable HTTP metadata MCP; it is not authorization to enable the private rendering profile.
 
 ## Required project settings
 
 Create a new Alpic project with:
 
 ```text
-Runtime: Python 3.13
+Runtime: Python 3.14
 Transport: Streamable HTTP
 Branch: main
 Root directory: <empty>
@@ -26,6 +26,21 @@ MAX_CONCURRENT_MCP_REQUESTS_PER_PRINCIPAL=4
 ```
 
 `DEPLOYMENT_PROFILE=alpic-metadata` is mandatory and exposes only `search_documents`, `get_document_metadata`, and `list_document_files`; it does not initialize the downloader, content store, scanner, or PDF runtime. `ALLOW_ANONYMOUS=true` is valid only for this profile. Alpic supplies `ALPIC_HOST`; the server derives `PUBLIC_BASE_URL=https://<ALPIC_HOST>` automatically, but `ALPIC_HOST` never selects a deployment profile. Do not add `PUBLIC_BASE_URL` unless a custom domain is already active.
+
+`ALPIC_HOST` must remain the provider-managed `*.alpic.live` environment host;
+an IP address or unrelated/custom domain cannot activate gateway trust. A custom
+public domain belongs in `PUBLIC_BASE_URL` and does not replace this provider
+ingress witness.
+
+For this exact anonymous production metadata profile, the application delegates
+public Host equality to the Alpic gateway because the gateway may select a
+different canonical upstream Host. Leave `NPLG_MCP_ALLOWED_HOSTS_JSON` and
+`NPLG_MCP_ALLOWED_ORIGINS_JSON` unset; either variable restores direct authority
+enforcement. The application still rejects missing, duplicate, or noncanonical
+Host values and duplicate or unapproved Origin values. This delegation is safe
+only while the workload is reachable exclusively through an Alpic gateway that
+controls the public Host boundary; hosted verification must prove that the
+origin cannot be reached directly.
 
 Do not configure `API_PRINCIPALS_JSON`, `API_BEARER_TOKEN`, `API_KEY`, `NPLG_PRIVATE_STATIC_TOKEN`, or any `X-API-Key` equivalent. Static authentication is forbidden in production. OAuth/Auth0/DCR remains deferred work and must not be represented by a shared secret or enabled for this initial public profile.
 

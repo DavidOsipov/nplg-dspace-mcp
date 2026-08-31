@@ -801,7 +801,7 @@ def test_wheel_metadata_includes_third_party_notices() -> None:
 
 
 def test_alpic_declares_python_runtime_and_explicit_uv_commands() -> None:
-    assert (ROOT / ".python-version").read_text(encoding="utf-8").strip() == "3.13"
+    assert (ROOT / ".python-version").read_text(encoding="utf-8").strip() == "3.14"
     data = _read_json_object(ROOT / "alpic.json")
     assert data == {
         "$schema": "https://assets.alpic.ai/alpic.json",
@@ -815,7 +815,7 @@ def test_alpic_declares_python_runtime_and_explicit_uv_commands() -> None:
 def test_alpic_operator_guide_states_platform_limits_without_overclaiming() -> None:
     guide = (ROOT / "deploy" / "ALPIC.md").read_text(encoding="utf-8").lower()
     for phrase in (
-        "python 3.13",
+        "python 3.14",
         "streamable http",
         "30-second",
         "dynamic `/assets/`",
@@ -861,6 +861,8 @@ def test_alpic_documented_environment_starts_anonymous_metadata_profile() -> Non
     assert config.asset_signing_secret is None
     assert config.api_principals == ()
     assert config.allow_anonymous is True
+    assert config.mcp_authority_mode == "alpic-gateway"
+    assert config.alpic_gateway_host == "nplg-dspace-mcp.example.alpic.live"
 
     application = create_app(config)
 

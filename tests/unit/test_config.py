@@ -268,6 +268,7 @@ def test_production_allows_anonymous_alpic_metadata_mode() -> None:
     )
 
     assert config.allow_anonymous is True
+    assert config.mcp_authority_mode == "direct"
 
 
 @pytest.mark.parametrize("profile", ["private-full", "distributed-full"])
@@ -468,7 +469,7 @@ def test_alpic_host_does_not_select_a_deployment_profile() -> None:
     config = load_config(
         {
             "NODE_ENV": "production",
-            "ALPIC_HOST": "mcp.example.net",
+            "ALPIC_HOST": "private-full.example.alpic.live",
             "ASSET_SIGNING_SECRET": "s" * 32,
             "CURSOR_SIGNING_SECRET": "c" * 32,
             "ALLOW_ANONYMOUS": "false",
@@ -479,6 +480,7 @@ def test_alpic_host_does_not_select_a_deployment_profile() -> None:
     )
 
     assert config.deployment_profile == "private-full"
+    assert config.mcp_authority_mode == "direct"
 
 
 def test_alpic_host_requires_explicit_production_security_settings() -> None:
@@ -741,6 +743,90 @@ def test_alpic_host_supplies_public_origin_and_ephemeral_cache_defaults() -> Non
     assert config.public_base_url == "https://nplg-dspace-mcp-abc123.alpic.live"
     assert config.cache_dir == _ALPIC_CACHE_DIR
     assert config.api_principals == ()
+
+
+def test_alpic_host_accepts_only_canonical_https_authority_forms() -> None:
+    base = {
+        "NODE_ENV": "production",
+        "CURSOR_SIGNING_SECRET": "c" * 32,
+        "ALLOW_ANONYMOUS": "true",
+        "DEPLOYMENT_PROFILE": "alpic-metadata",
+    }
+    configured = load_config(
+        {**base, "ALPIC_HOST": "https://public.example.alpic.live"}
+    )
+
+    assert configured.alpic_gateway_host == "public.example.alpic.live"
+    assert configured.public_base_url == "https://public.example.alpic.live"
+
+    for unsafe in (
+        "http://public.example.alpic.live",
+        "http://127.0.0.1",
+        "127.0.0.1",
+        "mcp.example.net",
+        "public.example.alpic.live.evil.example",
+        "https://user@public.example.alpic.live",
+        "PUBLIC.example.alpic.live",
+        "public.example.alpic.live:443",
+    ):
+        with pytest.raises(ValueError, match="ALPIC_HOST"):
+            _ = load_config({**base, "ALPIC_HOST": unsafe})
+
+
+def test_anonymous_alpic_metadata_delegates_authority_to_gateway() -> None:
+    """The reviewed Alpic profile delegates SDK Host enforcement to its gateway."""
+    configured = load_config(
+        {
+            "NODE_ENV": "production",
+            "ALPIC_HOST": "public.example.alpic.live",
+            "CURSOR_SIGNING_SECRET": "c" * 32,
+            "ALLOW_ANONYMOUS": "true",
+            "DEPLOYMENT_PROFILE": "alpic-metadata",
+        }
+    )
+
+    settings = build_transport_security_settings(configured)
+
+    assert configured.mcp_authority_mode == "alpic-gateway"
+    assert settings.enable_dns_rebinding_protection is False
+    assert settings.allowed_hosts == ["public.example.alpic.live"]
+    assert settings.allowed_origins == ["https://public.example.alpic.live"]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param({"ALLOW_ANONYMOUS": "false"}, id="protected"),
+        pytest.param(
+            {"NPLG_MCP_ALLOWED_HOSTS_JSON": '["public.example.alpic.live"]'},
+            id="explicit-hosts",
+        ),
+        pytest.param(
+            {
+                "NPLG_MCP_ALLOWED_ORIGINS_JSON": (
+                    '["https://public.example.alpic.live"]'
+                )
+            },
+            id="explicit-origins",
+        ),
+    ],
+)
+def test_alpic_gateway_authority_requires_anonymous_provider_policy(
+    override: dict[str, str],
+) -> None:
+    """Authentication or explicit authority policy keeps application enforcement."""
+    env = {
+        "NODE_ENV": "production",
+        "ALPIC_HOST": "public.example.alpic.live",
+        "CURSOR_SIGNING_SECRET": "c" * 32,
+        "ALLOW_ANONYMOUS": "true",
+        "DEPLOYMENT_PROFILE": "alpic-metadata",
+    }
+    env.update(override)
+
+    configured = load_config(env)
+
+    assert configured.mcp_authority_mode == "direct"
 
 
 @pytest.mark.parametrize(
