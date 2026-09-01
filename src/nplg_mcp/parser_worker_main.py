@@ -26,6 +26,8 @@ from .parser_ipc import (
     ParserSuccess,
     SearchCommand,
     SearchPayload,
+    SearchVersionCommand,
+    SearchVersionPayload,
     encode_parser_frame,
     parse_command_frame,
 )
@@ -34,6 +36,7 @@ from .parsers import (
     parse_metadata_formats,
     parse_oai_record,
     parse_search_results,
+    parse_search_version,
 )
 
 _CPU_SECONDS = 3
@@ -107,6 +110,18 @@ def _execute(command: ParserCommand) -> ParserSuccess:
                     command.markup,
                     source_url=command.source_url,
                     page_size=command.page_size,
+                ),
+            ),
+        )
+    if isinstance(command, SearchVersionCommand):
+        return ParserSuccess(
+            request_id=command.request_id,
+            status="ok",
+            payload=SearchVersionPayload(
+                operation="search_version",
+                value=parse_search_version(
+                    command.markup,
+                    source_url=command.source_url,
                 ),
             ),
         )

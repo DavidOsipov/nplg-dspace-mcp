@@ -33,7 +33,15 @@ _JSPUI_RANGE_SUFFIX = (
     r"([\d,]+)\s*[-\u2013]\s*მდე\s+სულ\s*[-\u2013]\s*([\d,]+)(?![\d,])"
 )
 _JSPUI_RANGE_RE = re.compile(f"{_JSPUI_RANGE_PREFIX}{_JSPUI_RANGE_SUFFIX}")
+_JSPUI_ENGLISH_RANGE_RE = re.compile(
+    r"""
+    \bResults\s+([\d,]+)\s*[-\u2013]\s*([\d,]+)\s+of\s+([\d,]+)(?![\d,])
+    \s+\(Search\ time:\s+[0-9]+(?:\.[0-9]+)?\s+seconds\)\.
+    """,
+    re.VERBOSE,
+)
 _SEARCH_INTEGER_RE = re.compile(r"(?:[0-9]+|[1-9][0-9]{0,2}(?:,[0-9]{3})+)")
+_SEARCH_VERSION_RE = re.compile(r"ex[0-9]{8}")
 _SIZE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?B)\s*$", re.IGNORECASE)
 _DC_KEY_RE = re.compile(r"^dc(?:\.[A-Za-z0-9_-]+)+$")
 _WHITESPACE_RUN_RE = re.compile(r"\s+")
@@ -872,6 +880,10 @@ def _has_search_results_class(value: object) -> bool:
     return _class_contains(value, "search-results")
 
 
+def _has_jspui_results_panel_class(value: object) -> bool:
+    return _class_contains(value, "panel") and _class_contains(value, "panel-info")
+
+
 def _has_next_page_class(value: object) -> bool:
     return _class_contains(value, "next-page-link")
 
@@ -958,6 +970,19 @@ def _search_contract(soup: BeautifulSoup, *, source_url: str) -> _SearchContract
         attrs={"summary": _JSPUI_SEARCH_TABLE_SUMMARY},
         recursive=False,
     )
+    if table is None:
+        panels = results.find_all(
+            "div",
+            class_=_has_jspui_results_panel_class,
+            recursive=False,
+            limit=2,
+        )
+        if len(panels) == 1:
+            table = panels[0].find(
+                "table",
+                attrs={"summary": _JSPUI_SEARCH_TABLE_SUMMARY},
+                recursive=False,
+            )
     if table is not jspui_tables[0] or results.parent is not pagination.parent:
         msg = (
             "The repository search response had an invalid contract marker cardinality."
@@ -980,10 +1005,10 @@ def _is_recognized_search_column(
     if variant == "jspui":
         return (
             text
-            == {
-                "title": "სათაური",
-                "date": "გამოცემის თარიღი",
-                "author": "ავტორი / ავტორები",
+            in {
+                "title": {"title", "სათაური"},
+                "date": {"issue date", "გამოცემის თარიღი"},
+                "author": {"author(s)", "ავტორი / ავტორები"},
             }[kind]
         )
     if kind == "title":
@@ -1191,7 +1216,11 @@ def _search_total(
             return minimum_total
         raw_total = _match_group(total_match, 1)
     else:
-        range_matches = list(_JSPUI_RANGE_RE.finditer(context_text))
+        range_matches = [
+            match
+            for pattern in (_JSPUI_RANGE_RE, _JSPUI_ENGLISH_RANGE_RE)
+            for match in pattern.finditer(context_text)
+        ]
         if len(range_matches) != 1:
             msg = (
                 "The repository search response had an invalid range marker "
@@ -1328,6 +1357,36 @@ def _next_search_offset(
         msg = "The repository returned an invalid pagination offset."
         raise _upstream_failure(msg, source_url=source_url)
     return parsed_offset
+
+
+def parse_search_version(html: str, *, source_url: str) -> str:
+    """Extract one bounded NPLG search-version marker from public HTML."""
+    preflight = _preflight_html(html, source_url=source_url)
+    soup = BeautifulSoup(html, "lxml")
+    constructed = _validate_html_tree(soup, source_url=source_url)
+    _require_preflight_agreement(
+        preflight,
+        constructed,
+        compare_nodes=False,
+        source_url=source_url,
+    )
+    heads = soup.find_all("head")
+    if len(heads) != 1:
+        msg = "The repository returned an invalid search-version marker."
+        raise _upstream_failure(msg, source_url=source_url)
+    markers = [
+        tag
+        for tag in heads[0].find_all("meta", recursive=False)
+        if _tag_attribute(tag, "name") == "sourcefv"
+    ]
+    if len(markers) != 1:
+        msg = "The repository returned an invalid search-version marker."
+        raise _upstream_failure(msg, source_url=source_url)
+    marker = _tag_attribute(markers[0], "content")
+    if _SEARCH_VERSION_RE.fullmatch(marker) is None:
+        msg = "The repository returned an invalid search-version marker."
+        raise _upstream_failure(msg, source_url=source_url)
+    return marker
 
 
 def parse_search_results(

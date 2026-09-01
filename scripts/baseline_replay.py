@@ -2035,6 +2035,25 @@ def _normalized_tool_error(
     return public_error
 
 
+def _live_tool_error_message(value: object) -> str | None:
+    """Read one exact content-only live tool error without schema masking."""
+    envelope = _sdk_object(value, context="tool error result")
+    if envelope.get("isError") is not True or "structuredContent" in envelope:
+        return None
+    content = envelope.get("content")
+    if not isinstance(content, list) or len(content) != 1:
+        return None
+    block = content[0]
+    if (
+        not isinstance(block, dict)
+        or set(block) != {"type", "text"}
+        or block.get("type") != "text"
+    ):
+        return None
+    text = block.get("text")
+    return text if isinstance(text, str) else None
+
+
 def _case_tool_fields(case: _BehaviorCase) -> frozenset[str] | None:
     name = case.params.get("name")
     if not isinstance(name, str):
@@ -2124,14 +2143,9 @@ def _matches_live_sdk_case(
         expected_code = (
             "INVALID_INPUT" if case.outcome == "strict-error" else "UPSTREAM_FAILURE"
         )
-        live_public_error = _normalized_tool_error(live_result, live=True)
+        live_message = _live_tool_error_message(live_result)
         frozen_public_error = _normalized_tool_error(frozen_result, live=False)
         if case.outcome == "strict-error":
-            live_projection = _strict_error_projection(
-                case,
-                live_public_error,
-                live=True,
-            )
             frozen_projection = _strict_error_projection(
                 case,
                 frozen_public_error,
@@ -2139,16 +2153,16 @@ def _matches_live_sdk_case(
             )
             matches = (
                 live_error is None
-                and live_projection is not None
-                and live_projection[0] == expected_code
-                and live_projection == frozen_projection
+                and frozen_projection is not None
+                and frozen_projection[0] == expected_code
+                and live_message == frozen_projection[1]
             )
         else:
             matches = (
                 live_error is None
-                and live_public_error is not None
-                and live_public_error.get("code") == expected_code
-                and live_public_error == frozen_public_error
+                and frozen_public_error is not None
+                and frozen_public_error.get("code") == expected_code
+                and live_message == frozen_public_error.get("message")
             )
     elif case.outcome == "generic-error":
         matches = (

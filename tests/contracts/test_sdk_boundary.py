@@ -168,17 +168,16 @@ def _context() -> ServerRequestContext[None]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("arguments", "expected_location"),
+    "arguments",
     [
-        ({"query": "fixture", "unexpected": True}, "arguments"),
-        ({"query": 1}, "query"),
-        ({"query": "fixture", "page_size": True}, "page_size"),
+        {"query": "fixture", "unexpected": True},
+        {"query": 1},
+        {"query": "fixture", "page_size": True},
     ],
 )
 async def test_sdk_boundary_rejects_bad_raw_arguments_before_tool_entry(
     tool_service: ToolService,
     arguments: dict[str, object],
-    expected_location: str,
 ) -> None:
     """Known-tool validation is an actionable tool result before service entry."""
     tools = RecordingTools(tool_service)
@@ -188,13 +187,10 @@ async def test_sdk_boundary_rejects_bad_raw_arguments_before_tool_entry(
     result = await handlers.on_call_tool(_context(), params)
 
     assert result.is_error is True
-    assert result.structured_content == {
-        "error": {
-            "code": ErrorCode.INVALID_INPUT.value,
-            "message": "Tool arguments did not match the declared schema.",
-            "details": {"locations": [expected_location]},
-        }
-    }
+    assert result.structured_content is None
+    assert "structuredContent" not in result.model_dump(
+        mode="json", by_alias=True, exclude_none=True
+    )
     assert len(result.content) == 1
     assert isinstance(result.content[0], types.TextContent)
     assert result.content[0].text == "Tool arguments did not match the declared schema."
@@ -202,11 +198,11 @@ async def test_sdk_boundary_rejects_bad_raw_arguments_before_tool_entry(
 
 
 @pytest.mark.asyncio
-async def test_sdk_boundary_sanitizes_malformed_validation_error_locations(
+async def test_sdk_boundary_does_not_inspect_untrusted_validation_diagnostics(
     tool_service: ToolService,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Malformed dependency diagnostics collapse to one bounded safe location."""
+    """Dependency diagnostics are unnecessary and never enter the error path."""
     tools = RecordingTools(tool_service)
     handlers = SdkHandlers(MetadataServiceComposition(tools=tools))
     params = types.CallToolRequestParams(
@@ -214,7 +210,7 @@ async def test_sdk_boundary_sanitizes_malformed_validation_error_locations(
         arguments={"query": 1},
     )
 
-    def malformed_errors(
+    def forbidden_errors(
         _error: ValidationError,
         *,
         include_url: bool = True,
@@ -222,20 +218,22 @@ async def test_sdk_boundary_sanitizes_malformed_validation_error_locations(
         include_input: bool = True,
     ) -> list[object]:
         _ = include_url, include_context, include_input
-        return ["not-an-error-object", {"loc": []}]
+        pytest.fail("validation diagnostics must not be inspected")
 
-    monkeypatch.setattr(ValidationError, "errors", malformed_errors)
+    monkeypatch.setattr(ValidationError, "errors", forbidden_errors)
 
     result = await handlers.on_call_tool(_context(), params)
 
     assert result.is_error is True
-    assert result.structured_content == {
-        "error": {
-            "code": ErrorCode.INVALID_INPUT.value,
-            "message": "Tool arguments did not match the declared schema.",
-            "details": {"locations": ["arguments"]},
-        }
-    }
+    assert result.structured_content is None
+    assert "structuredContent" not in result.model_dump(
+        mode="json", by_alias=True, exclude_none=True
+    )
+    assert len(result.content) == 1
+    assert isinstance(result.content[0], types.TextContent)
+    assert result.content[0].text == (
+        "Tool arguments did not match the declared schema."
+    )
     assert tools.calls == []
 
 
@@ -263,6 +261,10 @@ async def test_sdk_boundary_uses_fallback_text_for_malformed_public_error_messag
     result = await handlers.on_call_tool(_context(), params)
 
     assert result.is_error is True
+    assert result.structured_content is None
+    assert "structuredContent" not in result.model_dump(
+        mode="json", by_alias=True, exclude_none=True
+    )
     assert len(result.content) == 1
     content = result.content[0]
     assert isinstance(content, types.TextContent)
@@ -309,12 +311,10 @@ async def test_sdk_boundary_returns_expected_domain_error_as_tool_result(
     result = await handlers.on_call_tool(_context(), params)
 
     assert result.is_error is True
-    assert result.structured_content == {
-        "error": {
-            "code": ErrorCode.UPSTREAM_FAILURE.value,
-            "message": "The upstream repository is temporarily unavailable.",
-        }
-    }
+    assert result.structured_content is None
+    assert "structuredContent" not in result.model_dump(
+        mode="json", by_alias=True, exclude_none=True
+    )
     assert len(result.content) == 1
     assert isinstance(result.content[0], types.TextContent)
     assert result.content[0].text == (

@@ -53,7 +53,6 @@ if TYPE_CHECKING:
     from .json_types import JsonObject
     from .services import FullServices, MetadataServices
 
-_MAX_VALIDATION_LOCATIONS = 16
 _BASE64_VALIDATION_CHUNK_CODE_POINTS = 64 * 1024
 _MAX_INLINE_RESOURCE_BASE64_CODE_POINTS = (
     (HARD_MAX_INLINE_RESOURCE_BYTES + 2) // 3
@@ -73,46 +72,14 @@ def _binding_for_tool(name: str) -> ToolModelBinding:
     )
 
 
-def _safe_validation_locations(
-    binding: ToolModelBinding,
-    error: ValidationError,
-) -> list[str]:
-    """Return only bounded schema-owned top-level validation locations."""
-    known_fields = set(binding.input_model.model_fields)
-    known_fields.update(
-        field.alias
-        for field in binding.input_model.model_fields.values()
-        if field.alias is not None
-    )
-    locations: list[str] = []
-    raw_errors = cast(
-        "list[object]",
-        error.errors(include_url=False, include_input=False),
-    )
-    for raw_error in raw_errors[:_MAX_VALIDATION_LOCATIONS]:
-        location = "arguments"
-        if isinstance(raw_error, dict):
-            fields = cast("dict[object, object]", raw_error)
-            raw_location = fields.get("loc")
-            if isinstance(raw_location, tuple) and raw_location:
-                typed_location = cast("tuple[object, ...]", raw_location)
-                first = typed_location[0]
-                if type(first) is str and first in known_fields:
-                    location = first
-        if location not in locations:
-            locations.append(location)
-    return locations or ["arguments"]
-
-
 def _tool_error_result(error: AppError) -> types.CallToolResult:
-    """Project one bounded project error into the actionable tool channel."""
+    """Project one bounded error without violating the success output schema."""
     public_error = to_public_error(error)
     message = public_error.get("message")
     if not isinstance(message, str):
         message = "The server could not complete the request."
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=message)],
-        structured_content={"error": public_error},
         is_error=True,
     )
 
@@ -324,14 +291,11 @@ class SdkHandlers:
                 raw_arguments,
                 strict=True,
             )
-        except ValidationError as exc:
+        except ValidationError:
             return _tool_error_result(
                 AppError(
                     ErrorCode.INVALID_INPUT,
                     "Tool arguments did not match the declared schema.",
-                    safe_details={
-                        "locations": _safe_validation_locations(binding, exc),
-                    },
                 )
             )
         try:

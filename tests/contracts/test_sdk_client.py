@@ -19,7 +19,6 @@ from nplg_mcp.agent_workflow import (
     AGENT_WORKFLOW_MIME_TYPE,
     AGENT_WORKFLOW_URI,
 )
-from nplg_mcp.errors import ErrorCode
 from nplg_mcp.json_types import JsonObject, require_json_object
 from nplg_mcp.mcp_server import create_mcp_server
 from nplg_mcp.profiles import DeploymentProfile
@@ -172,17 +171,16 @@ async def test_official_client_returns_revalidated_structured_output(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("arguments", "expected_location"),
+    "arguments",
     [
-        ({"query": "fixture", "unexpected": True}, "arguments"),
-        ({"query": 1}, "query"),
-        ({"query": "fixture", "page_size": True}, "page_size"),
+        {"query": "fixture", "unexpected": True},
+        {"query": 1},
+        {"query": "fixture", "page_size": True},
     ],
 )
 async def test_official_client_rejects_invalid_raw_tool_arguments(
     app_services: MetadataServices,
     arguments: dict[str, object],
-    expected_location: str,
 ) -> None:
     """Known-tool argument errors remain in the actionable tool-result channel."""
     server = create_mcp_server(app_services, DeploymentProfile.ALPIC_METADATA)
@@ -191,13 +189,12 @@ async def test_official_client_rejects_invalid_raw_tool_arguments(
         result = await client.call_tool("search_documents", arguments)
 
     assert result.is_error is True
-    assert result.structured_content == {
-        "error": {
-            "code": ErrorCode.INVALID_INPUT.value,
-            "message": "Tool arguments did not match the declared schema.",
-            "details": {"locations": [expected_location]},
-        }
-    }
+    assert result.structured_content is None
+    assert len(result.content) == 1
+    assert isinstance(result.content[0], types.TextContent)
+    assert result.content[0].text == (
+        "Tool arguments did not match the declared schema."
+    )
 
 
 @pytest.mark.asyncio

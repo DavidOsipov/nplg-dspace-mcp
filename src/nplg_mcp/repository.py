@@ -229,6 +229,13 @@ class NplgRepository:
         init=False,
         repr=False,
     )
+    _search_version: str | None = field(default=None, init=False, repr=False)
+    _search_version_generation: int = field(default=0, init=False, repr=False)
+    _search_version_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         """Reject an invalid total request deadline."""
@@ -307,6 +314,50 @@ class NplgRepository:
 
     def _new_deadline(self) -> float:
         return asyncio.get_running_loop().time() + self.total_timeout_seconds
+
+    async def _get_search_version(
+        self,
+        *,
+        deadline: float,
+        stale_generation: int | None = None,
+    ) -> tuple[str, int]:
+        """Return one cached marker discovered from the queryless search page."""
+        try:
+            async with asyncio.timeout_at(deadline):
+                async with self._search_version_lock:
+                    if self._search_version is not None and (
+                        stale_generation is None
+                        or self._search_version_generation != stale_generation
+                    ):
+                        return self._search_version, self._search_version_generation
+                    discovery_url = f"{NPLG_ORIGIN}/simple-search"
+                    markup, final_url = await self._get_text(
+                        discovery_url,
+                        accepted_types=("text/html", "application/xhtml+xml"),
+                        deadline=deadline,
+                    )
+                    if final_url != discovery_url:
+                        raise AppError(
+                            ErrorCode.UPSTREAM_FAILURE,
+                            "The repository search discovery route changed.",
+                            http_status=502,
+                        )
+                    marker = await self._parse_within_deadline(
+                        self.parser_executor.parse_search_version(
+                            markup,
+                            source_url=final_url,
+                            deadline=deadline,
+                        )
+                    )
+                    self._search_version = marker
+                    self._search_version_generation += 1
+                    return marker, self._search_version_generation
+        except TimeoutError as exc:
+            raise AppError(
+                ErrorCode.UPSTREAM_FAILURE,
+                _REQUEST_DEADLINE_MESSAGE,
+                http_status=502,
+            ) from exc
 
     async def _parse_within_deadline(
         self,
@@ -569,12 +620,38 @@ class NplgRepository:
             else 0
         )
         try:
-            text, final_url = await self._get_text(
-                url,
-                params={"query": normalized_query, "rpp": page_size, "start": offset},
-                accepted_types=("text/html", "application/xhtml+xml"),
-                deadline=deadline,
+            search_version, search_version_generation = await self._get_search_version(
+                deadline=deadline
             )
+            search_params: dict[str, str | int] = {
+                "query": normalized_query,
+                "rpp": page_size,
+                "start": offset,
+                "envfv": search_version,
+            }
+            for may_refresh in (True, False):
+                try:
+                    text, final_url = await self._get_text(
+                        url,
+                        params=search_params,
+                        accepted_types=("text/html", "application/xhtml+xml"),
+                        deadline=deadline,
+                    )
+                    break
+                except AppError as exc:
+                    if exc.code is not ErrorCode.NOT_FOUND or not may_refresh:
+                        raise
+                    (
+                        search_version,
+                        search_version_generation,
+                    ) = await self._get_search_version(
+                        deadline=deadline,
+                        stale_generation=search_version_generation,
+                    )
+                    search_params["envfv"] = search_version
+            else:
+                msg = "unreachable"
+                raise AssertionError(msg)
         except AppError as exc:
             if exc.code is not ErrorCode.NOT_FOUND:
                 raise

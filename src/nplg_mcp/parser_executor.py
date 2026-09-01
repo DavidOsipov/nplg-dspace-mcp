@@ -33,6 +33,8 @@ from .parser_ipc import (
     ParserPayload,
     SearchCommand,
     SearchPayload,
+    SearchVersionCommand,
+    SearchVersionPayload,
     encode_parser_frame,
     parse_result_frame,
 )
@@ -43,6 +45,7 @@ from .parsers import (
     parse_metadata_formats,
     parse_oai_record,
     parse_search_results,
+    parse_search_version,
 )
 
 if TYPE_CHECKING:
@@ -54,7 +57,11 @@ _TERMINATION_GRACE_SECONDS = 0.25
 _MAX_WORKER_ARGUMENT_CODE_POINTS = 4_096
 
 type StrictParserCommand = (
-    SearchCommand | ItemCommand | MetadataFormatsCommand | OaiRecordCommand
+    SearchCommand
+    | SearchVersionCommand
+    | ItemCommand
+    | MetadataFormatsCommand
+    | OaiRecordCommand
 )
 
 
@@ -75,6 +82,16 @@ class ParserExecutor(Protocol):
         deadline: float,
     ) -> SearchPage:
         """Parse one repository search response."""
+        ...
+
+    async def parse_search_version(
+        self,
+        markup: str,
+        *,
+        source_url: str,
+        deadline: float,
+    ) -> str:
+        """Parse one repository search-version response."""
         ...
 
     async def parse_item(
@@ -133,6 +150,19 @@ class InlineParserExecutor:
                     source_url=source_url,
                     page_size=page_size,
                 )
+            )
+
+    async def parse_search_version(
+        self,
+        markup: str,
+        *,
+        source_url: str,
+        deadline: float,
+    ) -> str:
+        """Parse trusted search-version markup without a process boundary."""
+        async with asyncio.timeout_at(deadline):
+            return await PARSER_WORK.run(
+                lambda: parse_search_version(markup, source_url=source_url)
             )
 
     async def parse_item(
@@ -454,6 +484,30 @@ class SubprocessParserExecutor:
         payload = await self._execute(command, deadline=deadline)
         if not isinstance(payload, SearchPayload):
             message = "parser worker returned the wrong search payload"
+            raise ParserWorkerError(message)
+        return payload.value
+
+    async def parse_search_version(
+        self,
+        markup: str,
+        *,
+        source_url: str,
+        deadline: float,
+    ) -> str:
+        """Parse search-version HTML in one disposable process."""
+        try:
+            command = SearchVersionCommand(
+                request_id=uuid4(),
+                operation="search_version",
+                markup=markup,
+                source_url=source_url,
+            )
+        except ValidationError as exc:
+            message = "parser command failed strict validation"
+            raise ParserWorkerError(message) from exc
+        payload = await self._execute(command, deadline=deadline)
+        if not isinstance(payload, SearchVersionPayload):
+            message = "parser worker returned the wrong search-version payload"
             raise ParserWorkerError(message)
         return payload.value
 

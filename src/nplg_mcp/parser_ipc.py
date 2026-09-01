@@ -22,6 +22,7 @@ _MAX_ERROR_MESSAGE_CODE_POINTS = 512
 
 type ParserOperation = Literal[
     "search",
+    "search_version",
     "item",
     "metadata_formats",
     "oai_record",
@@ -44,6 +45,15 @@ Handle = Annotated[
     StringConstraints(strict=True, min_length=3, max_length=256),
 ]
 MetadataPrefix = Literal["dim", "oai_dc"]
+SearchVersion = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        min_length=10,
+        max_length=10,
+        pattern=r"^ex[0-9]{8}$",
+    ),
+]
 
 
 class ParserIpcError(ValueError):
@@ -58,6 +68,15 @@ class SearchCommand(StrictModel):
     markup: Markup
     source_url: SourceUrl
     page_size: Annotated[int, Field(strict=True, ge=1, le=50)]
+
+
+class SearchVersionCommand(StrictModel):
+    """Parse one bounded queryless repository-search HTML response."""
+
+    request_id: UUID
+    operation: Literal["search_version"]
+    markup: Markup
+    source_url: SourceUrl
 
 
 class ItemCommand(StrictModel):
@@ -89,7 +108,11 @@ class OaiRecordCommand(StrictModel):
 
 
 type ParserCommand = Annotated[
-    SearchCommand | ItemCommand | MetadataFormatsCommand | OaiRecordCommand,
+    SearchCommand
+    | SearchVersionCommand
+    | ItemCommand
+    | MetadataFormatsCommand
+    | OaiRecordCommand,
     Field(discriminator="operation"),
 ]
 
@@ -99,6 +122,13 @@ class SearchPayload(StrictModel):
 
     operation: Literal["search"]
     value: SearchPage
+
+
+class SearchVersionPayload(StrictModel):
+    """Successful repository search-version parse result."""
+
+    operation: Literal["search_version"]
+    value: SearchVersion
 
 
 class ItemPayload(StrictModel):
@@ -123,7 +153,11 @@ class OaiRecordPayload(StrictModel):
 
 
 type ParserPayload = Annotated[
-    SearchPayload | ItemPayload | MetadataFormatsPayload | OaiRecordPayload,
+    SearchPayload
+    | SearchVersionPayload
+    | ItemPayload
+    | MetadataFormatsPayload
+    | OaiRecordPayload,
     Field(discriminator="operation"),
 ]
 

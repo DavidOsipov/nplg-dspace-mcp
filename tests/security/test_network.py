@@ -57,6 +57,7 @@ _UNEXPECTED_UNIX = "Unix sockets are not expected"
 _FIRST_CONNECT_FAILED = "first connection failed"
 _CNAME_TTL = 2.0
 _EXPECTED_TTL = 5.0
+_EXPECTED_DISCOVERY_AND_SEARCH_CONNECTIONS = 2
 _FORGED_BOOLEAN: object = True
 _NETWORK_NAMESPACE = cast(
     "dict[str, object]",
@@ -1053,7 +1054,7 @@ async def test_runtime_client_binds_repository_connection_to_approved_literal(
         + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
         + body
     )
-    stream = _HttpStream(("1.1.1.1", 443), response)
+    streams: list[_HttpStream] = []
     connected_hosts: list[str] = []
 
     async def connect_tcp(
@@ -1068,6 +1069,8 @@ async def test_runtime_client_binds_repository_connection_to_approved_literal(
         connected_hosts.append(host)
         if port != _HTTPS_PORT:
             raise AssertionError(_UNEXPECTED_PORT)
+        stream = _HttpStream(("1.1.1.1", 443), response)
+        streams.append(stream)
         return stream
 
     def resolve(_host: str) -> tuple[str, ...]:
@@ -1105,7 +1108,8 @@ async def test_runtime_client_binds_repository_connection_to_approved_literal(
         if services.http_client is not None:
             await services.http_client.aclose()
 
-    assert connected_hosts == ["1.1.1.1"]
+    assert connected_hosts == ["1.1.1.1"] * _EXPECTED_DISCOVERY_AND_SEARCH_CONNECTIONS
+    assert all(stream.server_hostnames == [NPLG_HOST] for stream in streams)
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,8 @@ from nplg_mcp.parser_ipc import (
     ParserSuccess,
     SearchCommand,
     SearchPayload,
+    SearchVersionCommand,
+    SearchVersionPayload,
     encode_parser_frame,
     parse_result_frame,
 )
@@ -182,6 +184,21 @@ def test_worker_dispatches_search_to_the_real_bounded_parser() -> None:
     assert isinstance(result.payload, SearchPayload)
     assert result.payload.operation == "search"
     assert len(result.payload.value.items) == _EXPECTED_SEARCH_ITEMS
+
+
+def test_worker_dispatches_search_version_to_the_real_bounded_parser() -> None:
+    result = _EXECUTE(
+        SearchVersionCommand(
+            request_id=UUID(int=10),
+            operation="search_version",
+            markup=_fixture("search_results.html"),
+            source_url=_SEARCH_SOURCE,
+        )
+    )
+
+    assert isinstance(result.payload, SearchVersionPayload)
+    assert result.payload.operation == "search_version"
+    assert result.payload.value == "ex20251112"
 
 
 def test_worker_dispatches_item_to_the_real_bounded_parser() -> None:

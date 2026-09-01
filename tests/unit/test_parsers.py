@@ -20,6 +20,7 @@ from nplg_mcp.parsers import (
     parse_metadata_formats,
     parse_oai_record,
     parse_search_results,
+    parse_search_version,
 )
 from nplg_mcp.security import NPLG_HOST
 
@@ -29,6 +30,10 @@ _EXPECTED_NEXT_OFFSET = 2
 _EXPECTED_REPORTED_SIZE = 13_900_000
 _SEARCH_SOURCE = "https://dspace.nplg.gov.ge/simple-search?query=test"
 _FALLBACK_PAGINATION_OFFSET = 5
+_JSPUI_GEORGIAN_RANGE = "შედეგის ჩვენება 1- დან 2 \u2013 მდე სულ \u2013 42."
+_JSPUI_ENGLISH_RANGE = "Results 1-2 of 42 (Search time: 0.0 seconds)."
+_JSPUI_RESULTS_OPEN = '<div class="discovery-result-results">'
+_JSPUI_PANEL_OPEN = '<div class="panel panel-info">'
 _ITEM_HANDLE = "1234/499564"
 _ITEM_SOURCE = f"https://dspace.nplg.gov.ge/handle/{_ITEM_HANDLE}"
 
@@ -576,6 +581,93 @@ def test_search_parser_preserves_georgian_and_canonical_handles() -> None:
     assert page.items[1].authors == ("გაგუა, მალხაზ", "სხვა, ავტორი")
 
 
+def test_search_version_parser_extracts_the_single_public_marker() -> None:
+    """Catch omission or renaming of NPLG's required search-version marker."""
+    marker = parse_search_version(
+        """<!doctype html><html><head>
+        <meta name="sourcefv" content="ex20251112">
+        </head><body></body></html>""",
+        source_url="https://dspace.nplg.gov.ge/simple-search",
+    )
+
+    assert marker == "ex20251112"
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        pytest.param("source20251112", id="wrong-prefix"),
+        pytest.param("EX20251112", id="wrong-case"),
+        pytest.param("ex2025-11-12", id="punctuation"),
+        pytest.param("ex2025111", id="short-date"),
+        pytest.param("ex202511120", id="long-date"),
+    ],
+)
+def test_search_version_parser_rejects_unobserved_marker_shapes(marker: str) -> None:
+    """Catch widening the upstream marker into an attacker-controlled token."""
+    document = (
+        '<!doctype html><html><head><meta name="sourcefv" content="'
+        f'{marker}"></head><body></body></html>'
+    )
+
+    with pytest.raises(AppError) as captured:
+        _ = parse_search_version(document, source_url=_SEARCH_SOURCE)
+
+    assert captured.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_search_version_parser_rejects_marker_outside_document_head() -> None:
+    """Catch accepting attacker-controlled body metadata as route configuration."""
+    document = (
+        "<!doctype html><html><head><title>Search</title></head><body>"
+        '<meta name="sourcefv" content="ex20251112">'
+        "</body></html>"
+    )
+
+    with pytest.raises(AppError) as captured:
+        _ = parse_search_version(document, source_url=_SEARCH_SOURCE)
+
+    assert captured.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_search_version_parser_requires_one_document_head() -> None:
+    """Reject normalized fragments that never supplied the reviewed head boundary."""
+    document = "<!doctype html><html><body></body></html>"
+
+    with pytest.raises(AppError) as captured:
+        _ = parse_search_version(document, source_url=_SEARCH_SOURCE)
+
+    assert captured.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+@pytest.mark.parametrize(
+    "head_markup",
+    [
+        pytest.param("<title>Search</title>", id="missing"),
+        pytest.param(
+            """<meta name="sourcefv" content="ex20251112">
+<meta name="sourcefv" content="ex20260101">""",
+            id="duplicate",
+        ),
+        pytest.param('<meta name="sourcefv" content="">', id="empty"),
+        pytest.param(
+            '<noscript><meta name="sourcefv" content="ex20251112"></noscript>',
+            id="nested",
+        ),
+    ],
+)
+def test_search_version_parser_rejects_missing_or_ambiguous_marker(
+    head_markup: str,
+) -> None:
+    """Catch fail-open selection when discovery metadata is not unambiguous."""
+    document = f"<!doctype html><html><head>{head_markup}</head><body></body></html>"
+
+    with pytest.raises(AppError) as captured:
+        _ = parse_search_version(document, source_url=_SEARCH_SOURCE)
+
+    assert captured.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
 def test_search_parser_supports_current_jspui_contract() -> None:
     page = parse_search_results(
         _jspui_search_document(),
@@ -588,8 +680,68 @@ def test_search_parser_supports_current_jspui_contract() -> None:
     assert [item.handle for item in page.items] == ["1234/499564", "1234/560975"]
     assert page.items[0].title == "ივერია N161"
     assert page.items[0].issue_date == "2025-08-07"
+
+
+def test_search_parser_supports_current_jspui_results_panel_wrapper() -> None:
+    """Catch rejection of NPLG's single reviewed results-panel container."""
+    page = parse_search_results(
+        _jspui_search_document_with_panel(),
+        source_url=f"{_SEARCH_SOURCE}&envfv=ex20251112",
+        page_size=2,
+    )
+
+    assert page.total == _EXPECTED_SEARCH_TOTAL
+    assert [item.handle for item in page.items] == ["1234/499564", "1234/560975"]
     assert page.items[1].issue_date is None
     assert page.items[1].authors == ("გაგუა, მალხაზ", "სხვა, ავტორი")
+
+
+def test_search_parser_rejects_ambiguous_jspui_results_panels() -> None:
+    """Do not pick a table when two reviewed panel candidates are present."""
+    document = _jspui_search_document_with_panel().replace(
+        '<div class="panel panel-info"><table',
+        '<div class="panel panel-info"></div><div class="panel panel-info"><table',
+        1,
+    )
+
+    with pytest.raises(AppError, match="contract marker cardinality") as raised:
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_search_parser_rejects_nested_jspui_results_panel() -> None:
+    """Keep the reviewed panel relationship direct rather than recursive."""
+    document = (
+        _jspui_search_document_with_panel()
+        .replace(
+            f"{_JSPUI_RESULTS_OPEN}{_JSPUI_PANEL_OPEN}",
+            f"{_JSPUI_RESULTS_OPEN}<section>{_JSPUI_PANEL_OPEN}",
+            1,
+        )
+        .replace("</table></div></div>", "</table></div></section></div>", 1)
+    )
+
+    with pytest.raises(AppError, match="contract marker cardinality") as raised:
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_search_parser_supports_current_jspui_english_column_labels() -> None:
+    """Catch rejection of the exact English headers returned by live NPLG."""
+    document = (
+        _jspui_search_document()
+        .replace("წინასწარი<br/>დათვალიერება", "Preview", 1)
+        .replace("გამოცემის თარიღი", "Issue Date", 1)
+        .replace("სათაური", "Title", 1)
+        .replace("ავტორი / ავტორები", "Author(s)", 1)
+        .replace(_JSPUI_GEORGIAN_RANGE, _JSPUI_ENGLISH_RANGE, 1)
+    )
+
+    page = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert [item.handle for item in page.items] == ["1234/499564", "1234/560975"]
 
 
 def test_search_parser_rejects_jspui_range_with_a_missing_whole_data_row() -> None:
@@ -635,7 +787,37 @@ def test_search_parser_rejects_jspui_range_that_mismatches_current_offset() -> N
 )
 def test_search_parser_requires_one_jspui_range_marker(replacement: str) -> None:
     document = _jspui_search_document().replace(
-        "შედეგის ჩვენება 1- დან 2 \u2013 მდე სულ \u2013 42.",
+        _JSPUI_GEORGIAN_RANGE,
+        replacement,
+        1,
+    )
+
+    with pytest.raises(AppError, match="range marker cardinality") as raised:
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        pytest.param("Results 1-2 of 42.", id="missing-search-time-contract"),
+        pytest.param(
+            _document(_JSPUI_ENGLISH_RANGE, " ", _JSPUI_ENGLISH_RANGE),
+            id="duplicate-english-range",
+        ),
+        pytest.param(
+            _document(_JSPUI_GEORGIAN_RANGE, " ", _JSPUI_ENGLISH_RANGE),
+            id="mixed-language-ranges",
+        ),
+    ],
+)
+def test_search_parser_rejects_malformed_or_ambiguous_english_range(
+    replacement: str,
+) -> None:
+    """Keep live English compatibility exact and single-valued."""
+    document = _jspui_search_document().replace(
+        _JSPUI_GEORGIAN_RANGE,
         replacement,
         1,
     )
@@ -1328,6 +1510,18 @@ def _jspui_search_document() -> str:
         '<td headers="t3"><a href="/handle/1234/560975">რეზონანსი N164</a></td>'
         '<td headers="t4">გაგუა, მალხაზ; სხვა, ავტორი</td></tr>'
         "</table></div>"
+    )
+
+
+def _jspui_search_document_with_panel() -> str:
+    return (
+        _jspui_search_document()
+        .replace(
+            f"{_JSPUI_RESULTS_OPEN}<table",
+            f"{_JSPUI_RESULTS_OPEN}{_JSPUI_PANEL_OPEN}<table",
+            1,
+        )
+        .replace("</table></div>", "</table></div></div>", 1)
     )
 
 

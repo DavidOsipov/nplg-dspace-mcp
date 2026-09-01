@@ -1474,16 +1474,11 @@ async def test_streamable_http_strict_arguments_never_enter_handler(
     for response in rejected:
         assert response.status_code == HTTPStatus.OK
         assert _response_value(response, "result", "isError") is True
-        assert (
-            _response_value(
-                response,
-                "result",
-                "structuredContent",
-                "error",
-                "code",
-            )
-            == ErrorCode.INVALID_INPUT.value
+        result = _json_object(
+            _response_value(response, "result"),
+            context="tools/call result",
         )
+        assert "structuredContent" not in result
         assert _response_value(response, "result", "content", 0, "text") == (
             "Tool arguments did not match the declared schema."
         )
@@ -1612,16 +1607,11 @@ async def test_streamable_http_keeps_domain_and_unexpected_tool_failures_separat
 
     assert domain.status_code == HTTPStatus.OK
     assert _response_value(domain, "result", "isError") is True
-    assert (
-        _response_value(
-            domain,
-            "result",
-            "structuredContent",
-            "error",
-            "code",
-        )
-        == ErrorCode.RESTRICTED.value
+    domain_result = _json_object(
+        _response_value(domain, "result"),
+        context="tools/call result",
     )
+    assert "structuredContent" not in domain_result
     assert _response_value(domain, "result", "content", 0, "text") == (
         "The requested operation is restricted."
     )

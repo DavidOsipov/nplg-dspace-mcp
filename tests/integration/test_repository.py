@@ -51,6 +51,16 @@ _SYNTHETIC_BODY_FAILURE = "synthetic body failure"
 _CURSOR_SECRET = b"c" * 32
 _CURSOR_NOW = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
 _EXPECTED_DISCOVERY_REQUESTS = 2
+_EXPECTED_DISCOVERY_REDIRECT_AND_SEARCH_REQUESTS = 3
+_EXPECTED_DISCOVERY_REFRESH_REQUESTS = 4
+_EXPECTED_SHARED_SEARCH_VERSION_DISCOVERIES = 2
+_EXPECTED_CONCURRENT_SEARCH_ATTEMPTS = 4
+_SEARCH_VERSION = "ex20251112"
+_REFRESHED_SEARCH_VERSION = "ex20260101"
+_SEARCH_VERSION_DOCUMENT = (
+    '<!doctype html><html><head><meta name="sourcefv" '
+    f'content="{_SEARCH_VERSION}"></head><body></body></html>'
+)
 
 
 class _WriteCountingCache(dict[str, object]):
@@ -151,11 +161,12 @@ async def test_search_builds_bounded_dspace_request_and_opaque_cursor() -> None:
         )
         page = await repository.search("ივერია", page_size=2)
 
-    assert len(seen) == 1
-    query = parse_qs(urlsplit(str(seen[0].url)).query)
+    assert len(seen) == _EXPECTED_DISCOVERY_REQUESTS
+    query = parse_qs(urlsplit(str(seen[1].url)).query)
     assert query["query"] == ["ივერია"]
     assert query["rpp"] == ["2"]
     assert query["start"] == ["0"]
+    assert query["envfv"] == [_SEARCH_VERSION]
     assert page.next_cursor is not None
     assert (
         decode_cursor(
@@ -168,6 +179,287 @@ async def test_search_builds_bounded_dspace_request_and_opaque_cursor() -> None:
         )
         == _EXPECTED_PAGE_SIZE
     )
+
+
+@pytest.mark.asyncio
+async def test_search_discovers_current_version_and_sends_it_as_envfv() -> None:
+    """Catch search calls that omit NPLG's browser-injected version marker."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        query = parse_qs(urlsplit(str(request.url)).query, keep_blank_values=True)
+        if not query:
+            return httpx.Response(
+                200,
+                text=_SEARCH_VERSION_DOCUMENT,
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        return httpx.Response(
+            200,
+            text=fixture("search_results.html"),
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(client=client, validate_dns=False)
+        _ = await repository.search("ივერია", page_size=2)
+
+    assert len(seen) == _EXPECTED_DISCOVERY_REQUESTS
+    discovery_query = parse_qs(
+        urlsplit(str(seen[0].url)).query,
+        keep_blank_values=True,
+    )
+    search_query = parse_qs(urlsplit(str(seen[1].url)).query)
+    assert seen[0].url.path == "/simple-search"
+    assert discovery_query == {}
+    assert search_query["envfv"] == [_SEARCH_VERSION]
+    assert search_query["query"] == ["ივერია"]
+    assert search_query["rpp"] == ["2"]
+    assert search_query["start"] == ["0"]
+
+
+@pytest.mark.asyncio
+async def test_search_refreshes_stale_version_once_after_404() -> None:
+    """Catch stale marker failures that never refresh or retry without a bound."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        query = parse_qs(urlsplit(str(request.url)).query, keep_blank_values=True)
+        if not query:
+            marker = _SEARCH_VERSION if len(seen) == 1 else _REFRESHED_SEARCH_VERSION
+            return httpx.Response(
+                200,
+                text=_SEARCH_VERSION_DOCUMENT.replace(_SEARCH_VERSION, marker),
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        if query.get("envfv") == [_SEARCH_VERSION]:
+            return httpx.Response(
+                404,
+                text="untrusted stale-version response",
+                headers={"content-type": "text/html"},
+            )
+        return httpx.Response(
+            200,
+            text=fixture("search_results.html"),
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(client=client, validate_dns=False)
+        page = await repository.search("ივერია", page_size=2)
+
+    queries = [
+        parse_qs(urlsplit(str(request.url)).query, keep_blank_values=True)
+        for request in seen
+    ]
+    assert len(seen) == _EXPECTED_DISCOVERY_REFRESH_REQUESTS
+    assert queries == [
+        {},
+        {"query": ["ივერია"], "rpp": ["2"], "start": ["0"], "envfv": [_SEARCH_VERSION]},
+        {},
+        {
+            "query": ["ივერია"],
+            "rpp": ["2"],
+            "start": ["0"],
+            "envfv": [_REFRESHED_SEARCH_VERSION],
+        },
+    ]
+    assert len(page.items) == _EXPECTED_PAGE_SIZE
+
+
+@pytest.mark.asyncio
+async def test_search_reuses_cached_version_for_root_and_scoped_requests() -> None:
+    """Catch redundant discovery and omission on collection-scoped search."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            text=fixture("search_results.html"),
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(client=client, validate_dns=False)
+        _ = await repository.search("ივერია", page_size=2)
+        _ = await repository.search(
+            "გაზეთი",
+            scope_handle="1234/2",
+            page_size=2,
+        )
+
+    queries = [parse_qs(urlsplit(str(request.url)).query) for request in seen]
+    assert len(seen) == _EXPECTED_DISCOVERY_REDIRECT_AND_SEARCH_REQUESTS
+    assert [request.url.path for request in seen] == [
+        "/simple-search",
+        "/simple-search",
+        "/handle/1234/2/simple-search",
+    ]
+    assert queries[0] == {}
+    assert queries[1]["envfv"] == [_SEARCH_VERSION]
+    assert queries[2]["envfv"] == [_SEARCH_VERSION]
+
+
+@pytest.mark.asyncio
+async def test_search_stops_after_one_refresh_when_version_remains_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch unbounded refresh loops and parsing of untrusted 404 bodies."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        query = parse_qs(urlsplit(str(request.url)).query, keep_blank_values=True)
+        if not query:
+            return httpx.Response(
+                200,
+                text=_SEARCH_VERSION_DOCUMENT,
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        return httpx.Response(
+            404,
+            text="untrusted route detail",
+            headers={"content-type": "text/html"},
+        )
+
+    async def forbidden_parser(*_args: object, **_kwargs: object) -> object:
+        message = "search parser must not run after an upstream 404"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(SubprocessParserExecutor, "parse_search", forbidden_parser)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(client=client, validate_dns=False)
+        with pytest.raises(AppError) as captured:
+            _ = await repository.search("test", page_size=1)
+
+    queries = [
+        parse_qs(urlsplit(str(request.url)).query, keep_blank_values=True)
+        for request in seen
+    ]
+    assert captured.value.code is ErrorCode.UPSTREAM_FAILURE
+    assert captured.value.message == "The repository search service is unavailable."
+    assert captured.value.internal_details is None
+    assert len(seen) == _EXPECTED_DISCOVERY_REFRESH_REQUESTS
+    assert queries[0] == {}
+    assert queries[1]["envfv"] == [_SEARCH_VERSION]
+    assert queries[2] == {}
+    assert queries[3]["envfv"] == [_SEARCH_VERSION]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_searches_share_same_marker_refresh_after_404() -> None:
+    """Catch a serialized refresh herd when discovery returns the same marker."""
+    seen: list[httpx.Request] = []
+    initial_search_count = 0
+    initial_searches_arrived = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal initial_search_count
+        seen.append(request)
+        query = parse_qs(urlsplit(str(request.url)).query, keep_blank_values=True)
+        if not query:
+            return httpx.Response(
+                200,
+                text=_SEARCH_VERSION_DOCUMENT,
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        initial_search_count += 1
+        if initial_search_count <= _EXPECTED_SHARED_SEARCH_VERSION_DISCOVERIES:
+            if initial_search_count == _EXPECTED_SHARED_SEARCH_VERSION_DISCOVERIES:
+                initial_searches_arrived.set()
+            async with asyncio.timeout(1.0):
+                _ = await initial_searches_arrived.wait()
+        return httpx.Response(
+            404,
+            text="untrusted stale-version response",
+            headers={"content-type": "text/html"},
+        )
+
+    async def rejected_search(repository: NplgRepository, query: str) -> AppError:
+        try:
+            _ = await repository.search(query, page_size=1)
+        except AppError as exc:
+            return exc
+        message = "persistent upstream 404 must fail"
+        raise AssertionError(message)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(client=client, validate_dns=False)
+        errors = await asyncio.gather(
+            rejected_search(repository, "first"),
+            rejected_search(repository, "second"),
+        )
+
+    queries = [
+        parse_qs(urlsplit(str(request.url)).query, keep_blank_values=True)
+        for request in seen
+    ]
+    discovery_queries = [query for query in queries if not query]
+    search_queries = [query for query in queries if query]
+    assert all(error.code is ErrorCode.UPSTREAM_FAILURE for error in errors)
+    assert len(discovery_queries) == _EXPECTED_SHARED_SEARCH_VERSION_DISCOVERIES
+    assert len(search_queries) == _EXPECTED_CONCURRENT_SEARCH_ATTEMPTS
+    assert all(query["envfv"] == [_SEARCH_VERSION] for query in search_queries)
+
+
+@pytest.mark.asyncio
+async def test_search_does_not_refresh_version_after_restricted_response() -> None:
+    """Catch retries that turn an explicit upstream denial into extra traffic."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        query = parse_qs(urlsplit(str(request.url)).query, keep_blank_values=True)
+        if not query:
+            return httpx.Response(
+                200,
+                text=_SEARCH_VERSION_DOCUMENT,
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        return httpx.Response(
+            _HTTP_FORBIDDEN,
+            text="restricted",
+            headers={"content-type": "text/html"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(client=client, validate_dns=False)
+        with pytest.raises(AppError) as captured:
+            _ = await repository.search("test", page_size=1)
+
+    assert captured.value.code is ErrorCode.RESTRICTED
+    assert len(seen) == _EXPECTED_DISCOVERY_REQUESTS
+
+
+@pytest.mark.asyncio
+async def test_search_discovery_rejects_redirect_that_adds_query_state() -> None:
+    """Catch bootstrap redirects that smuggle marker state into the final URL."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if len(seen) == 1:
+            return httpx.Response(
+                302,
+                headers={"location": f"/simple-search?envfv={_SEARCH_VERSION}"},
+            )
+        return httpx.Response(
+            200,
+            text=_SEARCH_VERSION_DOCUMENT,
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(client=client, validate_dns=False)
+        with pytest.raises(AppError) as captured:
+            _ = await repository.search("test", page_size=1)
+
+    assert captured.value.code is ErrorCode.UPSTREAM_FAILURE
+    assert captured.value.message == "The repository search discovery route changed."
+    assert len(seen) == _EXPECTED_DISCOVERY_REQUESTS
 
 
 @pytest.mark.asyncio
@@ -219,6 +511,12 @@ async def test_search_normalizes_once_and_reuses_the_exact_canonical_query(
 
     def handler(request: httpx.Request) -> httpx.Response:
         request_query = parse_qs(urlsplit(str(request.url)).query)
+        if not request_query:
+            return httpx.Response(
+                200,
+                text=fixture("search_results.html"),
+                headers={"content-type": "text/html"},
+            )
         query = request_query["query"][0]
         upstream_queries.append(query)
         response_text = fixture("search_results.html")
@@ -297,7 +595,7 @@ async def test_search_cursor_replay_is_bound_to_every_pagination_context(
             )
 
     assert captured.value.code is ErrorCode.INVALID_INPUT
-    assert requests == 1
+    assert requests == _EXPECTED_DISCOVERY_REQUESTS
 
 
 @pytest.mark.asyncio
@@ -337,7 +635,7 @@ async def test_search_rejects_validly_signed_cursor_confusion_before_network(
             _ = await repository.search("ივერიელი", page_size=2, cursor=confused)
 
     assert captured.value.code is ErrorCode.INVALID_INPUT
-    assert requests == 1
+    assert requests == _EXPECTED_DISCOVERY_REQUESTS
 
 
 @pytest.mark.asyncio
@@ -370,7 +668,7 @@ async def test_search_rejects_expired_cursor_before_network() -> None:
             )
 
     assert captured.value.code is ErrorCode.INVALID_INPUT
-    assert requests == 1
+    assert requests == _EXPECTED_DISCOVERY_REQUESTS
 
 
 @pytest.mark.asyncio
@@ -389,7 +687,8 @@ async def test_scoped_search_uses_only_a_canonical_collection_handle() -> None:
         repository = NplgRepository(client=client, validate_dns=False)
         _ = await repository.search("გაზეთი", scope_handle="1234/2", page_size=2)
 
-    assert urlsplit(seen[0]).path == "/handle/1234/2/simple-search"
+    assert urlsplit(seen[0]).path == "/simple-search"
+    assert urlsplit(seen[1]).path == "/handle/1234/2/simple-search"
 
 
 @pytest.mark.asyncio
@@ -491,7 +790,7 @@ async def test_repository_acquires_shared_rate_limiter_before_upstream_request()
         repository = NplgRepository(client=client, validate_dns=False, limiter=limiter)
         _ = await repository.search("ივერია", page_size=2)
 
-    assert limiter.calls == 1
+    assert limiter.calls == _EXPECTED_DISCOVERY_REQUESTS
 
 
 @pytest.mark.asyncio
@@ -721,7 +1020,8 @@ async def test_repository_revalidates_dns_for_each_redirect_hop(
         requests += 1
         if requests == 1:
             return httpx.Response(
-                302, headers={"location": "/simple-search?query=test&rpp=2&start=0"}
+                302,
+                headers={"location": "/simple-search"},
             )
         return httpx.Response(
             200,
@@ -734,8 +1034,8 @@ async def test_repository_revalidates_dns_for_each_redirect_hop(
         repository = NplgRepository(client=client)
         _ = await repository.search("test", page_size=2)
 
-    assert requests == _EXPECTED_PAGE_SIZE
-    assert resolutions == _EXPECTED_PAGE_SIZE
+    assert requests == _EXPECTED_DISCOVERY_REDIRECT_AND_SEARCH_REQUESTS
+    assert resolutions == _EXPECTED_DISCOVERY_REDIRECT_AND_SEARCH_REQUESTS
 
 
 @pytest.mark.asyncio

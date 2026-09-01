@@ -67,10 +67,13 @@ templates:
 
 Clients resolve those canonical URIs through `resources/read`. Successful tool
 calls put their strictly validated Pydantic result in `structuredContent`; the
-SDK `content` array is intentionally empty. Tool result `resource_uri` fields
-identify resources that may be read through the protocol after the same
-authorization and expiry checks. The `alpic-metadata` profile does not register
-resource templates or advertise local storage, PDF processing, or asset routes.
+SDK `content` array carries one bounded human summary. Expected tool execution
+errors set `isError: true`, return one sanitized text message, and omit
+`structuredContent` so clients do not validate an error against the advertised
+success schema. Tool result `resource_uri` fields identify resources that may be
+read through the protocol after the same authorization and expiry checks. The
+`alpic-metadata` profile does not register resource templates or advertise local
+storage, PDF processing, or asset routes.
 
 ## Local development
 

@@ -232,7 +232,11 @@ Only `https://dspace.nplg.gov.ge/bitstream/...` URLs obtained from a validated i
 
 ## 8. MCP tools
 
-All tools return structured content validated against explicit output schemas. Errors use stable machine-readable codes.
+Successful tools return structured content validated against explicit output
+schemas. Expected tool execution errors set `isError: true`, return one bounded
+sanitized text message, and omit structured content so strict clients cannot
+validate an error object against a success-only schema. Stable internal error
+codes select the public message without creating a second result schema.
 
 ### 8.1 `search_documents`
 

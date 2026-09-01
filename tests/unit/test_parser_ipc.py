@@ -10,7 +10,11 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from nplg_mcp.parser_executor import ParserWorkerError, SubprocessParserExecutor
+from nplg_mcp.parser_executor import (
+    InlineParserExecutor,
+    ParserWorkerError,
+    SubprocessParserExecutor,
+)
 from nplg_mcp.parser_ipc import (
     MAX_PARSER_COMMAND_BYTES,
     MAX_PARSER_RESULT_BYTES,
@@ -19,6 +23,8 @@ from nplg_mcp.parser_ipc import (
     ParserIpcError,
     ParserSuccess,
     SearchCommand,
+    SearchVersionCommand,
+    SearchVersionPayload,
     encode_parser_frame,
     parse_command_frame,
     parse_result_frame,
@@ -139,6 +145,98 @@ def test_parser_result_frame_requires_exact_closed_payload_schema() -> None:
     ):
         with pytest.raises(ParserIpcError):
             _ = parse_result_frame(rejected)
+
+
+def test_search_version_ipc_round_trip_is_strict_and_discriminated() -> None:
+    command = SearchVersionCommand(
+        request_id=_REQUEST_ID,
+        operation="search_version",
+        markup='<html><head><meta name="sourcefv" content="ex20251112"></head></html>',
+        source_url="https://dspace.nplg.gov.ge/simple-search",
+    )
+    command_frame = encode_parser_frame(command, maximum=MAX_PARSER_COMMAND_BYTES)
+    result = ParserSuccess(
+        request_id=_REQUEST_ID,
+        status="ok",
+        payload=SearchVersionPayload(
+            operation="search_version",
+            value="ex20251112",
+        ),
+    )
+    result_frame = encode_parser_frame(result, maximum=MAX_PARSER_RESULT_BYTES)
+
+    assert parse_command_frame(command_frame) == command
+    assert parse_result_frame(result_frame) == result
+
+
+@pytest.mark.asyncio
+async def test_inline_parser_executor_parses_search_version_within_deadline() -> None:
+    executor = InlineParserExecutor()
+
+    marker = await executor.parse_search_version(
+        '<html><head><meta name="sourcefv" content="ex20251112"></head></html>',
+        source_url="https://dspace.nplg.gov.ge/simple-search",
+        deadline=asyncio.get_running_loop().time() + 1.0,
+    )
+
+    assert marker == "ex20251112"
+
+
+@pytest.mark.asyncio
+async def test_search_version_executor_rejects_invalid_command_before_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def reject_spawn(*_args: object, **_kwargs: object) -> NoReturn:
+        message = "invalid search-version command reached process creation"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", reject_spawn)
+    executor = SubprocessParserExecutor()
+
+    with pytest.raises(ParserWorkerError, match="strict validation"):
+        _ = await executor.parse_search_version(
+            "<html/>",
+            source_url="x" * 2_049,
+            deadline=asyncio.get_running_loop().time() + 1.0,
+        )
+
+    assert executor.active == 0
+
+
+@pytest.mark.asyncio
+async def test_search_version_executor_rejects_wrong_payload_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def wrong_payload(
+        *_args: object,
+        **_kwargs: object,
+    ) -> MetadataFormatsPayload:
+        return MetadataFormatsPayload(
+            operation="metadata_formats",
+            value=("dim",),
+        )
+
+    monkeypatch.setattr(SubprocessParserExecutor, "_execute", wrong_payload)
+    executor = SubprocessParserExecutor()
+
+    with pytest.raises(ParserWorkerError, match="wrong search-version payload"):
+        _ = await executor.parse_search_version(
+            "<html/>",
+            source_url="https://dspace.nplg.gov.ge/simple-search",
+            deadline=asyncio.get_running_loop().time() + 1.0,
+        )
+
+    assert executor.active == 0
+
+
+@pytest.mark.parametrize("value", ["EX20251112", "ex2025111", "ex202511120"])
+def test_search_version_payload_rejects_unobserved_shapes(value: str) -> None:
+    payload: dict[str, object] = {"operation": "search_version", "value": value}
+    with pytest.raises(ValidationError):
+        _ = SearchVersionPayload.model_validate(
+            payload,
+            strict=True,
+        )
 
 
 @pytest.mark.parametrize("page_size", [True, 1.0, "1", 0, 51])

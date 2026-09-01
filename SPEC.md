@@ -18,6 +18,14 @@ repository, downloader, PDF worker, storage path, or transport response.
 Zod schemas are an independent oracle in the later contract phase; they must
 not be generated from Python models or treated as evidence in this phase.
 
+Successful tool calls return Pydantic-validated `structuredContent` conforming
+to the tool's advertised success `outputSchema`. Actionable tool execution
+errors return `isError: true` with one bounded, sanitized `TextContent` message
+and omit `structuredContent`, so strict clients cannot validate an error object
+against a success-only schema and mask the actionable failure. Stable internal
+error codes continue to select that public message without becoming a second,
+incompatible result schema.
+
 ## Security invariants
 
 - The server remains upstream-read-only and accepts only canonical NPLG URLs.
@@ -48,6 +56,16 @@ not be generated from Python models or treated as evidence in this phase.
   records state that limitation explicitly.
 - Secrets, bearer tokens, raw authorization headers, and untrusted archive
   content are excluded from fixtures and public errors.
+
+## NPLG search compatibility
+
+`search_documents` discovers the current public NPLG search-version marker from
+the queryless `/simple-search` page and sends that validated value as `envfv` on
+root and collection-scoped searches. Discovery and search share one request
+deadline, parsing remains bounded and isolated, and a cached marker is refreshed
+at most once when NPLG rejects a search with `404`. Missing, ambiguous, or
+malformed markers fail closed as an upstream error. The marker is compatibility
+metadata, not a credential, and does not change the tool input or output schema.
 
 ## Client-side PDF workflow resource
 

@@ -576,7 +576,6 @@ def test_live_case_matcher_normalizes_actionable_tool_error_envelopes(
     }
     historical_error = public_error.copy()
     if outcome == "strict-error":
-        public_error["details"] = {"locations": ["arguments"]}
         historical_error["details"] = {
             "validation": [
                 {
@@ -588,17 +587,13 @@ def test_live_case_matcher_normalizes_actionable_tool_error_envelopes(
         }
     live = _SdkProjection(
         {
+            "content": [{"type": "text", "text": "Bounded public failure."}],
             "isError": True,
-            "structuredContent": {"error": public_error},
         }
     )
     historical: JsonObject = {
         "isError": True,
         "structuredContent": historical_error,
-    }
-    current: JsonObject = {
-        "isError": True,
-        "structuredContent": {"error": public_error},
     }
 
     assert (
@@ -611,44 +606,49 @@ def test_live_case_matcher_normalizes_actionable_tool_error_envelopes(
         )
         is True
     )
-    assert (
-        _PRIVATE_REPLAY_CALLS["_matches_live_sdk_case"](
-            case,
-            live,
-            None,
-            current,
-            None,
-        )
-        is True
-    )
 
 
 @pytest.mark.parametrize(
-    "structured",
+    "live_result",
     [
-        {"code": "INVALID_INPUT", "message": "flat-live-mutant"},
-        {"error": {"code": "OTHER", "message": "wrong-code"}},
         {
-            "error": {"code": "INVALID_INPUT", "message": "extra-wrapper"},
-            "extra": {},
+            "content": [{"type": "text", "text": "Bounded public failure."}],
+            "isError": True,
+            "structuredContent": {
+                "code": "INVALID_INPUT",
+                "message": "Bounded public failure.",
+            },
         },
-        {"error": {"code": "INVALID_INPUT"}},
+        {
+            "content": [{"type": "text", "text": "Bounded public failure."}],
+            "isError": False,
+        },
+        {"content": [], "isError": True},
+        {
+            "content": [{"type": "text", "text": "Wrong public failure."}],
+            "isError": True,
+        },
+        {
+            "content": [{"type": "image", "text": "Bounded public failure."}],
+            "isError": True,
+        },
+        {
+            "content": [
+                {"type": "text", "text": "Bounded public failure.", "extra": True}
+            ],
+            "isError": True,
+        },
     ],
 )
 def test_live_case_matcher_rejects_malformed_actionable_tool_errors(
-    structured: JsonObject,
+    live_result: JsonObject,
 ) -> None:
     case = _replay_case("strict-error")
     frozen_error: JsonObject = {
         "code": "INVALID_INPUT",
         "message": "Bounded public failure.",
     }
-    live = _SdkProjection(
-        {
-            "isError": True,
-            "structuredContent": structured,
-        }
-    )
+    live = _SdkProjection(live_result)
 
     assert (
         _PRIVATE_REPLAY_CALLS["_matches_live_sdk_case"](
