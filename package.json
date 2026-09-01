@@ -25,7 +25,7 @@
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@modelcontextprotocol/conformance": "0.2.0-alpha.11",
-    "@types/node": "24.13.3",
+    "@types/node": "26.3.0",
     "eslint": "10.9.1",
     "markdownlint-cli2": "0.23.2",
     "pyright": "1.1.413",
