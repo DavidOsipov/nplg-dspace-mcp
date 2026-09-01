@@ -56,6 +56,10 @@ _RESTRICTED_MARKERS = (
 )
 _JSPUI_IDENTIFIER_LEAD_IN = "Please use this identifier to cite or link to this item:"
 _JSPUI_SEARCH_TABLE_SUMMARY = "This table browses all dspace content"
+_JSPUI_EMPTY_SEARCH_MESSAGE = "Search produced no results."
+_SEARCH_LAYOUT_FAILURE_MESSAGE = (
+    "NPLG search is temporarily unavailable. Please try again later."
+)
 _MIN_METADATA_CELLS = 2
 _SIZE_CELL_INDEX = 2
 _LANGUAGE_CELL_INDEX = 2
@@ -923,7 +927,120 @@ def _normalize_date(value: str | None) -> str | None:
     return normalized
 
 
-def _search_contract(soup: BeautifulSoup, *, source_url: str) -> _SearchContract:
+def _is_jspui_empty_search_page(
+    soup: BeautifulSoup,
+    *,
+    source_url: str,
+    page_size: int,
+    current_offset: int,
+) -> bool:
+    """Recognize the exact observed JSPUI empty-search contract."""
+    messages: list[Tag] = []
+    for tag in soup.find_all("p"):
+        if _tag_text(tag) == _JSPUI_EMPTY_SEARCH_MESSAGE:
+            messages.append(tag)
+            if len(messages) > 1:
+                break
+    if len(messages) != 1 or current_offset != 0:
+        return False
+    message = messages[0]
+    column = message.parent
+    row = column.parent if isinstance(column, Tag) else None
+    container = row.parent if isinstance(row, Tag) else None
+    main = container.parent if isinstance(container, Tag) else None
+    if (
+        not isinstance(column, Tag)
+        or column.name != "div"
+        or not _class_contains(column.get("class"), "col-md-9")
+        or not isinstance(row, Tag)
+        or row.name != "div"
+        or not _class_contains(row.get("class"), "row")
+        or not isinstance(container, Tag)
+        or container.name != "div"
+        or not _class_contains(container.get("class"), "container")
+        or not isinstance(main, Tag)
+        or main.name != "main"
+        or _tag_attribute(main, "id") != "content"
+        or _tag_attribute(main, "role") != "main"
+        or soup.find_all("main", id="content", attrs={"role": "main"}, limit=2)
+        != [main]
+    ):
+        return False
+    headings = column.find_all("h2", recursive=False, limit=2)
+    panels = column.find_all(
+        "div",
+        class_="discovery-search-form",
+        recursive=False,
+        limit=2,
+    )
+    if (
+        len(headings) != 1
+        or _tag_text(headings[0]) != "Search"
+        or len(panels) != 1
+        or not _class_contains(panels[0].get("class"), "panel")
+        or not _class_contains(panels[0].get("class"), "panel-default")
+        or column.find("table") is not None
+        or any(
+            _has_next_page_class(link.get("class"))
+            or _tag_text(link).lower() in {"next", "next page", ">", "მომდევნო"}
+            for link in column.find_all("a", href=True)
+        )
+    ):
+        return False
+    panel_headers = panels[0].find_all(
+        "div",
+        class_="discovery-query",
+        recursive=False,
+        limit=2,
+    )
+    if len(panel_headers) != 1 or not _class_contains(
+        panel_headers[0].get("class"), "panel-heading"
+    ):
+        return False
+    forms = panel_headers[0].find_all("form", recursive=False, limit=2)
+    if (
+        len(forms) != 1
+        or _tag_attribute(forms[0], "method") != "get"
+        or _tag_attribute(forms[0], "action") != "simple-search"
+    ):
+        return False
+    source_query = parse_qs(
+        urlsplit(source_url).query,
+        keep_blank_values=True,
+    )
+    expected_query = source_query.get("query", [])
+    expected_page_size = source_query.get("rpp", [])
+    inputs = forms[0].find_all("input", recursive=False)
+    query_inputs = [tag for tag in inputs if _tag_attribute(tag, "name") == "query"]
+    page_size_inputs = [tag for tag in inputs if _tag_attribute(tag, "name") == "rpp"]
+    sort_inputs = [tag for tag in inputs if _tag_attribute(tag, "name") == "sort_by"]
+    order_inputs = [tag for tag in inputs if _tag_attribute(tag, "name") == "order"]
+    return (
+        len(expected_query) == 1
+        and len(expected_page_size) == 1
+        and expected_page_size[0] == str(page_size)
+        and len(query_inputs) == 1
+        and _tag_attribute(query_inputs[0], "type") == "text"
+        and _tag_attribute(query_inputs[0], "value") == expected_query[0]
+        and len(page_size_inputs) == 1
+        and _tag_attribute(page_size_inputs[0], "type") == "hidden"
+        and _tag_attribute(page_size_inputs[0], "value") == expected_page_size[0]
+        and len(sort_inputs) == 1
+        and _tag_attribute(sort_inputs[0], "type") == "hidden"
+        and _tag_attribute(sort_inputs[0], "value") == "score"
+        and len(order_inputs) == 1
+        and _tag_attribute(order_inputs[0], "type") == "hidden"
+        and _tag_attribute(order_inputs[0], "value") == "desc"
+    )
+
+
+def _search_contract(
+    soup: BeautifulSoup,
+    *,
+    source_url: str,
+    page_size: int,
+    current_offset: int,
+) -> _SearchContract | None:
     xmlui_containers = soup.find_all(
         id="aspect_discovery_SimpleSearch_div_search-results", limit=2
     )
@@ -939,18 +1056,14 @@ def _search_contract(soup: BeautifulSoup, *, source_url: str) -> _SearchContract
     has_xmlui_markers = bool(xmlui_containers)
     has_jspui_markers = bool(jspui_results or jspui_pagination or jspui_tables)
     if has_xmlui_markers and has_jspui_markers:
-        msg = (
-            "The repository search response had an invalid contract marker cardinality."
-        )
-        raise _upstream_failure(msg, source_url=source_url)
+        raise _upstream_failure(_SEARCH_LAYOUT_FAILURE_MESSAGE, source_url=source_url)
 
     if has_xmlui_markers:
         if len(xmlui_containers) != 1:
-            msg = (
-                "The repository search response had an invalid contract marker "
-                "cardinality."
+            raise _upstream_failure(
+                _SEARCH_LAYOUT_FAILURE_MESSAGE,
+                source_url=source_url,
             )
-            raise _upstream_failure(msg, source_url=source_url)
         container = xmlui_containers[0]
         table = container.find("table", class_=_has_search_results_class)
         if not isinstance(table, Tag):
@@ -958,11 +1071,16 @@ def _search_contract(soup: BeautifulSoup, *, source_url: str) -> _SearchContract
             raise _upstream_failure(msg, source_url=source_url)
         return _SearchContract(container=container, table=table, variant="xmlui")
 
+    if not has_jspui_markers and _is_jspui_empty_search_page(
+        soup,
+        source_url=source_url,
+        page_size=page_size,
+        current_offset=current_offset,
+    ):
+        return None
+
     if len(jspui_results) != 1 or len(jspui_pagination) != 1 or len(jspui_tables) != 1:
-        msg = (
-            "The repository search response had an invalid contract marker cardinality."
-        )
-        raise _upstream_failure(msg, source_url=source_url)
+        raise _upstream_failure(_SEARCH_LAYOUT_FAILURE_MESSAGE, source_url=source_url)
     results = jspui_results[0]
     pagination = jspui_pagination[0]
     table = results.find(
@@ -984,10 +1102,7 @@ def _search_contract(soup: BeautifulSoup, *, source_url: str) -> _SearchContract
                 recursive=False,
             )
     if table is not jspui_tables[0] or results.parent is not pagination.parent:
-        msg = (
-            "The repository search response had an invalid contract marker cardinality."
-        )
-        raise _upstream_failure(msg, source_url=source_url)
+        raise _upstream_failure(_SEARCH_LAYOUT_FAILURE_MESSAGE, source_url=source_url)
     return _SearchContract(
         container=pagination,
         table=jspui_tables[0],
@@ -1410,7 +1525,20 @@ def parse_search_results(
         compare_nodes=False,
         source_url=source_url,
     )
-    contract = _search_contract(soup, source_url=source_url)
+    current_offset = _current_search_offset(source_url=source_url)
+    contract = _search_contract(
+        soup,
+        source_url=source_url,
+        page_size=page_size,
+        current_offset=current_offset,
+    )
+    if contract is None:
+        return SearchPage(
+            items=(),
+            total=0,
+            next_offset=None,
+            source_url=source_url,
+        )
     columns = _search_columns(
         contract.table,
         source_url=source_url,
@@ -1423,7 +1551,6 @@ def parse_search_results(
         maximum_items=page_size,
         variant=contract.variant,
     )
-    current_offset = _current_search_offset(source_url=source_url)
     total = _search_total(
         contract.container,
         item_count=len(items),

@@ -66,6 +66,11 @@ deadline, parsing remains bounded and isolated, and a cached marker is refreshed
 at most once when NPLG rejects a search with `404`. Missing, ambiguous, or
 malformed markers fail closed as an upstream error. The marker is compatibility
 metadata, not a credential, and does not change the tool input or output schema.
+The observed JSPUI `Search produced no results.` response is accepted as an
+empty result page only when its page structure, search form, and echoed request
+parameters match the reviewed NPLG contract. Near-miss, mixed, or unsupported
+layouts fail closed with a retry-oriented public error; parser implementation
+details are not exposed to MCP clients.
 
 ## Client-side PDF workflow resource
 

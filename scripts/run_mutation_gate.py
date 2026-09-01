@@ -260,6 +260,7 @@ _REQUIRED_LOCAL_FUNCTIONS: dict[str, tuple[str, ...]] = {
         "x__has_search_results_class",
         "x__html_attribute_text",
         "x__html_field_code_point_counts",
+        "x__is_jspui_empty_search_page",
         "x__is_recognized_search_column",
         "x__local_name",
         "x__match_group",

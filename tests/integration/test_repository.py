@@ -220,6 +220,54 @@ async def test_search_discovers_current_version_and_sends_it_as_envfv() -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_parses_current_empty_jspui_response_in_default_subprocess() -> (
+    None
+):
+    """Catch rejecting NPLG's no-result page after the parser boundary."""
+    query_text = "nplgcontractprobe-20260901"
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        query = parse_qs(urlsplit(str(request.url)).query, keep_blank_values=True)
+        if not query:
+            return httpx.Response(
+                200,
+                text=_SEARCH_VERSION_DOCUMENT,
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        return httpx.Response(
+            200,
+            text=fixture("search_no_results.html"),
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(client=client, validate_dns=False)
+        assert isinstance(repository.parser_executor, SubprocessParserExecutor)
+        page = await repository.search(query_text, page_size=1)
+
+    expected_source_url = (
+        "https://dspace.nplg.gov.ge/simple-search?"
+        f"query={query_text}&rpp=1&start=0&envfv={_SEARCH_VERSION}"
+    )
+    assert len(seen) == _EXPECTED_DISCOVERY_REQUESTS
+    assert parse_qs(urlsplit(str(seen[0].url)).query, keep_blank_values=True) == {}
+    assert str(seen[1].url) == expected_source_url
+    assert parse_qs(urlsplit(str(seen[1].url)).query, keep_blank_values=True) == {
+        "query": [query_text],
+        "rpp": ["1"],
+        "start": ["0"],
+        "envfv": [_SEARCH_VERSION],
+    }
+    assert page.items == ()
+    assert page.total == 0
+    assert page.next_offset is None
+    assert page.next_cursor is None
+    assert page.source_url == expected_source_url
+
+
+@pytest.mark.asyncio
 async def test_search_refreshes_stale_version_once_after_404() -> None:
     """Catch stale marker failures that never refresh or retry without a bound."""
     seen: list[httpx.Request] = []

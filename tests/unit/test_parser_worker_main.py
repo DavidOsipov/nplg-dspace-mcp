@@ -63,6 +63,10 @@ _ERROR_DETAILS = cast("_ErrorDetails", _WORKER_NAMESPACE["_error_details"])
 _EXECUTE = cast("_Execute", _WORKER_NAMESPACE["_execute"])
 _FIXTURES = Path(__file__).parents[1] / "fixtures"
 _SEARCH_SOURCE = "https://dspace.nplg.gov.ge/simple-search?query=test"
+_EMPTY_SEARCH_SOURCE = (
+    "https://dspace.nplg.gov.ge/simple-search?"
+    "query=nplgcontractprobe-20260901&rpp=1&start=0&envfv=ex20251112"
+)
 _ITEM_SOURCE = "https://dspace.nplg.gov.ge/handle/1234/560449?mode=full"
 _EXPECTED_SEARCH_ITEMS = 2
 _UPSTREAM_HTTP_STATUS = 502
@@ -184,6 +188,28 @@ def test_worker_dispatches_search_to_the_real_bounded_parser() -> None:
     assert isinstance(result.payload, SearchPayload)
     assert result.payload.operation == "search"
     assert len(result.payload.value.items) == _EXPECTED_SEARCH_ITEMS
+
+
+def test_worker_dispatches_current_empty_search_page_to_the_real_bounded_parser() -> (
+    None
+):
+    """Catch treating NPLG's observed empty search response as malformed IPC data."""
+    result = _EXECUTE(
+        SearchCommand(
+            request_id=UUID(int=2),
+            operation="search",
+            markup=_fixture("search_no_results.html"),
+            source_url=_EMPTY_SEARCH_SOURCE,
+            page_size=1,
+        )
+    )
+
+    assert isinstance(result.payload, SearchPayload)
+    assert result.payload.operation == "search"
+    assert result.payload.value.items == ()
+    assert result.payload.value.total == 0
+    assert result.payload.value.next_offset is None
+    assert result.payload.value.source_url == _EMPTY_SEARCH_SOURCE
 
 
 def test_worker_dispatches_search_version_to_the_real_bounded_parser() -> None:

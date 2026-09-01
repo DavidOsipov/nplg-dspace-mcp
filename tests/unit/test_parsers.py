@@ -29,6 +29,13 @@ _EXPECTED_SEARCH_TOTAL = 42
 _EXPECTED_NEXT_OFFSET = 2
 _EXPECTED_REPORTED_SIZE = 13_900_000
 _SEARCH_SOURCE = "https://dspace.nplg.gov.ge/simple-search?query=test"
+_EMPTY_SEARCH_SOURCE = (
+    "https://dspace.nplg.gov.ge/simple-search?"
+    "query=nplgcontractprobe-20260901&rpp=1&start=0&envfv=ex20251112"
+)
+_SEARCH_LAYOUT_FAILURE_MESSAGE = (
+    "NPLG search is temporarily unavailable. Please try again later."
+)
 _FALLBACK_PAGINATION_OFFSET = 5
 _JSPUI_GEORGIAN_RANGE = "შედეგის ჩვენება 1- დან 2 \u2013 მდე სულ \u2013 42."
 _JSPUI_ENGLISH_RANGE = "Results 1-2 of 42 (Search time: 0.0 seconds)."
@@ -682,6 +689,160 @@ def test_search_parser_supports_current_jspui_contract() -> None:
     assert page.items[0].issue_date == "2025-08-07"
 
 
+def test_search_parser_returns_empty_page_for_current_jspui_no_results() -> None:
+    """Catch treating NPLG's observed empty-search page as a malformed contract."""
+    page = parse_search_results(
+        fixture("search_no_results.html"),
+        source_url=_EMPTY_SEARCH_SOURCE,
+        page_size=1,
+    )
+
+    assert page.items == ()
+    assert page.total == 0
+    assert page.next_offset is None
+    assert page.source_url == _EMPTY_SEARCH_SOURCE
+
+
+def test_search_parser_uses_actionable_message_for_unsupported_layout() -> None:
+    """Catch exposing parser cardinality terminology through the MCP tool result."""
+    document = fixture("search_no_results.html").replace(
+        "Search produced no results.",
+        "Search response unavailable.",
+        1,
+    )
+
+    with pytest.raises(AppError) as raised:
+        _ = parse_search_results(
+            document,
+            source_url=_EMPTY_SEARCH_SOURCE,
+            page_size=1,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+    assert raised.value.message == _SEARCH_LAYOUT_FAILURE_MESSAGE
+    assert "cardinality" not in raised.value.message
+
+
+@pytest.mark.parametrize(
+    ("target", "replacement"),
+    [
+        pytest.param(
+            "<p>Search produced no results.</p>",
+            ("<p>Search produced no results.</p><p>Search produced no results.</p>"),
+            id="duplicate-empty-marker",
+        ),
+        pytest.param(
+            "<p>Search produced no results.</p>",
+            (
+                "<p>Unrelated context.</p>"
+                "<p>Search produced no results.</p>"
+                "<p>Search produced no results.</p>"
+            ),
+            id="duplicate-empty-marker-after-unrelated-paragraph",
+        ),
+        pytest.param(
+            "<p>Search produced no results.</p>",
+            "<section><p>Search produced no results.</p></section>",
+            id="nested-empty-marker",
+        ),
+        pytest.param(
+            'value="nplgcontractprobe-20260901"',
+            'value="different-query"',
+            id="mismatched-query-echo",
+        ),
+        pytest.param(
+            '<input type="text" name="query" value="nplgcontractprobe-20260901">',
+            (
+                '<input type="text" name="query" '
+                'value="nplgcontractprobe-20260901">'
+                '<input type="hidden" name="query" value="shadowed">'
+            ),
+            id="duplicate-query-control",
+        ),
+        pytest.param(
+            '<input type="hidden" name="sort_by" value="score">',
+            '<input type="hidden" name="sort_by" value="title">',
+            id="unexpected-sort-contract",
+        ),
+        pytest.param(
+            '<input type="hidden" name="order" value="desc">',
+            '<input type="hidden" name="order" value="asc">',
+            id="unexpected-order-contract",
+        ),
+        pytest.param(
+            '<form method="get" action="simple-search">',
+            '<form method="get" action="other-search">',
+            id="wrong-form-action",
+        ),
+        pytest.param(
+            "<p>Search produced no results.</p>",
+            (
+                '<table summary="This table browses all dspace content"></table>'
+                "<p>Search produced no results.</p>"
+            ),
+            id="mixed-results-marker",
+        ),
+        pytest.param(
+            "<p>Search produced no results.</p>",
+            (
+                '<a class="next-page" href="?start=1">Next</a>'
+                "<p>Search produced no results.</p>"
+            ),
+            id="next-page-marker",
+        ),
+    ],
+)
+def test_search_parser_rejects_near_miss_jspui_empty_contract(
+    target: str,
+    replacement: str,
+) -> None:
+    """Keep empty success bound to the observed NPLG page contract."""
+    document = fixture("search_no_results.html").replace(target, replacement, 1)
+
+    with pytest.raises(AppError) as raised:
+        _ = parse_search_results(
+            document,
+            source_url=_EMPTY_SEARCH_SOURCE,
+            page_size=1,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+    assert raised.value.message == _SEARCH_LAYOUT_FAILURE_MESSAGE
+
+
+@pytest.mark.parametrize(
+    "source_url",
+    [
+        pytest.param(
+            _EMPTY_SEARCH_SOURCE.replace("start=0", "start=1"),
+            id="nonzero-offset",
+        ),
+        pytest.param(
+            _EMPTY_SEARCH_SOURCE.replace(
+                "query=nplgcontractprobe-20260901",
+                "query=nplgcontractprobe-20260901&query=shadowed",
+            ),
+            id="duplicate-source-query",
+        ),
+        pytest.param(
+            _EMPTY_SEARCH_SOURCE.replace("rpp=1", "rpp=2"),
+            id="mismatched-source-page-size",
+        ),
+    ],
+)
+def test_search_parser_rejects_unbound_jspui_empty_contract(source_url: str) -> None:
+    """Do not turn a page for different request parameters into empty success."""
+    with pytest.raises(AppError) as raised:
+        _ = parse_search_results(
+            fixture("search_no_results.html"),
+            source_url=source_url,
+            page_size=1,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+    assert raised.value.message == _SEARCH_LAYOUT_FAILURE_MESSAGE
+
+
 def test_search_parser_supports_current_jspui_results_panel_wrapper() -> None:
     """Catch rejection of NPLG's single reviewed results-panel container."""
     page = parse_search_results(
@@ -704,10 +865,11 @@ def test_search_parser_rejects_ambiguous_jspui_results_panels() -> None:
         1,
     )
 
-    with pytest.raises(AppError, match="contract marker cardinality") as raised:
+    with pytest.raises(AppError) as raised:
         _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
 
     assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+    assert raised.value.message == _SEARCH_LAYOUT_FAILURE_MESSAGE
 
 
 def test_search_parser_rejects_nested_jspui_results_panel() -> None:
@@ -722,10 +884,11 @@ def test_search_parser_rejects_nested_jspui_results_panel() -> None:
         .replace("</table></div></div>", "</table></div></section></div>", 1)
     )
 
-    with pytest.raises(AppError, match="contract marker cardinality") as raised:
+    with pytest.raises(AppError) as raised:
         _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
 
     assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+    assert raised.value.message == _SEARCH_LAYOUT_FAILURE_MESSAGE
 
 
 def test_search_parser_supports_current_jspui_english_column_labels() -> None:
@@ -831,15 +994,19 @@ def test_search_parser_rejects_malformed_or_ambiguous_english_range(
 def test_search_parser_rejects_duplicate_jspui_contract_markers() -> None:
     document = _jspui_search_document() + _jspui_search_document()
 
-    with pytest.raises(AppError, match="contract marker cardinality"):
+    with pytest.raises(AppError) as raised:
         _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.message == _SEARCH_LAYOUT_FAILURE_MESSAGE
 
 
 def test_search_parser_rejects_mixed_xmlui_and_jspui_contract_markers() -> None:
     document = _search_document() + _jspui_search_document()
 
-    with pytest.raises(AppError, match="contract marker cardinality"):
+    with pytest.raises(AppError) as raised:
         _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.message == _SEARCH_LAYOUT_FAILURE_MESSAGE
 
 
 def test_search_parser_rejects_detached_jspui_pagination() -> None:
@@ -850,8 +1017,10 @@ def test_search_parser_rejects_detached_jspui_pagination() -> None:
     )
     document = f"<aside>{document}</section>"
 
-    with pytest.raises(AppError, match="contract marker cardinality"):
+    with pytest.raises(AppError) as raised:
         _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.message == _SEARCH_LAYOUT_FAILURE_MESSAGE
 
 
 @pytest.mark.parametrize(
@@ -1322,8 +1491,10 @@ def test_search_parser_fails_closed_when_contract_marker_is_missing() -> None:
 def test_search_parser_rejects_duplicate_contract_markers() -> None:
     document = _search_document() + _search_document()
 
-    with pytest.raises(AppError, match="contract marker"):
+    with pytest.raises(AppError) as raised:
         _ = parse_search_results(document, source_url=_SEARCH_SOURCE)
+
+    assert raised.value.message == _SEARCH_LAYOUT_FAILURE_MESSAGE
 
 
 def test_item_parser_rejects_duplicate_contract_markers() -> None:
