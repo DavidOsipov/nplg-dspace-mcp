@@ -20,7 +20,7 @@ import pytest
 from annotated_types import Ge, Le
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
-from pydantic import BaseModel, StringConstraints, TypeAdapter, ValidationError
+from pydantic import BaseModel, Field, StringConstraints, TypeAdapter, ValidationError
 from referencing import Registry, Resource
 
 import nplg_mcp.contracts.schema as schema_module
@@ -69,6 +69,8 @@ _MAX_SCHEMA_KEY_LENGTH = 128
 _MAX_RAW_JSON_BYTES = 65_536
 _MAX_KEYWORD_LENGTH = 64
 _CONTRACT_MODEL_COUNT = 15
+_ZOD_PAGE_SIZE_BOUND = "page_size: safeInteger\n    .gte(1)\n    .lte(50)"
+_ZOD_PAGE_SIZE_BOUND_MUTANT = "page_size: safeInteger\n    .gte(1)\n    .lte(51)"
 _ALLOWED_FORMATS: tuple[str, ...] = ()
 _CORPUS_FIELDS = frozenset(
     {
@@ -1298,8 +1300,8 @@ def test_oracle_launcher_fails_closed_on_process_and_protocol_faults() -> None:
         ),
         (
             "bound",
-            "page_size: safeInteger.gte(1).lte(50).default(20),",
-            "page_size: safeInteger.gte(1).lte(51).default(20),",
+            _ZOD_PAGE_SIZE_BOUND,
+            _ZOD_PAGE_SIZE_BOUND_MUTANT,
             "input.SearchDocumentsInput: Zod schema parity",
         ),
         (
@@ -1422,7 +1424,10 @@ def test_common_mode_bound_mutation_is_still_killed_by_normative_corpus(
             Ge(1),
             Le(51),
             SAFE_INTEGER_VALIDATOR,
-        ] = 20
+        ] = Field(
+            default=20,
+            description="Maximum number of results to return, from 1 through 50.",
+        )
 
     original_bindings = tool_model_bindings()
     monkeypatch.setattr(
@@ -1437,8 +1442,8 @@ def test_common_mode_bound_mutation_is_still_killed_by_normative_corpus(
     )
     document = _run_private_zod_source_mutant(
         tmp_path,
-        target="page_size: safeInteger.gte(1).lte(50).default(20),",
-        replacement="page_size: safeInteger.gte(1).lte(51).default(20),",
+        target=_ZOD_PAGE_SIZE_BOUND,
+        replacement=_ZOD_PAGE_SIZE_BOUND_MUTANT,
     )
     with pytest.raises(
         AssertionError,

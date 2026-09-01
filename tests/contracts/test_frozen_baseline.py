@@ -6772,3 +6772,28 @@ async def test_replay_setup_rejects_wrong_render_output_model(
         match="render setup returned the wrong strict output model",
     ):
         await _APPLY_REPLAY_SETUP(tools, setup)
+
+
+def test_stable_catalog_projection_rejects_an_incomplete_normalized_key_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject a normalizer that silently drops one reviewed catalog key."""
+
+    def incomplete_projection(_value: object) -> tuple[JsonObject, ...]:
+        return ({"name": "retained"},)
+
+    monkeypatch.setattr(
+        baseline_replay,
+        "normalize_tool_catalog",
+        incomplete_projection,
+    )
+    catalog: dict[str, object] = {
+        "retained": {"name": "retained"},
+        "silently-dropped": {"name": "silently-dropped"},
+    }
+
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError,
+        match="entry is invalid",
+    ):
+        _ = _PRIVATE_REPLAY_CALLS["_stable_catalog_bytes"](catalog)

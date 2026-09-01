@@ -1268,22 +1268,21 @@ def _require_expected_response(
 
 def _stable_catalog_bytes(catalog: Mapping[str, object]) -> bytes:
     """Project frozen stable metadata while intentionally excluding SDK schemas."""
+    try:
+        normalized = normalize_tool_catalog(list(catalog.values()))
+    except ValueError as exc:
+        msg = "replay fixture tool catalog entry is invalid"
+        raise BaselineCaptureError(msg) from exc
     projected: dict[str, object] = {}
-    for name, raw in catalog.items():
-        if not isinstance(raw, dict):
+    for entry in normalized:
+        name = entry.get("name")
+        if type(name) is not str or name not in catalog or name in projected:
             msg = "replay fixture tool catalog entry is invalid"
             raise BaselineCaptureError(msg)
-        entry = cast("dict[str, object]", raw)
-        try:
-            projected[name] = {
-                "annotations": entry["annotations"],
-                "description": entry["description"],
-                "name": entry["name"],
-                "title": entry["title"],
-            }
-        except KeyError as exc:
-            msg = "replay fixture tool catalog entry is incomplete"
-            raise BaselineCaptureError(msg) from exc
+        projected[name] = entry
+    if set(projected) != set(catalog):
+        msg = "replay fixture tool catalog entry is invalid"
+        raise BaselineCaptureError(msg)
     return canonical_json_bytes(projected)
 
 

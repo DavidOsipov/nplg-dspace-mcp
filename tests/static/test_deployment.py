@@ -48,7 +48,8 @@ EXPECTED_CLAMAV_IMAGE = (
 )
 EXPECTED_ALPIC_INSTALL_COMMAND = (
     "uv venv --python python3 .venv && uv pip install --python .venv/bin/python "
-    "--require-hashes --no-deps --only-binary=:all: -r requirements.lock"
+    "--require-hashes --no-deps --only-binary=:all: -r requirements.lock && "
+    "uv pip install --python .venv/bin/python --no-build-isolation --no-deps ."
 )
 
 load_yaml_object = cast("Callable[[str], object]", yaml.safe_load)
@@ -399,10 +400,12 @@ def test_runtime_lock_is_complete_and_exactly_pinned() -> None:
         "soupsieve==2.8.4",
         "sse-starlette==3.4.8",
         "starlette==1.3.1",
+        "setuptools==84.0.0",
         "truststore==0.10.4",
         "typing-extensions==4.16.0",
         "typing-inspection==0.4.2",
         "uvicorn==0.48.0",
+        "wheel==0.48.0",
     }
     input_lines = {
         line.strip()
@@ -413,6 +416,7 @@ def test_runtime_lock_is_complete_and_exactly_pinned() -> None:
         "attrs==26.1.0",
         "cffi==2.1.1 ; platform_python_implementation != 'PyPy'",
         "jsonschema-specifications==2025.9.1",
+        "packaging==26.3",
         (
             "pycparser==3.0 ; implementation_name != 'PyPy' and "
             "platform_python_implementation != 'PyPy'"
@@ -801,6 +805,7 @@ def test_wheel_metadata_includes_third_party_notices() -> None:
 
 
 def test_alpic_declares_python_runtime_and_explicit_uv_commands() -> None:
+    """Require an installed runtime package without a source-path fallback."""
     assert (ROOT / ".python-version").read_text(encoding="utf-8").strip() == "3.14"
     data = _read_json_object(ROOT / "alpic.json")
     assert data == {
@@ -808,7 +813,7 @@ def test_alpic_declares_python_runtime_and_explicit_uv_commands() -> None:
         "transportType": "streamablehttp",
         "installCommand": EXPECTED_ALPIC_INSTALL_COMMAND,
         "buildCommand": ".venv/bin/python -m compileall -q src scripts",
-        "startCommand": "HOST=0.0.0.0 PYTHONPATH=src .venv/bin/python -m nplg_mcp",
+        "startCommand": "HOST=0.0.0.0 .venv/bin/python -m nplg_mcp",
     }
 
 

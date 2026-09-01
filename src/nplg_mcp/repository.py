@@ -568,12 +568,21 @@ class NplgRepository:
             if cursor is not None
             else 0
         )
-        text, final_url = await self._get_text(
-            url,
-            params={"query": normalized_query, "rpp": page_size, "start": offset},
-            accepted_types=("text/html", "application/xhtml+xml"),
-            deadline=deadline,
-        )
+        try:
+            text, final_url = await self._get_text(
+                url,
+                params={"query": normalized_query, "rpp": page_size, "start": offset},
+                accepted_types=("text/html", "application/xhtml+xml"),
+                deadline=deadline,
+            )
+        except AppError as exc:
+            if exc.code is not ErrorCode.NOT_FOUND:
+                raise
+            raise AppError(
+                ErrorCode.UPSTREAM_FAILURE,
+                "The repository search service is unavailable.",
+                http_status=502,
+            ) from exc
         page = await self._parse_within_deadline(
             self.parser_executor.parse_search(
                 text,

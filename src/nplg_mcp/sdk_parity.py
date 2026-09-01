@@ -8,6 +8,13 @@ from typing import Protocol, cast, runtime_checkable
 
 from .json_types import JsonObject, load_json_value, require_json_object
 
+_ANNOTATION_HINT_KEYS = (
+    "destructiveHint",
+    "idempotentHint",
+    "openWorldHint",
+    "readOnlyHint",
+)
+
 
 class SdkParityNormalizationError(ValueError):
     """Raised when an untrusted parity input cannot be normalized safely."""
@@ -76,6 +83,54 @@ def _catalog_name(tool: JsonObject) -> bytes:
     return name.encode("utf-8")
 
 
+def _stable_text(tool: JsonObject, *, field: str) -> str:
+    """Return one required string field from stable tool metadata."""
+    if field not in tool:
+        raise SdkParityNormalizationError(
+            context="tool catalog entry",
+            reason="is missing stable metadata",
+        )
+    value = tool[field]
+    if type(value) is not str:
+        raise SdkParityNormalizationError(
+            context=f"tool catalog entry {field}",
+            reason="is invalid",
+        )
+    return value
+
+
+def _stable_annotations(tool: JsonObject) -> JsonObject:
+    """Remove only a validated duplicate annotation title from parity data."""
+    raw_annotations = tool.get("annotations")
+    if type(raw_annotations) is not dict:
+        raise SdkParityNormalizationError(
+            context="tool catalog annotations",
+            reason="is invalid",
+        )
+    annotations = raw_annotations
+    stable_keys = frozenset(_ANNOTATION_HINT_KEYS)
+    if frozenset(annotations) - {"title"} != stable_keys:
+        raise SdkParityNormalizationError(
+            context="tool catalog annotations",
+            reason="has invalid keys",
+        )
+    for key in _ANNOTATION_HINT_KEYS:
+        if type(annotations[key]) is not bool:
+            raise SdkParityNormalizationError(
+                context=f"tool catalog annotation {key}",
+                reason="is invalid",
+            )
+    if "title" in annotations:
+        title = _stable_text(tool, field="title")
+        annotation_title = annotations.get("title")
+        if annotation_title != title:
+            raise SdkParityNormalizationError(
+                context="tool catalog annotation title",
+                reason="does not match top-level title",
+            )
+    return {key: annotations[key] for key in _ANNOTATION_HINT_KEYS}
+
+
 def normalize_tool_catalog(value: object) -> tuple[JsonObject, ...]:
     """Normalize stable catalog metadata after separately ledgering schema drift."""
     tools = tuple(
@@ -88,22 +143,15 @@ def normalize_tool_catalog(value: object) -> tuple[JsonObject, ...]:
             context="tool catalog",
             reason="has duplicate names",
         )
-    normalized: list[JsonObject] = []
-    for tool in tools:
-        try:
-            normalized.append(
-                {
-                    "annotations": tool["annotations"],
-                    "description": tool["description"],
-                    "name": tool["name"],
-                    "title": tool["title"],
-                }
-            )
-        except KeyError as exc:
-            raise SdkParityNormalizationError(
-                context="tool catalog entry",
-                reason="is missing stable metadata",
-            ) from exc
+    normalized: list[JsonObject] = [
+        {
+            "annotations": _stable_annotations(tool),
+            "description": _stable_text(tool, field="description"),
+            "name": _stable_text(tool, field="name"),
+            "title": _stable_text(tool, field="title"),
+        }
+        for tool in tools
+    ]
     return tuple(sorted(normalized, key=_catalog_name))
 
 

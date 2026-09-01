@@ -1449,6 +1449,22 @@ def test_tool_service_rejects_a_forged_deployment_profile(tmp_path: Path) -> Non
         )
 
 
+def test_tool_service_rejects_missing_reviewed_tool_title(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delitem(
+        tools_module._TOOL_TITLES,  # pyright: ignore[reportPrivateUsage]
+        "search_documents",
+    )
+
+    with pytest.raises(ValueError, match="tool title is unavailable"):
+        _ = ToolService(
+            dependencies=ToolServiceDependencies(repository=FakeRepository()),
+            config=replace(config(tmp_path), deployment_profile="alpic-metadata"),
+        )
+
+
 def test_tool_catalog_is_deterministic_and_strict(tmp_path: Path) -> None:
     tools, _ = service(tmp_path)
     first = tools.list_tools()
@@ -1486,6 +1502,42 @@ def test_tool_catalog_is_deterministic_and_strict(tmp_path: Path) -> None:
         assert annotations.get("destructiveHint") is False
         assert annotations.get("idempotentHint") is (name != "download_document_file")
         _ = json.dumps(tool, ensure_ascii=False)
+
+
+def test_tool_annotations_repeat_the_human_readable_title(tmp_path: Path) -> None:
+    """Catch descriptors that omit the client-visible annotation title."""
+    tools, _ = service(tmp_path)
+
+    for tool in tools.list_tools():
+        title = _json_string(tool.get("title"), context="tool title")
+        annotations = require_json_object(
+            tool.get("annotations"),
+            context="tool annotations",
+        )
+        assert annotations.get("title") == title
+
+
+def test_search_input_schema_describes_every_parameter(tmp_path: Path) -> None:
+    """Catch search parameters that clients cannot explain to users."""
+    tools, _ = service(tmp_path)
+    search = next(
+        tool for tool in tools.list_tools() if tool.get("name") == "search_documents"
+    )
+    schema = require_json_object(search.get("inputSchema"), context="search schema")
+    properties = require_json_object(
+        schema.get("properties"),
+        context="search properties",
+    )
+
+    assert set(properties) == {"query", "cursor", "page_size", "scope_handle"}
+    for name in properties:
+        parameter = require_json_object(
+            properties.get(name),
+            context=f"search parameter {name}",
+        )
+        description = parameter.get("description")
+        assert isinstance(description, str)
+        assert description.strip()
 
 
 @pytest.mark.asyncio

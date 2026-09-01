@@ -140,13 +140,14 @@ verify.
 
 ```bash
 python3 scripts/verify_deploy.py \
-  --base-url "$PUBLIC_BASE_URL"
+  --base-url "$PUBLIC_BASE_URL" \
+  --profile private-full
 ```
 
 The future protected verifier must receive an OAuth access-token handle from the
 credential broker after the selected issuer/resource/audience relationship is proven.
 Legacy bearer-token and API-key environment inputs are not substitutes. The verifier
-checks the sessionless MCP `2026-07-28` envelope, discovery, and the exact metadata-only
+checks the sessionless MCP `2026-07-28` envelope, discovery, and the exact private-full
 tool catalog. It does not query the public probe paths because Caddy deliberately
 returns 404 for them.
 
@@ -172,7 +173,7 @@ Transport: Streamable HTTP
 Authorization: Bearer <credential for this client's principal_id>
 ```
 
-The server is stateless and does not issue an `Mcp-Session-Id`. The production metadata profile has no downloadable runtime assets.
+The direct private-full application endpoint is stateless/sessionless and does not issue an `Mcp-Session-Id`; this does not describe Alpic's hosted gateway.
 
 ### ChatGPT developer mode
 
@@ -294,7 +295,9 @@ git fetch --tags
 git checkout <reviewed-tag-or-commit>
 docker compose build --pull
 docker compose up -d
-python3 scripts/verify_deploy.py --base-url "$PUBLIC_BASE_URL"
+python3 scripts/verify_deploy.py \
+  --base-url "$PUBLIC_BASE_URL" \
+  --profile private-full
 ```
 
 Rollback by checking out the prior reviewed commit and rebuilding. Do not use a floating application image tag in production.
@@ -337,4 +340,4 @@ The production wheel uses pypdfium2/PDFium and the synthetic test corpus uses Re
 
 The Python and Caddy base images are pinned by immutable multi-platform index digest. Treat digest changes as reviewed dependency upgrades: update the tag and digest together, rebuild, scan the resulting image, and rerun the complete verification suite before deployment.
 
-`requirements.lock` pins every direct and transitive runtime package and includes mechanically generated SHA-256 hashes for the resolved distributions; the version/pin set was reviewed, not every distribution file represented by those hashes. Docker and Alpic install it with `--require-hashes --no-deps --only-binary=:all:`. Hash locking constrains package bytes; it does not replace registry-account security, dependency review, image signing, or deployment by immutable image digest.
+`requirements.lock` pins every direct and transitive runtime package plus the reviewed PEP 517 backend packages (`setuptools`, `wheel`, and their locked dependency), with mechanically generated SHA-256 hashes for the resolved distributions; the version/pin set was reviewed, not every distribution file represented by those hashes. Docker and Alpic install the lock with `--require-hashes --no-deps --only-binary=:all:`. Alpic then installs this project with `--no-build-isolation --no-deps`, so that source build can use only the already locked backend environment. Hash locking constrains package bytes; it does not replace registry-account security, dependency review, image signing, or deployment by immutable image digest.

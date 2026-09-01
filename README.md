@@ -1,13 +1,13 @@
 # NPLG DSpace MCP
 
-Upstream-read-only Streamable HTTP MCP server for the National Parliamentary Library of Georgia's Iverieli repository (`dspace.nplg.gov.ge`). Its public Alpic profile searches the archive and returns metadata plus public bitstream URLs. The separate private profile can download validated PDFs and render historical Georgian newspapers as full-page JPEGs plus overlapping crop-only tiles.
+Upstream-read-only Streamable HTTP MCP server for the National Parliamentary Library of Georgia's Iverieli repository (`dspace.nplg.gov.ge`). Its public Alpic profile exposes archive search and returns metadata plus public bitstream URLs. `search_documents` fails closed with `UPSTREAM_FAILURE` when NPLG's search route is unavailable; it does not use an unapproved fallback scraper. The separate private profile can download validated PDFs and render historical Georgian newspapers as full-page JPEGs plus overlapping crop-only tiles.
 
 ## What is implemented
 
-- Sessionless MCP `2026-07-28` over `POST /mcp`, with a compatibility path for `2025-11-25` clients.
-- NPLG-specific DSpace 5.5 XMLUI/Manakin and OAI-PMH adapter; this is intentionally not a generic DSpace scraper.
+- The direct/private application endpoint is sessionless MCP `2026-07-28` over `POST /mcp` and uses `server/discover`. Alpic's hosted gateway uses standard `initialize`, currently negotiates `2025-11-25`, requires `notifications/initialized`, and may issue an `Mcp-Session-Id` that must be reused.
+- NPLG-specific current JSPUI, legacy DSpace 5.5 XMLUI/Manakin, and OAI-PMH adapters; this is intentionally not a generic DSpace scraper.
 - Exact-origin, canonical-handle, DNS/IP, redirect, MIME, signature, streaming-size, and path controls.
-- Rich Dublin Core metadata with OAI-DIM preference and bounded XMLUI fallback.
+- Rich Dublin Core metadata with OAI-DIM preference and bounded JSPUI/XMLUI repository-HTML fallback.
 - Content-addressed public PDF storage, signed expiring asset URLs, and canonical MCP resource reads for authorized PDFs, manifests, page JPEGs, and tiles in the private profile.
 - Conservative PDFium-based page classification:
   - byte-identical extraction for eligible single embedded JPEG pages;
@@ -195,7 +195,7 @@ docker compose --env-file .env config --quiet
 
 ## Explicit limitations
 
-- Live XMLUI/OAI compatibility must be rechecked after deployment because upstream HTML can change.
+- Live JSPUI/XMLUI/OAI compatibility must be rechecked after deployment because upstream HTML can change.
 - The server uses the official MCP Python SDK behind project-owned HTTP admission
   and bounded JSON preflight controls; those controls cover only this server's
   supported profiles.

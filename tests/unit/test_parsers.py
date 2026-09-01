@@ -28,6 +28,7 @@ _EXPECTED_SEARCH_TOTAL = 42
 _EXPECTED_NEXT_OFFSET = 2
 _EXPECTED_REPORTED_SIZE = 13_900_000
 _SEARCH_SOURCE = "https://dspace.nplg.gov.ge/simple-search?query=test"
+_FALLBACK_PAGINATION_OFFSET = 5
 _ITEM_HANDLE = "1234/499564"
 _ITEM_SOURCE = f"https://dspace.nplg.gov.ge/handle/{_ITEM_HANDLE}"
 
@@ -575,6 +576,523 @@ def test_search_parser_preserves_georgian_and_canonical_handles() -> None:
     assert page.items[1].authors == ("გაგუა, მალხაზ", "სხვა, ავტორი")
 
 
+def test_search_parser_supports_current_jspui_contract() -> None:
+    page = parse_search_results(
+        _jspui_search_document(),
+        source_url=_SEARCH_SOURCE,
+        page_size=2,
+    )
+
+    assert page.total == _EXPECTED_SEARCH_TOTAL
+    assert page.next_offset == _EXPECTED_NEXT_OFFSET
+    assert [item.handle for item in page.items] == ["1234/499564", "1234/560975"]
+    assert page.items[0].title == "ივერია N161"
+    assert page.items[0].issue_date == "2025-08-07"
+    assert page.items[1].issue_date is None
+    assert page.items[1].authors == ("გაგუა, მალხაზ", "სხვა, ავტორი")
+
+
+def test_search_parser_rejects_jspui_range_with_a_missing_whole_data_row() -> None:
+    second_row = (
+        '<tr><td headers="t1">-</td><td headers="t2">-</td>'
+        '<td headers="t3"><a href="/handle/1234/560975">'
+        "რეზონანსი N164</a></td>"
+        '<td headers="t4">გაგუა, მალხაზ; სხვა, ავტორი</td></tr>'
+    )
+    document = _jspui_search_document().replace(second_row, "", 1)
+
+    with pytest.raises(AppError) as raised:
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_search_parser_rejects_jspui_range_that_mismatches_current_offset() -> None:
+    document = _jspui_search_document().replace("start=2", "start=4", 1)
+
+    with pytest.raises(AppError) as raised:
+        _ = parse_search_results(
+            document,
+            source_url=f"{_SEARCH_SOURCE}&start=2",
+            page_size=2,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        pytest.param("No range is available.", id="missing-range-marker"),
+        pytest.param(
+            _document(
+                "შედეგის ჩვენება 1- დან 2 \u2013 მდე სულ \u2013 42. ",
+                "შედეგის ჩვენება 1- დან 2 \u2013 მდე სულ \u2013 42.",
+            ),
+            id="duplicate-range-marker",
+        ),
+    ],
+)
+def test_search_parser_requires_one_jspui_range_marker(replacement: str) -> None:
+    document = _jspui_search_document().replace(
+        "შედეგის ჩვენება 1- დან 2 \u2013 მდე სულ \u2013 42.",
+        replacement,
+        1,
+    )
+
+    with pytest.raises(AppError, match="range marker cardinality") as raised:
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_search_parser_rejects_duplicate_jspui_contract_markers() -> None:
+    document = _jspui_search_document() + _jspui_search_document()
+
+    with pytest.raises(AppError, match="contract marker cardinality"):
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+
+def test_search_parser_rejects_mixed_xmlui_and_jspui_contract_markers() -> None:
+    document = _search_document() + _jspui_search_document()
+
+    with pytest.raises(AppError, match="contract marker cardinality"):
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+
+def test_search_parser_rejects_detached_jspui_pagination() -> None:
+    document = _jspui_search_document().replace(
+        '</li></ul></div><div class="discovery-result-results">',
+        '</li></ul></div></aside><section><div class="discovery-result-results">',
+        1,
+    )
+    document = f"<aside>{document}</section>"
+
+    with pytest.raises(AppError, match="contract marker cardinality"):
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        pytest.param(
+            '<th id="t3">სათაური</th><th id="duplicate">სათაური</th>',
+            id="duplicate-title-column",
+        ),
+        pytest.param(
+            '<th id="t3">სათაური</th>' + '<th id="duplicate">ავტორი / ავტორები</th>',
+            id="duplicate-author-column",
+        ),
+    ],
+)
+def test_search_parser_rejects_duplicate_recognized_jspui_columns(
+    mutation: str,
+) -> None:
+    document = _jspui_search_document().replace(
+        '<th id="t3">სათაური</th>',
+        mutation,
+        1,
+    )
+
+    with pytest.raises(AppError, match="column cardinality"):
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+
+@pytest.mark.parametrize(
+    ("header_id", "reviewed_label", "replacement_label"),
+    [
+        pytest.param("t2", "გამოცემის თარიღი", "", id="missing-date-label"),
+        pytest.param(
+            "t2",
+            "გამოცემის თარიღი",
+            "Published",
+            id="unrecognized-date-label",
+        ),
+        pytest.param(
+            "t2",
+            "გამოცემის თარიღი",
+            "Candidate",
+            id="date-substring-false-positive",
+        ),
+        pytest.param("t4", "ავტორი / ავტორები", "", id="missing-author-label"),
+        pytest.param(
+            "t4",
+            "ავტორი / ავტორები",
+            "Creators",
+            id="unrecognized-author-label",
+        ),
+    ],
+)
+def test_search_parser_requires_exact_jspui_semantic_header_labels(
+    header_id: str,
+    reviewed_label: str,
+    replacement_label: str,
+) -> None:
+    document = _jspui_search_document().replace(
+        f'<th id="{header_id}">{reviewed_label}</th>',
+        f'<th id="{header_id}">{replacement_label}</th>',
+        1,
+    )
+
+    with pytest.raises(AppError) as raised:
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        pytest.param("<th>გამოცემის თარიღი</th>", id="missing-header-id"),
+        pytest.param(
+            '<th id="">გამოცემის თარიღი</th>',
+            id="blank-header-id",
+        ),
+        pytest.param(
+            '<th id=" t2">გამოცემის თარიღი</th>',
+            id="whitespace-padded-header-id",
+        ),
+        pytest.param(
+            '<th id="t2 t3">გამოცემის თარიღი</th>',
+            id="multiple-token-header-id",
+        ),
+    ],
+)
+def test_search_parser_rejects_invalid_jspui_header_ids(replacement: str) -> None:
+    document = _jspui_search_document().replace(
+        '<th id="t2">გამოცემის თარიღი</th>',
+        replacement,
+        1,
+    )
+
+    with pytest.raises(AppError, match="invalid header bindings") as raised:
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_search_parser_rejects_duplicate_jspui_header_ids() -> None:
+    document = _jspui_search_document().replace('id="t2"', 'id="t1"', 1)
+
+    with pytest.raises(AppError, match="invalid header bindings") as raised:
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_search_parser_fails_closed_if_required_title_resolution_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def absent_column(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(parser_module, "_search_column_index", absent_column)
+
+    with pytest.raises(AppError, match="did not contain a title column") as raised:
+        _ = parse_search_results(
+            _jspui_search_document(),
+            source_url=_SEARCH_SOURCE,
+            page_size=2,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_search_parser_rejects_multiple_item_links_in_title_cell() -> None:
+    document = _jspui_search_document().replace(
+        '<a href="/handle/1234/499564">ივერია N161</a>',
+        (
+            '<a href="/handle/1234/499564">ივერია N161</a>'
+            '<a href="/handle/1234/777777">Other</a>'
+        ),
+        1,
+    )
+
+    with pytest.raises(AppError, match="item link cardinality"):
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+
+def test_search_parser_rejects_duplicate_jspui_canonical_item_identity() -> None:
+    document = _jspui_search_document().replace(
+        "/handle/1234/560975",
+        "/handle/1234/499564",
+        1,
+    )
+
+    with pytest.raises(AppError) as raised:
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_search_parser_rejects_conflicting_next_links() -> None:
+    document = _jspui_search_document().replace(
+        "</li></ul>",
+        (
+            '</li><li><a class="next-page-link" '
+            'href="?query=test&amp;rpp=2&amp;start=4">Next</a></li></ul>'
+        ),
+        1,
+    )
+
+    with pytest.raises(AppError, match="pagination link cardinality"):
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+
+@pytest.mark.parametrize(
+    "total",
+    [
+        pytest.param("0", id="less-than-items"),
+        pytest.param("9" * 5_000, id="oversized-integer"),
+    ],
+)
+def test_search_parser_rejects_invalid_jspui_totals(total: str) -> None:
+    document = _jspui_search_document().replace(
+        "სულ \u2013 42.",
+        f"სულ \u2013 {total}.",
+        1,
+    )
+
+    with pytest.raises(AppError, match="invalid search total") as raised:
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+@pytest.mark.parametrize(
+    "malformed_total",
+    [
+        pytest.param(",42", id="leading-comma"),
+        pytest.param("42,", id="trailing-comma"),
+        pytest.param("4,,2", id="repeated-comma"),
+        pytest.param("1,04", id="misgrouped-comma"),
+    ],
+)
+def test_search_parser_rejects_malformed_jspui_integer_grouping(
+    malformed_total: str,
+) -> None:
+    document = _jspui_search_document().replace(
+        "სულ \u2013 42.",
+        f"სულ \u2013 {malformed_total}.",
+        1,
+    )
+
+    with pytest.raises(AppError, match="invalid search total") as raised:
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+@pytest.mark.parametrize(
+    ("displayed_total", "expected_total"),
+    [
+        pytest.param("1042", 1_042, id="ungrouped-digits"),
+        pytest.param("1,042", 1_042, id="canonical-grouping"),
+    ],
+)
+def test_search_parser_accepts_canonical_jspui_integer_grouping(
+    displayed_total: str,
+    expected_total: int,
+) -> None:
+    document = _jspui_search_document().replace(
+        "სულ \u2013 42.",
+        f"სულ \u2013 {displayed_total}.",
+        1,
+    )
+
+    page = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert page.total == expected_total
+
+
+@pytest.mark.parametrize(
+    ("source_url", "next_offset"),
+    [
+        pytest.param(
+            f"{_SEARCH_SOURCE}&start=2",
+            "2",
+            id="non-progressing",
+        ),
+        pytest.param(_SEARCH_SOURCE, "10000001", id="cursor-overflow"),
+        pytest.param(_SEARCH_SOURCE, "43", id="beyond-total"),
+    ],
+)
+def test_search_parser_rejects_invalid_next_offset_invariants(
+    source_url: str,
+    next_offset: str,
+) -> None:
+    document = _jspui_search_document().replace("start=2", f"start={next_offset}", 1)
+    if source_url != _SEARCH_SOURCE:
+        document = document.replace("1- დან 2", "3- დან 4", 1)
+
+    with pytest.raises(AppError, match="pagination offset") as raised:
+        _ = parse_search_results(document, source_url=source_url, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        pytest.param("missing-required-next", id="missing-required-next-link"),
+        pytest.param("wrong-progress", id="wrong-next-page-offset"),
+        pytest.param("spurious-final-next", id="spurious-final-page-link"),
+    ],
+)
+def test_search_parser_binds_jspui_next_link_to_the_displayed_range(fault: str) -> None:
+    document = _jspui_search_document()
+    if fault == "missing-required-next":
+        document = document.replace(
+            _document(
+                '<ul class="pagination pull-right"><li>',
+                '<a href="/simple-search?query=test&amp;rpp=2&amp;start=2">',
+                "მომდევნო</a>",
+                "</li></ul>",
+            ),
+            "",
+            1,
+        )
+    elif fault == "wrong-progress":
+        document = document.replace("start=2", "start=3", 1)
+    else:
+        document = document.replace("სულ \u2013 42.", "სულ \u2013 2.", 1)
+        document = document.replace("start=2", "start=1", 1)
+
+    with pytest.raises(AppError, match="invalid pagination offset") as raised:
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+@pytest.mark.parametrize(
+    ("source_url", "blank_next_offset"),
+    [
+        pytest.param(
+            f"{_SEARCH_SOURCE}&start=0&start=",
+            False,
+            id="blank-duplicate-current-offset",
+        ),
+        pytest.param(
+            _SEARCH_SOURCE,
+            True,
+            id="blank-duplicate-next-offset",
+        ),
+    ],
+)
+def test_search_parser_rejects_blank_duplicate_pagination_offsets(
+    source_url: str,
+    *,
+    blank_next_offset: bool,
+) -> None:
+    document = _jspui_search_document()
+    if blank_next_offset:
+        document = document.replace("start=2", "start=2&amp;start=", 1)
+
+    with pytest.raises(AppError, match="pagination offset") as raised:
+        _ = parse_search_results(document, source_url=source_url, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        pytest.param("", id="missing-title-cell"),
+        pytest.param('<td headers="t3">რეზონანსი N164</td>', id="missing-title-link"),
+    ],
+)
+def test_search_parser_rejects_malformed_jspui_result_rows(
+    replacement: str,
+) -> None:
+    title_cell = (
+        '<td headers="t3"><a href="/handle/1234/560975">რეზონანსი N164</a></td>'
+    )
+    document = _jspui_search_document().replace(title_cell, replacement, 1)
+
+    with pytest.raises(AppError, match="search row") as raised:
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        pytest.param("", id="missing-trailing-author-cell"),
+        pytest.param(
+            _document(
+                '<td headers="t4">გაგუა, მალხაზ; სხვა, ავტორი</td>',
+                '<td headers="unexpected">unexpected</td>',
+            ),
+            id="extra-data-cell",
+        ),
+    ],
+)
+def test_search_parser_rejects_invalid_jspui_data_cell_cardinality(
+    replacement: str,
+) -> None:
+    author_cell = '<td headers="t4">გაგუა, მალხაზ; სხვა, ავტორი</td>'
+    document = _jspui_search_document().replace(author_cell, replacement, 1)
+
+    with pytest.raises(AppError, match="search row") as raised:
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        pytest.param(
+            _document(
+                '<tr><td headers="t1">-</td><td headers="t4">ავტორი</td>',
+                '<td headers="t3"><a href="/handle/1234/499564">',
+                'ივერია N161</a></td><td headers="t2">7-Aug-2025</td></tr>',
+            ),
+            id="reordered-date-and-author-bindings",
+        ),
+        pytest.param(
+            _document(
+                '<tr><td headers="t1">-</td><td headers="t4">7-Aug-2025</td>',
+                '<td headers="t3"><a href="/handle/1234/499564">',
+                'ივერია N161</a></td><td headers="t4">ავტორი</td></tr>',
+            ),
+            id="duplicate-author-binding",
+        ),
+        pytest.param(
+            _document(
+                '<tr><td headers="t1">-</td><td>7-Aug-2025</td>',
+                '<td headers="t3"><a href="/handle/1234/499564">',
+                'ივერია N161</a></td><td headers="t4">ავტორი</td></tr>',
+            ),
+            id="missing-date-binding",
+        ),
+        pytest.param(
+            _document(
+                '<tr><td headers="t1">-</td><td headers="">7-Aug-2025</td>',
+                '<td headers="t3"><a href="/handle/1234/499564">',
+                'ივერია N161</a></td><td headers="t4">ავტორი</td></tr>',
+            ),
+            id="blank-date-binding",
+        ),
+    ],
+)
+def test_search_parser_rejects_invalid_jspui_header_bindings(
+    replacement: str,
+) -> None:
+    first_row = (
+        '<tr><td headers="t1">-</td><td headers="t2">7-Aug-2025</td>'
+        '<td headers="t3"><a href="/handle/1234/499564">'
+        'ივერია N161</a></td><td headers="t4">ავტორი</td></tr>'
+    )
+    document = _jspui_search_document().replace(first_row, replacement, 1)
+
+    with pytest.raises(AppError) as raised:
+        _ = parse_search_results(document, source_url=_SEARCH_SOURCE, page_size=2)
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
 @pytest.mark.parametrize(
     "offset_date", ["2025-01-01T23:30:00+04:00", "2025-01-01T23:30:00+0400"]
 )
@@ -734,7 +1252,7 @@ def test_full_item_parser_returns_raw_qualified_metadata() -> None:
         source_url="https://dspace.nplg.gov.ge/handle/1234/560449?mode=full",
     )
     assert item.title == "ბორჯომი N34"
-    assert item.metadata_source == "xmlui_full"
+    assert item.metadata_source == "jspui_full"
     assert any(
         field.key == "dc.language.iso" and field.value == "ka"
         for field in item.raw_fields
@@ -788,6 +1306,31 @@ def _search_document(
     )
 
 
+def _jspui_search_document() -> str:
+    return (
+        '<div class="discovery-result-pagination row container">'
+        '<div class="alert alert-info">'
+        "შედეგის ჩვენება 1- დან 2 \u2013 მდე სულ \u2013 42."
+        "</div>"
+        '<ul class="pagination pull-right"><li>'
+        '<a href="/simple-search?query=test&amp;rpp=2&amp;start=2">მომდევნო</a>'
+        "</li></ul></div>"
+        '<div class="discovery-result-results">'
+        '<table align="center" class="table" '
+        'summary="This table browses all dspace content">'
+        '<tr><th id="t1">წინასწარი<br/>დათვალიერება</th>'
+        '<th id="t2">გამოცემის თარიღი</th><th id="t3">სათაური</th>'
+        '<th id="t4">ავტორი / ავტორები</th></tr>'
+        '<tr><td headers="t1">-</td><td headers="t2">7-Aug-2025</td>'
+        '<td headers="t3"><a href="/handle/1234/499564">ივერია N161</a></td>'
+        '<td headers="t4">ავტორი</td></tr>'
+        '<tr><td headers="t1">-</td><td headers="t2">-</td>'
+        '<td headers="t3"><a href="/handle/1234/560975">რეზონანსი N164</a></td>'
+        '<td headers="t4">გაგუა, მალხაზ; სხვა, ავტორი</td></tr>'
+        "</table></div>"
+    )
+
+
 def _item_document(
     *,
     identity: str = f"<code>{_ITEM_HANDLE}</code>",
@@ -798,6 +1341,160 @@ def _item_document(
         '<div id="aspect_artifactbrowser_ItemViewer_div_item-view">'
         f'{identity}<table class="itemDisplayTable">{rows}</table>{extra}</div>'
     )
+
+
+def _jspui_item_document(
+    *,
+    identity: str = f"<code>https://dspace.nplg.gov.ge/handle/{_ITEM_HANDLE}</code>",
+    rows: str = "<tr><td>Title:</td><td>Inside title</td></tr>",
+    extra: str = "",
+) -> str:
+    return (
+        '<main id="content" role="main"><div class="container">'
+        '<div class="well">Please use this identifier to cite or link to this item: '
+        f"{identity}</div>"
+        f'<table class="itemDisplayTable">{rows}</table>{extra}'
+        "</div></main>"
+    )
+
+
+def test_jspui_item_parser_rejects_duplicate_item_containers() -> None:
+    document = _jspui_item_document() + _jspui_item_document()
+
+    with pytest.raises(AppError, match="contract marker cardinality"):
+        _ = parse_item_page(
+            document,
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+
+def test_jspui_item_parser_ignores_a_well_less_decoy_container() -> None:
+    decoy = (
+        '<main id="content" role="main"><div class="container">'
+        "unrelated content"
+        "</div></main>"
+    )
+
+    item = parse_item_page(
+        decoy + _jspui_item_document(),
+        expected_handle=_ITEM_HANDLE,
+        source_url=_ITEM_SOURCE,
+    )
+
+    assert item.title == "Inside title"
+
+
+def test_jspui_item_parser_rejects_duplicate_direct_identity_wells() -> None:
+    document = _jspui_item_document().replace(
+        "</code></div>",
+        '</code></div><div class="well">duplicate marker</div>',
+        1,
+    )
+
+    with pytest.raises(AppError, match="contract marker cardinality") as raised:
+        _ = parse_item_page(
+            document,
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+    assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
+
+
+def test_item_parser_rejects_mixed_xmlui_and_jspui_contract_markers() -> None:
+    document = _item_document() + _jspui_item_document()
+
+    with pytest.raises(AppError, match="contract marker cardinality"):
+        _ = parse_item_page(
+            document,
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+
+def test_jspui_item_parser_rejects_duplicate_identity_codes() -> None:
+    identity = (
+        f"<code>https://dspace.nplg.gov.ge/handle/{_ITEM_HANDLE}</code>"
+        f"<code>https://dspace.nplg.gov.ge/handle/{_ITEM_HANDLE}</code>"
+    )
+
+    with pytest.raises(AppError, match="contract marker cardinality"):
+        _ = parse_item_page(
+            _jspui_item_document(identity=identity),
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+
+def test_jspui_item_parser_requires_the_identifier_lead_in() -> None:
+    document = _jspui_item_document().replace(
+        "Please use this identifier to cite or link to this item: ",
+        "Unrelated code: ",
+    )
+
+    with pytest.raises(AppError, match="contract marker cardinality"):
+        _ = parse_item_page(
+            document,
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+
+def test_jspui_item_parser_binds_the_identifier_code_not_a_sibling_link() -> None:
+    correct_link = f'<a href="/handle/{_ITEM_HANDLE}">requested item</a>'
+
+    with pytest.raises(AppError, match="did not match the requested handle"):
+        _ = parse_item_page(
+            _jspui_item_document(
+                identity="<code>not-an-item-identifier</code>",
+                extra=correct_link,
+            ),
+            expected_handle=_ITEM_HANDLE,
+            source_url=_ITEM_SOURCE,
+        )
+
+
+def test_jspui_item_parser_ignores_bitstreams_outside_item_scope() -> None:
+    outside = f'<a href="/bitstream/{_ITEM_HANDLE}/1/outside.pdf">outside.pdf</a>'
+    inside = f'<a href="/bitstream/{_ITEM_HANDLE}/1/inside.pdf">inside.pdf</a>'
+
+    item = parse_item_page(
+        outside + _jspui_item_document(extra=inside),
+        expected_handle=_ITEM_HANDLE,
+        source_url=_ITEM_SOURCE,
+    )
+
+    assert tuple(bitstream.filename for bitstream in item.bitstreams) == ("inside.pdf",)
+
+
+def test_jspui_item_parser_ignores_metadata_outside_item_scope() -> None:
+    outside = (
+        '<table class="itemDisplayTable">'
+        "<tr><td>Title:</td><td>Outside title</td></tr>"
+        "</table>"
+    )
+
+    item = parse_item_page(
+        outside + _jspui_item_document(),
+        expected_handle=_ITEM_HANDLE,
+        source_url=_ITEM_SOURCE,
+    )
+
+    assert item.title == "Inside title"
+
+
+def test_jspui_item_parser_ignores_restriction_markers_outside_item_scope() -> None:
+    inside = f'<a href="/bitstream/{_ITEM_HANDLE}/1/inside.pdf">inside.pdf</a>'
+
+    item = parse_item_page(
+        "internal network" + _jspui_item_document(extra=inside),
+        expected_handle=_ITEM_HANDLE,
+        source_url=_ITEM_SOURCE,
+    )
+
+    assert item.restricted is False
+    assert tuple(bitstream.filename for bitstream in item.bitstreams) == ("inside.pdf",)
 
 
 def test_item_parser_preserves_nested_metadata_row_order_without_duplicates() -> None:
@@ -943,29 +1640,22 @@ def test_search_parser_rejects_unsafe_or_untitled_items(rows: str) -> None:
     assert raised.value.code is ErrorCode.UPSTREAM_FAILURE
 
 
-@pytest.mark.parametrize(
-    ("pagination", "expected_offset"),
-    [
-        ('<a href="?start=5">Next</a>', 5),
-        ('<a class="next-page-link" href="?query=test">Next</a>', None),
-    ],
-)
-def test_search_parser_supports_fallback_and_absent_pagination_offsets(
-    pagination: str,
-    expected_offset: int | None,
-) -> None:
+def test_search_parser_supports_fallback_pagination_offset() -> None:
     page = parse_search_results(
-        _search_document(pagination=pagination),
+        _search_document(
+            pagination=f'<a href="?start={_FALLBACK_PAGINATION_OFFSET}">Next</a>'
+        ),
         source_url=_SEARCH_SOURCE,
     )
 
-    assert page.next_offset == expected_offset
+    assert page.next_offset == _FALLBACK_PAGINATION_OFFSET
 
 
 @pytest.mark.parametrize(
     "pagination",
     [
         '<a class="next-page-link" href="https://example.com/?start=2">Next</a>',
+        '<a class="next-page-link" href="?query=test">Next</a>',
         '<a class="next-page-link" href="?start=not-an-integer">Next</a>',
         '<a class="next-page-link" href="?start=-1">Next</a>',
     ],

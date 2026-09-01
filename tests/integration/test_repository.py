@@ -171,6 +171,41 @@ async def test_search_builds_bounded_dspace_request_and_opaque_cursor() -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_endpoint_404_is_upstream_failure_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Treat a missing search route as an upstream failure, never a missing item."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            404,
+            text="sensitive Apache route detail",
+            headers={"content-type": "text/html; charset=iso-8859-1"},
+        )
+
+    async def forbidden_parser(*_args: object, **_kwargs: object) -> object:
+        message = "search parser must not run after an upstream 404"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(SubprocessParserExecutor, "parse_search", forbidden_parser)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        repository = NplgRepository(client=client, validate_dns=False)
+        with pytest.raises(AppError) as captured:
+            _ = await repository.search("test", page_size=1)
+
+    assert captured.value.code is ErrorCode.UPSTREAM_FAILURE
+    assert captured.value.http_status == _HTTP_BAD_GATEWAY
+    assert captured.value.message == "The repository search service is unavailable."
+    assert captured.value.internal_details is None
+    assert len(seen) == 1
+    assert seen[0].method == "GET"
+    assert seen[0].url.host == "dspace.nplg.gov.ge"
+    assert seen[0].url.path == "/simple-search"
+
+
+@pytest.mark.asyncio
 async def test_search_normalizes_once_and_reuses_the_exact_canonical_query(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -183,11 +218,19 @@ async def test_search_normalizes_once_and_reuses_the_exact_canonical_query(
         return canonicalize(value)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        query = parse_qs(urlsplit(str(request.url)).query)["query"][0]
+        request_query = parse_qs(urlsplit(str(request.url)).query)
+        query = request_query["query"][0]
         upstream_queries.append(query)
+        response_text = fixture("search_results.html")
+        if request_query.get("start") == ["2"]:
+            response_text = response_text.replace(
+                "Results 1-2",
+                "Results 3-4",
+                1,
+            ).replace("start=2", "start=4", 1)
         return httpx.Response(
             200,
-            text=fixture("search_results.html"),
+            text=response_text,
             headers={"content-type": "text/html"},
         )
 
@@ -400,7 +443,7 @@ async def test_metadata_prefers_discovered_dim_and_falls_back_to_full_html() -> 
         record = await repository.get_metadata("1234/560449")
 
     assert record.title == "ბორჯომი N34"
-    assert record.metadata_source == "xmlui_full"
+    assert record.metadata_source == "jspui_full"
     assert any("metadataPrefix=dim" in url for url in calls)
     assert calls[-1].endswith("/handle/1234/560449?mode=full")
 
@@ -1382,7 +1425,7 @@ async def test_unsupported_oai_formats_fall_back_to_bound_full_item_html() -> No
         )
 
     assert paths == ["/oai/request", "/handle/1234/560449"]
-    assert record.metadata_source == "xmlui_full"
+    assert record.metadata_source == "jspui_full"
 
 
 @pytest.mark.asyncio

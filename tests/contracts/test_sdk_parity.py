@@ -59,7 +59,12 @@ _EXPECTED_DIFFERENCE_CASES = frozenset(
 def _stable_tool(name: object) -> dict[str, object]:
     """Build one minimal parity catalog entry with controlled name typing."""
     return {
-        "annotations": {},
+        "annotations": {
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+            "readOnlyHint": True,
+        },
         "description": "fixture",
         "name": name,
         "title": "Fixture",
@@ -79,6 +84,117 @@ def test_parity_catalog_rejects_non_string_name() -> None:
 def test_parity_catalog_rejects_duplicate_names() -> None:
     with pytest.raises(SdkParityNormalizationError, match="has duplicate names"):
         _ = normalize_tool_catalog([_stable_tool("same"), _stable_tool("same")])
+
+
+def test_parity_catalog_accepts_matching_additive_annotation_title() -> None:
+    legacy = _stable_tool("same")
+    modern = _stable_tool("same")
+    modern_annotations = cast("dict[str, object]", modern["annotations"])
+    modern_annotations["title"] = "Fixture"
+
+    normalized = normalize_tool_catalog([legacy])
+    assert normalized == normalize_tool_catalog([modern])
+    assert normalized[0]["annotations"] == legacy["annotations"]
+
+
+def test_parity_catalog_retains_annotation_hint_differences() -> None:
+    legacy = _stable_tool("same")
+    modern = _stable_tool("same")
+    modern_annotations = cast("dict[str, object]", modern["annotations"])
+    modern_annotations["readOnlyHint"] = False
+
+    assert normalize_tool_catalog([legacy]) != normalize_tool_catalog([modern])
+
+
+@pytest.mark.parametrize("annotation_title", ["Different", 1, None])
+def test_parity_catalog_rejects_invalid_annotation_title(
+    annotation_title: object,
+) -> None:
+    tool = _stable_tool("same")
+    annotations = cast("dict[str, object]", tool["annotations"])
+    annotations["title"] = annotation_title
+
+    with pytest.raises(
+        SdkParityNormalizationError,
+        match="annotation title: does not match top-level title",
+    ):
+        _ = normalize_tool_catalog([tool])
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [("description", []), ("title", 1)],
+)
+def test_parity_catalog_rejects_non_string_stable_metadata(
+    field: str,
+    invalid_value: object,
+) -> None:
+    tool = _stable_tool("same")
+    tool[field] = invalid_value
+
+    with pytest.raises(
+        SdkParityNormalizationError,
+        match=rf"tool catalog entry {field}: is invalid",
+    ):
+        _ = normalize_tool_catalog([tool])
+
+
+@pytest.mark.parametrize("field", ["description", "title"])
+def test_parity_catalog_rejects_missing_stable_metadata(field: str) -> None:
+    tool = _stable_tool("same")
+    del tool[field]
+
+    with pytest.raises(
+        SdkParityNormalizationError,
+        match="tool catalog entry: is missing stable metadata",
+    ):
+        _ = normalize_tool_catalog([tool])
+
+
+@pytest.mark.parametrize("mutation", ["missing", "non-object"])
+def test_parity_catalog_rejects_malformed_annotations(mutation: str) -> None:
+    tool = _stable_tool("same")
+    if mutation == "missing":
+        del tool["annotations"]
+    else:
+        tool["annotations"] = []
+
+    with pytest.raises(
+        SdkParityNormalizationError,
+        match="tool catalog annotations: is invalid",
+    ):
+        _ = normalize_tool_catalog([tool])
+
+
+@pytest.mark.parametrize("invalid_value", [1, "true", None])
+def test_parity_catalog_rejects_non_boolean_annotation_hint(
+    invalid_value: object,
+) -> None:
+    tool = _stable_tool("same")
+    annotations = cast("dict[str, object]", tool["annotations"])
+    annotations["readOnlyHint"] = invalid_value
+
+    with pytest.raises(
+        SdkParityNormalizationError,
+        match="tool catalog annotation readOnlyHint: is invalid",
+    ):
+        _ = normalize_tool_catalog([tool])
+
+
+@pytest.mark.parametrize("mutation", ["missing", "unexpected"])
+def test_parity_catalog_rejects_noncanonical_annotation_keys(mutation: str) -> None:
+    tool = _stable_tool("same")
+    annotations = cast("dict[str, object]", tool["annotations"])
+    if mutation == "missing":
+        del annotations["openWorldHint"]
+    else:
+        annotations["futureHint"] = False
+
+    with pytest.raises(
+        SdkParityNormalizationError,
+        match="tool catalog annotations: has invalid keys",
+    ):
+        _ = normalize_tool_catalog([tool])
 
 
 def test_parity_tool_result_accepts_python_sdk_snake_case_projection() -> None:
@@ -192,7 +308,7 @@ async def test_sdk_and_legacy_metadata_semantics_are_differentially_equal(
     assert normalize_tool_result(legacy_result) == normalize_tool_result(sdk_result)
     entry = _difference_records_by_case()["metadata-tool-catalog-schema-projection"]
     assert entry == {
-        "approval_date": "2026-08-21",
+        "approval_date": "2026-09-01",
         "case_id": "metadata-tool-catalog-schema-projection",
         "frozen_value_sha256": _canonical_digest(legacy_catalog),
         "normative_source": "https://modelcontextprotocol.io/specification/2026-07-28/server/tools",
@@ -200,9 +316,9 @@ async def test_sdk_and_legacy_metadata_semantics_are_differentially_equal(
             sdk_catalog.model_dump(mode="json", by_alias=True)["tools"]
         ),
         "rationale": (
-            "The frozen custom protocol suppresses outputSchema and selected "
-            "input-schema constraints; its retained compatibility result is "
-            "ledgered until Task 14 removes the adapter."
+            "The frozen custom protocol omits the mirrored annotation title, four "
+            "search-parameter descriptions, outputSchema, and selected input-schema "
+            "constraints; its retained compatibility result remains ledgered."
         ),
         "reviewer": "Codex local implementation review (not release authority)",
     }

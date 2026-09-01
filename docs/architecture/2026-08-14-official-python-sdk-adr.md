@@ -44,10 +44,11 @@ error is permitted to close that gap.
 
 The digest-bound `metadata-tool-catalog-schema-projection` difference is
 limited to the frozen custom-protocol advertisement. The official SDK projects
-the complete current Pydantic input/output schemas; retained custom behavior
-continues to enforce the same Pydantic models at runtime. The ledger is local
-implementation evidence, not release approval, and the custom adapter is
-removed in Task 14.
+the complete current Pydantic input/output schemas, including four
+client-visible search-parameter descriptions, and mirrors each human-readable
+tool title in its annotations. Retained custom behavior continues to enforce
+the same Pydantic models at runtime. The ledger is local implementation
+evidence, not release approval, and the custom adapter is removed in Task 14.
 
 Task 14 deliberately changes three `private-full` resource semantics and binds
 each side to the accepted-difference ledger: canonical artifact resources now

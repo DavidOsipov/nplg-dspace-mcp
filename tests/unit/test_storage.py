@@ -138,6 +138,20 @@ def test_readiness_preserves_existing_app_error(
     assert captured.value is expected
 
 
+def test_readiness_accepts_healthy_store_without_lifecycle(tmp_path: Path) -> None:
+    store = ContentAddressedStore(tmp_path)
+    artifact = store.put_bytes(
+        b"healthy",
+        namespace="documents",
+        filename="source.bin",
+        media_type="application/octet-stream",
+    )
+
+    store.ensure_ready()
+
+    assert store.resolve_asset(artifact.relative_path).read_bytes() == b"healthy"
+
+
 def test_readiness_rejects_used_bytes_over_maximum_without_lifecycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -184,23 +184,22 @@ def _ensure_private_directory_at(
         )
     except FileExistsError:
         pass
-    descriptor: int | None = None
     try:
         descriptor, _ = _open_verified_directory(
             name,
             directory_fd=parent_descriptor,
         )
-        _validate_owned_private_directory(
-            descriptor,
-            context=context,
-            created=created,
-        )
+        try:
+            _validate_owned_private_directory(
+                descriptor,
+                context=context,
+                created=created,
+            )
+        finally:
+            os.close(descriptor)
     except (OSError, ValueError) as exc:
         msg = f"{context} directory is unsafe"
         raise ValueError(msg) from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
 
 
 def _ensure_private_directory_path(path: Path, *, context: str) -> None:
@@ -211,20 +210,19 @@ def _ensure_private_directory_path(path: Path, *, context: str) -> None:
         path.chmod(_PRIVATE_DIRECTORY_MODE, follow_symlinks=False)
     except FileExistsError:
         pass
-    descriptor: int | None = None
     try:
         descriptor, _ = _open_verified_directory(path)
-        _validate_owned_private_directory(
-            descriptor,
-            context=context,
-            created=created,
-        )
+        try:
+            _validate_owned_private_directory(
+                descriptor,
+                context=context,
+                created=created,
+            )
+        finally:
+            os.close(descriptor)
     except (OSError, ValueError) as exc:
         msg = f"{context} directory is unsafe"
         raise ValueError(msg) from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
 
 
 def _validate_private_regular_file_at(
@@ -368,36 +366,39 @@ def _resolve_private_asset(
     root: Path,
     parts: tuple[str, ...],
 ) -> Path:
-    descriptor: int | None = None
     candidate = root
     try:
         descriptor = os.dup(root_descriptor)
-        for component in parts[:-1]:
-            metadata = os.stat(
-                component,
+        try:
+            for component in parts[:-1]:
+                metadata = os.stat(
+                    component,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                child_descriptor = _open_resolved_asset_directory(
+                    component,
+                    parent_descriptor=descriptor,
+                    metadata=metadata,
+                )
+                parent_descriptor = descriptor
+                descriptor = child_descriptor
+                os.close(parent_descriptor)
+                candidate /= component
+            final_component = parts[-1]
+            final_metadata = os.stat(
+                final_component,
                 dir_fd=descriptor,
                 follow_symlinks=False,
             )
-            child_descriptor = _open_resolved_asset_directory(
-                component,
+            _validate_resolved_asset_file(
+                final_component,
                 parent_descriptor=descriptor,
-                metadata=metadata,
+                metadata=final_metadata,
             )
+            return candidate / final_component
+        finally:
             os.close(descriptor)
-            descriptor = child_descriptor
-            candidate /= component
-        final_component = parts[-1]
-        final_metadata = os.stat(
-            final_component,
-            dir_fd=descriptor,
-            follow_symlinks=False,
-        )
-        _validate_resolved_asset_file(
-            final_component,
-            parent_descriptor=descriptor,
-            metadata=final_metadata,
-        )
-        return candidate / final_component
     except FileNotFoundError as exc:
         try:
             _raise_missing_asset()
@@ -408,9 +409,6 @@ def _resolve_private_asset(
             _raise_corrupt_asset_storage()
         except AppError as corrupt:
             raise corrupt from exc
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
 
 
 def _validate_artifact_directory(

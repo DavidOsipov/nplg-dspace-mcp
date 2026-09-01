@@ -13,7 +13,7 @@ Branch: main
 Root directory: <empty>
 ```
 
-The runtime is a project-level setting. The install command explicitly reuses Alpic's `python3` binary, so `uv` does not attempt to download another interpreter. `alpic.json` enforces the checked-in SHA-256 hashes with `--require-hashes` in addition to exact versions and binary-only installation.
+The runtime is a project-level setting. The install command explicitly reuses Alpic's `python3` binary, so `uv` does not attempt to download another interpreter. Its first install step enforces the checked-in SHA-256 hashes with `--require-hashes` in addition to exact versions and binary-only installation of runtime and PEP 517 backend packages. Its second step installs this project with `--no-build-isolation --no-deps`, using the already locked `setuptools`/`wheel` environment without resolving anything else. The start command then imports the installed distribution without a source-tree `PYTHONPATH` fallback.
 
 Add these environment variables:
 
@@ -48,11 +48,13 @@ Do not configure `API_PRINCIPALS_JSON`, `API_BEARER_TOKEN`, `API_KEY`, `NPLG_PRI
 
 The failed deployment selected Node and executed `npm ci` because the tracked Git branch did not contain the Python source, `pyproject.toml`, or a Python lock/configuration surface. After the complete source tree is pushed, `.python-version`, `pyproject.toml`, `requirements.lock`, and `alpic.json` make the intended Python build explicit.
 
+Installing the project distribution is also required for disposable metadata parsers. They start from `/` with a closed environment and intentionally do not inherit the server's `PYTHONPATH`; relying on a start-command-only source path can make server validation pass while every parser-backed repository operation fails.
+
 ## Material platform limitations
 
 Alpic uses a **serverless** MCP gateway. It documents a **30-second** limit for each tool invocation and reserves `/assets/*` for build-time static CDN files. This server currently generates dynamic `/assets/` URLs at runtime and relies on local filesystem artifacts across multiple calls (`download` → `inspect` → `render` → `tiles`). Therefore Alpic is **not a supported full-fidelity deployment target** for the document-download and visual-rendering pipeline in the current release.
 
-Local metadata-profile compatibility already covered by offline tests:
+Local metadata-profile contract/parser compatibility already covered by offline tests:
 
 - search;
 - metadata retrieval;
@@ -76,8 +78,10 @@ separately deployed least-privilege worker for long-running PDF work.
 Do not perform a public or staging deployment from this guide until the exact
 candidate and local gates are complete and an authorized provider-side action
 binds that candidate to the named Alpic environment. The hosted verification
-must prove the public `/mcp` route, exact three-tool catalog, sessionless
-behavior, effective Host and Origin values, the exact
+must prove the public `/mcp` route, exact three-tool catalog, standard
+initialization, exact `2025-11-25` negotiation, the initialized notification,
+consistent reuse of any gateway-issued session identifier, effective Host and
+Origin values, the exact
 `nplg://skills/georgian-newspaper-visual-analysis` Markdown resource, absence
 of resource templates and private resources, and absence of asset routes.
 OAuth/Auth0/DCR evidence is not a prerequisite for this anonymous metadata-only

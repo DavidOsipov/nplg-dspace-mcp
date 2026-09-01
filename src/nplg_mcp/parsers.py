@@ -18,15 +18,22 @@ from bs4 import BeautifulSoup, Tag
 from bs4.element import Comment, Declaration, Doctype, NavigableString
 from defusedxml import ElementTree as DefusedElementTree
 
-from .contracts import StrictModel
+from .contracts import MAX_SAFE_INTEGER, StrictModel
 from .errors import AppError, ErrorCode
 from .security import NPLG_HOST, NPLG_ORIGIN, parse_handle_input, validate_upstream_url
+from .tokens import MAX_CURSOR_OFFSET
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from xml.etree.ElementTree import Element
 
 _TOTAL_RE = re.compile(r"\bof\s+([\d,]+)\b", re.IGNORECASE)
+_JSPUI_RANGE_PREFIX = r"\bშედეგის\s+ჩვენება\s+([\d,]+)\s*[-\u2013]\s*დან\s+"
+_JSPUI_RANGE_SUFFIX = (
+    r"([\d,]+)\s*[-\u2013]\s*მდე\s+სულ\s*[-\u2013]\s*([\d,]+)(?![\d,])"
+)
+_JSPUI_RANGE_RE = re.compile(f"{_JSPUI_RANGE_PREFIX}{_JSPUI_RANGE_SUFFIX}")
+_SEARCH_INTEGER_RE = re.compile(r"(?:[0-9]+|[1-9][0-9]{0,2}(?:,[0-9]{3})+)")
 _SIZE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?B)\s*$", re.IGNORECASE)
 _DC_KEY_RE = re.compile(r"^dc(?:\.[A-Za-z0-9_-]+)+$")
 _WHITESPACE_RUN_RE = re.compile(r"\s+")
@@ -39,6 +46,8 @@ _RESTRICTED_MARKERS = (
     "შიდა ქსელ",
     "ბიბლიოთეკის შენობიდან",
 )
+_JSPUI_IDENTIFIER_LEAD_IN = "Please use this identifier to cite or link to this item:"
+_JSPUI_SEARCH_TABLE_SUMMARY = "This table browses all dspace content"
 _MIN_METADATA_CELLS = 2
 _SIZE_CELL_INDEX = 2
 _LANGUAGE_CELL_INDEX = 2
@@ -215,6 +224,15 @@ class _SearchColumns:
     title: int
     date: int | None
     author: int | None
+    cell_count: int
+    header_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _SearchContract:
+    container: Tag
+    table: Tag
+    variant: Literal["xmlui", "jspui"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -825,8 +843,29 @@ def _tag_attribute(tag: Tag, name: str, default: str = "") -> str:
     return value if isinstance(value, str) else default
 
 
+def _single_token_attribute(tag: Tag, name: str) -> str | None:
+    """Return one exact HTML token from string or parser token-list storage."""
+    raw: object = tag.get(name)
+    if isinstance(raw, str):
+        token = raw
+    elif isinstance(raw, list):
+        values = cast("list[object]", raw)
+        if len(values) != 1 or not isinstance(values[0], str):
+            return None
+        token = values[0]
+    else:
+        return None
+    if not token or token != token.strip() or len(token.split()) != 1:
+        return None
+    return token
+
+
 def _class_contains(value: object, expected: str) -> bool:
-    return isinstance(value, str) and expected in value
+    if isinstance(value, str):
+        return expected in value.split()
+    if isinstance(value, list):
+        return expected in value
+    return False
 
 
 def _has_search_results_class(value: object) -> bool:
@@ -872,28 +911,159 @@ def _normalize_date(value: str | None) -> str | None:
     return normalized
 
 
-def _search_columns(table: Tag, *, source_url: str) -> _SearchColumns:
-    header_cells = [_tag_text(cell).lower() for cell in table.select("thead th")]
-    try:
-        title_index = next(
-            index for index, text in enumerate(header_cells) if text == "title"
+def _search_contract(soup: BeautifulSoup, *, source_url: str) -> _SearchContract:
+    xmlui_containers = soup.find_all(
+        id="aspect_discovery_SimpleSearch_div_search-results", limit=2
+    )
+    jspui_results = soup.find_all("div", class_="discovery-result-results", limit=2)
+    jspui_pagination = soup.find_all(
+        "div", class_="discovery-result-pagination", limit=2
+    )
+    jspui_tables = soup.find_all(
+        "table",
+        attrs={"summary": _JSPUI_SEARCH_TABLE_SUMMARY},
+        limit=2,
+    )
+    has_xmlui_markers = bool(xmlui_containers)
+    has_jspui_markers = bool(jspui_results or jspui_pagination or jspui_tables)
+    if has_xmlui_markers and has_jspui_markers:
+        msg = (
+            "The repository search response had an invalid contract marker cardinality."
         )
-    except StopIteration as exc:
+        raise _upstream_failure(msg, source_url=source_url)
+
+    if has_xmlui_markers:
+        if len(xmlui_containers) != 1:
+            msg = (
+                "The repository search response had an invalid contract marker "
+                "cardinality."
+            )
+            raise _upstream_failure(msg, source_url=source_url)
+        container = xmlui_containers[0]
+        table = container.find("table", class_=_has_search_results_class)
+        if not isinstance(table, Tag):
+            msg = "The repository search response did not contain a results table."
+            raise _upstream_failure(msg, source_url=source_url)
+        return _SearchContract(container=container, table=table, variant="xmlui")
+
+    if len(jspui_results) != 1 or len(jspui_pagination) != 1 or len(jspui_tables) != 1:
+        msg = (
+            "The repository search response had an invalid contract marker cardinality."
+        )
+        raise _upstream_failure(msg, source_url=source_url)
+    results = jspui_results[0]
+    pagination = jspui_pagination[0]
+    table = results.find(
+        "table",
+        attrs={"summary": _JSPUI_SEARCH_TABLE_SUMMARY},
+        recursive=False,
+    )
+    if table is not jspui_tables[0] or results.parent is not pagination.parent:
+        msg = (
+            "The repository search response had an invalid contract marker cardinality."
+        )
+        raise _upstream_failure(msg, source_url=source_url)
+    return _SearchContract(
+        container=pagination,
+        table=jspui_tables[0],
+        variant="jspui",
+    )
+
+
+def _is_recognized_search_column(
+    text: str,
+    *,
+    kind: Literal["title", "date", "author"],
+    variant: Literal["xmlui", "jspui"],
+) -> bool:
+    """Match one exact reviewed XMLUI/JSPUI search-column label."""
+    if variant == "jspui":
+        return (
+            text
+            == {
+                "title": "სათაური",
+                "date": "გამოცემის თარიღი",
+                "author": "ავტორი / ავტორები",
+            }[kind]
+        )
+    if kind == "title":
+        return text in {"title", "სათაური"}
+    if kind == "date":
+        return "date" in text or "თარიღ" in text
+    return "author" in text or "ავტორ" in text
+
+
+def _search_column_index(
+    header_cells: list[str],
+    *,
+    source_url: str,
+    kind: Literal["title", "date", "author"],
+    variant: Literal["xmlui", "jspui"],
+    required: bool = False,
+) -> int | None:
+    """Resolve one recognized column without first-match ambiguity."""
+    matches = [
+        index
+        for index, text in enumerate(header_cells)
+        if _is_recognized_search_column(text, kind=kind, variant=variant)
+    ]
+    if len(matches) > 1 or (required and len(matches) != 1):
+        msg = f"The repository search table had invalid {kind} column cardinality."
+        raise _upstream_failure(msg, source_url=source_url)
+    return matches[0] if matches else None
+
+
+def _search_columns(
+    table: Tag,
+    *,
+    source_url: str,
+    variant: Literal["xmlui", "jspui"],
+) -> _SearchColumns:
+    if variant == "xmlui":
+        header_tags: list[Tag] = list(table.select("thead th"))
+        header_ids: tuple[str, ...] = ()
+    else:
+        rows = table.find_all("tr", recursive=False, limit=1)
+        header_tags = rows[0].find_all("th", recursive=False) if rows else []
+        header_values = tuple(
+            _single_token_attribute(cell, "id") for cell in header_tags
+        )
+        if any(value is None for value in header_values):
+            msg = "The repository search table had invalid header bindings."
+            raise _upstream_failure(msg, source_url=source_url)
+        header_ids = cast("tuple[str, ...]", header_values)
+        if len(set(header_ids)) != len(header_ids):
+            msg = "The repository search table had invalid header bindings."
+            raise _upstream_failure(msg, source_url=source_url)
+    header_cells = [_tag_text(cell).lower() for cell in header_tags]
+    title_index = _search_column_index(
+        header_cells,
+        source_url=source_url,
+        kind="title",
+        variant=variant,
+        required=True,
+    )
+    if title_index is None:
         msg = "The repository search table did not contain a title column."
-        raise _upstream_failure(
-            msg,
-            source_url=source_url,
-        ) from exc
+        raise _upstream_failure(msg, source_url=source_url)
     return _SearchColumns(
         title=title_index,
-        date=next(
-            (index for index, text in enumerate(header_cells) if "date" in text),
-            None,
+        date=_search_column_index(
+            header_cells,
+            source_url=source_url,
+            kind="date",
+            variant=variant,
+            required=variant == "jspui",
         ),
-        author=next(
-            (index for index, text in enumerate(header_cells) if "author" in text),
-            None,
+        author=_search_column_index(
+            header_cells,
+            source_url=source_url,
+            kind="author",
+            variant=variant,
+            required=variant == "jspui",
         ),
+        cell_count=len(header_cells),
+        header_ids=header_ids,
     )
 
 
@@ -903,20 +1073,28 @@ def _search_items(
     columns: _SearchColumns,
     source_url: str,
     maximum_items: int,
+    variant: Literal["xmlui", "jspui"],
 ) -> tuple[SearchItem, ...]:
     items: list[SearchItem] = []
-    rows = table.select("tbody tr")
+    seen_handles: set[str] = set()
+    rows = (
+        table.select("tbody tr")
+        if variant == "xmlui"
+        else table.find_all("tr", recursive=False)[1:]
+    )
     if len(rows) > maximum_items:
         msg = "The repository search response exceeded the search item limit."
         raise _upstream_failure(msg, source_url=source_url)
     for row in rows:
-        cells = row.find_all("td", recursive=False)
-        if columns.title >= len(cells):
+        parsed_row = _search_row_cells_and_link(
+            row,
+            columns=columns,
+            source_url=source_url,
+            variant=variant,
+        )
+        if parsed_row is None:
             continue
-        title_cell = cells[columns.title]
-        link = title_cell.find("a", href=True)
-        if not isinstance(link, Tag):
-            continue
+        cells, link = parsed_row
         try:
             handle, canonical_url = _canonical_item_from_href(
                 _tag_attribute(link, "href"), source_url=source_url
@@ -928,6 +1106,10 @@ def _search_items(
                 source_url=source_url,
                 cause=exc,
             ) from exc
+        if variant == "jspui" and handle in seen_handles:
+            msg = "The repository returned a duplicate search item."
+            raise _upstream_failure(msg, source_url=source_url)
+        seen_handles.add(handle)
         title = _tag_text(link)
         if not title:
             msg = "The repository returned a search item without a title."
@@ -958,29 +1140,162 @@ def _search_items(
     return tuple(items)
 
 
-def _search_total(container: Tag, *, item_count: int) -> int:
+def _search_row_cells_and_link(
+    row: Tag,
+    *,
+    columns: _SearchColumns,
+    source_url: str,
+    variant: Literal["xmlui", "jspui"],
+) -> tuple[list[Tag], Tag] | None:
+    """Return one strict JSPUI row or one optional legacy XMLUI row."""
+    cells = row.find_all("td", recursive=False)
+    malformed = columns.title >= len(cells) or (
+        variant == "jspui" and len(cells) != columns.cell_count
+    )
+    if malformed:
+        if variant == "jspui":
+            msg = "The repository returned a malformed search row."
+            raise _upstream_failure(msg, source_url=source_url)
+        return None
+    if variant == "jspui" and any(
+        _single_token_attribute(cell, "headers") != expected
+        for cell, expected in zip(cells, columns.header_ids, strict=True)
+    ):
+        msg = "The repository returned a malformed search row."
+        raise _upstream_failure(msg, source_url=source_url)
+    links = cells[columns.title].find_all("a", href=True, limit=2)
+    if len(links) > 1:
+        msg = "The repository search row had invalid item link cardinality."
+        raise _upstream_failure(msg, source_url=source_url)
+    if not links:
+        if variant == "jspui":
+            msg = "The repository returned a malformed search row."
+            raise _upstream_failure(msg, source_url=source_url)
+        return None
+    return cells, links[0]
+
+
+def _search_total(
+    container: Tag,
+    *,
+    item_count: int,
+    current_offset: int,
+    source_url: str,
+    variant: Literal["xmlui", "jspui"],
+) -> int:
+    minimum_total = current_offset + item_count
     context_text = _tag_text(container)
-    total_match = _TOTAL_RE.search(context_text)
-    return (
-        item_count
-        if total_match is None
-        else int(_match_group(total_match, 1).replace(",", ""))
+    if variant == "xmlui":
+        total_match = _TOTAL_RE.search(context_text)
+        if total_match is None:
+            return minimum_total
+        raw_total = _match_group(total_match, 1)
+    else:
+        range_matches = list(_JSPUI_RANGE_RE.finditer(context_text))
+        if len(range_matches) != 1:
+            msg = (
+                "The repository search response had an invalid range marker "
+                "cardinality."
+            )
+            raise _upstream_failure(msg, source_url=source_url)
+        range_match = range_matches[0]
+        displayed_first = _bounded_search_integer(
+            _match_group(range_match, 1),
+            maximum=MAX_SAFE_INTEGER,
+            context="search range",
+            source_url=source_url,
+        )
+        displayed_end = _bounded_search_integer(
+            _match_group(range_match, 2),
+            maximum=MAX_SAFE_INTEGER,
+            context="search range",
+            source_url=source_url,
+        )
+        if (
+            displayed_first != current_offset + 1
+            or displayed_end < displayed_first
+            or item_count != displayed_end - displayed_first + 1
+        ):
+            msg = "The repository returned an invalid search range."
+            raise _upstream_failure(msg, source_url=source_url)
+        raw_total = _match_group(range_match, 3)
+    total = _bounded_search_integer(
+        raw_total,
+        maximum=MAX_SAFE_INTEGER,
+        context="search total",
+        source_url=source_url,
+    )
+    if total < max(item_count, minimum_total):
+        msg = "The repository returned an invalid search total."
+        raise _upstream_failure(msg, source_url=source_url)
+    return total
+
+
+def _bounded_search_integer(
+    raw_value: str,
+    *,
+    maximum: int,
+    context: str,
+    source_url: str,
+) -> int:
+    """Parse one untrusted bounded ASCII integer into an upstream value."""
+    if _SEARCH_INTEGER_RE.fullmatch(raw_value) is None:
+        msg = f"The repository returned an invalid {context}."
+        raise _upstream_failure(msg, source_url=source_url)
+    normalized = raw_value.replace(",", "")
+    if (
+        not normalized
+        or not normalized.isascii()
+        or not normalized.isdigit()
+        or len(normalized) > len(str(maximum))
+    ):
+        msg = f"The repository returned an invalid {context}."
+        raise _upstream_failure(msg, source_url=source_url)
+    parsed = int(normalized)
+    if parsed > maximum:
+        msg = f"The repository returned an invalid {context}."
+        raise _upstream_failure(msg, source_url=source_url)
+    return parsed
+
+
+def _current_search_offset(*, source_url: str) -> int:
+    """Extract one bounded current offset from the final upstream URL."""
+    raw_offsets = parse_qs(
+        urlsplit(source_url).query,
+        keep_blank_values=True,
+    ).get("start", [])
+    if not raw_offsets:
+        return 0
+    if len(raw_offsets) != 1:
+        msg = "The repository returned an invalid pagination offset."
+        raise _upstream_failure(msg, source_url=source_url)
+    return _bounded_search_integer(
+        raw_offsets[0],
+        maximum=MAX_CURSOR_OFFSET,
+        context="pagination offset",
+        source_url=source_url,
     )
 
 
-def _next_search_offset(container: Tag, *, source_url: str) -> int | None:
-    next_link = container.find("a", class_=_has_next_page_class, href=True)
-    if not isinstance(next_link, Tag):
-        next_link = next(
-            (
-                a
-                for a in container.find_all("a", href=True)
-                if _tag_text(a).lower() in {"next", "next page", ">"}
-            ),
-            None,
-        )
-    if not isinstance(next_link, Tag):
+def _next_search_offset(
+    container: Tag,
+    *,
+    source_url: str,
+    current_offset: int,
+    maximum_total: int | None,
+) -> int | None:
+    candidates = [
+        link
+        for link in container.find_all("a", href=True)
+        if _has_next_page_class(link.get("class"))
+        or _tag_text(link).lower() in {"next", "next page", ">", "მომდევნო"}
+    ]
+    if len(candidates) > 1:
+        msg = "The repository search response had invalid pagination link cardinality."
+        raise _upstream_failure(msg, source_url=source_url)
+    if not candidates:
         return None
+    next_link = candidates[0]
     absolute = urljoin(source_url, _tag_attribute(next_link, "href"))
     try:
         _ = validate_upstream_url(absolute)
@@ -991,24 +1306,27 @@ def _next_search_offset(container: Tag, *, source_url: str) -> int | None:
             source_url=source_url,
             cause=exc,
         ) from exc
-    raw_start = parse_qs(urlsplit(absolute).query).get("start", [None])[0]
-    if raw_start is None:
-        return None
-    try:
-        parsed_offset = int(raw_start)
-    except ValueError as exc:
+    raw_offsets = parse_qs(
+        urlsplit(absolute).query,
+        keep_blank_values=True,
+    ).get("start", [])
+    if not raw_offsets:
         msg = "The repository returned an invalid pagination offset."
-        raise _upstream_failure(
-            msg,
-            source_url=source_url,
-            cause=exc,
-        ) from exc
-    if parsed_offset < 0:
-        msg = "The repository returned a negative pagination offset."
-        raise _upstream_failure(
-            msg,
-            source_url=source_url,
-        )
+        raise _upstream_failure(msg, source_url=source_url)
+    if len(raw_offsets) != 1:
+        msg = "The repository returned an invalid pagination offset."
+        raise _upstream_failure(msg, source_url=source_url)
+    parsed_offset = _bounded_search_integer(
+        raw_offsets[0],
+        maximum=MAX_CURSOR_OFFSET,
+        context="pagination offset",
+        source_url=source_url,
+    )
+    if parsed_offset <= current_offset or (
+        maximum_total is not None and parsed_offset >= maximum_total
+    ):
+        msg = "The repository returned an invalid pagination offset."
+        raise _upstream_failure(msg, source_url=source_url)
     return parsed_offset
 
 
@@ -1033,39 +1351,45 @@ def parse_search_results(
         compare_nodes=False,
         source_url=source_url,
     )
-    containers = soup.find_all(
-        id="aspect_discovery_SimpleSearch_div_search-results", limit=2
+    contract = _search_contract(soup, source_url=source_url)
+    columns = _search_columns(
+        contract.table,
+        source_url=source_url,
+        variant=contract.variant,
     )
-    if len(containers) != 1:
-        msg = (
-            "The repository search response had an invalid contract marker cardinality."
-        )
-        raise _upstream_failure(
-            msg,
-            source_url=source_url,
-        )
-    container = containers[0]
-
-    table = container.find("table", class_=_has_search_results_class)
-    if not isinstance(table, Tag):
-        msg = "The repository search response did not contain a results table."
-        raise _upstream_failure(
-            msg,
-            source_url=source_url,
-        )
-
-    columns = _search_columns(table, source_url=source_url)
     items = _search_items(
-        table,
+        contract.table,
         columns=columns,
         source_url=source_url,
         maximum_items=page_size,
+        variant=contract.variant,
     )
+    current_offset = _current_search_offset(source_url=source_url)
+    total = _search_total(
+        contract.container,
+        item_count=len(items),
+        current_offset=current_offset,
+        source_url=source_url,
+        variant=contract.variant,
+    )
+    next_offset = _next_search_offset(
+        contract.container,
+        source_url=source_url,
+        current_offset=current_offset,
+        maximum_total=total if contract.variant == "jspui" else None,
+    )
+    if contract.variant == "jspui":
+        expected_next = current_offset + len(items)
+        if (expected_next < total and next_offset != expected_next) or (
+            expected_next >= total and next_offset is not None
+        ):
+            msg = "The repository returned an invalid pagination offset."
+            raise _upstream_failure(msg, source_url=source_url)
 
     return SearchPage(
         items=items,
-        total=_search_total(container, item_count=len(items)),
-        next_offset=_next_search_offset(container, source_url=source_url),
+        total=total,
+        next_offset=next_offset,
         source_url=source_url,
     )
 
@@ -1233,14 +1557,54 @@ def _extract_handle(container: Tag) -> str | None:
     return None
 
 
+def _item_container(
+    soup: BeautifulSoup, *, source_url: str
+) -> tuple[Tag, Literal["xmlui", "jspui"], Tag | None]:
+    """Resolve one legacy XMLUI or current JSPUI item-content container."""
+    xmlui = soup.find_all(
+        id="aspect_artifactbrowser_ItemViewer_div_item-view",
+        limit=2,
+    )
+    jspui: list[tuple[Tag, Tag]] = []
+    for main in soup.find_all("main", id="content", attrs={"role": "main"}):
+        for container in main.find_all("div", class_="container", recursive=False):
+            wells = container.find_all(
+                "div",
+                class_="well",
+                recursive=False,
+                limit=2,
+            )
+            if not wells:
+                continue
+            if len(wells) != 1:
+                msg = "The item response had an invalid contract marker cardinality."
+                raise _upstream_failure(msg, source_url=source_url)
+            well = wells[0]
+            codes = well.find_all("code", recursive=False, limit=2)
+            if len(codes) != 1 or not _tag_text(well).startswith(
+                _JSPUI_IDENTIFIER_LEAD_IN
+            ):
+                msg = "The item response had an invalid contract marker cardinality."
+                raise _upstream_failure(msg, source_url=source_url)
+            jspui.append((container, codes[0]))
+
+    if len(xmlui) == 1 and not jspui:
+        return xmlui[0], "xmlui", None
+    if not xmlui and len(jspui) == 1:
+        container, identity = jspui[0]
+        return container, "jspui", identity
+    msg = "The item response had an invalid contract marker cardinality."
+    raise _upstream_failure(msg, source_url=source_url)
+
+
 type _MetadataRow = tuple[Tag, tuple[Tag, ...]]
 
 
-def _metadata_rows(soup: BeautifulSoup) -> tuple[_MetadataRow, ...]:
+def _metadata_rows(container: Tag) -> tuple[_MetadataRow, ...]:
     """Select metadata rows once and retain their direct data cells."""
     rows: list[_MetadataRow] = []
     seen: set[int] = set()
-    for table in soup.find_all("table", class_="itemDisplayTable"):
+    for table in container.find_all("table", class_="itemDisplayTable"):
         for row in table.find_all("tr"):
             identity = id(row)
             if identity in seen:
@@ -1315,7 +1679,7 @@ def _full_fields(rows: tuple[_MetadataRow, ...]) -> tuple[RawMetadataField, ...]
 
 
 def _collections(
-    soup: BeautifulSoup,
+    container: Tag,
     rows: tuple[_MetadataRow, ...],
 ) -> tuple[str, ...]:
     values: list[str] = []
@@ -1327,7 +1691,7 @@ def _collections(
             links = [_tag_text(link) for link in cells[1].find_all("a")]
             values.extend(links or [_tag_text(cells[1])])
     if not values:
-        for paragraph in soup.find_all(["p", "div"]):
+        for paragraph in container.find_all(["p", "div"]):
             text = _tag_text(paragraph)
             if text.lower().startswith("appears in collections:"):
                 links = [_tag_text(link) for link in paragraph.find_all("a")]
@@ -1354,16 +1718,17 @@ def parse_item_page(
         compare_nodes=False,
         source_url=source_url,
     )
-    containers = soup.find_all(
-        id="aspect_artifactbrowser_ItemViewer_div_item-view", limit=2
+    container, variant, jspui_identity = _item_container(
+        soup,
+        source_url=source_url,
     )
-    if len(containers) != 1:
-        msg = "The item response had an invalid contract marker cardinality."
-        raise _upstream_failure(
-            msg,
-            source_url=source_url,
-        )
-    actual = _extract_handle(containers[0])
+    if jspui_identity is None:
+        actual = _extract_handle(container)
+    else:
+        try:
+            actual = parse_handle_input(_tag_text(jspui_identity))
+        except AppError:
+            actual = None
     if actual is None or actual != expected:
         msg = "The item response did not match the requested handle."
         raise _upstream_failure(
@@ -1371,12 +1736,12 @@ def parse_item_page(
             source_url=source_url,
         )
 
-    page_text = _tag_text(soup).lower()
+    page_text = _tag_text(container).lower()
     matching_restrictions = [
         marker for marker in _RESTRICTED_MARKERS if marker in page_text
     ]
     restricted = bool(matching_restrictions)
-    bitstream_links = tuple(soup.find_all("a", href=_has_bitstream_href))
+    bitstream_links = tuple(container.find_all("a", href=_has_bitstream_href))
     if restricted and bitstream_links:
         msg = "The item response contained ambiguous access markers."
         raise _upstream_failure(msg, source_url=source_url)
@@ -1386,7 +1751,7 @@ def parse_item_page(
         else None
     )
 
-    metadata_rows = _metadata_rows(soup)
+    metadata_rows = _metadata_rows(container)
     is_full = any(
         cells
         and next(
@@ -1396,7 +1761,7 @@ def parse_item_page(
         is cells[0]
         and _DC_KEY_RE.fullmatch(_tag_text(cells[0])) is not None
         for row, cells in metadata_rows
-    ) or bool(soup.find(string=_has_full_metadata_text))
+    ) or bool(container.find(string=_has_full_metadata_text))
     fields = _full_fields(metadata_rows) if is_full else _summary_fields(metadata_rows)
     if not fields:
         msg = "The item response did not contain recognizable metadata."
@@ -1405,7 +1770,7 @@ def parse_item_page(
             source_url=source_url,
         )
 
-    collections = _collections(soup, metadata_rows)
+    collections = _collections(container, metadata_rows)
     bitstreams = _parse_bitstreams(
         bitstream_links,
         handle=expected,
@@ -1426,7 +1791,7 @@ def parse_item_page(
             bitstreams=bitstreams,
             restricted=restricted,
             restriction_reason=restriction_reason,
-            metadata_source="xmlui_full" if is_full else "xmlui_summary",
+            metadata_source=f"{variant}_{'full' if is_full else 'summary'}",
             fallback_title=fallback_title,
         ),
     )

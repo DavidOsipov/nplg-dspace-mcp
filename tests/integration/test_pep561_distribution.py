@@ -61,6 +61,61 @@ def _run_git(worktree: Path, *arguments: str) -> bytes:
     ).stdout
 
 
+def _verify_parser_worker_import_from_wheel(
+    *,
+    wheel: Path,
+    target: Path,
+    cwd: Path,
+) -> None:
+    install = subprocess.run(  # noqa: S603
+        (
+            sys.executable,
+            "-I",
+            "-B",
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--no-index",
+            "--no-deps",
+            "--target",
+            target.as_posix(),
+            wheel.as_posix(),
+        ),
+        cwd=cwd,
+        env=_closed_environment(),
+        check=False,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=_TIMEOUT_SECONDS,
+    )
+    assert install.returncode == 0, (install.stdout, install.stderr)
+
+    source = (
+        "import json,pathlib,sys;"
+        f"sys.path.insert(0,{target.as_posix()!r});"
+        "import nplg_mcp.parser_worker_main as worker;"
+        "print(json.dumps({'module':worker.__file__},sort_keys=True))"
+    )
+    probe = subprocess.run(  # noqa: S603
+        (sys.executable, "-I", "-B", "-c", source),
+        cwd=Path("/"),
+        env=_closed_environment(),
+        check=False,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=_TIMEOUT_SECONDS,
+    )
+    assert probe.returncode == 0, (probe.stdout, probe.stderr)
+    payload = require_json_object(
+        load_json_value(probe.stdout),
+        context="installed parser worker probe",
+    )
+    module = payload["module"]
+    assert isinstance(module, str)
+    assert target.resolve(strict=True) in Path(module).resolve(strict=True).parents
+
+
 def _committed_candidate_worktree(root: Path) -> tuple[Path, str, str]:
     worktree = root / "candidate-worktree"
     worktree.mkdir()
@@ -206,4 +261,11 @@ def test_pep561_artifacts_and_external_consumers(tmp_path: Path) -> None:
     _validate_evidence_document(
         evidence,
         require_full=not artifact_only,
+    )
+    wheels = tuple((output / "dist").glob("*.whl"))
+    assert len(wheels) == 1
+    _verify_parser_worker_import_from_wheel(
+        wheel=wheels[0],
+        target=tmp_path / "installed-parser-worker",
+        cwd=tmp_path,
     )

@@ -301,7 +301,9 @@ def run_conformance(
         with tempfile.TemporaryDirectory(prefix="nplg-mcp-conformance-") as raw_dir:
             result_dir = Path(raw_dir)
             result_dir.chmod(0o700)
-            started_at_ns = time.time_ns()
+            # Compare timestamps sampled by the same filesystem clock. A userspace
+            # wall-clock sample can narrowly lead a subsequently written inode.
+            started_at_ns = result_dir.stat().st_mtime_ns
             argv = build_harness_argv(
                 url=url,
                 result_dir=result_dir,

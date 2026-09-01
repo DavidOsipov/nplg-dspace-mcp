@@ -118,16 +118,33 @@ class SearchDocumentsInput(StrictInput):
             pattern=NON_BLANK_SAFE_TEXT_PATTERN,
         ),
         AfterValidator(reject_unsafe_text),
+        Field(description="Search terms sent to the NPLG repository."),
     ]
-    cursor: (
+    cursor: Annotated[
         Annotated[
             ContractText,
             StringConstraints(min_length=0, max_length=1_024),
         ]
-        | None
-    ) = None
-    page_size: PageSize = 20
-    scope_handle: Handle | None = None
+        | None,
+        Field(
+            description=(
+                "Opaque continuation cursor returned by a previous identical search."
+            )
+        ),
+    ] = None
+    page_size: Annotated[
+        PageSize,
+        Field(description="Maximum number of results to return, from 1 through 50."),
+    ] = 20
+    scope_handle: Annotated[
+        Handle | None,
+        Field(
+            description=(
+                "Optional canonical NPLG collection or community handle that limits "
+                "the search."
+            )
+        ),
+    ] = None
 
     @field_validator("query")
     @classmethod

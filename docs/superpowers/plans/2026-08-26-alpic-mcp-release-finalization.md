@@ -186,12 +186,15 @@ Rerun Step 4 after any refactor. Leave all edits unstaged.
 
 ### Task 2: Complete the Anonymous Three-tool Alpic Metadata Slice
 
-This task implements the approved first runtime/candidate boundary: anonymous,
-sessionless Streamable HTTP for the public `alpic-metadata` profile only.
-OAuth, Auth0, DCR, protected provider custody, and private profiles remain
-explicitly deferred. Their absence is not an authentication vulnerability in
-this public metadata-only slice. This task does not establish a hosted
-deployment, deploy pack, custody, or release authority.
+This task implements the approved first runtime/candidate boundary: an
+anonymous, sessionless modern application profile for `alpic-metadata`. The
+provider-hosted Alpic transport may terminate that profile through the standard
+`initialize` lifecycle, negotiate `2025-11-25`, and issue a session identifier
+that clients must consistently reuse. OAuth, Auth0, DCR, protected provider
+custody, and private profiles remain explicitly deferred. Their absence is not
+an authentication vulnerability in this public metadata-only slice. This task
+does not establish a hosted deployment, deploy pack, custody, or release
+authority.
 
 **Files:**
 
@@ -245,11 +248,13 @@ Add or retain tests proving:
   resource, no resource templates or private resources, and no asset route;
 - malformed Host, Origin, headers, JSON, duplicate keys, bodies, and protocol
   inputs fail closed at their existing bounds;
-- the deployment verifier issues `server/discover`, `tools/list`,
-  `resources/list`, and one exact `resources/read` for `alpic-metadata`, while
-  `private-full` still verifies `nplg://about`;
-- unknown profiles, extra tools, annotation drift, session creation, and
-  malformed private resource responses are rejected.
+- the hosted `alpic-metadata` verifier issues `initialize`,
+  `notifications/initialized`, `tools/list`, `resources/list`, and one exact
+  `resources/read`, while the direct `private-full` verifier issues
+  `server/discover` and still verifies `nplg://about`;
+- unknown profiles, extra tools, annotation drift, hosted session rotation or
+  omitted reuse, direct-application session creation, and malformed private
+  resource responses are rejected.
 
 - [ ] **Step 2: Observe RED**
 
@@ -479,11 +484,14 @@ profile-input contract cannot express the approved anonymous mode, stop at
 The protected staging proof must bind the exact candidate, source tree, wheel,
 sdist, protected-workflow battery-built deploy pack, environment, deployment,
 runtime, canonical URLs, and a canonical `tools/list` digest covering the exact
-three names, schemas, and annotations. It must prove credential-free,
-sessionless Streamable HTTP behavior; the exact digest-bound client-workflow
-resource; absence of resource templates, prompts, subscriptions, private or
-dynamic resources, application-owned dynamic asset routes or private artifact
-bytes, custom application data APIs, and private-profile composition;
+three names, schemas, and annotations. It must prove credential-free hosted
+initialization, exact protocol negotiation, the initialized notification, and
+consistent reuse of any provider-issued session identifier, while separately
+proving that the direct application endpoint remains sessionless; the exact
+digest-bound client-workflow resource; absence of resource templates, prompts,
+subscriptions, private or dynamic resources, application-owned dynamic asset
+routes or private artifact bytes, custom application data APIs, and
+private-profile composition;
 Host/Origin, method,
 content-type, framing, and protocol admission; bounded
 malformed/unmatched-credential rejection; and enforcement of the exact

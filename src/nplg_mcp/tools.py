@@ -118,6 +118,16 @@ _OPEN_WORLD_TOOLS = frozenset(
         "search_documents",
     }
 )
+_TOOL_TITLES = {
+    "download_document_file": "Download a public PDF",
+    "get_document_metadata": "Read full document metadata",
+    "get_render_manifest": "Read a render manifest",
+    "inspect_pdf": "Inspect a downloaded PDF",
+    "list_document_files": "List document files",
+    "render_pdf_page_tiles": "Create crop-only page tiles",
+    "render_pdf_pages": "Render PDF pages as JPEG",
+    "search_documents": "Search NPLG Iverieli",
+}
 _PRIVATE_PDF_PIPELINE_VERSION_FIELDS = (
     "manifest_schema_version",
     "render_pipeline_version",
@@ -134,6 +144,15 @@ def _tool_annotations(name: str) -> ToolAnnotations:
         idempotent_hint=name != "download_document_file",
         open_world_hint=name in _OPEN_WORLD_TOOLS,
     )
+
+
+def _tool_title(name: str) -> str:
+    """Return the single reviewed human-readable title for a known tool."""
+    title = _TOOL_TITLES.get(name)
+    if title is None:
+        message = "tool title is unavailable"
+        raise ValueError(message)
+    return title
 
 
 def _json_string(value: object, *, context: str) -> str:
@@ -465,7 +484,7 @@ class ToolService:
                 (
                     ToolDefinition[HandleInput, DocumentMetadataOutput](
                         name="get_document_metadata",
-                        title="Read full document metadata",
+                        title=_tool_title("get_document_metadata"),
                         description=_joined_text(
                             "Read rich Dublin Core metadata for an NPLG item,",
                             "preferring OAI-DIM and falling back to the full",
@@ -479,7 +498,7 @@ class ToolService:
                     ),
                     ToolDefinition[HandleInput, DocumentFilesOutput](
                         name="list_document_files",
-                        title="List document files",
+                        title=_tool_title("list_document_files"),
                         description=_joined_text(
                             "List public or restricted bitstreams bound to a",
                             "canonical NPLG item handle.",
@@ -492,7 +511,7 @@ class ToolService:
                     ),
                     ToolDefinition[SearchDocumentsInput, SearchDocumentsOutput](
                         name="search_documents",
-                        title="Search NPLG Iverieli",
+                        title=_tool_title("search_documents"),
                         description=_joined_text(
                             "Search the NPLG DSpace repository, optionally within",
                             "a canonical collection handle, and return an opaque",
@@ -531,7 +550,7 @@ class ToolService:
         definitions: tuple[RegisteredTool, ...] = (
             ToolDefinition[DownloadDocumentInput, DownloadDocumentOutput](
                 name="download_document_file",
-                title="Download a public PDF",
+                title=_tool_title("download_document_file"),
                 description=_joined_text(
                     "Download a PDF bitstream previously discovered on the",
                     "requested NPLG item page. Arbitrary URLs are not accepted.",
@@ -544,7 +563,7 @@ class ToolService:
             ),
             ToolDefinition[HandleInput, DocumentMetadataOutput](
                 name="get_document_metadata",
-                title="Read full document metadata",
+                title=_tool_title("get_document_metadata"),
                 description=_joined_text(
                     "Read rich Dublin Core metadata for an NPLG item, preferring",
                     "OAI-DIM and falling back to the full XMLUI/Manakin record.",
@@ -557,7 +576,7 @@ class ToolService:
             ),
             ToolDefinition[RenderIdInput, RenderManifestOutput](
                 name="get_render_manifest",
-                title="Read a render manifest",
+                title=_tool_title("get_render_manifest"),
                 description=_joined_text(
                     "Read deterministic page-render metadata and signed image",
                     "URLs for an existing render identifier.",
@@ -570,7 +589,7 @@ class ToolService:
             ),
             ToolDefinition[ArtifactInput, PdfInspectionOutput](
                 name="inspect_pdf",
-                title="Inspect a downloaded PDF",
+                title=_tool_title("inspect_pdf"),
                 description=_joined_text(
                     "Classify every PDF page and report embedded scan dimensions,",
                     "effective DPI, crop, rotation, and text-overlay characteristics.",
@@ -583,7 +602,7 @@ class ToolService:
             ),
             ToolDefinition[HandleInput, DocumentFilesOutput](
                 name="list_document_files",
-                title="List document files",
+                title=_tool_title("list_document_files"),
                 description=_joined_text(
                     "List public or restricted bitstreams bound to a canonical",
                     "NPLG item handle.",
@@ -596,7 +615,7 @@ class ToolService:
             ),
             ToolDefinition[RenderTilesInput, RenderTilesOutput](
                 name="render_pdf_page_tiles",
-                title="Create crop-only page tiles",
+                title=_tool_title("render_pdf_page_tiles"),
                 description=_joined_text(
                     "Crop a rendered page into overlapping JPEG tiles without",
                     "resizing. Defaults are 2048\N{MULTIPLICATION SIGN}2048 with",
@@ -610,7 +629,7 @@ class ToolService:
             ),
             ToolDefinition[RenderPagesInput, RenderPagesOutput](
                 name="render_pdf_pages",
-                title="Render PDF pages as JPEG",
+                title=_tool_title("render_pdf_pages"),
                 description=_joined_text(
                     "Render selected pages on their native embedded-scan pixel",
                     "grid when determinable; otherwise use an explicitly labelled",
@@ -624,7 +643,7 @@ class ToolService:
             ),
             ToolDefinition[SearchDocumentsInput, SearchDocumentsOutput](
                 name="search_documents",
-                title="Search NPLG Iverieli",
+                title=_tool_title("search_documents"),
                 description=_joined_text(
                     "Search the NPLG DSpace repository, optionally within a",
                     "canonical collection handle, and return an opaque",
@@ -673,6 +692,7 @@ class ToolService:
                     "inputSchema": input_schema,
                     "outputSchema": output_schema,
                     "annotations": {
+                        "title": definition.title,
                         "readOnlyHint": definition.annotations.read_only_hint,
                         "destructiveHint": definition.annotations.destructive_hint,
                         "idempotentHint": definition.annotations.idempotent_hint,

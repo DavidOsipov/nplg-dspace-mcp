@@ -371,10 +371,23 @@ export const searchDocumentsInput = z.strictObject({
           message: "query must contain non-whitespace characters",
         });
       }
-    }),
-  cursor: inertText(CODE_POINT_LIMITS.cursor).nullable().default(null),
-  page_size: safeInteger.gte(1).lte(50).default(20),
-  scope_handle: inputHandle.nullable().default(null),
+    })
+    .describe("Search terms sent to the NPLG repository."),
+  cursor: inertText(CODE_POINT_LIMITS.cursor)
+    .nullable()
+    .default(null)
+    .describe("Opaque continuation cursor returned by a previous identical search."),
+  page_size: safeInteger
+    .gte(1)
+    .lte(50)
+    .default(20)
+    .describe("Maximum number of results to return, from 1 through 50."),
+  scope_handle: inputHandle
+    .nullable()
+    .default(null)
+    .describe(
+      "Optional canonical NPLG collection or community handle that limits the search.",
+    ),
 }).describe("Validated input for repository search.");
 
 export const searchDocumentsOutput = z.strictObject({

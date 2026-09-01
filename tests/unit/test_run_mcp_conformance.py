@@ -7,7 +7,6 @@ import json
 import os
 import socket
 import subprocess
-import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, cast
@@ -126,7 +125,7 @@ def test_runner_rejects_missing_malformed_stale_or_failed_checks(
     fault: str,
 ) -> None:
     """Refuse incomplete, stale, ambiguous, or unsuccessful harness evidence."""
-    started_at_ns = time.time_ns()
+    started_at_ns = tmp_path.stat().st_mtime_ns
     scenario_dir = tmp_path / "server-server-stateless-2026-08-21T00-00-00-000Z"
     scenario_dir.mkdir()
     checks_path = scenario_dir / "checks.json"
@@ -169,7 +168,7 @@ def test_runner_preserves_successful_wire_check_records(tmp_path: Path) -> None:
     scenario_dir = tmp_path / "server-server-stateless-2026-08-21T00-00-00-000Z"
     scenario_dir.mkdir()
     checks_path = scenario_dir / "checks.json"
-    started_at_ns = time.time_ns()
+    started_at_ns = tmp_path.stat().st_mtime_ns
     check: dict[str, object] = {
         "id": "sep-2575-example",
         "name": "Example",

@@ -10,6 +10,7 @@ import os
 import stat
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from http import HTTPStatus
 from pathlib import Path
 from typing import BinaryIO, Never, cast
 
@@ -404,6 +405,82 @@ def test_asset_resolution_maps_descriptor_errors_to_corruption(
         )
 
     assert raised.value.code is ErrorCode.INTERNAL_ERROR
+
+
+def test_asset_resolution_transfers_child_ownership_before_parent_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ContentAddressedStore(tmp_path)
+    artifact = store.put_bytes(
+        b"payload",
+        namespace="documents",
+        filename="source.bin",
+        media_type="application/octet-stream",
+    )
+    parts = tuple(artifact.relative_path.split("/"))
+    real_close = os.close
+    real_open_child = storage_module._open_resolved_asset_directory
+    opened_children: list[int] = []
+    close_calls: list[int] = []
+
+    def tracked_open_child(
+        component: str,
+        *,
+        parent_descriptor: int,
+        metadata: os.stat_result,
+    ) -> int:
+        child = real_open_child(
+            component,
+            parent_descriptor=parent_descriptor,
+            metadata=metadata,
+        )
+        opened_children.append(child)
+        return child
+
+    def fail_first_close_after_release(descriptor: int) -> None:
+        close_calls.append(descriptor)
+        real_close(descriptor)
+        if len(close_calls) == 1:
+            msg = "simulated parent close failure after descriptor release"
+            raise OSError(msg)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            storage_module,
+            "_open_resolved_asset_directory",
+            tracked_open_child,
+        )
+        patch.setattr(os, "close", fail_first_close_after_release)
+        with pytest.raises(AppError) as raised:
+            _ = storage_module._resolve_private_asset(
+                store._root_descriptor,
+                store.root,
+                parts,
+            )
+
+    assert raised.value.code is ErrorCode.INTERNAL_ERROR
+    assert raised.value.message == "Artifact storage is corrupted."
+    assert raised.value.http_status == HTTPStatus.INTERNAL_SERVER_ERROR
+    assert raised.value.safe_details is None
+    assert len(opened_children) == 1
+    child_descriptor = opened_children[0]
+    child_was_open = False
+    try:
+        _ = os.fstat(child_descriptor)
+    except OSError:
+        child_was_open = False
+    else:
+        child_was_open = True
+    finally:
+        if child_was_open:
+            real_close(child_descriptor)
+    parent_descriptor = close_calls[0]
+    assert (
+        close_calls.count(parent_descriptor),
+        close_calls.count(child_descriptor),
+        child_was_open,
+    ) == (1, 1, False)
 
 
 def test_artifact_tree_validation_enforces_depth_and_entry_bounds(
@@ -1659,6 +1736,16 @@ def test_reconcile_and_staging_reservations_reject_unavailable_or_unbalanced_sta
     assert unmanaged.value.code is ErrorCode.INVALID_INPUT
     with pytest.raises(RuntimeError, match="unbalanced"):
         store._release_staging_bytes(store.staging_dir / "missing", 1)
+
+
+def test_reconcile_lifecycle_uses_configured_authorities(tmp_path: Path) -> None:
+    store, _clock, _capacity = _coverage_lifecycle_store(tmp_path)
+
+    report = store.reconcile_lifecycle()
+
+    assert report.status == "satisfied"
+    assert report.freed_bytes == 0
+    assert report.freed_objects == 0
 
 
 def test_filename_validation_retains_a_defensive_normalization_guard(

@@ -29,7 +29,7 @@ DEFAULT_CURSOR_TTL_SECONDS = 900
 CURSOR_KEY_ID = "cursor-v1"
 _CURSOR_KEY_PURPOSE = b"nplg-mcp:cursor-signing:v1"
 _MIN_SIGNING_SECRET_BYTES = 32
-_MAX_CURSOR_OFFSET = 10_000_000
+MAX_CURSOR_OFFSET = 10_000_000
 _MAX_CURSOR_TOKEN_BYTES = 1_024
 
 BoundedKeyId = Annotated[
@@ -48,7 +48,7 @@ CanonicalHandle = Annotated[
         pattern=r"^[1-9][0-9]{0,31}/[1-9][0-9]{0,31}$",
     ),
 ]
-NonNegativeInt = Annotated[int, Ge(0), Le(_MAX_CURSOR_OFFSET)]
+NonNegativeInt = Annotated[int, Ge(0), Le(MAX_CURSOR_OFFSET)]
 PageSize = Annotated[int, Ge(1), Le(50)]
 
 
