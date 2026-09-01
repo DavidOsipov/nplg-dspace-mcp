@@ -1,7 +1,7 @@
 # Copyright (c) 2026 David Osipov
 """Adversarial properties for JSON lexical preflight."""
 # mypy: disable-error-code=misc
-# Hypothesis 6.165.9's decorators are dynamically typed at this boundary.
+# Hypothesis 6.167.1's decorators are dynamically typed at this boundary.
 
 from __future__ import annotations
 

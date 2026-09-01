@@ -84,6 +84,9 @@ consistent reuse of any gateway-issued session identifier, effective Host and
 Origin values, the exact
 `nplg://skills/georgian-newspaper-visual-analysis` Markdown resource, absence
 of resource templates and private resources, and absence of asset routes.
+The Python application process is modern-only, so this candidate-bound external proof must
+show that Alpic terminates or translates the legacy lifecycle at the public
+gateway instead of forwarding legacy frames to `/mcp` unchanged.
 OAuth/Auth0/DCR evidence is not a prerequisite for this anonymous metadata-only
 profile. Resource availability proves retrieval only; arbitrary MCP clients are
 not required to load or follow the workflow.

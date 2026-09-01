@@ -56,12 +56,12 @@ _INSUFFICIENT_SCOPE_CHALLENGE = (
 _MAX_EXTERNAL_TEXT_LENGTH = 4096
 _MAX_PERSISTED_ITEMS = 64
 _MAX_RAW_CONTRACT_BYTES = 2_097_152
-_REVIEWED_DATE = "2026-08-15"
+_REVIEWED_DATE = "2026-09-01"
 _SDK_UPSTREAM_COMMIT_UNAVAILABLE_REASON = (
     "The official PyPI wheel metadata does not publish a verified VCS commit."
 )
 _SDK_REASON = (
-    "SDK v2.0.0 applies static route scopes before MCP parsing, omits the RFC "
+    "SDK v2.1.1 applies static route scopes before MCP parsing, omits the RFC "
     "minimum-scope parameter, and accepts duplicate Authorization headers."
 )
 _ALPIC_PROVENANCE = (
@@ -71,7 +71,7 @@ _ALPIC_PROVENANCE = (
 _ALPIC_TASKS_PROVENANCE = (
     "Alpic documents a separate long-running Tasks compute path with a default "
     "TTL of up to six hours; the official Python SDK roadmap defers SEP-2663 "
-    "Tasks from mcp 2.0.0. No authorized Alpic task conformance probe exists."
+    "Tasks from mcp 2.1.1. No authorized Alpic task conformance probe exists."
 )
 _ALPIC_TASKS_BLOCKERS = (
     "MCP_TASKS_REVISION_UNFROZEN",
@@ -86,7 +86,7 @@ _ALPIC_TASKS_BLOCKERS = (
     "ALPIC_TASK_ARTIFACT_DELIVERY_UNPROVEN",
     "ALPIC_TASK_CLIENT_SUPPORT_UNPROVEN",
 )
-_TASKS_REVIEWED_DATE = "2026-08-24"
+_TASKS_REVIEWED_DATE = "2026-09-01"
 _ALPIC_TASKS_SOURCE_EVIDENCE_DIGEST = (
     "67dadaf3dee652e1f1f63dd26b3031043badffc64af4cf9c168090c422673a1b"
 )
@@ -111,8 +111,8 @@ _ALPIC_TASKS_SOURCE_REQUIREMENTS = (
     ),
 )
 _LOCKED_MCP_ARTIFACT_SHA256S = (
-    "0f440e735c13ece8bb19bc62cf0b86f4313448432fbb77d35e14034f4e050728",
-    "1cb4c75d2d2c7b8c1d756355e5d82a39f2822cc7f13e22a2051d7ca3592349d6",
+    "1c6c31c5d6471c58db76af3af8af67f46d11d01f0a59077d0a308cbdb3d3e915",
+    "50b7ba1ebbe117008ea7bdd288234043e69c20b403d6851d19661e6d431a75ef",
 )
 
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$", strict=True)]
@@ -317,8 +317,8 @@ class SdkAuthorizationCapabilityVerdict(_DigestModel):
     """Closed authorization-capability verdict for the pinned official SDK."""
 
     schema_version: Literal["2.0"]
-    mcp_version: Literal["2.0.0"]
-    mcp_types_version: Literal["2.0.0"]
+    mcp_version: Literal["2.1.1"]
+    mcp_types_version: Literal["2.1.1"]
     upstream_repository: Literal["https://github.com/modelcontextprotocol/python-sdk"]
     upstream_commit: GitObjectId | None
     upstream_commit_unavailable_reason: NonEmpty
@@ -961,8 +961,8 @@ class UnsupportedAlpicTasksCapabilityVerdict(_AlpicTasksCapabilityBase):
     """A strict negative verdict that cannot carry live-evidence identities."""
 
     extension_revision_state: TasksRevisionState
-    mcp_version: Literal["2.0.0"]
-    mcp_types_version: Literal["2.0.0"]
+    mcp_version: Literal["2.1.1"]
+    mcp_types_version: Literal["2.1.1"]
     sdk_server_support: TaskSdkSupport
     sdk_client_support: TaskSdkSupport
     provider_default_task_ttl_seconds: Literal[21600]
@@ -1683,8 +1683,8 @@ def probe_sdk_authorization() -> SdkAuthorizationCapabilityVerdict:
                 _SDK_UPSTREAM_COMMIT_UNAVAILABLE_REASON
             ),
             "locked_artifact_sha256s": (
-                "0f440e735c13ece8bb19bc62cf0b86f4313448432fbb77d35e14034f4e050728",
-                "1cb4c75d2d2c7b8c1d756355e5d82a39f2822cc7f13e22a2051d7ca3592349d6",
+                "1c6c31c5d6471c58db76af3af8af67f46d11d01f0a59077d0a308cbdb3d3e915",
+                "50b7ba1ebbe117008ea7bdd288234043e69c20b403d6851d19661e6d431a75ef",
             ),
             "installed_package_tree_sha256": _package_tree_sha256("mcp"),
             "sdk_boundary_file": "mcp/server/auth/middleware/bearer_auth.py",

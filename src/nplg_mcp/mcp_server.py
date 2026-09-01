@@ -2,9 +2,9 @@
 # mypy: disable-error-code="misc"
 """Official MCP SDK server construction for the NPLG service boundary."""
 
-# MCP 2.0.0's low-level Server registration keeps a generic request payload as
+# MCP 2.1.1's low-level Server registration keeps a generic request payload as
 # Any. Handler values cross that vendor-owned edge only here and in the strict
-# SdkHandlers adapter. Upstream: https://github.com/modelcontextprotocol/python-sdk/tree/v2.0.0
+# SdkHandlers adapter. Upstream: https://github.com/modelcontextprotocol/python-sdk/tree/v2.1.1
 
 from __future__ import annotations
 

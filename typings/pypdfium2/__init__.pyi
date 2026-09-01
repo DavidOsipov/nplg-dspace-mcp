@@ -56,7 +56,7 @@ class PdfPage(Protocol):
     def get_rotation(self) -> int: ...
     def get_objects(
         self,
-        # pypdfium2 5.8.0 exposes `filter`; renaming it would break keyword parity.
+        # pypdfium2 5.13.0 exposes `filter`; renaming it would break keyword parity.
         filter: Sequence[int] | None = None,  # noqa: A002
         max_depth: int = 15,
         form: PdfObject | None = None,
@@ -80,7 +80,7 @@ class PdfPage(Protocol):
 class PdfDocument:
     def __init__(
         self,
-        # pypdfium2 5.8.0 exposes `input`; renaming it would break keyword parity.
+        # pypdfium2 5.13.0 exposes `input`; renaming it would break keyword parity.
         input: str | Path | bytes,  # noqa: A002
         password: str | bytes | None = None,
         autoclose: bool = False,

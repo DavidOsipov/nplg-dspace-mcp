@@ -2718,7 +2718,7 @@ def test_local_gate_commands_bind_python_tools_to_the_isolated_driver() -> None:
         "cyclonedx": ("cyclonedx_py", "cyclonedx-bom", "7.3.1"),
         "mypy": ("mypy", "mypy", "2.3.1"),
         "pip-audit": ("pip_audit", "pip-audit", "2.10.1"),
-        "ruff": ("ruff", "ruff", "0.16.3"),
+        "ruff": ("ruff", "ruff", "0.16.5"),
     }
     for name, (module, distribution, version) in expected_modules.items():
         command = next(item for item in commands if item.name == name)
@@ -2743,6 +2743,7 @@ def test_local_gate_commands_bind_python_tools_to_the_isolated_driver() -> None:
     )
     zizmor = next(command for command in commands if command.name == "zizmor")
     assert zizmor.executable == Path(sys.executable).parent / "zizmor"
+    assert zizmor.version == "1.30.0"
     assert zizmor.argv[1:] == ("--offline", "--format=json", ".github/workflows")
     pyright = next(command for command in commands if command.name == "pyright")
     assert pyright.offline_evidence == (SUBJECT_DIGEST, *PYRIGHT_EVIDENCE)

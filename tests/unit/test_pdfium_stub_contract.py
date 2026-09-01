@@ -19,7 +19,7 @@ from pypdfium2 import raw as pdfium_c
 
 from tests.helpers.pdf_factory import make_raster_pdf
 
-_PINNED_PYPDFIUM_VERSION: Final = "5.8.0"
+_PINNED_PYPDFIUM_VERSION: Final = "5.13.0"
 _RASTER_WIDTH: Final = 64
 _RASTER_HEIGHT: Final = 48
 _STUB_ROOT: Final = Path(__file__).parents[2] / "typings" / "pypdfium2"
@@ -51,7 +51,7 @@ _PDF_CONSTRUCTOR_RATIONALE: Final = (
     "    # app.py, app_factory.py, test_pdf.py, and delete_render.py depend on this",
     "    # explicit keyword contract; a limits bundle crosses Task 6A/6C boundaries.",
 )
-_VENDOR_PREFIX: Final = "        # pypdfium2 5.8.0 exposes"
+_VENDOR_PREFIX: Final = "        # pypdfium2 5.13.0 exposes"
 _FILTER_RATIONALE: Final = (
     f"{_VENDOR_PREFIX} `filter`; renaming it would break keyword parity.",
 )

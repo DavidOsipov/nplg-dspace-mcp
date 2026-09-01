@@ -29,6 +29,9 @@ _SIMPLE_ESCAPES = {
     ord("r"): b"\r",
     ord("t"): b"\t",
 }
+type _JsonValueKind = Literal[
+    "array", "boolean", "integer", "null", "number", "object", "string"
+]
 
 
 class JsonPreflightError(ValueError):
@@ -79,6 +82,7 @@ class _Frame:
     ]
     members: int = 0
     keys: set[str] = field(default_factory=_empty_key_set)
+    current_key: str | None = None
     allow_end: bool = True
 
 
@@ -92,6 +96,8 @@ class _JsonPreflightParser:
         self._index = 0
         self._tokens = 0
         self._frames: list[_Frame] = []
+        self._root_object_keys: set[str] | None = None
+        self._root_request_id_is_valid = False
         self._root_complete = False
 
     def validate(self) -> None:
@@ -102,7 +108,7 @@ class _JsonPreflightParser:
         while not self._root_complete:
             self._skip_whitespace()
             if not self._frames:
-                self._begin_value()
+                _ = self._begin_value()
                 continue
 
             frame = self._frames[-1]
@@ -112,15 +118,13 @@ class _JsonPreflightParser:
                 else:
                     self._increment_array_item(frame)
                     frame.state = "array_after_value"
-                    self._begin_value()
+                    _ = self._begin_value()
             elif frame.state == "array_after_value":
                 self._consume_array_separator(frame)
             elif frame.state == "object_key_or_end":
                 self._consume_object_key(frame)
             elif frame.state == "object_value":
-                self._increment_object_member(frame)
-                frame.state = "object_after_value"
-                self._begin_value()
+                self._consume_object_value(frame)
             else:
                 self._consume_object_separator(frame)
 
@@ -128,32 +132,40 @@ class _JsonPreflightParser:
         if self._index != len(self._payload):
             self._fail()
 
-    def _begin_value(self) -> None:
+    def _begin_value(self) -> _JsonValueKind:
         self._count_token()
         value = self._peek_byte()
         if value == ord("{"):
             self._index += 1
             self._push_container("object")
+            kind: _JsonValueKind = "object"
         elif value == ord("["):
             self._index += 1
             self._push_container("array")
+            kind = "array"
         elif value == ord('"'):
             _ = self._consume_string(max_bytes=self._limits.max_scalar_bytes)
             self._finish_scalar()
+            kind = "string"
         elif value == ord("-") or self._is_digit(value):
-            self._consume_number()
+            is_integer = self._consume_number()
             self._finish_scalar()
+            kind = "integer" if is_integer else "number"
         elif self._payload.startswith(b"true", self._index):
             self._index += len(b"true")
             self._finish_scalar()
+            kind = "boolean"
         elif self._payload.startswith(b"false", self._index):
             self._index += len(b"false")
             self._finish_scalar()
+            kind = "boolean"
         elif self._payload.startswith(b"null", self._index):
             self._index += len(b"null")
             self._finish_scalar()
+            kind = "null"
         else:
             self._fail()
+        return kind
 
     def _push_container(self, kind: Literal["array", "object"]) -> None:
         if len(self._frames) >= self._limits.max_depth:
@@ -161,7 +173,22 @@ class _JsonPreflightParser:
         state: Literal["array_value_or_end", "object_key_or_end"] = (
             "array_value_or_end" if kind == "array" else "object_key_or_end"
         )
-        self._frames.append(_Frame(kind=kind, state=state))
+        frame = _Frame(kind=kind, state=state)
+        if not self._frames and kind == "object":
+            self._root_object_keys = frame.keys
+        self._frames.append(frame)
+
+    def has_root_object_member(self, member: str) -> bool:
+        """Return whether one decoded key occurs in a validated root object."""
+        if not self._root_complete:
+            self._fail()
+        return self._root_object_keys is not None and member in self._root_object_keys
+
+    def has_valid_root_request_id(self) -> bool:
+        """Return whether the root carries an SDK-compatible request identifier."""
+        if not self._root_complete:
+            self._fail()
+        return self._root_request_id_is_valid
 
     def _finish_scalar(self) -> None:
         if not self._frames:
@@ -191,12 +218,14 @@ class _JsonPreflightParser:
         if key is None or key in frame.keys:
             self._fail()
         frame.keys.add(key)
+        frame.current_key = key
         self._skip_whitespace()
         if not self._consume_byte(ord(":")):
             self._fail()
         frame.state = "object_value"
 
     def _consume_object_separator(self, frame: _Frame) -> None:
+        frame.current_key = None
         if self._consume_byte(ord(",")):
             frame.state = "object_key_or_end"
             frame.allow_end = False
@@ -204,6 +233,14 @@ class _JsonPreflightParser:
             self._finish_container()
         else:
             self._fail()
+
+    def _consume_object_value(self, frame: _Frame) -> None:
+        self._increment_object_member(frame)
+        is_root_request_id = self._is_root_request_id_value(frame)
+        frame.state = "object_after_value"
+        value_kind = self._begin_value()
+        if is_root_request_id:
+            self._root_request_id_is_valid = value_kind in {"integer", "string"}
 
     def _increment_array_item(self, frame: _Frame) -> None:
         frame.members += 1
@@ -304,12 +341,12 @@ class _JsonPreflightParser:
         self._index = end
         return int(digits.decode("ascii"), 16)
 
-    def _consume_number(self) -> None:
+    def _consume_number(self) -> bool:
         start = self._index
         self._consume_sign()
         self._consume_integer()
-        self._consume_fraction()
-        self._consume_exponent()
+        has_fraction = self._consume_fraction()
+        has_exponent = self._consume_exponent()
         if self._index - start > self._limits.max_scalar_bytes:
             self._fail()
         try:
@@ -318,6 +355,7 @@ class _JsonPreflightParser:
             self._fail()
         if not finite:
             self._fail()
+        return not has_fraction and not has_exponent
 
     def _consume_sign(self) -> None:
         if self._consume_byte(ord("-")) and self._index >= len(self._payload):
@@ -334,13 +372,15 @@ class _JsonPreflightParser:
         if digits > self._limits.max_integer_digits:
             self._fail()
 
-    def _consume_fraction(self) -> None:
+    def _consume_fraction(self) -> bool:
         if self._consume_byte(ord(".")):
             _ = self._consume_one_or_more_digits()
+            return True
+        return False
 
-    def _consume_exponent(self) -> None:
+    def _consume_exponent(self) -> bool:
         if self._peek_byte() not in {ord("e"), ord("E")}:
-            return
+            return False
         self._index += 1
         if self._peek_byte() in {ord("+"), ord("-")}:
             self._index += 1
@@ -349,6 +389,14 @@ class _JsonPreflightParser:
         )
         if exponent > self._limits.max_exponent_magnitude:
             self._fail()
+        return True
+
+    def _is_root_request_id_value(self, frame: _Frame) -> bool:
+        return (
+            len(self._frames) == 1
+            and frame.kind == "object"
+            and frame.current_key == "id"
+        )
 
     def _consume_one_or_more_digits(self, *, limit: int | None = None) -> int:
         digits = 0
@@ -402,6 +450,39 @@ def preflight_json(
     selected_limits = limits or _DEFAULT_LIMITS
     try:
         _JsonPreflightParser(payload, selected_limits).validate()
+    except JsonPreflightError:
+        raise
+    except (IndexError, OverflowError, UnicodeError, ValueError) as exc:
+        raise JsonPreflightError from exc
+
+
+def preflight_json_has_root_object_member(
+    payload: bytes,
+    *,
+    member: str,
+    limits: JsonPreflightLimits | None = None,
+) -> bool:
+    """Validate JSON once and report a decoded root-object key without reparsing."""
+    selected_limits = limits or _DEFAULT_LIMITS
+    try:
+        parser = _JsonPreflightParser(payload, selected_limits)
+        parser.validate()
+        return parser.has_root_object_member(member)
+    except JsonPreflightError:
+        raise
+    except (IndexError, OverflowError, UnicodeError, ValueError) as exc:
+        raise JsonPreflightError from exc
+
+
+def preflight_json_has_valid_root_request_id(
+    payload: bytes, *, limits: JsonPreflightLimits | None = None
+) -> bool:
+    """Validate JSON once and accept only an SDK-compatible root request ID."""
+    selected_limits = limits or _DEFAULT_LIMITS
+    try:
+        parser = _JsonPreflightParser(payload, selected_limits)
+        parser.validate()
+        return parser.has_valid_root_request_id()
     except JsonPreflightError:
         raise
     except (IndexError, OverflowError, UnicodeError, ValueError) as exc:

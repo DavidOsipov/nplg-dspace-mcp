@@ -188,6 +188,7 @@ def test_quality_command_plan_is_ordered_and_includes_typings() -> None:
     ]
     assert all(Path(command.argv[0]).is_absolute() for command in commands)
     assert all("typings" in " ".join(command.argv) for command in commands)
+    assert [command.version for command in commands[:2]] == ["0.16.5", "0.16.5"]
     assert commands[0].argv[1:3] == ("format", "--check")
     assert commands[1].argv[1:4] == ("check", "--output-format", "json")
     assert commands[2].argv[:2] == (
@@ -273,7 +274,7 @@ def test_tool_version_probes_are_exact_and_use_managed_node_directly() -> None:
     probes = version_probes(Path("/repo"), Path("/managed/bin/node"))
 
     assert [(probe.command, probe.expected_stdout) for probe in probes] == [
-        (("/repo/.venv/bin/ruff", "--version"), b"ruff 0.16.3\n"),
+        (("/repo/.venv/bin/ruff", "--version"), b"ruff 0.16.5\n"),
         (("/managed/bin/node", "--version"), b"v24.19.0\n"),
         (
             (
@@ -1955,7 +1956,7 @@ def test_quality_gate_runs_versions_and_commands_in_an_isolated_cache(
     commands = (
         ToolCommand(
             tool="ruff",
-            version="0.16.3",
+            version="0.16.5",
             python_target="3.12",
             diagnostic=False,
             argv=("/ruff", "check"),

@@ -4,9 +4,9 @@ The source code authored for **NPLG DSpace MCP** is licensed under the MIT Licen
 
 ## Production PDF runtime
 
-### pypdfium2 5.8.0 and PDFium
+### pypdfium2 5.13.0 and PDFium
 
-The production PDF renderer is `pypdfium2==5.8.0`.
+The production PDF renderer is `pypdfium2==5.13.0`.
 
 - pypdfium2 is offered under Apache-2.0 and BSD-3-Clause terms.
 - PDFium is distributed under a BSD-style license.
@@ -16,7 +16,7 @@ This notice is a routing summary, not a replacement for the complete license tex
 
 ## Synthetic-PDF test dependencies
 
-The optional test environment uses `reportlab==4.4.9` and `pypdf==6.16.1` to generate deterministic PDF fixtures. Both are permissively licensed. PyMuPDF/MuPDF is not a runtime or test dependency of this project.
+The optional test environment uses `reportlab==5.0.1` and `pypdf==6.16.2` to generate deterministic PDF fixtures. Both are permissively licensed. PyMuPDF/MuPDF is not a runtime or test dependency of this project.
 
 ## Other dependencies
 

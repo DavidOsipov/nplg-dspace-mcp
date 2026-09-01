@@ -93,20 +93,20 @@ _SUCCESS_RETURN_CODES = frozenset({0})
 _GIT_EXECUTABLE = "/usr/bin/git"
 _SUPPORTED_PYTHON_VERSIONS = frozenset({(3, 12), (3, 13), (3, 14)})
 _PINNED_RUNTIME_DISTRIBUTIONS = (
-    ("coverage", "7.15.4"),
-    ("diff-cover", "10.5.0"),
-    ("hypothesis", "6.165.9"),
+    ("coverage", "7.16.0"),
+    ("diff-cover", "10.5.1"),
+    ("hypothesis", "6.167.1"),
     ("pytest", "9.1.1"),
 )
 _TRUSTED_TOOL_MODULES = (
-    ("coverage", "coverage", "7.15.4"),
-    ("diff_cover", "diff-cover", "10.5.0"),
+    ("coverage", "coverage", "7.16.0"),
+    ("diff_cover", "diff-cover", "10.5.1"),
     ("pytest", "pytest", "9.1.1"),
 )
 _MUTATION_TRUSTED_TOOL_MODULES = (
     ("mutmut", "mutmut", "3.7.0"),
     ("pytest", "pytest", "9.1.1"),
-    ("coverage", "coverage", "7.15.4"),
+    ("coverage", "coverage", "7.16.0"),
 )
 _TRUSTED_TOOL_SHADOWS = (
     "coverage.py",

@@ -229,10 +229,10 @@ CONTRACT_SOURCE_INVENTORY = (
 PHASE_TWO_NODE_PINS = {
     "@eslint/js": "10.0.1",
     "@types/node": "24.13.3",
-    "eslint": "10.8.1",
+    "eslint": "10.9.1",
     "markdownlint-cli2": "0.23.2",
     "typescript": "6.0.3",
-    "typescript-eslint": "8.67.0",
+    "typescript-eslint": "8.69.0",
     "zod": "4.5.4",
 }
 PACKAGE_LOCK_EVIDENCE_JOBS = 2
@@ -382,7 +382,7 @@ def test_quality_lock_keeps_security_linter_separate() -> None:
     development = (ROOT / "requirements-dev.in").read_text(encoding="utf-8")
     security = (ROOT / "requirements-security.in").read_text(encoding="utf-8")
     assert "semgrep" not in development.lower()
-    assert "semgrep==1.173.0" in security
+    assert "semgrep==1.175.0" in security
 
 
 def test_ci_runs_the_strict_quality_contract_with_release_identity() -> None:

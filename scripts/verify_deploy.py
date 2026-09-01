@@ -220,7 +220,7 @@ _INPUT_SCHEMA_ROOTS_BY_TOOL: dict[str, str] = {
 }
 _CONTRACT_SCHEMA_ID = "https://nplg-dspace-mcp.invalid/contracts/tool-contracts/v1"
 _CONTRACT_EXPORTER_VERSION = "1.0.0-title-strip-codepoint-v1"
-_CONTRACT_PYDANTIC_VERSION = "2.13.4"
+_CONTRACT_PYDANTIC_VERSION = "2.13.5"
 _CONTRACT_ZOD_VERSION = "4.5.4"
 _CONTRACT_MANIFEST_VERSION = 1
 _BASELINE_MANIFEST_VERSION = 3

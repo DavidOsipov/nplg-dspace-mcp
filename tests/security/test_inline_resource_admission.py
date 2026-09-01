@@ -126,7 +126,9 @@ def _receive() -> Receive:
         if sent:
             return _message({"type": "http.disconnect"})
         sent = True
-        return _message({"type": "http.request", "body": b"{}", "more_body": False})
+        return _message(
+            {"type": "http.request", "body": b'{"id":1}', "more_body": False}
+        )
 
     return receive
 

@@ -4,7 +4,7 @@ Upstream-read-only Streamable HTTP MCP server for the National Parliamentary Lib
 
 ## What is implemented
 
-- The direct/private application endpoint is sessionless MCP `2026-07-28` over `POST /mcp` and uses `server/discover`. Alpic's hosted gateway uses standard `initialize`, currently negotiates `2025-11-25`, requires `notifications/initialized`, and may issue an `Mcp-Session-Id` that must be reused.
+- The direct/private application endpoint is sessionless MCP `2026-07-28` over `POST /mcp` and uses `server/discover`. Alpic's hosted gateway separately owns the public legacy `initialize` lifecycle, currently negotiates `2025-11-25`, requires `notifications/initialized`, and may issue an `Mcp-Session-Id` that must be reused; a passing candidate-bound hosted verification proves that lifecycle is terminated or translated at the gateway rather than forwarded to the modern-only application process.
 - NPLG-specific current JSPUI, legacy DSpace 5.5 XMLUI/Manakin, and OAI-PMH adapters; this is intentionally not a generic DSpace scraper.
 - Exact-origin, canonical-handle, DNS/IP, redirect, MIME, signature, streaming-size, and path controls.
 - Rich Dublin Core metadata with OAI-DIM preference and bounded JSPUI/XMLUI repository-HTML fallback.
@@ -84,8 +84,8 @@ the repository-pinned SHA-256 after accepted upstream-evidence review. Runtime
 and development dependencies are hash-pinned.
 
 `requirements-security.in` is intentionally separate from
-`requirements-dev.in`: Semgrep `1.173.0` hard-pins `mcp==1.29.0`, which is
-incompatible with the required official `mcp==2.0.0`. Combining those inputs
+`requirements-dev.in`: Semgrep `1.175.0` hard-pins `mcp==1.29.0`, which is
+incompatible with the required official `mcp==2.1.1`. Combining those inputs
 would produce an unsatisfiable lock rather than a stricter environment.
 
 ```bash

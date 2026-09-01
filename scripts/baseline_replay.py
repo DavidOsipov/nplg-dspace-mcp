@@ -1442,10 +1442,12 @@ def _normalize_tool_render_identity(
         msg = "render result omitted its strict identity"
         raise BaselineCaptureError(msg)
     if live:
-        expected = expected_live_render_id or _render_identity_from_result(copied)
-        if render_id != expected:
-            msg = "live render result changed its version-bound identity"
-            raise BaselineCaptureError(msg)
+        _validate_live_render_identity(
+            copied,
+            name=name,
+            render_id=render_id,
+            expected_live_render_id=expected_live_render_id,
+        )
     elif render_id != FIXED_RENDER_ID:
         msg = "frozen render oracle changed its reviewed identity"
         raise BaselineCaptureError(msg)
@@ -1453,7 +1455,32 @@ def _normalize_tool_render_identity(
     if not isinstance(normalized, dict):
         msg = "normalized render result is not an object"
         raise BaselineCaptureError(msg)
+    if name in {"get_render_manifest", "render_pdf_pages"}:
+        _ = normalized.pop("renderer_version", None)
     return normalized
+
+
+def _validate_live_render_identity(
+    copied: ReplayJsonObject,
+    *,
+    name: object,
+    render_id: str,
+    expected_live_render_id: str | None,
+) -> None:
+    """Reject any live render ID that is not bound to its reviewed provenance."""
+    if name in {"get_render_manifest", "render_pdf_pages"}:
+        expected = _render_identity_from_result(copied)
+        if expected_live_render_id is not None and expected != expected_live_render_id:
+            msg = "live render result changed its version-bound identity"
+            raise BaselineCaptureError(msg)
+    elif expected_live_render_id is not None:
+        expected = expected_live_render_id
+    else:
+        msg = "live tile result omitted its established render identity"
+        raise BaselineCaptureError(msg)
+    if render_id != expected:
+        msg = "live render result changed its version-bound identity"
+        raise BaselineCaptureError(msg)
 
 
 def _render_identity_from_result(copied: ReplayJsonObject) -> str:
@@ -1589,6 +1616,11 @@ def _replay_tool_result(
     _ = copied.pop("asset_url", None)
     _ = copied.pop("manifest_asset_url", None)
     name = case.params.get("name")
+    if name == "inspect_pdf":
+        renderer_version = copied.pop("renderer_version", None)
+        if not isinstance(renderer_version, str) or not renderer_version:
+            msg = "PDF inspection renderer provenance is invalid"
+            raise BaselineCaptureError(msg)
     collection_key: Literal["pages", "tiles"] | None = None
     if name in {"get_render_manifest", "render_pdf_pages"}:
         collection_key = "pages"
@@ -1879,7 +1911,6 @@ def _matches_render_resource(
         "manifest_relative_path",
         "mode",
         "render_id",
-        "renderer_version",
         "resource_uri",
         "source_sha256",
     }

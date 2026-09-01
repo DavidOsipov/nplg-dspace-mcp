@@ -52,6 +52,8 @@ from nplg_mcp.json_types import (
     load_json_value,
     require_json_object,
 )
+from nplg_mcp.pdf_executor import DEFAULT_FALLBACK_DPI
+from nplg_mcp.pdf_identity import RenderIdentityRequest, render_identifier
 from scripts import baseline_capture_io, baseline_replay, capture_baseline
 from tests.helpers import pdf_factory
 from tests.helpers.app_factory import make_tool_service
@@ -160,6 +162,7 @@ _PRIVATE_REPLAY_CALLS = {
         "_matches_live_sdk_case",
         "_matches_render_resource",
         "_normalize_render_collection",
+        "_normalize_tool_render_identity",
         "_normalized_render_pages",
         "_replay_tool_result",
         "_sdk_error",
@@ -542,6 +545,202 @@ def test_live_resource_matchers_reject_missing_and_malformed_content() -> None:
         )
         is False
     )
+
+
+def test_live_render_matcher_normalizes_only_a_recomputed_version_bound_identity() -> (
+    None
+):
+    """A renderer upgrade needs a new ID, but cannot change frozen pixel semantics."""
+    resources = load_fixture_index("resources.json")
+    record = require_test_object(
+        resources["resource.read-render.legacy"],
+        context="frozen render record",
+    )
+    expected = require_test_object(record["expected"], context="frozen render expected")
+    payload = require_test_object(expected["payload"], context="frozen render payload")
+    result = require_test_object(payload["result"], context="frozen render result")
+    frozen_contents = copy.deepcopy(
+        require_test_array(result["contents"], context="frozen render contents")
+    )
+    version_only_contents = copy.deepcopy(frozen_contents)
+    version_only_content = require_test_object(
+        version_only_contents[0],
+        context="version-only render content",
+    )
+    raw_manifest = version_only_content.get("text")
+    assert isinstance(raw_manifest, str)
+    manifest = require_test_object(
+        load_json_value(raw_manifest),
+        context="version-only render manifest",
+    )
+    old_render_id = manifest.get("render_id")
+    source_sha256 = manifest.get("source_sha256")
+    pages = require_test_array(manifest.get("pages"), context="version-only pages")
+    page = require_test_object(pages[0], context="version-only page")
+    page_number = page.get("page_number")
+    assert isinstance(old_render_id, str)
+    assert isinstance(source_sha256, str)
+    assert type(page_number) is int
+
+    upgraded_renderer_version = "pdfium-153.0.7999.0_pypdfium2-5.13.0_pillow-12.3.0"
+    manifest["renderer_version"] = upgraded_renderer_version
+    version_only_content["text"] = json.dumps(
+        manifest,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    assert (
+        _PRIVATE_REPLAY_CALLS["_matches_render_resource"](
+            version_only_contents,
+            frozen_contents,
+        )
+        is False
+    )
+
+    upgraded_render_id = render_identifier(
+        RenderIdentityRequest(
+            source_sha256=source_sha256,
+            pages=(page_number,),
+            mode="native",
+            renderer_version=upgraded_renderer_version,
+            fallback_dpi=DEFAULT_FALLBACK_DPI,
+        )
+    )
+    upgraded_contents = cast(
+        "list[JsonValue]",
+        load_json_value(
+            json.dumps(version_only_contents, ensure_ascii=True).replace(
+                old_render_id,
+                upgraded_render_id,
+            )
+        ),
+    )
+    upgraded_content = require_test_object(
+        upgraded_contents[0],
+        context="upgraded render content",
+    )
+    upgraded_manifest_text = upgraded_content.get("text")
+    assert isinstance(upgraded_manifest_text, str)
+    upgraded_manifest = require_test_object(
+        load_json_value(upgraded_manifest_text),
+        context="upgraded render manifest",
+    )
+    upgraded_pages = require_test_array(
+        upgraded_manifest.get("pages"),
+        context="upgraded render pages",
+    )
+    upgraded_page = require_test_object(
+        upgraded_pages[0],
+        context="upgraded render page",
+    )
+    page_sha256 = upgraded_page.get("sha256")
+    assert isinstance(page_sha256, str)
+    upgraded_page["resource_uri"] = f"nplg://artifact/doc_{page_sha256}"
+    upgraded_content["text"] = json.dumps(
+        upgraded_manifest,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    assert (
+        _PRIVATE_REPLAY_CALLS["_matches_render_resource"](
+            upgraded_contents,
+            frozen_contents,
+        )
+        is True
+    )
+
+
+def test_tool_render_normalizer_recomputes_before_discarding_renderer_version() -> None:
+    """A supplied setup ID cannot mask a forged current renderer version."""
+    source_sha256 = "3" * 64
+    current_renderer_version = "pdfium-153.0.7999.0_pypdfium2-5.13.0_pillow-12.3.0"
+    current_render_id = render_identifier(
+        RenderIdentityRequest(
+            source_sha256=source_sha256,
+            pages=(1,),
+            mode="native",
+            renderer_version=current_renderer_version,
+            fallback_dpi=DEFAULT_FALLBACK_DPI,
+        )
+    )
+    current: JsonObject = {
+        "mode": "native",
+        "pages": [{"page_number": 1}],
+        "render_id": current_render_id,
+        "renderer_version": current_renderer_version,
+        "source_sha256": source_sha256,
+    }
+    normalize = _PRIVATE_REPLAY_CALLS["_normalize_tool_render_identity"]
+    normalized_current = require_test_object(
+        normalize(
+            copy.deepcopy(current),
+            name="get_render_manifest",
+            live=True,
+            expected_live_render_id=current_render_id,
+        ),
+        context="normalized current render",
+    )
+    assert "renderer_version" not in normalized_current
+
+    forged = copy.deepcopy(current)
+    forged["renderer_version"] = "forged-renderer-version"
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError,
+        match="version-bound identity",
+    ):
+        _ = normalize(
+            forged,
+            name="get_render_manifest",
+            live=True,
+            expected_live_render_id=current_render_id,
+        )
+
+
+@pytest.mark.parametrize("renderer_version", [None, "", 1])
+def test_inspection_replay_requires_string_renderer_provenance(
+    renderer_version: int | str | None,
+) -> None:
+    """Inspection provenance is required before its reviewed version is normalized."""
+    fixture = load_fixture_index("result-cases.json")
+    record = require_test_object(
+        fixture["tool.inspect_pdf.legacy.success"],
+        context="frozen inspection record",
+    )
+    expected = require_test_object(
+        record["expected"],
+        context="frozen inspection expected",
+    )
+    payload = require_test_object(
+        expected["payload"],
+        context="frozen inspection payload",
+    )
+    result = copy.deepcopy(
+        require_test_object(payload["result"], context="frozen inspection result")
+    )
+    structured_content = require_test_object(
+        result["structuredContent"],
+        context="frozen inspection structured content",
+    )
+    if renderer_version is None:
+        _ = structured_content.pop("renderer_version")
+    else:
+        structured_content["renderer_version"] = renderer_version
+
+    case = copy.copy(_replay_case("tool-success"))
+    inspection_params: dict[str, str] = {"name": "inspect_pdf"}
+    object.__setattr__(case, "params", inspection_params)
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError,
+        match="PDF inspection renderer provenance",
+    ):
+        _ = _PRIVATE_REPLAY_CALLS["_replay_tool_result"](
+            case,
+            _SdkProjection(result),
+            live=True,
+        )
 
 
 def test_live_case_matcher_executes_default_protocol_comparison() -> None:
@@ -6059,7 +6258,7 @@ EXPECTED_TASK1_SUPPRESSIONS = (
     ),
     SuppressionOccurrence(
         path="tests/contracts/test_frozen_baseline.py",
-        line=998,
+        line=1197,
         rationale=(
             (
                 "# Security rationale: GIT_EXECUTABLE is absolute; fixed "
@@ -6075,7 +6274,7 @@ EXPECTED_TASK1_SUPPRESSIONS = (
     ),
     SuppressionOccurrence(
         path="tests/contracts/test_frozen_baseline.py",
-        line=4296,
+        line=4495,
         rationale=(
             (
                 "# Security rationale: sys.executable launches only the "

@@ -128,7 +128,7 @@ async def test_bounded_body_ignores_unexpected_event_before_request_chunk(
     sdk_entries = 0
     incoming: list[dict[str, object]] = [
         {"type": "unexpected.event"},
-        {"type": "http.request", "body": b"{}", "more_body": False},
+        {"type": "http.request", "body": b'{"id":1}', "more_body": False},
     ]
 
     async def downstream(_scope: Scope, _receive: Receive, send: Send) -> None:
@@ -190,7 +190,7 @@ async def test_deadline_after_complete_response_does_not_send_another_body(
         received = True
         request: dict[str, object] = {
             "type": "http.request",
-            "body": b"{}",
+            "body": b'{"id":1}',
             "more_body": False,
         }
         return cast("Message", request)

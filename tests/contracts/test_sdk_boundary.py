@@ -1019,10 +1019,10 @@ def test_runtime_manifests_pin_the_official_sdk_transport_stack() -> None:
     requirements = Path("requirements.in").read_text(encoding="utf-8")
     project = Path("pyproject.toml").read_text(encoding="utf-8")
     expected = {
-        "mcp==2.0.0",
-        "mcp-types==2.0.0",
-        "httpx2==2.9.0",
-        "httpcore2==2.9.0",
+        "mcp==2.1.1",
+        "mcp-types==2.1.1",
+        "httpx2==2.12.0",
+        "httpcore2==2.12.0",
         "truststore==0.10.4",
         "jsonschema==4.26.0",
         "opentelemetry-api==1.44.0",

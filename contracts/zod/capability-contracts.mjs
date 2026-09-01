@@ -10,21 +10,21 @@ import { z } from "zod";
 const MAX_EXTERNAL_TEXT_LENGTH = 4096;
 const MAX_PERSISTED_ITEMS = 64;
 const MAX_RAW_CONTRACT_BYTES = 2_097_152;
-const REVIEWED_DATE = "2026-08-15";
+const REVIEWED_DATE = "2026-09-01";
 const SDK_UPSTREAM_COMMIT_UNAVAILABLE_REASON = "The official PyPI wheel metadata does not publish a verified VCS commit.";
-const SDK_REASON = "SDK v2.0.0 applies static route scopes before MCP parsing, omits the RFC minimum-scope parameter, and accepts duplicate Authorization headers.";
+const SDK_REASON = "SDK v2.1.1 applies static route scopes before MCP parsing, omits the RFC minimum-scope parameter, and accepts duplicate Authorization headers.";
 const ALPIC_PROVENANCE = "Alpic public documentation summary; no versioned raw detector fixture or immutable response transcript was published for this review.";
-const ALPIC_TASKS_PROVENANCE = "Alpic documents a separate long-running Tasks compute path with a default TTL of up to six hours; the official Python SDK roadmap defers SEP-2663 Tasks from mcp 2.0.0. No authorized Alpic task conformance probe exists.";
-const ALPIC_TASKS_REVIEWED_DATE = "2026-08-24";
+const ALPIC_TASKS_PROVENANCE = "Alpic documents a separate long-running Tasks compute path with a default TTL of up to six hours; the official Python SDK roadmap defers SEP-2663 Tasks from mcp 2.1.1. No authorized Alpic task conformance probe exists.";
+const ALPIC_TASKS_REVIEWED_DATE = "2026-09-01";
 const ALPIC_TASKS_SOURCE_EVIDENCE_DIGEST = "67dadaf3dee652e1f1f63dd26b3031043badffc64af4cf9c168090c422673a1b";
 const RESOURCE_METADATA_URL = "https://mcp.example.test/.well-known/oauth-protected-resource";
 const INVALID_TOKEN_CHALLENGE = `Bearer error="invalid_token", error_description="Authentication required", resource_metadata="${RESOURCE_METADATA_URL}"`;
 const INSUFFICIENT_SCOPE_CHALLENGE = `Bearer error="insufficient_scope", error_description="Required scope: nplg:search", resource_metadata="${RESOURCE_METADATA_URL}"`;
-const INSTALLED_MCP_TREE_SHA256 = "c8a7f99464c9a0ed755526a539c63db31a12d178a09061e979234ade529eeb49";
+const INSTALLED_MCP_TREE_SHA256 = "9a459bc5a9814fba453cdf809b50dd73fd67db0ffd5df9c7fe52b555dffe5a23";
 const SDK_BOUNDARY_SHA256 = "7d3b6ce44ffd7f90b55984bf46a0f51049ce683486f5512b1a0466be69aa6ae0";
 const LOCKED_MCP_ARTIFACT_SHA256S = [
-  "0f440e735c13ece8bb19bc62cf0b86f4313448432fbb77d35e14034f4e050728",
-  "1cb4c75d2d2c7b8c1d756355e5d82a39f2822cc7f13e22a2051d7ca3592349d6",
+  "1c6c31c5d6471c58db76af3af8af67f46d11d01f0a59077d0a308cbdb3d3e915",
+  "50b7ba1ebbe117008ea7bdd288234043e69c20b403d6851d19661e6d431a75ef",
 ];
 
 const sha256 = z.string().regex(/^[0-9a-f]{64}$/);
@@ -557,8 +557,8 @@ const sdkBlockers = z.tuple([
 
 export const sdkAuthorizationCapabilitySchema = z.strictObject({
   schema_version: z.literal("2.0"),
-  mcp_version: z.literal("2.0.0"),
-  mcp_types_version: z.literal("2.0.0"),
+  mcp_version: z.literal("2.1.1"),
+  mcp_types_version: z.literal("2.1.1"),
   upstream_repository: z.literal("https://github.com/modelcontextprotocol/python-sdk"),
   upstream_commit: gitObjectId.nullable(),
   upstream_commit_unavailable_reason: z.literal(SDK_UPSTREAM_COMMIT_UNAVAILABLE_REASON),
@@ -850,8 +850,8 @@ const alpicTasksCommonShape = {
 const unsupportedAlpicTasksCapabilitySchema = z.strictObject({
   ...alpicTasksCommonShape,
   extension_revision_state: z.literal("draft"),
-  mcp_version: z.literal("2.0.0"),
-  mcp_types_version: z.literal("2.0.0"),
+  mcp_version: z.literal("2.1.1"),
+  mcp_types_version: z.literal("2.1.1"),
   installed_sdk_tree_sha256: z.literal(INSTALLED_MCP_TREE_SHA256),
   sdk_server_support: z.literal("unsupported"),
   sdk_client_support: z.literal("unsupported"),

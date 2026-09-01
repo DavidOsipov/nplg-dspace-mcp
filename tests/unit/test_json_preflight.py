@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING, Literal
 
 import pytest
 from pydantic import ValidationError
@@ -13,7 +14,12 @@ from nplg_mcp.json_preflight import (
     JsonPreflightError,
     JsonPreflightLimits,
     preflight_json,
+    preflight_json_has_root_object_member,
+    preflight_json_has_valid_root_request_id,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def test_accepts_valid_json_without_normalizing_the_input() -> None:
@@ -21,6 +27,72 @@ def test_accepts_valid_json_without_normalizing_the_input() -> None:
     payload = b'{"a":[true,null,-12.3e+2,"text"]}'
 
     preflight_json(payload)
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (b'{"id":1}', "present"),
+        (b'{"\\u0069d":1}', "present"),
+        (b'{"nested":{"id":1}}', "absent"),
+        (b'{"label":"id"}', "absent"),
+        (b'[{"id":1}]', "absent"),
+    ],
+    ids=["root", "escaped-root", "nested", "value", "array"],
+)
+def test_reports_only_decoded_root_object_member_presence(
+    payload: bytes, expected: Literal["present", "absent"]
+) -> None:
+    """The HTTP boundary can inspect one root key without reparsing JSON."""
+    assert preflight_json_has_root_object_member(payload, member="id") is (
+        expected == "present"
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (b'{"id":0}', "accepted"),
+        (b'{"id":-1}', "accepted"),
+        (b'{"id":"request"}', "accepted"),
+        (b'{"\\u0069d":"request"}', "accepted"),
+        (b"{}", "rejected"),
+        (b'{"id":null}', "rejected"),
+        (b'{"id":true}', "rejected"),
+        (b'{"id":false}', "rejected"),
+        (b'{"id":{}}', "rejected"),
+        (b'{"id":[]}', "rejected"),
+        (b'{"id":1.0}', "rejected"),
+        (b'{"id":1e0}', "rejected"),
+        (b'{"nested":{"id":1}}', "rejected"),
+    ],
+    ids=[
+        "zero",
+        "negative-integer",
+        "string",
+        "escaped-root-key",
+        "absent",
+        "null",
+        "true",
+        "false",
+        "object",
+        "array",
+        "fraction",
+        "exponent",
+        "nested",
+    ],
+)
+def test_accepts_only_a_strict_root_json_rpc_request_identifier(
+    payload: bytes, expected: Literal["accepted", "rejected"]
+) -> None:
+    """Only SDK-compatible root request IDs can pass the HTTP notification guard."""
+    assert preflight_json_has_valid_root_request_id(payload) is (expected == "accepted")
+
+
+def test_root_member_inspection_preserves_the_same_malformed_json_boundary() -> None:
+    """Root-key inspection must not turn malformed input into a false green."""
+    with pytest.raises(JsonPreflightError, match="Invalid JSON request body"):
+        _ = preflight_json_has_root_object_member(b'{"id":', member="id")
 
 
 @pytest.mark.parametrize(
@@ -143,6 +215,50 @@ def test_preflight_never_invokes_standard_decoded_tree_constructors(
     monkeypatch.setattr(json, "loads", decoded_tree_forbidden)
 
     preflight_json(b'{"a":[true,null,-12.3e+2,"text"]}')
+
+
+def test_root_accessors_reject_reads_before_validation() -> None:
+    """Root metadata remains unavailable until the lexical validation completes."""
+    parser = json_preflight_module._JsonPreflightParser(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        b'{"id":1}', JsonPreflightLimits()
+    )
+
+    with pytest.raises(JsonPreflightError, match="Invalid JSON request body"):
+        _ = parser.has_root_object_member("id")
+    with pytest.raises(JsonPreflightError, match="Invalid JSON request body"):
+        _ = parser.has_valid_root_request_id()
+
+
+@pytest.mark.parametrize(
+    "invoke",
+    [
+        pytest.param(
+            lambda: preflight_json_has_root_object_member(b'{"id":1}', member="id"),
+            id="root-object-member",
+        ),
+        pytest.param(
+            lambda: preflight_json_has_valid_root_request_id(b'{"id":1}'),
+            id="root-request-id",
+        ),
+    ],
+)
+def test_accessor_wrappers_convert_unexpected_parser_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    invoke: Callable[[], bool],
+) -> None:
+    """Unexpected lexical parser failures never escape either public accessor."""
+
+    def unexpected_index_error(_self: object) -> None:
+        raise IndexError
+
+    monkeypatch.setattr(
+        json_preflight_module._JsonPreflightParser,  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        "validate",
+        unexpected_index_error,
+    )
+
+    with pytest.raises(JsonPreflightError, match="Invalid JSON request body"):
+        _ = invoke()
 
 
 @pytest.mark.parametrize(

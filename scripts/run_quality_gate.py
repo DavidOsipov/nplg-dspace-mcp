@@ -603,14 +603,14 @@ def command_plan(
     commands: list[ToolCommand] = [
         ToolCommand(
             tool="ruff",
-            version="0.16.3",
+            version="0.16.5",
             python_target="3.12",
             diagnostic=False,
             argv=(ruff, "format", "--check", *config, *selected),
         ),
         ToolCommand(
             tool="ruff",
-            version="0.16.3",
+            version="0.16.5",
             python_target="3.12",
             diagnostic=True,
             argv=(ruff, "check", "--output-format", "json", *config, *selected),
@@ -662,7 +662,7 @@ def version_probes(root: Path, node_executable: Path) -> tuple[VersionProbe, ...
     return (
         VersionProbe(
             command=((root / ".venv" / "bin" / "ruff").as_posix(), "--version"),
-            expected_stdout=b"ruff 0.16.3\n",
+            expected_stdout=b"ruff 0.16.5\n",
         ),
         VersionProbe(
             command=(node_executable.as_posix(), "--version"),
@@ -1165,7 +1165,7 @@ def run_self_test(root: Path, node_executable: Path) -> None:
         commands: tuple[ToolCommand, ToolCommand, ToolCommand] = (
             ToolCommand(
                 tool="ruff",
-                version="0.16.3",
+                version="0.16.5",
                 python_target="3.12",
                 diagnostic=True,
                 argv=(

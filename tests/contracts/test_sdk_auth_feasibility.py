@@ -99,8 +99,8 @@ def test_sdk_probe_is_a_strict_unsupported_v2_contract() -> None:
         "MCP_DYNAMIC_SCOPE_403_UNSUPPORTED",
         "SDK_DUPLICATE_AUTHORIZATION_REQUIRES_OUTER_REJECTION",
     )
-    assert verdict.mcp_version == "2.0.0"
-    assert verdict.mcp_types_version == "2.0.0"
+    assert verdict.mcp_version == "2.1.1"
+    assert verdict.mcp_types_version == "2.1.1"
     assert verdict.protocol_revision == "MCP-2026-07-28"
     assert verdict.upstream_commit is None
     assert verdict.upstream_commit_unavailable_reason

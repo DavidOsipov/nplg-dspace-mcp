@@ -7302,8 +7302,8 @@ def test_legacy_trusted_driver_modes_and_proofs_remain_closed(
         (module, distribution, version)
         for module, distribution, version, _origin in proofs[0]
     ) == (
-        ("coverage", "coverage", "7.15.4"),
-        ("diff_cover", "diff-cover", "10.5.0"),
+        ("coverage", "coverage", "7.16.0"),
+        ("diff_cover", "diff-cover", "10.5.1"),
         ("pytest", "pytest", "9.1.1"),
     )
 
@@ -7335,7 +7335,7 @@ def test_trusted_mutation_command_dispatches_the_fixed_toolchain(
     ) == (
         ("mutmut", "mutmut", "3.7.0"),
         ("pytest", "pytest", "9.1.1"),
-        ("coverage", "coverage", "7.15.4"),
+        ("coverage", "coverage", "7.16.0"),
     )
     result = SystemExecutor()(
         CommandRequest(

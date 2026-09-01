@@ -83,6 +83,7 @@ MCP_PROTOCOL_VERSION_REQUIRED = -32020
 MCP_PROTOCOL_VERSION_UNSUPPORTED = -32022
 REQUEST_BODY_LIMIT_BYTES = 4096
 OVERSIZED_REQUEST_CHUNK_BYTES = REQUEST_BODY_LIMIT_BYTES + 1
+_MINIMAL_ROOT_ID_BODY = b'{"id":1}'
 EXPECTED_ADMITTED_TOOL_CALLS = 2
 _STORAGE_WORK_CAPACITY = 2
 _LEASE_TEST_GIB = 1024 * 1024 * 1024
@@ -597,7 +598,9 @@ async def test_safe_http_token_protocol_version_reaches_sdk_unchanged(
         transport=httpx.ASGITransport(app=application),
         base_url="https://mcp.example.test",
     ) as client:
-        response = await client.post("/mcp", headers=headers, content=b"{}")
+        response = await client.post(
+            "/mcp", headers=headers, content=_MINIMAL_ROOT_ID_BODY
+        )
 
     assert response.status_code == HTTPStatus.OK
     assert seen_versions == [b"v999+test"]
@@ -683,6 +686,113 @@ async def test_unsafe_protocol_version_bytes_stop_before_sdk(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"jsonrpc":"2.0","method":"tools/list"}',
+        b'{"jsonrpc":"2.0","id":null,"method":"tools/list"}',
+        b'{"jsonrpc":"2.0","id":true,"method":"tools/list"}',
+        b'{"jsonrpc":"2.0","id":false,"method":"tools/list"}',
+        b'{"jsonrpc":"2.0","id":{},"method":"tools/list"}',
+        b'{"jsonrpc":"2.0","id":[],"method":"tools/list"}',
+        b'{"jsonrpc":"2.0","id":1.0,"method":"tools/list"}',
+        b'{"jsonrpc":"2.0","id":1e0,"method":"tools/list"}',
+        b'{"jsonrpc":"2.0","\\u0069d":null,"method":"tools/list"}',
+    ],
+    ids=[
+        "absent",
+        "null",
+        "true",
+        "false",
+        "object",
+        "array",
+        "fraction",
+        "exponent",
+        "escaped-null-key",
+    ],
+)
+async def test_non_request_modern_identifier_is_rejected_before_sdk_dispatch(
+    tmp_path: Path, payload: bytes
+) -> None:
+    """A client cannot make an SDK request fire-and-forget over modern HTTP."""
+    calls = 0
+
+    async def recording_sdk(scope: Scope, receive: Receive, send: Send) -> None:
+        nonlocal calls
+        del scope, receive
+        calls += 1
+        await _send_ok_json(send)
+
+    configured = replace(
+        config(tmp_path),
+        mcp_allowed_hosts=(CanonicalHost("mcp.example.test"),),
+        mcp_allowed_origins=(CanonicalOrigin("https://mcp.example.test"),),
+    )
+    application = McpSecurityMiddleware(recording_sdk, config=configured)
+    application.start()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="https://mcp.example.test",
+    ) as client:
+        response = await client.post(
+            "/mcp",
+            headers=modern_headers("tools/list"),
+            content=payload,
+        )
+
+    assert response.status_code == HTTPStatus.BAD_REQUEST
+    assert _response_object(response) == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": JSON_RPC_INVALID_REQUEST, "message": "Invalid Request"},
+    }
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"id":0}',
+        b'{"id":-1}',
+        b'{"\\u0069d":"request"}',
+    ],
+    ids=["zero", "negative-integer", "escaped-string-key"],
+)
+async def test_decoded_root_identifier_is_forwarded_without_reparse(
+    tmp_path: Path, payload: bytes
+) -> None:
+    """Escaped JSON spelling cannot bypass or falsely trip the root-id guard."""
+    bodies: list[bytes] = []
+
+    async def recording_sdk(scope: Scope, receive: Receive, send: Send) -> None:
+        del scope
+        message = cast("dict[str, object]", await receive())
+        bodies.append(cast("bytes", message["body"]))
+        await _send_ok_json(send)
+
+    configured = replace(
+        config(tmp_path),
+        mcp_allowed_hosts=(CanonicalHost("mcp.example.test"),),
+        mcp_allowed_origins=(CanonicalOrigin("https://mcp.example.test"),),
+    )
+    application = McpSecurityMiddleware(recording_sdk, config=configured)
+    application.start()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application),
+        base_url="https://mcp.example.test",
+    ) as client:
+        response = await client.post(
+            "/mcp",
+            headers=modern_headers("tools/list"),
+            content=payload,
+        )
+
+    assert response.status_code == HTTPStatus.OK
+    assert bodies == [payload]
+
+
+@pytest.mark.asyncio
 async def test_protocol_version_byte_length_accepts_exact_limit(
     tmp_path: Path,
 ) -> None:
@@ -713,7 +823,9 @@ async def test_protocol_version_byte_length_accepts_exact_limit(
         transport=httpx.ASGITransport(app=application),
         base_url="https://mcp.example.test",
     ) as client:
-        response = await client.post("/mcp", headers=headers, content=b"{}")
+        response = await client.post(
+            "/mcp", headers=headers, content=_MINIMAL_ROOT_ID_BODY
+        )
 
     assert response.status_code == HTTPStatus.OK
     assert seen_versions == [b"a" * 32]
@@ -1042,7 +1154,7 @@ async def test_body_limit_rejects_first_excess_chunk_before_sdk(
 
     cfg = replace(
         config(tmp_path),
-        max_request_body_bytes=2,
+        max_request_body_bytes=len(_MINIMAL_ROOT_ID_BODY),
         mcp_allowed_hosts=(CanonicalHost("mcp.example.test"),),
         mcp_allowed_origins=(CanonicalOrigin("https://mcp.example.test"),),
     )
@@ -1055,12 +1167,12 @@ async def test_body_limit_rejects_first_excess_chunk_before_sdk(
         exact = await client.post(
             "/mcp",
             headers=modern_headers("server/discover"),
-            content=b"{}",
+            content=_MINIMAL_ROOT_ID_BODY,
         )
         excess = await client.post(
             "/mcp",
             headers=modern_headers("server/discover"),
-            content=b"{}x",
+            content=_MINIMAL_ROOT_ID_BODY + b"x",
         )
 
     assert exact.status_code == HTTPStatus.OK
@@ -1109,7 +1221,7 @@ async def test_json_post_requires_exact_json_media_type(
 
 @pytest.mark.asyncio
 async def test_original_json_bytes_reach_sdk_exactly_once(tmp_path: Path) -> None:
-    original = b'{ "value" : "\\u0061" }'
+    original = b'{ "\\u0069d" : 1, "value" : "\\u0061" }'
     original_receive_calls = 0
     sdk_bodies: list[bytes] = []
 
@@ -1195,7 +1307,7 @@ async def test_response_policy_replaces_conflicting_downstream_headers(
         response = await client.post(
             "/mcp",
             headers=modern_headers("server/discover"),
-            content=b"{}",
+            content=_MINIMAL_ROOT_ID_BODY,
         )
 
     assert response.headers.get_list("content-security-policy") == [
@@ -1249,7 +1361,7 @@ async def test_sse_policy_preserves_single_no_buffering_and_keepalive(
         response = await client.post(
             "/mcp",
             headers=modern_headers("server/discover"),
-            content=b"{}",
+            content=_MINIMAL_ROOT_ID_BODY,
         )
 
     assert response.headers.get_list("x-accel-buffering") == ["no"]
@@ -2957,7 +3069,7 @@ async def test_mcp_admission_rejects_excess_work_without_queueing(
             client.post(
                 "/mcp",
                 headers=modern_headers("server/discover"),
-                content=b"{}",
+                content=_MINIMAL_ROOT_ID_BODY,
             )
         )
         async with asyncio.timeout(1):
@@ -2966,7 +3078,7 @@ async def test_mcp_admission_rejects_excess_work_without_queueing(
             client.post(
                 "/mcp",
                 headers=modern_headers("server/discover"),
-                content=b"{}",
+                content=_MINIMAL_ROOT_ID_BODY,
             ),
             timeout=1,
         )
@@ -2981,7 +3093,7 @@ async def test_mcp_admission_rejects_excess_work_without_queueing(
         third = await client.post(
             "/mcp",
             headers=modern_headers("server/discover"),
-            content=b"{}",
+            content=_MINIMAL_ROOT_ID_BODY,
         )
 
     assert third.status_code == HTTPStatus.OK
@@ -3036,7 +3148,7 @@ async def test_anonymous_bodies_consume_available_global_capacity_and_recover(
             exhausted = await client.post(
                 "/mcp",
                 headers=modern_headers("server/discover"),
-                content=b"{}",
+                content=_MINIMAL_ROOT_ID_BODY,
             )
             assert exhausted.status_code == HTTPStatus.SERVICE_UNAVAILABLE
             assert _response_value(exhausted, "error", "code") == "RATE_LIMITED"
@@ -3048,7 +3160,7 @@ async def test_anonymous_bodies_consume_available_global_capacity_and_recover(
         recovered = await client.post(
             "/mcp",
             headers=modern_headers("server/discover"),
-            content=b"{}",
+            content=_MINIMAL_ROOT_ID_BODY,
         )
 
     assert recovered.status_code == HTTPStatus.OK
@@ -3097,7 +3209,7 @@ async def test_cancelled_anonymous_body_releases_global_admission(
         recovered = await client.post(
             "/mcp",
             headers=modern_headers("server/discover"),
-            content=b"{}",
+            content=_MINIMAL_ROOT_ID_BODY,
         )
 
     assert recovered.status_code == HTTPStatus.OK
@@ -3135,12 +3247,12 @@ async def test_anonymous_handler_error_releases_global_admission(
             _ = await client.post(
                 "/mcp",
                 headers=modern_headers("server/discover"),
-                content=b"{}",
+                content=_MINIMAL_ROOT_ID_BODY,
             )
         recovered = await client.post(
             "/mcp",
             headers=modern_headers("server/discover"),
-            content=b"{}",
+            content=_MINIMAL_ROOT_ID_BODY,
         )
 
     assert recovered.status_code == HTTPStatus.OK
@@ -3156,9 +3268,9 @@ async def test_global_exhaustion_rolls_back_authenticated_principal_admission(
 
     async def stalled_body() -> AsyncIterator[bytes]:
         entered.set()
-        yield b"{"
+        yield b'{"id":'
         _ = await release.wait()
-        yield b"}"
+        yield b"1}"
 
     async def accepting_sdk(scope: Scope, receive: Receive, send: Send) -> None:
         del scope, receive
@@ -3201,7 +3313,7 @@ async def test_global_exhaustion_rolls_back_authenticated_principal_admission(
             globally_exhausted = await client.post(
                 "/mcp",
                 headers=authenticated_headers,
-                content=b"{}",
+                content=_MINIMAL_ROOT_ID_BODY,
             )
         finally:
             release.set()
@@ -3209,7 +3321,7 @@ async def test_global_exhaustion_rolls_back_authenticated_principal_admission(
         recovered = await client.post(
             "/mcp",
             headers=authenticated_headers,
-            content=b"{}",
+            content=_MINIMAL_ROOT_ID_BODY,
         )
 
     assert globally_exhausted.status_code == HTTPStatus.SERVICE_UNAVAILABLE
@@ -3267,7 +3379,7 @@ async def test_principal_admission_prevents_one_credential_from_starving_another
                     **modern_headers("server/discover"),
                     "Authorization": f"Bearer {first_token}",
                 },
-                content=b"{}",
+                content=_MINIMAL_ROOT_ID_BODY,
             )
         )
         async with asyncio.timeout(1):
@@ -3279,7 +3391,7 @@ async def test_principal_admission_prevents_one_credential_from_starving_another
                 **modern_headers("server/discover"),
                 "Authorization": f"Bearer {first_token}",
             },
-            content=b"{}",
+            content=_MINIMAL_ROOT_ID_BODY,
         )
         other_principal = await client.post(
             "/mcp",
@@ -3287,7 +3399,7 @@ async def test_principal_admission_prevents_one_credential_from_starving_another
                 **modern_headers("server/discover"),
                 "Authorization": f"Bearer {second_token}",
             },
-            content=b"{}",
+            content=_MINIMAL_ROOT_ID_BODY,
         )
         release.set()
         first_response = await first
@@ -3333,14 +3445,14 @@ async def test_application_deadline_cancels_silent_handler_and_releases_permit(
             client.post(
                 "/mcp",
                 headers=modern_headers("server/discover"),
-                content=b"{}",
+                content=_MINIMAL_ROOT_ID_BODY,
             ),
             timeout=1,
         )
         after = await client.post(
             "/mcp",
             headers=modern_headers("server/discover"),
-            content=b"{}",
+            content=_MINIMAL_ROOT_ID_BODY,
         )
 
     assert timed_out.status_code == HTTPStatus.GATEWAY_TIMEOUT
@@ -3404,7 +3516,11 @@ async def test_application_deadline_never_starts_a_second_response(
         if received:
             return {"type": "http.disconnect"}
         received = True
-        return {"type": "http.request", "body": b"{}", "more_body": False}
+        return {
+            "type": "http.request",
+            "body": _MINIMAL_ROOT_ID_BODY,
+            "more_body": False,
+        }
 
     sent: list[Message] = []
 

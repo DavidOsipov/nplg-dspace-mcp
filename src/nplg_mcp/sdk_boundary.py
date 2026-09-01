@@ -2,10 +2,10 @@
 # mypy: disable-error-code="explicit-any,misc"
 """Narrow typed adaptation from strict services to MCP SDK result models."""
 
-# MCP 2.0.0 exposes protocol-edge dict[str, Any] fields. This is the sole
+# MCP 2.1.1 exposes protocol-edge dict[str, Any] fields. This is the sole
 # project adapter allowed to cross that boundary; strict Pydantic validation
 # occurs before service dispatch and before output serialization.
-# Upstream: https://github.com/modelcontextprotocol/python-sdk/tree/v2.0.0
+# Upstream: https://github.com/modelcontextprotocol/python-sdk/tree/v2.1.1
 
 from __future__ import annotations
 

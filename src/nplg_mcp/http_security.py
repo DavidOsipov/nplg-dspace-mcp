@@ -17,7 +17,11 @@ from starlette.responses import JSONResponse as StarletteJSONResponse
 from .admission import AdmissionGate, PrincipalAdmission
 from .config import canonicalize_mcp_host
 from .errors import AppError, ErrorCode, to_public_error
-from .json_preflight import JsonPreflightError, JsonPreflightLimits, preflight_json
+from .json_preflight import (
+    JsonPreflightError,
+    JsonPreflightLimits,
+    preflight_json_has_valid_root_request_id,
+)
 from .resource_admission import InlineResourceAdmission
 
 if TYPE_CHECKING:
@@ -49,6 +53,8 @@ _SAFE_VERSION_BYTES = frozenset(
 )
 _MAX_APPLICATION_DEADLINE_SECONDS = 20.0
 _MAX_VERSION_BYTES = 32
+_JSON_RPC_INVALID_REQUEST = -32600
+_JSON_RPC_INVALID_REQUEST_MESSAGE = "Invalid Request"
 
 
 class _TypedReceive(Protocol):
@@ -542,7 +548,7 @@ class McpSecurityMiddleware:
                 await response(scope, receive, policy_send)
                 return
             try:
-                preflight_json(
+                has_request_id = preflight_json_has_valid_root_request_id(
                     body,
                     limits=JsonPreflightLimits(
                         max_body_bytes=self._config.mcp_max_body_bytes
@@ -551,6 +557,20 @@ class McpSecurityMiddleware:
             except JsonPreflightError:
                 response = _JSONResponse(
                     {"error": "Invalid JSON request body"},
+                    status_code=400,
+                )
+                await response(scope, receive, policy_send)
+                return
+            if not has_request_id:
+                response = _JSONResponse(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": _JSON_RPC_INVALID_REQUEST,
+                            "message": _JSON_RPC_INVALID_REQUEST_MESSAGE,
+                        },
+                    },
                     status_code=400,
                 )
                 await response(scope, receive, policy_send)

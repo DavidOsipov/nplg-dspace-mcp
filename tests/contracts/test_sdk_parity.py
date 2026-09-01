@@ -22,6 +22,7 @@ from nplg_mcp.sdk_parity import (
     normalize_tool_result,
 )
 from nplg_mcp.services import FullServiceComposition
+from scripts.baseline_replay import normalize_response_numbers
 from tests.helpers.app_factory import FIXTURE_ERROR_CANARY, make_tool_service
 
 if TYPE_CHECKING:
@@ -50,6 +51,7 @@ _EXPECTED_DIFFERENCE_CASES = frozenset(
     {
         "metadata-tool-catalog-schema-projection",
         "private-artifact-resource-content",
+        "private-pdf-inspection-renderer-version",
         "private-render-resource-identity",
         "private-resource-template-catalog",
     }
@@ -413,6 +415,51 @@ async def test_sdk_and_legacy_private_resource_semantics_are_differentially_equa
         case_id="private-resource-template-catalog",
         frozen_value=[],
         official_sdk_value=official_templates,
+    )
+
+
+@pytest.mark.asyncio
+async def test_sdk_and_frozen_pdf_inspection_renderer_provenance_is_ledgered(
+    tmp_path: Path,
+) -> None:
+    """Keep inspection semantics frozen while binding the renderer upgrade by digest."""
+    result_fixture = _load_digest_verified_fixture("result-cases.json")
+    frozen_inspection = normalize_tool_result(
+        _frozen_result(result_fixture, "tool.inspect_pdf.modern.success")
+    )
+    tools = make_tool_service(tmp_path, frozen_origin=True)
+    services = FullServiceComposition(tools=tools, store=tools.store)
+    server = create_mcp_server(services, DeploymentProfile.PRIVATE_FULL)
+
+    async with Client(server, mode=MODERN_PROTOCOL_VERSION) as client:
+        downloaded = await client.call_tool(
+            "download_document_file",
+            {"handle": "1234/560449", "bitstream_id": "bs_public"},
+        )
+        raw_downloaded_content = cast("object", downloaded.structured_content)
+        assert isinstance(raw_downloaded_content, dict)
+        downloaded_content = cast("JsonObject", raw_downloaded_content)
+        artifact_id = downloaded_content["artifact_id"]
+        assert isinstance(artifact_id, str)
+        sdk_inspection = await client.call_tool(
+            "inspect_pdf",
+            {"artifact_id": artifact_id},
+        )
+
+    official_inspection = normalize_tool_result(sdk_inspection)
+    frozen_semantics = frozen_inspection.copy()
+    official_semantics = official_inspection.copy()
+    frozen_renderer_version = frozen_semantics.pop("renderer_version", None)
+    official_renderer_version = official_semantics.pop("renderer_version", None)
+    assert isinstance(frozen_renderer_version, str)
+    assert isinstance(official_renderer_version, str)
+    assert normalize_response_numbers(frozen_semantics) == normalize_response_numbers(
+        official_semantics
+    )
+    _assert_ledgered_difference(
+        case_id="private-pdf-inspection-renderer-version",
+        frozen_value=frozen_renderer_version,
+        official_sdk_value=official_renderer_version,
     )
 
 

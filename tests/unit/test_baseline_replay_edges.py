@@ -8,7 +8,13 @@ from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import pytest
 
-from nplg_mcp.pdf_identity import TileGeometryRequest, tile_geometry_identifier
+from nplg_mcp.pdf_executor import DEFAULT_FALLBACK_DPI
+from nplg_mcp.pdf_identity import (
+    RenderIdentityRequest,
+    TileGeometryRequest,
+    render_identifier,
+    tile_geometry_identifier,
+)
 from scripts import baseline_capture_io, baseline_replay
 
 if TYPE_CHECKING:
@@ -141,19 +147,55 @@ def test_render_normalization_requires_strict_render_id() -> None:
         )
 
 
+def test_live_tile_render_normalization_requires_established_identity() -> None:
+    """A tile result cannot establish its render identity without the replay setup."""
+    normalize = cast(
+        "_NormalizeToolRenderIdentity",
+        _private("normalize_tool_render_identity"),
+    )
+
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError,
+        match="omitted its established render identity",
+    ):
+        _ = normalize(
+            {"render_id": "rnd_" + ("1" * 32)},
+            name="render_pdf_page_tiles",
+            live=True,
+            expected_live_render_id=None,
+        )
+
+
+def test_live_versioned_render_normalization_requires_complete_provenance() -> None:
+    """A supplied setup ID cannot bypass page-render identity recomputation."""
+    normalize = cast(
+        "_NormalizeToolRenderIdentity",
+        _private("normalize_tool_render_identity"),
+    )
+
+    with pytest.raises(
+        baseline_capture_io.BaselineCaptureError,
+        match="cannot establish its version-bound identity",
+    ):
+        _ = normalize(
+            {"render_id": "rnd_" + ("1" * 32)},
+            name="render_pdf_pages",
+            live=True,
+            expected_live_render_id="rnd_" + ("2" * 32),
+        )
+
+
 @pytest.mark.parametrize(
-    ("mode", "render_id", "expected", "message"),
+    ("mode", "render_id", "message"),
     [
         (
             "live",
             "rnd_" + ("1" * 32),
-            "rnd_" + ("2" * 32),
             "live render result changed",
         ),
         (
             "frozen",
             "rnd_" + ("1" * 32),
-            None,
             "frozen render oracle changed",
         ),
     ],
@@ -161,7 +203,6 @@ def test_render_normalization_requires_strict_render_id() -> None:
 def test_render_normalization_rejects_live_and_frozen_identity_drift(
     mode: Literal["live", "frozen"],
     render_id: str,
-    expected: str | None,
     message: str,
 ) -> None:
     normalize = cast(
@@ -169,9 +210,31 @@ def test_render_normalization_rejects_live_and_frozen_identity_drift(
         _private("normalize_tool_render_identity"),
     )
 
+    result: baseline_replay.ReplayJsonObject = {
+        "mode": "native",
+        "pages": [{"page_number": 1}],
+        "render_id": render_id,
+        "renderer_version": "test-renderer/1.0",
+        "source_sha256": "a" * 64,
+    }
+    expected = (
+        render_identifier(
+            RenderIdentityRequest(
+                source_sha256="a" * 64,
+                pages=(1,),
+                mode="native",
+                renderer_version="test-renderer/1.0",
+                fallback_dpi=DEFAULT_FALLBACK_DPI,
+            )
+        )
+        if mode == "live"
+        else None
+    )
+    assert expected is None or render_id != expected
+
     with pytest.raises(baseline_capture_io.BaselineCaptureError, match=message):
         _ = normalize(
-            {"render_id": render_id},
+            result,
             name="render_pdf_pages",
             live=mode == "live",
             expected_live_render_id=expected,

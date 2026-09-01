@@ -2151,7 +2151,7 @@ class _TrustedReleaseTool:
 
 
 _TRUSTED_RELEASE_TOOLS = (
-    _TrustedReleaseTool("ruff", "ruff", "ruff", "0.16.3", "module"),
+    _TrustedReleaseTool("ruff", "ruff", "ruff", "0.16.5", "module"),
     _TrustedReleaseTool(
         "mypy",
         "mypy",
@@ -2574,7 +2574,7 @@ def local_gate_commands(
         _gate_command(
             name="zizmor",
             executable=zizmor,
-            version="1.29.0",
+            version="1.30.0",
             argv=(
                 zizmor.as_posix(),
                 "--offline",
