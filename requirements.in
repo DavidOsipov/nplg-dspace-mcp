@@ -28,7 +28,7 @@ pydantic-core==2.46.4
 pypdfium2==5.8.0
 pyjwt[crypto]==2.13.0
 python-multipart==0.0.32
-pywin32==311 ; sys_platform == 'win32'
+pywin32==312 ; sys_platform == 'win32'
 # Hash-lock the PEP 517 backend used by Alpic's no-isolation source install.
 setuptools==84.0.0
 soupsieve==2.8.4

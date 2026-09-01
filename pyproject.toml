@@ -27,7 +27,7 @@ dependencies = [
   "opentelemetry-api==1.44.0",
   "PyJWT[crypto]==2.13.0",
   "python-multipart==0.0.32",
-  "pywin32==311 ; sys_platform == 'win32'",
+  "pywin32==312 ; sys_platform == 'win32'",
   "sse-starlette==3.4.8",
   "truststore==0.10.4",
   "beautifulsoup4==4.14.3",
