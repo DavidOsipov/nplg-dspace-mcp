@@ -31,7 +31,7 @@ python-multipart==0.0.32
 pywin32==311 ; sys_platform == 'win32'
 # Hash-lock the PEP 517 backend used by Alpic's no-isolation source install.
 setuptools==84.0.0
-soupsieve==2.8.4
+soupsieve==2.9.2
 sse-starlette==3.4.8
 starlette==1.3.1
 truststore==0.10.4
