@@ -9,7 +9,7 @@ coverage==7.16.0
 hypothesis==6.167.1
 jsonschema==4.26.0
 PyYAML==6.0.3
-pypdf==6.16.2
+pypdf==6.17.0
 reportlab==5.0.1
 
 # Static and security quality tools.
