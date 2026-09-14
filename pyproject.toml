@@ -31,7 +31,7 @@ dependencies = [
   "sse-starlette==3.4.8",
   "truststore==0.10.4",
   "beautifulsoup4==4.15.0",
-  "lxml==6.1.2",
+  "lxml==6.1.3",
   "defusedxml==0.7.1",
   "dnspython==2.8.0",
   "pypdfium2==5.13.0",
