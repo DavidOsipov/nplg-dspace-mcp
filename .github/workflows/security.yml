@@ -52,7 +52,7 @@ jobs:
         run: python scripts/verify_release.py local-gates --worktree "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/nplg-security-sast" --node-executable "$(command -v node)" --compare-branch origin/main
 
       - name: Analyze with CodeQL
-        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        uses: github/codeql-action/analyze@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         with:
           category: /language:python
 
