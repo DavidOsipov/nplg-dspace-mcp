@@ -47,7 +47,7 @@ test = [
   "coverage==7.16.0",
   "hypothesis==6.167.1",
   "PyYAML==6.0.3",
-  "pypdf==6.16.2",
+  "pypdf==6.19.0",
   "reportlab==5.0.1",
 ]
 
