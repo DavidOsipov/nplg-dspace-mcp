@@ -72,7 +72,7 @@ jobs:
           sha256sum "$RUNNER_TEMP/nplg-lint/"*.txt > "$RUNNER_TEMP/nplg-lint/SHA256SUMS"
 
       - name: Upload lint evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lint-${{ matrix.python-version }}-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/nplg-lint
@@ -135,7 +135,7 @@ jobs:
           sha256sum "$RUNNER_TEMP/nplg-types/"*.txt > "$RUNNER_TEMP/nplg-types/SHA256SUMS"
 
       - name: Upload type evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: types-${{ github.sha }}-${{ github.run_attempt }}
           path: |
@@ -212,7 +212,7 @@ jobs:
           sha256sum contracts/generated/*.json contracts/zod/*.mjs contracts/zod/*.ts contracts/tool-contracts.corpus.json tests/contracts/*.mjs tests/contracts/test_zod_contracts.py "$RUNNER_TEMP/nplg-contracts/generated-contracts.diff" > "$RUNNER_TEMP/nplg-contracts/SHA256SUMS"
 
       - name: Upload contract evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: contracts-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/nplg-contracts
@@ -255,7 +255,7 @@ jobs:
           sha256sum "$RUNNER_TEMP/nplg-package/canonical/"* > "$RUNNER_TEMP/nplg-package/SHA256SUMS"
 
       - name: Upload the canonical package
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: canonical-package-${{ github.sha }}-${{ github.run_attempt }}
           path: |
@@ -316,7 +316,7 @@ jobs:
           sha256sum "$RUNNER_TEMP/nplg-tests/python-version.txt" "$RUNNER_TEMP/canonical-package/SHA256SUMS" > "$RUNNER_TEMP/nplg-tests/SHA256SUMS"
 
       - name: Upload test evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tests-${{ matrix.python-version }}-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/nplg-tests

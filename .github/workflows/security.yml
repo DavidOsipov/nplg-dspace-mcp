@@ -64,7 +64,7 @@ jobs:
 
       - name: Upload SAST evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sast-${{ github.sha }}-${{ github.run_attempt }}
           path: |
@@ -113,7 +113,7 @@ jobs:
 
       - name: Upload SCA evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sca-${{ github.sha }}-${{ github.run_attempt }}
           path: |
@@ -162,7 +162,7 @@ jobs:
 
       - name: Upload SBOM evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom-${{ github.sha }}-${{ github.run_attempt }}
           path: |
@@ -208,7 +208,7 @@ jobs:
 
       - name: Upload secret-scan evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: secrets-${{ github.sha }}-${{ github.run_attempt }}
           path: |
@@ -254,7 +254,7 @@ jobs:
 
       - name: Upload container evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: container-${{ github.sha }}-${{ github.run_attempt }}
           path: |
